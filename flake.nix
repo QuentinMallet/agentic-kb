@@ -109,16 +109,11 @@
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
 
-              nativeBuildInputs = with pkgs; [ pkg-config cmake makeWrapper ];
-              buildInputs = with pkgs; [ openssl onnxruntime ];
+              nativeBuildInputs = with pkgs; [ pkg-config cmake ];
+              buildInputs = with pkgs; [ openssl ];
 
               OPENSSL_NO_VENDOR = "1";
               doCheck = false;
-
-              postInstall = ''
-                wrapProgram $out/bin/kb \
-                  --set ORT_DYLIB_PATH "${pkgs.onnxruntime}/lib/libonnxruntime.so"
-              '';
 
               meta = with pkgs.lib; {
                 description = "Agent knowledge base CLI (SQLite + JSONL + semantic search)";
@@ -139,7 +134,9 @@
               ])
             ]
             ++ (with pkgs; [
+              pkg-config
               cmake
+              openssl.dev
               tlaps
               tlaplus18
               mdbook
@@ -148,16 +145,12 @@
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao
               dex
-
-              onnxruntime
             ]);
 
             shellHook = ''
                             export CARGO_HOME="$PWD/.cargo"
                             export PATH="$CARGO_HOME/bin:$PATH"
-                            export LD_LIBRARY_PATH="${pkgs.onnxruntime}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
-                            export FASTEMBED_CACHE_PATH="$PWD/.fastembed-cache"
-                            mkdir -p .fastembed-cache/models/BAAI/bge-small-en-v1.5
+                            export OPENSSL_NO_VENDOR="1"
                             mkdir -p .cargo
                             echo '*' > .cargo/.gitignore
 
