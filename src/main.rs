@@ -14,10 +14,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use fs2::FileExt;
 use rusqlite::{params, Connection};
 use uuid::Uuid;
+
+// ── Vector math ───────────────────────────────────────────────────────────────
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
+}
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -168,10 +181,6 @@ fn open_db(db_path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("open DB {}", db_path.display()))?;
-    // Load sqlite-vec extension (provides vec0 virtual table).
-    unsafe {
-        sqlite_vec::load(&conn).context("load sqlite-vec extension")?;
-    }
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     ensure_schema(&conn)?;
     Ok(conn)
@@ -198,9 +207,11 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             id UNINDEXED, path, summary, content, tags
         );
 
-        -- sqlite-vec vector index; rowid = entries.rowid for join.
-        CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(
-            embedding float[384]
+        -- Embedding store: raw float32 LE bytes, rowid-linked to entries.
+        -- Cosine similarity computed in Rust (avoids sqlite-vec build issues).
+        CREATE TABLE IF NOT EXISTS entries_emb (
+            rowid    INTEGER PRIMARY KEY REFERENCES entries(rowid) ON DELETE CASCADE,
+            embedding BLOB NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS test_cases (
@@ -268,14 +279,14 @@ fn read_events(events_path: &Path) -> Result<Vec<serde_json::Value>> {
 
 fn init_model(cache_dir: &Path) -> Result<TextEmbedding> {
     TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::BGESmallENV15)
+        TextInitOptions::new(EmbeddingModel::BGESmallENV15)
             .with_cache_dir(cache_dir.to_path_buf())
             .with_show_download_progress(true),
     )
     .context("init fastembed BAAI/bge-small-en-v1.5")
 }
 
-fn embed(model: &TextEmbedding, text: &str) -> Result<Vec<f32>> {
+fn embed(model: &mut TextEmbedding, text: &str) -> Result<Vec<f32>> {
     let mut vecs = model
         .embed(vec![text.to_string()], None)
         .context("generate embedding")?;
@@ -290,7 +301,7 @@ fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
 
 fn apply_event(
     conn: &Connection,
-    model: Option<&TextEmbedding>,
+    model: Option<&mut TextEmbedding>,
     event: &serde_json::Value,
 ) -> Result<()> {
     let action = event["action"].as_str().unwrap_or("");
@@ -331,13 +342,13 @@ fn apply_event(
                 params![id, path, summary, content, tags],
             )?;
 
-            // Sync vector index.
+            // Sync embedding store.
             if let Some(m) = model {
                 let text = format!("{} {} {}", path, summary, content);
                 let emb = embed(m, &text)?;
                 let blob = f32s_to_blob(&emb);
                 conn.execute(
-                    "INSERT OR REPLACE INTO entries_vec(rowid, embedding) VALUES(?1,?2)",
+                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
                     params![rowid, blob],
                 )?;
             }
@@ -423,8 +434,8 @@ fn cmd_add(
     append_event(&paths.events, &event)?;
 
     let conn = open_db(&paths.db)?;
-    let model = init_model(&paths.fastembed_cache).ok();
-    apply_event(&conn, model.as_ref(), &event)?;
+    let mut model = init_model(&paths.fastembed_cache).ok();
+    apply_event(&conn, model.as_mut(), &event)?;
 
     println!("added  {} ({})", path, id);
     Ok(())
@@ -458,17 +469,18 @@ fn cmd_rebuild(paths: &Paths) -> Result<()> {
     // Drop the DB so we start from a clean slate.
     if paths.db.exists() {
         fs::remove_file(&paths.db)?;
-        let _ = fs::remove_file(paths.db.with_extension("db-wal"));
-        let _ = fs::remove_file(paths.db.with_extension("db-shm"));
+        let db_str = paths.db.to_string_lossy();
+        let _ = fs::remove_file(format!("{}-wal", db_str));
+        let _ = fs::remove_file(format!("{}-shm", db_str));
     }
 
     let conn = open_db(&paths.db)?;
-    let model = init_model(&paths.fastembed_cache)?;
+    let mut model = init_model(&paths.fastembed_cache)?;
     let events = read_events(&paths.events)?;
 
     eprintln!("replaying {} events…", events.len());
     for event in &events {
-        apply_event(&conn, Some(&model), event)
+        apply_event(&conn, Some(&mut model), event)
             .with_context(|| format!("apply event: {}", event))?;
     }
 
@@ -514,34 +526,46 @@ fn cmd_search(paths: &Paths, query: String, fts: bool, semantic: bool) -> Result
 
     if do_semantic {
         println!("=== Semantic results ===");
-        let model = init_model(&paths.fastembed_cache)?;
-        let emb = embed(&model, &query)?;
-        let blob = f32s_to_blob(&emb);
+        let mut model = init_model(&paths.fastembed_cache)?;
+        let q_emb = embed(&mut model, &query)?;
 
+        // Load all non-stale entries with embeddings; compute cosine similarity in memory.
         let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.tags, ev.distance
-             FROM (SELECT rowid, distance FROM entries_vec WHERE embedding MATCH ?1 AND k=10) ev
-             JOIN entries e ON e.rowid = ev.rowid
-             WHERE e.is_stale=0
-             ORDER BY ev.distance",
+            "SELECT e.id, e.path, e.summary, e.tags, emb.embedding
+             FROM entries_emb emb
+             JOIN entries e ON e.rowid = emb.rowid
+             WHERE e.is_stale = 0",
         )?;
-        let mut count = 0;
-        let rows = stmt.query_map(params![blob], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, f64>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, path, summary, tags, dist) = row?;
-            println!("  [{path}] {summary}  dist={dist:.4}  tags={tags}  id={id}");
-            count += 1;
-        }
-        if count == 0 {
+        let mut candidates: Vec<(f32, String, String, String, String)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, path, summary, tags, blob)| {
+                let emb: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                let sim = cosine_similarity(&q_emb, &emb);
+                (sim, id, path, summary, tags)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<_> = candidates.into_iter().take(10).collect();
+
+        if top.is_empty() {
             println!("  (no results)");
+        } else {
+            for (sim, id, path, summary, tags) in top {
+                println!("  [{path}] {summary}  sim={sim:.4}  tags={tags}  id={id}");
+            }
         }
     }
 
