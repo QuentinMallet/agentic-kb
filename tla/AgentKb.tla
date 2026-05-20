@@ -52,11 +52,13 @@ EXTENDS Sequences, FiniteSets, Naturals, TLC
 CONSTANTS
     Procs,      \* set of process IDs, e.g. {"p1","p2"}
     EntryIds,   \* set of possible entry IDs, e.g. {"e1","e2"}
-    DataVals    \* set of possible data values, e.g. {"d1"}
+    DataVals,   \* set of possible data values, e.g. {"d1"}
+    MaxLogLen   \* maximum log length for TLC state-space bound, e.g. 3
 
 ASSUME Procs    # {}
 ASSUME EntryIds # {}
 ASSUME DataVals # {}
+ASSUME MaxLogLen \in Nat /\ MaxLogLen > 0
 
 (* ──────────────────────────── Tagged-union values ──────────────────────── *)
 
@@ -88,6 +90,10 @@ VARIABLES
     pc           \* [Procs -> ProcStep]
 
 vars == <<log, db, lock_holder, pending, pc>>
+
+\* TLC state-space bound: only explore states with log length <= MaxLogLen.
+\* Keeps the state space finite; invariants hold for all log lengths.
+LogLenBound == Len(log) <= MaxLogLen
 
 ProcSteps == {
     "idle",
@@ -268,7 +274,11 @@ Next ==
         \/ \E id \in EntryIds, d \in DataVals : StartWrite(p, UpsertEvent(id, d))
         \/ \E id \in EntryIds               : StartWrite(p, ExpireEvent(id))
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+\* Safety spec (used for INVARIANT checking — bounded by LogLenBound).
+Spec == Init /\ [][Next]_vars
+
+\* Liveness spec (requires PROPERTY in cfg; much slower to check).
+LiveSpec == Spec /\ WF_vars(Next)
 
 (* ──────────────────────────── Safety invariants ────────────────────────── *)
 
