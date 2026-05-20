@@ -21,6 +21,25 @@ use uuid::Uuid;
 
 // ── Vector math ───────────────────────────────────────────────────────────────
 
+fn git_head_sha() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn git_repo_root() -> Option<std::path::PathBuf> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -59,6 +78,12 @@ enum Command {
         /// Entry ID (auto-generated UUID if omitted)
         #[arg(long)]
         id: Option<String>,
+    },
+    /// Check if kb entries for given files are stale (file changed since entry was recorded)
+    StaleCheck {
+        /// One or more file paths to check
+        #[arg(required = true)]
+        files: Vec<String>,
     },
     /// Mark an entry stale
     Expire {
@@ -132,7 +157,11 @@ fn find_paths() -> Result<Paths> {
         if dir.join(".state").is_dir() {
             return Ok(Paths {
                 lock: dir.join(".state").join(".lock"),
-                events: dir.join("agent-kb").join("agent-kb-events.jsonl"),
+                // Events live inside .state/ (agentic orphan branch) so the
+                // heartbeat hook can commit them automatically.
+                events: dir.join(".state").join("agent-kb").join("agent-kb-events.jsonl"),
+                // DB is a local materialised cache at repo root — gitignored on
+                // the code branch, never committed.
                 db: dir.join("agent-kb").join("agent-kb.db"),
                 fastembed_cache: fastembed_cache_dir(),
             });
@@ -413,6 +442,7 @@ fn cmd_add(
 ) -> Result<()> {
     let _lock = acquire_lock(&paths.lock)?;
     let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let version_ref = version_ref.or_else(git_head_sha);
     let tags_json: serde_json::Value =
         serde_json::json!(tags.split(',').map(|t| t.trim()).collect::<Vec<_>>());
     let ts = Utc::now().to_rfc3339();
@@ -572,6 +602,77 @@ fn cmd_search(paths: &Paths, query: String, fts: bool, semantic: bool) -> Result
     Ok(())
 }
 
+fn cmd_stale_check(paths: &Paths, files: Vec<String>) -> Result<()> {
+    let conn = open_db(&paths.db)?;
+    let repo_root = git_repo_root();
+    let mut found_any = false;
+
+    for file in &files {
+        // Normalize to a repo-relative path so it matches how entries are stored.
+        // If the path is absolute and repo_root is known, strip the prefix.
+        let rel_path: String = if let Some(ref root) = repo_root {
+            let p = std::path::Path::new(file);
+            if p.is_absolute() {
+                p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
+            } else {
+                file.clone()
+            }
+        } else {
+            file.clone()
+        };
+
+        // Query by exact path and also by suffix match for flexibility.
+        let mut stmt = conn.prepare(
+            "SELECT id, summary, version_ref, path FROM entries
+             WHERE (path = ?1 OR path LIKE '%' || ?1 OR ?1 LIKE '%' || path)
+               AND version_ref IS NOT NULL AND is_stale = 0",
+        )?;
+        let rows: Vec<_> = stmt
+            .query_map(params![rel_path], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, summary, version_ref, stored_path) in rows {
+            let mut cmd = std::process::Command::new("git");
+            if let Some(ref root) = repo_root {
+                cmd.arg("-C").arg(root);
+            }
+            cmd.args([
+                "log",
+                "--oneline",
+                &format!("{}..HEAD", version_ref),
+                "--",
+                &stored_path,
+            ]);
+            if let Ok(out) = cmd.output() {
+                if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                    let count = std::str::from_utf8(&out.stdout)
+                        .unwrap_or("")
+                        .lines()
+                        .count();
+                    println!(
+                        "STALE  [{stored_path}] {summary}  id={id}  recorded-at={version_ref}  ({count} commit{} ago)",
+                        if count == 1 { "" } else { "s" }
+                    );
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    if !found_any {
+        println!("ok");
+    }
+    Ok(())
+}
+
 fn cmd_compact(paths: &Paths) -> Result<()> {
     let _lock = acquire_lock(&paths.lock)?;
     let events = read_events(&paths.events)?;
@@ -711,6 +812,7 @@ fn cmd_test_add(
 ) -> Result<()> {
     let _lock = acquire_lock(&paths.lock)?;
     let id = id.unwrap_or_else(|| format!("{}-{}", app, name.replace(' ', "-")));
+    let version_ref = version_ref.or_else(git_head_sha);
     let ts = Utc::now().to_rfc3339();
     let session = std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
 
@@ -785,6 +887,8 @@ fn main() -> Result<()> {
             version_ref,
             id,
         } => cmd_add(&paths, path, summary, content, tags, version_ref, id),
+
+        Command::StaleCheck { files } => cmd_stale_check(&paths, files),
 
         Command::Expire { id, reason } => cmd_expire(&paths, id, reason),
 
