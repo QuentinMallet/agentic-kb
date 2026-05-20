@@ -236,10 +236,11 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             id UNINDEXED, path, summary, content, tags
         );
 
-        -- Embedding store: raw float32 LE bytes, rowid-linked to entries.
-        -- Cosine similarity computed in Rust (avoids sqlite-vec build issues).
+        -- Embedding store: raw float32 LE bytes, rowid-linked to entries by convention.
+        -- SQLite FK cannot reference `rowid` (implicit, not declared); orphans are
+        -- filtered out by the JOIN with entries, so no explicit FK needed.
         CREATE TABLE IF NOT EXISTS entries_emb (
-            rowid    INTEGER PRIMARY KEY REFERENCES entries(rowid) ON DELETE CASCADE,
+            rowid    INTEGER PRIMARY KEY,
             embedding BLOB NOT NULL
         );
 
@@ -915,5 +916,136 @@ fn main() -> Result<()> {
             adapter,
             detail,
         } => cmd_run(&paths, test_id, result, adapter, detail),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::fs;
+    use std::process::Command as Cmd;
+    use tempfile::tempdir;
+
+    // ── PBT: cosine_similarity ────────────────────────────────────────────────
+
+    proptest! {
+        /// Commutativity: sim(a, b) == sim(b, a)
+        #[test]
+        fn cosine_similarity_commutative(
+            a in prop::collection::vec(-1.0f32..=1.0, 1..8),
+            b in prop::collection::vec(-1.0f32..=1.0, 1..8),
+        ) {
+            let len = a.len().min(b.len());
+            let a = &a[..len];
+            let b = &b[..len];
+            let ab = cosine_similarity(a, b);
+            let ba = cosine_similarity(b, a);
+            prop_assert!((ab - ba).abs() < 1e-5, "sim({a:?},{b:?})={ab} != sim({b:?},{a:?})={ba}");
+        }
+
+        /// Self-similarity: sim(v, v) == 1.0 for any non-zero vector
+        #[test]
+        fn cosine_similarity_self_is_one(
+            v in prop::collection::vec(0.01f32..=1.0, 1..8),
+        ) {
+            let sim = cosine_similarity(&v, &v);
+            prop_assert!((sim - 1.0).abs() < 1e-5, "self-sim({v:?})={sim}");
+        }
+
+        /// Range: result is in [-1.0, 1.0] for any non-zero vectors
+        #[test]
+        fn cosine_similarity_bounded(
+            a in prop::collection::vec(-1.0f32..=1.0, 1..8),
+            b in prop::collection::vec(-1.0f32..=1.0, 1..8),
+        ) {
+            let len = a.len().min(b.len());
+            let sim = cosine_similarity(&a[..len], &b[..len]);
+            prop_assert!(sim >= -1.0001 && sim <= 1.0001, "sim out of range: {sim}");
+        }
+    }
+
+    /// Zero vector → similarity = 0.0
+    #[test]
+    fn cosine_similarity_zero_vector() {
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[0.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0], &[0.0]), 0.0);
+    }
+
+    // ── Unit: git helpers ─────────────────────────────────────────────────────
+
+    /// Inside the agentic-kb repo, git_head_sha() returns a full 40-char hex SHA.
+    #[test]
+    fn git_head_sha_returns_full_sha_in_repo() {
+        let sha = git_head_sha().expect("should be inside a git repo");
+        assert_eq!(sha.len(), 40, "expected full SHA, got: {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {sha}");
+    }
+
+    /// Inside the agentic-kb repo, git_repo_root() returns an existing directory.
+    #[test]
+    fn git_repo_root_returns_existing_dir() {
+        let root = git_repo_root().expect("should be inside a git repo");
+        assert!(root.is_dir(), "repo root not a dir: {root:?}");
+    }
+
+    // ── Integration: cmd_add auto-tags version_ref ────────────────────────────
+
+    /// After kb add inside a git+.state workspace, the DB entry has a non-null
+    /// version_ref matching the current HEAD SHA.
+    #[test]
+    fn cmd_add_auto_populates_version_ref() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        // Init a minimal git repo.
+        Cmd::new("git").args(["init", "-b", "master"]).current_dir(root).output()?;
+        Cmd::new("git").args(["config", "user.email", "test@test"]).current_dir(root).output()?;
+        Cmd::new("git").args(["config", "user.name", "Test"]).current_dir(root).output()?;
+        fs::write(root.join("README"), "init")?;
+        Cmd::new("git").args(["add", "."]).current_dir(root).output()?;
+        Cmd::new("git").args(["commit", "-m", "init"]).current_dir(root).output()?;
+
+        // Create .state/ so find_paths() resolves from root.
+        fs::create_dir_all(root.join(".state/agent-kb"))?;
+
+        let expected_sha = String::from_utf8(
+            Cmd::new("git").args(["rev-parse", "HEAD"]).current_dir(root).output()?.stdout,
+        )?.trim().to_string();
+
+        let paths = Paths {
+            lock: root.join(".state").join(".lock"),
+            events: root.join(".state").join("agent-kb").join("agent-kb-events.jsonl"),
+            db: root.join("agent-kb").join("agent-kb.db"),
+            fastembed_cache: std::env::temp_dir().join("fastembed-test"),
+        };
+
+        // Add entry — version_ref should be auto-populated from HEAD.
+        // We must cd into root so git commands resolve correctly.
+        let orig = std::env::current_dir()?;
+        std::env::set_current_dir(root)?;
+        cmd_add(
+            &paths,
+            "src/lib.rs".to_string(),
+            "test entry".to_string(),
+            "content".to_string(),
+            "test".to_string(),
+            None, // no explicit version_ref → should auto-populate
+            None,
+        )?;
+        std::env::set_current_dir(orig)?;
+
+        // Verify the DB entry has version_ref == HEAD SHA.
+        let conn = Connection::open(&paths.db)?;
+        let version_ref: Option<String> = conn.query_row(
+            "SELECT version_ref FROM entries WHERE path = 'src/lib.rs'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(version_ref, Some(expected_sha));
+        Ok(())
     }
 }
