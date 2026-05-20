@@ -465,7 +465,12 @@ fn cmd_add(
     append_event(&paths.events, &event)?;
 
     let conn = open_db(&paths.db)?;
-    let mut model = init_model(&paths.fastembed_cache).ok();
+    // KB_NO_EMBED=1 skips fastembed (useful in CI or sandboxed envs where ORT deadlocks).
+    let mut model = if std::env::var("KB_NO_EMBED").is_ok() {
+        None
+    } else {
+        init_model(&paths.fastembed_cache).ok()
+    };
     apply_event(&conn, model.as_mut(), &event)?;
 
     println!("added  {} ({})", path, id);
@@ -506,12 +511,13 @@ fn cmd_rebuild(paths: &Paths) -> Result<()> {
     }
 
     let conn = open_db(&paths.db)?;
-    let mut model = init_model(&paths.fastembed_cache)?;
+    let no_embed = std::env::var("KB_NO_EMBED").is_ok();
+    let mut model = if no_embed { None } else { Some(init_model(&paths.fastembed_cache)?) };
     let events = read_events(&paths.events)?;
 
     eprintln!("replaying {} events…", events.len());
     for event in &events {
-        apply_event(&conn, Some(&mut model), event)
+        apply_event(&conn, model.as_mut(), event)
             .with_context(|| format!("apply event: {}", event))?;
     }
 
@@ -555,7 +561,7 @@ fn cmd_search(paths: &Paths, query: String, fts: bool, semantic: bool) -> Result
         }
     }
 
-    if do_semantic {
+    if do_semantic && std::env::var("KB_NO_EMBED").is_err() {
         println!("=== Semantic results ===");
         let mut model = init_model(&paths.fastembed_cache)?;
         let q_emb = embed(&mut model, &query)?;
