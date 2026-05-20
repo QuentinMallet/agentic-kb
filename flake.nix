@@ -31,11 +31,6 @@
           cargo = toolchain;
           rustc = toolchain;
         };
-        bgeSmallModel = pkgs.fetchurl {
-          url = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
-          sha256 = pkgs.lib.fakeSha256;
-          name = "bge-small-en-v1.5-model.onnx";
-        };
       in
       {
         packages =
@@ -122,10 +117,7 @@
 
               postInstall = ''
                 wrapProgram $out/bin/kb \
-                  --set FASTEMBED_CACHE_PATH "$out/share/fastembed-models" \
                   --set ORT_DYLIB_PATH "${pkgs.onnxruntime}/lib/libonnxruntime.so"
-                mkdir -p $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5
-                ln -s ${bgeSmallModel} $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5/model.onnx
               '';
 
               meta = with pkgs.lib; {
