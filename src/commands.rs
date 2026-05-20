@@ -3,6 +3,7 @@
 pub mod add;
 pub mod compact;
 pub mod expire;
+pub mod mcp;
 pub mod rebuild;
 pub mod run;
 pub mod search;
@@ -21,6 +22,8 @@ pub enum KbCmd {
     Add(add::Add),
     /// Search knowledge entries
     Search(search::Search),
+    /// Run MCP port protocol server (line-delimited JSON over stdio)
+    Mcp(mcp::Mcp),
     /// Check if kb entries for given files are stale
     StaleCheck(stale_check::StaleCheck),
     /// Replay all events and rebuild agent-kb.db from scratch

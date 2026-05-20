@@ -35,6 +35,26 @@
       {
         packages =
           let
+            # Elixir MCP server (escript — no external hex deps, uses OTP 27 :json)
+            mcpPackage = pkgs.stdenv.mkDerivation {
+              pname = "agentic-kb-mcp";
+              version = "0.1.0";
+              src = ./mcp;
+              nativeBuildInputs = [ pkgs.elixir_1_18 ];
+              MIX_ENV = "prod";
+              HEX_OFFLINE = "1";
+              buildPhase = ''
+                export HOME=$TMPDIR
+                export MIX_HOME=$TMPDIR/.mix
+                export HEX_HOME=$TMPDIR/.hex
+                mix escript.build --no-deps-check
+              '';
+              installPhase = ''
+                install -Dm755 agentic_kb_mcp $out/bin/agentic-kb-mcp
+              '';
+            };
+          in
+          let
             omcSrc =
               if builtins.pathExists ./.omc then
                 builtins.path {
@@ -101,6 +121,7 @@
           {
             doc = mkDoc { };
             doc-with-planning = mkDoc { includePlanning = true; };
+            mcp = mcpPackage;
           }
           // pkgs.lib.optionalAttrs hasCargoLock {
             default = platform.buildRustPackage {
