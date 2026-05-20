@@ -1,6 +1,7 @@
 //! Embedder trait and implementations
 
 use anyhow::Result;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -30,7 +31,6 @@ impl Embedder for NoopEmbedder {
 /// Candle-based embedder using BAAI/bge-small-en-v1.5.
 /// Lazily loads the model on first embed() call.
 pub struct CandleEmbedder {
-    #[allow(dead_code)]
     cache_dir: PathBuf,
     inner: Mutex<Option<CandleInner>>,
 }
@@ -58,17 +58,45 @@ impl CandleEmbedder {
         self.inner.lock().unwrap().is_some()
     }
 
-    fn load_model() -> Result<CandleInner> {
+    /// Download a single file from HuggingFace Hub, caching locally.
+    /// Uses ureq with auto-redirect following (handles relative Location headers).
+    fn download_hf_file(model_id: &str, filename: &str, cache_dir: &Path) -> Result<PathBuf> {
+        let safe_id = model_id.replace('/', "--");
+        let dir = cache_dir.join(&safe_id);
+        std::fs::create_dir_all(&dir)?;
+        let out_path = dir.join(filename);
+        if out_path.exists() {
+            return Ok(out_path);
+        }
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            model_id, filename
+        );
+        eprintln!("kb: downloading {} from HuggingFace...", filename);
+        let agent = ureq::AgentBuilder::new().build();
+        let resp = agent
+            .get(&url)
+            .call()
+            .map_err(|e| anyhow::anyhow!("download {filename}: {e}"))?;
+        let mut reader = resp.into_reader();
+        let tmp = out_path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::copy(&mut reader, &mut f)?;
+            f.flush()?;
+        }
+        std::fs::rename(&tmp, &out_path)?;
+        Ok(out_path)
+    }
+
+    fn load_model(cache_dir: &Path) -> Result<CandleInner> {
         use candle_core::Device;
         use candle_nn::VarBuilder;
-        use hf_hub::api::sync::Api;
 
-        let api = Api::new()?;
-        let repo = api.model("BAAI/bge-small-en-v1.5".to_string());
-
-        let config_path = repo.get("config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors")?;
+        let model_id = "BAAI/bge-small-en-v1.5";
+        let config_path = Self::download_hf_file(model_id, "config.json", cache_dir)?;
+        let tokenizer_path = Self::download_hf_file(model_id, "tokenizer.json", cache_dir)?;
+        let weights_path = Self::download_hf_file(model_id, "model.safetensors", cache_dir)?;
 
         let config_data = std::fs::read_to_string(&config_path)?;
         let config: candle_transformers::models::bert::Config =
@@ -97,7 +125,7 @@ impl Embedder for CandleEmbedder {
 
         let mut guard = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         if guard.is_none() {
-            *guard = Some(Self::load_model()?);
+            *guard = Some(Self::load_model(&self.cache_dir)?);
         }
         let inner = guard.as_ref().unwrap();
 
