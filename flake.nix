@@ -122,7 +122,8 @@
 
               postInstall = ''
                 wrapProgram $out/bin/kb \
-                  --set FASTEMBED_CACHE_PATH "$out/share/fastembed-models"
+                  --set FASTEMBED_CACHE_PATH "$out/share/fastembed-models" \
+                  --set ORT_DYLIB_PATH "${pkgs.onnxruntime}/lib/libonnxruntime.so"
                 mkdir -p $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5
                 ln -s ${bgeSmallModel} $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5/model.onnx
               '';

@@ -1,0 +1,22 @@
+[package]
+name = "kb"
+version = "0.1.0"
+edition = "2021"
+description = "Agent knowledge base CLI — JSONL event log + SQLite materialized cache with FTS5 and semantic search"
+
+[[bin]]
+name = "kb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+fastembed = { version = "5", default-features = false }
+fs2 = "0.4"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlite-vec = "0.1.10-alpha.4"
+uuid = { version = "1", features = ["v4"] }
