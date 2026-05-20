@@ -19,18 +19,22 @@
       system:
 
       let
-        target = "aarch64-unknown-linux-musl";
-        toolchain =
-          with fenix.packages.${system};
-          combine [
-            stable.cargo
-            stable.rustc
-            targets.${target}.stable.rust-std
-          ];
+        toolchain = fenix.packages.${system}.stable.withComponents [
+          "cargo"
+          "rustc"
+          "rust-src"
+          "clippy"
+          "rustfmt"
+        ];
         pkgs = nixpkgs.legacyPackages.${system};
         platform = pkgs.makeRustPlatform {
           cargo = toolchain;
           rustc = toolchain;
+        };
+        bgeSmallModel = pkgs.fetchurl {
+          url = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
+          sha256 = pkgs.lib.fakeSha256;
+          name = "bge-small-en-v1.5-model.onnx";
         };
       in
       {
@@ -105,14 +109,29 @@
           }
           // pkgs.lib.optionalAttrs hasCargoLock {
             default = platform.buildRustPackage {
-              pname = "package";
-              nativeBuildInputs = with pkgs; [ cmake ];
-              buildInputs = with pkgs; [ stdenv.cc.cc.lib ];
+              pname = "kb";
               version = "0.1.0";
-
               src = ./.;
-
               cargoLock.lockFile = ./Cargo.lock;
+
+              nativeBuildInputs = with pkgs; [ pkg-config cmake makeWrapper ];
+              buildInputs = with pkgs; [ openssl onnxruntime ];
+
+              OPENSSL_NO_VENDOR = "1";
+              doCheck = false;
+
+              postInstall = ''
+                wrapProgram $out/bin/kb \
+                  --set FASTEMBED_CACHE_PATH "$out/share/fastembed-models"
+                mkdir -p $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5
+                ln -s ${bgeSmallModel} $out/share/fastembed-models/models/BAAI/bge-small-en-v1.5/model.onnx
+              '';
+
+              meta = with pkgs.lib; {
+                description = "Agent knowledge base CLI (SQLite + JSONL + semantic search)";
+                mainProgram = "kb";
+                platforms = platforms.unix;
+              };
             };
           };
         devShells = {
@@ -136,12 +155,16 @@
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao
               dex
+
+              onnxruntime
             ]);
 
             shellHook = ''
                             export CARGO_HOME="$PWD/.cargo"
                             export PATH="$CARGO_HOME/bin:$PATH"
-                            export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib";
+                            export LD_LIBRARY_PATH="${pkgs.onnxruntime}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
+                            export FASTEMBED_CACHE_PATH="$PWD/.fastembed-cache"
+                            mkdir -p .fastembed-cache/models/BAAI/bge-small-en-v1.5
                             mkdir -p .cargo
                             echo '*' > .cargo/.gitignore
 
