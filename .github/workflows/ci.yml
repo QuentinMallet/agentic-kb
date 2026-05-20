@@ -1,0 +1,29 @@
+name: CI
+
+# Note: nix build and nix build .#doc are skipped — both cross-compile to
+# aarch64-unknown-linux-musl and cannot run on ubuntu-latest. Validation uses
+# nix flake check (flake structure) and native cargo commands via nix develop.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Validate flake
+        run: nix flake check
+      - name: Build (native)
+        run: nix develop -c cargo build
+      - name: Test
+        run: nix develop -c cargo test
+      - name: Lint
+        run: nix develop -c cargo clippy -- -D warnings
+      - name: Format check
+        run: nix develop -c cargo fmt --check
