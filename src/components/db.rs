@@ -39,6 +39,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             tags        TEXT NOT NULL,
             version_ref TEXT,
             is_stale    INTEGER DEFAULT 0,
+            permanent   INTEGER DEFAULT 0,
             created_at  TEXT DEFAULT (datetime('now')),
             updated_at  TEXT DEFAULT (datetime('now'))
         );
@@ -75,6 +76,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Migration: add `permanent` column to existing DBs that pre-date this field.
+    // SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.37; ignore "duplicate column" error.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN permanent INTEGER DEFAULT 0;");
     Ok(())
 }
 
@@ -96,16 +100,18 @@ pub fn apply_event(
             let tags = event["tags"].to_string();
             let version_ref = event["version_ref"].as_str();
             let ts = event["ts"].as_str().unwrap_or("");
+            let permanent = event["permanent"].as_bool().unwrap_or(false) as i32;
 
             conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)
                  ON CONFLICT(id) DO UPDATE SET
                    path=excluded.path, summary=excluded.summary,
                    content=excluded.content, tags=excluded.tags,
                    version_ref=excluded.version_ref,
+                   permanent=excluded.permanent,
                    is_stale=0, updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, ts],
+                params![id, path, summary, content, tags, version_ref, permanent, ts],
             )?;
 
             let rowid: i64 = conn.query_row(

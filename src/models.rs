@@ -41,6 +41,9 @@ pub struct Entry {
     pub tags: String,
     /// Git commit SHA when entry was recorded
     pub version_ref: Option<String>,
+    /// Whether this entry survives compact/expire cycles
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 /// A test case definition.

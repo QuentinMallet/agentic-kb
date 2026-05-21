@@ -136,19 +136,18 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
             Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
         };
 
-        let rows: Vec<_> = stmt
-            .query_map(params![query, limit as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })
-            .unwrap_or_else(|_| Box::new(std::iter::empty()))
-            .filter_map(|r| r.ok())
-            .collect();
+        let rows: Vec<_> = match stmt.query_map(params![query, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        }) {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        };
 
         for (entry_id, path, summary, content, tags_str) in rows {
             let tags: Value = serde_json::from_str(&tags_str).unwrap_or(Value::Array(vec![]));
@@ -181,7 +180,7 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
             Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
         };
 
-        let mut candidates: Vec<(f32, String, String, String, String, String)> = stmt
+        let mut candidates: Vec<(f32, String, String, String, String, String)> = match stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -191,15 +190,17 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
                     r.get::<_, String>(4)?,
                     r.get::<_, Vec<u8>>(5)?,
                 ))
-            })
-            .unwrap_or_else(|_| Box::new(std::iter::empty()))
-            .filter_map(|r| r.ok())
-            .map(|(entry_id, path, summary, content, tags_str, blob)| {
-                let emb_vec = blob_to_f32s(&blob);
-                let sim = cosine_similarity(&q_emb, &emb_vec);
-                (sim, entry_id, path, summary, content, tags_str)
-            })
-            .collect();
+            }) {
+            Ok(mapped) => mapped
+                .filter_map(|r| r.ok())
+                .map(|(entry_id, path, summary, content, tags_str, blob)| {
+                    let emb_vec = blob_to_f32s(&blob);
+                    let sim = cosine_similarity(&q_emb, &emb_vec);
+                    (sim, entry_id, path, summary, content, tags_str)
+                })
+                .collect(),
+            Err(_) => vec![],
+        };
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 

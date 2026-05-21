@@ -147,6 +147,7 @@ mod tests {
             tags: "auth,security".to_string(),
             version_ref: Some("abc123".to_string()),
             id: Some("search-test-1".to_string()),
+            permanent: false,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 

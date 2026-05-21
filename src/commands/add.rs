@@ -28,6 +28,9 @@ pub struct Add {
     /// Entry ID (auto-generated UUID if omitted)
     #[arg(long)]
     pub id: Option<String>,
+    /// Mark entry as permanent (survives compact and resists expire)
+    #[arg(long, default_value_t = false)]
+    pub permanent: bool,
 }
 
 impl Runnable for Add {
@@ -75,6 +78,7 @@ impl Add {
             "content": self.content,
             "tags": tags_json,
             "version_ref": version_ref,
+            "permanent": self.permanent,
             "ts": ts,
             "session": session,
         });
@@ -197,6 +201,7 @@ mod tests {
             tags: "rust,test".to_string(),
             version_ref: Some("abc123".to_string()),
             id: Some("test-id-1".to_string()),
+            permanent: false,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -215,6 +220,98 @@ mod tests {
             .unwrap();
         assert_eq!(path, "src/lib.rs");
         assert_eq!(summary, "test entry");
+    }
+
+    #[test]
+    fn test_cmd_add_permanent_flag_stored_in_db() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // permanent=true
+        let cmd = Add {
+            path: "skills/new-module".to_string(),
+            summary: "how to add a NixOS module".to_string(),
+            content: "content here".to_string(),
+            tags: "nixos,skill".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some("perm-test-1".to_string()),
+            permanent: true,
+        };
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let permanent: i64 = conn
+            .query_row(
+                "SELECT permanent FROM entries WHERE id='perm-test-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(permanent, 1);
+
+        // permanent=false (default)
+        let cmd2 = Add {
+            path: "skills/other".to_string(),
+            summary: "non-permanent".to_string(),
+            content: "content".to_string(),
+            tags: "test".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some("perm-test-2".to_string()),
+            permanent: false,
+        };
+        cmd2.execute_with(&paths, &embedder).unwrap();
+
+        let permanent2: i64 = conn
+            .query_row(
+                "SELECT permanent FROM entries WHERE id='perm-test-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(permanent2, 0);
+
+        // JSONL event includes permanent field
+        let events_content = fs::read_to_string(&paths.events).unwrap();
+        assert!(events_content.contains("\"permanent\":true"));
+        assert!(events_content.contains("\"permanent\":false"));
+    }
+
+    #[test]
+    fn test_cmd_add_old_event_without_permanent_replays() {
+        // Old JSONL events without the `permanent` field should deserialize with permanent=false
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Write a raw event without `permanent` field (simulates pre-permanent JSONL)
+        let old_event = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "old-event-1",
+            "path": "src/old.rs",
+            "summary": "old entry",
+            "content": "old content",
+            "tags": ["old"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        events::append_event(&paths.events, &old_event).unwrap();
+
+        let conn = db::open_db(&paths.db).unwrap();
+        db::apply_event(&conn, &embedder, &old_event).unwrap();
+
+        let permanent: i64 = conn
+            .query_row(
+                "SELECT permanent FROM entries WHERE id='old-event-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(permanent, 0, "old events without permanent field must default to 0");
     }
 
     #[test]
@@ -243,6 +340,7 @@ mod tests {
             tags: "test".to_string(),
             version_ref: None,
             id: None,
+            permanent: false,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
