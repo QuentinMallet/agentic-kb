@@ -17,7 +17,7 @@ pub struct Add {
     #[arg(long)]
     pub summary: String,
     /// Full content
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub content: String,
     /// Comma-separated tags
     #[arg(long)]

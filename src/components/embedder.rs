@@ -136,6 +136,12 @@ impl Embedder for CandleEmbedder {
 
         let ids = encoding.get_ids().to_vec();
         let type_ids = encoding.get_type_ids().to_vec();
+
+        // Truncate to BAAI/bge-small-en-v1.5 max sequence length (512 tokens).
+        // Without truncation the model panics on index-out-of-bounds for long inputs.
+        const MAX_SEQ_LEN: usize = 512;
+        let ids: Vec<u32> = ids.into_iter().take(MAX_SEQ_LEN).collect();
+        let type_ids: Vec<u32> = type_ids.into_iter().take(MAX_SEQ_LEN).collect();
         let len = ids.len();
 
         let device = Device::Cpu;
