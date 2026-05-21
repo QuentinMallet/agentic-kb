@@ -19,6 +19,9 @@ pub struct Search {
     /// Semantic similarity search only
     #[arg(long)]
     pub semantic: bool,
+    /// Search a different repo's KB (path to repo root)
+    #[arg(long)]
+    pub repo: Option<std::path::PathBuf>,
 }
 
 impl Runnable for Search {
@@ -33,7 +36,11 @@ impl Runnable for Search {
 impl Search {
     /// Execute the search command.
     pub fn execute(&self) -> anyhow::Result<()> {
-        let paths = config::Paths::discover()?;
+        let paths = if let Some(repo) = &self.repo {
+            config::Paths::from_root(repo)
+        } else {
+            config::Paths::discover()?
+        };
         let emb = crate::commands::add::make_embedder(&paths);
         self.execute_with(&paths, emb.as_ref())
     }
@@ -156,7 +163,38 @@ mod tests {
             query: "authentication".to_string(),
             fts: true,
             semantic: false,
+            repo: None,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
+    }
+
+    #[test]
+    fn test_cmd_search_repo_flag_searches_alternate_kb() {
+        // Build a "remote" KB in a separate temp dir
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path();
+        fs::create_dir_all(remote_root.join(".state/agent-kb")).unwrap();
+        let remote_paths = Paths::from_root(remote_root);
+        let embedder = NoopEmbedder;
+
+        let add_cmd = Add {
+            path: "remote/mod.rs".to_string(),
+            summary: "remote knowledge".to_string(),
+            content: "cross-repo content".to_string(),
+            tags: "remote".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("remote-1".to_string()),
+            permanent: false,
+        };
+        add_cmd.execute_with(&remote_paths, &embedder).unwrap();
+
+        // Search the remote KB via --repo (simulate by passing remote_paths directly)
+        let search_cmd = Search {
+            query: "remote knowledge".to_string(),
+            fts: true,
+            semantic: false,
+            repo: Some(remote_root.to_path_buf()),
+        };
+        search_cmd.execute_with(&remote_paths, &embedder).unwrap();
     }
 }

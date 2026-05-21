@@ -70,7 +70,8 @@ impl Compact {
         entry_pairs.sort_by_key(|(i, _)| *i);
         for (i, id) in entry_pairs {
             let mut ev = evts[i].clone();
-            if expire_ids.contains(id) {
+            let is_permanent = ev["permanent"].as_bool().unwrap_or(false);
+            if expire_ids.contains(id) && !is_permanent {
                 ev["is_stale"] = serde_json::json!(true);
             }
             compacted.push(ev);
@@ -141,5 +142,37 @@ mod tests {
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0]["summary"], "v2");
+    }
+
+    #[test]
+    fn test_cmd_compact_permanent_entry_not_marked_stale() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        // Permanent entry upsert
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "perm1", "path": "a.rs", "summary": "perm",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z",
+            "permanent": true
+        });
+        append_event(&paths.events, &upsert).unwrap();
+
+        // Expire event (e.g. via --force)
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "perm1", "ts": "2024-01-01T01:00:00Z"
+        });
+        append_event(&paths.events, &expire).unwrap();
+
+        let cmd = Compact;
+        cmd.execute_with_paths(&paths).unwrap();
+
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(after.len(), 1);
+        // permanent entry must NOT have is_stale folded in
+        assert!(after[0]["is_stale"].is_null() || after[0]["is_stale"] == false);
     }
 }
