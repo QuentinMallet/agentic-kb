@@ -153,6 +153,8 @@ pub fn apply_event(
                 "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
                 params![id],
             )?;
+            // Remove from FTS so expired entries don't appear in search
+            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
         }
 
         ("upsert", "test_cases") => {
@@ -440,6 +442,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(is_stale, 1);
+    }
+
+    #[test]
+    fn test_apply_event_expire_cleans_fts() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "fts1", "path": "src/auth.rs", "summary": "auth module",
+            "content": "handles JWT tokens", "tags": ["auth"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Verify FTS entry exists before expire
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1);
+
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "fts1"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        // FTS entry must be gone after expire
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "expire must remove entry from FTS index");
     }
 
     #[test]
