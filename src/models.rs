@@ -3,7 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Compute cosine similarity between two vectors.
+/// Returns 0.0 if vectors have different lengths (dimension mismatch from
+/// model upgrade or corrupt embedding blob).
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        eprintln!(
+            "kb: cosine_similarity dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -134,6 +144,27 @@ mod tests {
             let len = a.len().min(b.len());
             let sim = cosine_similarity(&a[..len], &b[..len]);
             prop_assert!(sim >= -1.0001 && sim <= 1.0001, "sim out of range: {sim}");
+        }
+    }
+
+    /// Mismatched lengths -> similarity = 0.0
+    #[test]
+    fn test_cosine_similarity_mismatched_lengths() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0, 3.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[1.0]), 0.0);
+    }
+
+    proptest! {
+        /// Mismatched random vectors always return 0.0
+        #[test]
+        fn proptest_cosine_similarity_mismatched_returns_zero(
+            a in prop::collection::vec(-1.0f32..=1.0, 1..8),
+            b in prop::collection::vec(-1.0f32..=1.0, 1..8),
+        ) {
+            if a.len() != b.len() {
+                prop_assert_eq!(cosine_similarity(&a, &b), 0.0);
+            }
         }
     }
 
