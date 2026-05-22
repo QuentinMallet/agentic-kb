@@ -4,6 +4,7 @@ pub mod add;
 pub mod compact;
 pub mod expire;
 pub mod mcp;
+pub mod reembed;
 pub mod rebuild;
 pub mod run;
 pub mod search;
@@ -32,6 +33,8 @@ pub enum KbCmd {
     Compact(compact::Compact),
     /// Mark an entry stale
     Expire(expire::Expire),
+    /// Re-embed entries that are missing embeddings
+    Reembed(reembed::Reembed),
     /// List test cases
     Tests(tests::Tests),
     /// Add or update a test case

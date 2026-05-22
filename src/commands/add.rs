@@ -6,6 +6,7 @@ use crate::components::events;
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
+use rusqlite::params;
 
 /// Add or update a knowledge entry
 #[derive(Command, Debug, Parser)]
@@ -31,6 +32,10 @@ pub struct Add {
     /// Mark entry as permanent (survives compact and resists expire)
     #[arg(long, default_value_t = false)]
     pub permanent: bool,
+    /// Expire all existing non-stale entries at this path before inserting.
+    /// Useful for idempotent re-ingestion (e.g. kb-ingest chunk updates).
+    #[arg(long, default_value_t = false)]
+    pub replace_path: bool,
 }
 
 impl Runnable for Add {
@@ -69,6 +74,38 @@ impl Add {
         let session =
             std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
 
+        // Open DB once; used for both the optional path-replace step and the upsert.
+        let conn = db::open_db(&paths.db)?;
+
+        // --replace-path: expire all existing non-stale entries at this path before
+        // inserting. Bypasses the permanent guard in expire.rs (the user is explicitly
+        // replacing the entry via kb add --replace-path).
+        if self.replace_path {
+            let existing_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
+                )?;
+                // Bind to named variable so stmt is not borrowed at end-of-block
+                let ids: Vec<String> = stmt
+                    .query_map(params![self.path], |r| r.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                ids
+            };
+            for old_id in existing_ids {
+                let expire_ev = serde_json::json!({
+                    "action": "expire",
+                    "table": "entries",
+                    "id": old_id,
+                    "reason": "replaced by --replace-path",
+                    "ts": ts,
+                    "session": session,
+                });
+                events::append_event(&paths.events, &expire_ev)?;
+                db::apply_event(&conn, embedder, &expire_ev)?;
+            }
+        }
+
         let event = serde_json::json!({
             "action": "upsert",
             "table": "entries",
@@ -84,8 +121,6 @@ impl Add {
         });
 
         events::append_event(&paths.events, &event)?;
-
-        let conn = db::open_db(&paths.db)?;
         db::apply_event(&conn, embedder, &event)?;
 
         println!("added  {} ({})", self.path, id);
@@ -202,6 +237,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("test-id-1".to_string()),
             permanent: false,
+            replace_path: false,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -239,6 +275,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("perm-test-1".to_string()),
             permanent: true,
+            replace_path: false,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -261,6 +298,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("perm-test-2".to_string()),
             permanent: false,
+            replace_path: false,
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
@@ -315,6 +353,59 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_add_replace_path_expires_old_entries() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Add initial entry at path
+        let cmd1 = Add {
+            path: "docs/guide.md".to_string(),
+            summary: "original guide".to_string(),
+            content: "original content".to_string(),
+            tags: "docs".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("rp-old".to_string()),
+            permanent: false,
+            replace_path: false,
+        };
+        cmd1.execute_with(&paths, &embedder).unwrap();
+
+        // Re-add same path with --replace-path
+        let cmd2 = Add {
+            path: "docs/guide.md".to_string(),
+            summary: "updated guide".to_string(),
+            content: "updated content".to_string(),
+            tags: "docs".to_string(),
+            version_ref: Some("def".to_string()),
+            id: Some("rp-new".to_string()),
+            permanent: false,
+            replace_path: true,
+        };
+        cmd2.execute_with(&paths, &embedder).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let old_stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id='rp-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_stale, 1, "old entry must be stale after --replace-path");
+        let new_stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id='rp-new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_stale, 0, "new entry must be active");
+    }
+
+    #[test]
     fn test_cmd_add_auto_populates_version_ref() {
         let (dir, paths) = setup_test_repo();
         let embedder = NoopEmbedder;
@@ -341,6 +432,7 @@ mod tests {
             version_ref: None,
             id: None,
             permanent: false,
+            replace_path: false,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 

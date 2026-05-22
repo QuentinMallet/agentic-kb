@@ -8,7 +8,6 @@
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::{db, embedder, events};
 use crate::config;
-use crate::models::{blob_to_f32s, cosine_similarity};
 use abscissa_core::{Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
@@ -111,125 +110,44 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     };
     let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
     let mode = req.get("mode").and_then(|m| m.as_str()).unwrap_or("hybrid");
+    let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let do_fts = mode == "fts" || mode == "hybrid";
-    let do_semantic = mode == "semantic" || mode == "hybrid";
+    let opts = db::SearchOptions {
+        limit,
+        do_fts: mode == "fts" || mode == "hybrid",
+        do_semantic: mode == "semantic" || mode == "hybrid",
+        path_prefix,
+        tag_filter,
+    };
 
     let conn = match db::open_db(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let mut entries: Vec<Value> = Vec::new();
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    if do_fts {
-        let mut stmt = match conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags
-             FROM entries_fts f
-             JOIN entries e ON e.id = f.id
-             WHERE f.entries_fts MATCH ?1 AND e.is_stale=0
-             ORDER BY rank
-             LIMIT ?2",
-        ) {
-            Ok(s) => s,
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-        };
-
-        let rows: Vec<_> = match stmt.query_map(params![query, limit as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        }) {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => vec![],
-        };
-
-        for (entry_id, path, summary, content, tags_str) in rows {
-            let tags: Value = serde_json::from_str(&tags_str).unwrap_or(Value::Array(vec![]));
-            seen_ids.insert(entry_id.clone());
-            entries.push(json!({
-                "path": path,
-                "summary": summary,
-                "content": content,
-                "tags": tags,
-                "score": 1.0,
-                "id": entry_id,
-                "source": "fts",
-            }));
-        }
-    }
-
-    if do_semantic && !emb.is_noop() {
-        let q_emb = match emb.embed(&query) {
-            Ok(e) => e,
-            Err(_) => return json!({"id":id,"type":"result","entries":entries}),
-        };
-
-        let mut stmt = match conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags, emb.embedding
-             FROM entries_emb emb
-             JOIN entries e ON e.rowid = emb.rowid
-             WHERE e.is_stale = 0",
-        ) {
-            Ok(s) => s,
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-        };
-
-        let mut candidates: Vec<(f32, String, String, String, String, String)> = match stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Vec<u8>>(5)?,
-                ))
-            }) {
-            Ok(mapped) => mapped
-                .filter_map(|r| r.ok())
-                .map(|(entry_id, path, summary, content, tags_str, blob)| {
-                    let emb_vec = blob_to_f32s(&blob);
-                    let sim = cosine_similarity(&q_emb, &emb_vec);
-                    (sim, entry_id, path, summary, content, tags_str)
+    match db::search_entries(&conn, emb, &query, &opts) {
+        Ok(results) => {
+            let entries: Vec<Value> = results
+                .into_iter()
+                .map(|e| {
+                    let tags: Value =
+                        serde_json::from_str(&e.tags).unwrap_or(Value::Array(vec![]));
+                    json!({
+                        "path": e.path,
+                        "summary": e.summary,
+                        "content": e.content,
+                        "tags": tags,
+                        "score": e.score,
+                        "id": e.id,
+                        "source": e.source,
+                    })
                 })
-                .collect(),
-            Err(_) => vec![],
-        };
-
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        for (sim, entry_id, path, summary, content, tags_str) in candidates.into_iter().take(limit) {
-            if seen_ids.contains(&entry_id) {
-                continue;
-            }
-            let tags: Value = serde_json::from_str(&tags_str).unwrap_or(Value::Array(vec![]));
-            entries.push(json!({
-                "path": path,
-                "summary": summary,
-                "content": content,
-                "tags": tags,
-                "score": sim,
-                "id": entry_id,
-                "source": "semantic",
-            }));
+                .collect();
+            json!({"id": id, "type": "result", "entries": entries})
         }
-
-        // Re-sort by score for hybrid mode
-        entries.sort_by(|a, b| {
-            let sa = a["score"].as_f64().unwrap_or(0.0);
-            let sb = b["score"].as_f64().unwrap_or(0.0);
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        entries.truncate(limit);
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
-
-    json!({"id": id, "type": "result", "entries": entries})
 }
 
 fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {

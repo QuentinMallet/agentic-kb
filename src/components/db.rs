@@ -1,7 +1,7 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
-use crate::models::f32s_to_blob;
+use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::fs;
@@ -184,6 +184,162 @@ pub fn apply_event(
         _ => {} // unknown event — skip silently
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared search infrastructure
+// ---------------------------------------------------------------------------
+
+/// Options for hybrid FTS5 + semantic search.
+pub struct SearchOptions {
+    pub limit: usize,
+    pub do_fts: bool,
+    pub do_semantic: bool,
+    /// Only return entries whose path starts with this prefix.
+    pub path_prefix: Option<String>,
+    /// Only return entries that have this exact tag.
+    pub tag_filter: Option<String>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+        }
+    }
+}
+
+/// A single result entry returned by `search_entries`.
+pub struct SearchEntry {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub content: String,
+    /// Raw JSON array string (e.g. `["rust","test"]`).
+    pub tags: String,
+    /// Relevance score (cosine similarity for semantic, 1.0 for FTS).
+    pub score: f32,
+    /// `"fts"` or `"semantic"`.
+    pub source: &'static str,
+}
+
+/// Shared hybrid search used by both the CLI and MCP handler.
+///
+/// FTS queries are wrapped in double-quotes to enable phrase search and prevent
+/// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
+pub fn search_entries(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<SearchEntry>> {
+    let mut entries: Vec<SearchEntry> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if opts.do_fts {
+        // Wrap in double-quotes → phrase match; escape embedded double-quotes
+        let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.path, e.summary, e.content, e.tags
+             FROM entries_fts f
+             JOIN entries e ON e.id = f.id
+             WHERE f.entries_fts MATCH ?1
+               AND e.is_stale = 0
+               AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+               AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
+             ORDER BY rank
+             LIMIT ?4",
+        )?;
+        let rows: Vec<_> = stmt
+            .query_map(
+                params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, path, summary, content, tags) in rows {
+            seen_ids.insert(id.clone());
+            entries.push(SearchEntry {
+                id,
+                path,
+                summary,
+                content,
+                tags,
+                score: 1.0,
+                source: "fts",
+            });
+        }
+    }
+
+    if opts.do_semantic && !embedder.is_noop() {
+        let q_emb = embedder.embed(query)?;
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.path, e.summary, e.content, e.tags, emb.embedding
+             FROM entries_emb emb
+             JOIN entries e ON e.rowid = emb.rowid
+             WHERE e.is_stale = 0
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
+        )?;
+        let mut candidates: Vec<(f32, String, String, String, String, String)> = stmt
+            .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(id, path, summary, content, tags, blob)| {
+                let emb_vec = blob_to_f32s(&blob);
+                let sim = cosine_similarity(&q_emb, &emb_vec);
+                (sim, id, path, summary, content, tags)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
+            if seen_ids.contains(&id) {
+                continue;
+            }
+            entries.push(SearchEntry {
+                id,
+                path,
+                summary,
+                content,
+                tags,
+                score: sim,
+                source: "semantic",
+            });
+        }
+
+        // Re-sort hybrid results by score descending and cap at limit
+        if opts.do_fts {
+            entries.sort_by(|a, b| {
+                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            entries.truncate(opts.limit);
+        }
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

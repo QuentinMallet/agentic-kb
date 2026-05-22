@@ -113,6 +113,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("expire-test-1".to_string()),
             permanent: false,
+            replace_path: false,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -151,6 +152,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("perm-expire-1".to_string()),
             permanent: true,
+            replace_path: false,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -181,6 +183,7 @@ mod tests {
             version_ref: Some("abc123".to_string()),
             id: Some("perm-expire-2".to_string()),
             permanent: true,
+            replace_path: false,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
