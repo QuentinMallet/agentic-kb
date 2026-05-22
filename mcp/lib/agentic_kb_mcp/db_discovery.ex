@@ -1,6 +1,7 @@
 defmodule AgenticKbMcp.DbDiscovery do
   @moduledoc """
   Walk up from cwd looking for agent-kb/agent-kb.db — mirrors the Rust Paths::discover() logic.
+  Also checks .state/agent-kb/agent-kb.db at each level (worktree/agentic branch convention).
   """
 
   @spec discover(String.t()) :: {:ok, String.t()} | {:error, :not_found}
@@ -9,17 +10,15 @@ defmodule AgenticKbMcp.DbDiscovery do
   end
 
   defp do_discover(dir) do
-    candidate = Path.join([dir, "agent-kb", "agent-kb.db"])
+    candidates = [
+      Path.join([dir, "agent-kb", "agent-kb.db"]),
+      Path.join([dir, ".state", "agent-kb", "agent-kb.db"])
+    ]
 
-    cond do
-      File.exists?(candidate) ->
-        {:ok, candidate}
-
-      dir == "/" ->
-        {:error, :not_found}
-
-      true ->
-        do_discover(Path.dirname(dir))
+    case Enum.find(candidates, &File.exists?/1) do
+      nil when dir == "/" -> {:error, :not_found}
+      nil -> do_discover(Path.dirname(dir))
+      path -> {:ok, path}
     end
   end
 end
