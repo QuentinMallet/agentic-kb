@@ -31,6 +31,7 @@ pub fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
 
 /// Convert little-endian byte blob back to f32 vec.
 pub fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
+    debug_assert!(b.len().is_multiple_of(4), "blob length {} not divisible by 4 — corrupt embedding?", b.len());
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -86,24 +87,6 @@ pub struct RunRecord {
     pub detail: Option<String>,
     /// Run UUID
     pub run_id: Option<String>,
-}
-
-/// A knowledge base event (from the JSONL log).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct KbEvent {
-    /// Action: upsert, expire, insert
-    pub action: String,
-    /// Table: entries, test_cases, run_history
-    pub table: String,
-    /// Timestamp
-    #[serde(default)]
-    pub ts: String,
-    /// Session ID
-    #[serde(default)]
-    pub session: String,
-    /// Remaining fields (id, path, summary, content, tags, etc.)
-    #[serde(flatten)]
-    pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -185,29 +168,4 @@ mod tests {
         assert_eq!(original, recovered);
     }
 
-    /// Event round-trip serialization
-    #[test]
-    fn test_event_roundtrip_serialization() {
-        let mut fields = serde_json::Map::new();
-        fields.insert("id".to_string(), serde_json::json!("test-id-1"));
-        fields.insert("path".to_string(), serde_json::json!("src/lib.rs"));
-        fields.insert("summary".to_string(), serde_json::json!("test summary"));
-        fields.insert("content".to_string(), serde_json::json!("test content"));
-        fields.insert(
-            "tags".to_string(),
-            serde_json::json!(["rust", "test"]),
-        );
-
-        let event = KbEvent {
-            action: "upsert".to_string(),
-            table: "entries".to_string(),
-            ts: "2024-01-01T00:00:00Z".to_string(),
-            session: "cli".to_string(),
-            fields,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let recovered: KbEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(event, recovered);
-    }
 }

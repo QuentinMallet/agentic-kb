@@ -1,4 +1,5 @@
 //! Embedder trait and implementations
+#![allow(unsafe_code)] // candle VarBuilder::from_mmaped_safetensors requires unsafe
 
 use anyhow::Result;
 use std::io::Write;
@@ -40,7 +41,10 @@ struct CandleInner {
     tokenizer: tokenizers::Tokenizer,
 }
 
-// Safety: CandleInner fields are only accessed under the Mutex lock.
+// SAFETY: CandleInner (BertModel + Tokenizer) may contain non-Send raw pointers
+// internally, but all access is serialized through the Mutex<Option<CandleInner>>
+// in embed(). The MCP server and CLI are single-threaded; the Mutex ensures no
+// concurrent access even if callers change in the future.
 unsafe impl Send for CandleEmbedder {}
 unsafe impl Sync for CandleEmbedder {}
 

@@ -44,10 +44,10 @@ impl Expire {
         embedder: &dyn Embedder,
     ) -> anyhow::Result<()> {
         let _lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_db(&paths.db)?;
 
         // Guard: refuse to expire permanent entries unless --force
         if !self.force {
-            let conn = db::open_db(&paths.db)?;
             let permanent: Option<i64> = conn
                 .query_row(
                     "SELECT permanent FROM entries WHERE id=?1",
@@ -78,7 +78,6 @@ impl Expire {
         });
 
         events::append_event(&paths.events, &event)?;
-        let conn = db::open_db(&paths.db)?;
         db::apply_event(&conn, embedder, &event)?;
 
         println!("expired {}", self.id);

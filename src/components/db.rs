@@ -250,8 +250,15 @@ pub fn search_entries(
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     if opts.do_fts {
-        // Wrap in double-quotes → phrase match; escape embedded double-quotes
-        let safe_query = format!("\"{}\"", query.replace('"', "\"\""));
+        // Quote each whitespace-delimited term individually to prevent FTS5
+        // operator injection (AND/OR/NOT) while allowing multi-term recall.
+        // "auth security" matches entries with both words anywhere, not just
+        // as an exact phrase.
+        let safe_query: String = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut stmt = conn.prepare(
             "SELECT e.id, e.path, e.summary, e.content, e.tags
              FROM entries_fts f
@@ -303,6 +310,7 @@ pub fn search_entries(
                AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         )?;
+        // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
         let mut candidates: Vec<(f32, String, String, String, String, String)> = stmt
             .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
                 Ok((

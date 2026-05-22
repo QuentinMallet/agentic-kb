@@ -80,6 +80,7 @@ impl Paths {
     }
 
     /// Build Paths rooted at a specific directory (for testing).
+    /// Uses `.state/agent-kb/` consistently (no symlink in test tempdirs).
     pub fn from_root(root: &Path) -> Self {
         Paths {
             lock: root.join(".state").join(".lock"),
@@ -87,7 +88,10 @@ impl Paths {
                 .join(".state")
                 .join("agent-kb")
                 .join("agent-kb-events.jsonl"),
-            db: root.join("agent-kb").join("agent-kb.db"),
+            db: root
+                .join(".state")
+                .join("agent-kb")
+                .join("agent-kb.db"),
             fastembed_cache: model_cache_dir(),
         }
     }
@@ -146,7 +150,7 @@ mod tests {
         );
         assert_eq!(
             paths.db,
-            PathBuf::from("/tmp/test-repo/agent-kb/agent-kb.db")
+            PathBuf::from("/tmp/test-repo/.state/agent-kb/agent-kb.db")
         );
     }
 }
