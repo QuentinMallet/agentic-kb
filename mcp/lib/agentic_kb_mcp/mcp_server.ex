@@ -23,6 +23,14 @@ defmodule AgenticKbMcp.McpServer do
             "type" => "string",
             "enum" => ["hybrid", "fts", "semantic"],
             "description" => "Search mode (default: hybrid)"
+          },
+          "path_prefix" => %{
+            "type" => "string",
+            "description" => "Filter results to entries whose path starts with this prefix"
+          },
+          "tag" => %{
+            "type" => "string",
+            "description" => "Filter results to entries that have this exact tag"
           }
         },
         "required" => ["query"]
@@ -196,6 +204,8 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("query", args["query"])
       |> put_if_present("limit", args["limit"])
       |> put_if_present("mode", args["mode"])
+      |> put_if_present("path_prefix", args["path_prefix"])
+      |> put_if_present("tag", args["tag"])
 
     port_call_to_content(req)
   end
