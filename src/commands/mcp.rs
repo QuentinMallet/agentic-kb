@@ -96,6 +96,7 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
         "expire" => handle_expire(&id, &req, paths, emb),
         "stale_check" => handle_stale_check(&id, &req, paths),
         "compact" => handle_compact(&id, paths),
+        "reembed" => handle_reembed(&id, &req, paths, emb),
         "rebuild" => handle_rebuild(&id, paths, emb),
         _ => json!({
             "id": id,
@@ -357,6 +358,69 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 
     json!({"id": id, "type": "ok", "rebuilt": total})
+}
+
+fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let dry_run = req.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_chars = req.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(1800) as usize;
+
+    if emb.is_noop() {
+        return json!({"id":id,"type":"ok","embedded":0,"skipped":0,"missing":0,
+                       "message":"KB_NO_EMBED is set — no embedder available"});
+    }
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT e.rowid, e.id, e.path, e.summary, e.content
+         FROM entries e
+         WHERE e.is_stale = 0
+           AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
+    ) {
+        Ok(s) => s,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let candidates: Vec<(i64, String, String, String, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap_or_else(|_| panic!("query failed"))
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total_missing = candidates.len();
+    let to_embed: Vec<_> = candidates.iter()
+        .filter(|(_, _, path, summary, content)| path.len() + summary.len() + content.len() + 2 <= max_chars)
+        .collect();
+    let skipped = total_missing - to_embed.len();
+
+    if dry_run {
+        return json!({"id":id,"type":"ok","embedded":0,"skipped":skipped,"missing":to_embed.len(),
+                       "dry_run":true});
+    }
+
+    let mut done = 0u32;
+    let mut failed = 0u32;
+    for (rowid, _id, path, summary, content) in &to_embed {
+        let text = format!("{} {} {}", path, summary, content);
+        match emb.embed(&text) {
+            Ok(emb_vec) => {
+                let blob = crate::models::f32s_to_blob(&emb_vec);
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+                    params![rowid, blob],
+                );
+                done += 1;
+            }
+            Err(_) => { failed += 1; }
+        }
+    }
+
+    json!({"id":id,"type":"ok","embedded":done,"failed":failed,"skipped":skipped})
 }
 
 fn handle_compact(id: &Value, paths: &config::Paths) -> Value {

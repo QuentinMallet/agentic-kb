@@ -115,6 +115,23 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_reembed",
+      "description" => "Re-embed entries missing embeddings (e.g. written with KB_NO_EMBED=1)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "dry_run" => %{
+            "type" => "boolean",
+            "description" => "Show what would be re-embedded without writing (default false)"
+          },
+          "max_chars" => %{
+            "type" => "integer",
+            "description" => "Skip entries exceeding this char limit (default 1800)"
+          }
+        }
+      }
+    },
+    %{
       "name" => "kb_compact",
       "description" => "Compact the event log by squashing superseded events",
       "inputSchema" => %{
@@ -289,6 +306,15 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_reembed", args, _state) do
+    req =
+      %{"method" => "reembed", "id" => gen_id()}
+      |> put_if_present("dry_run", args["dry_run"])
+      |> put_if_present("max_chars", args["max_chars"])
+
+    port_call_to_content(req)
+  end
+
   defp dispatch_tool("kb_compact", _args, _state) do
     req = %{"method" => "compact", "id" => gen_id()}
     port_call_to_content(req)
@@ -318,6 +344,15 @@ defmodule AgenticKbMcp.McpServer do
             %{"type" => "text", "text" => "Imported #{imported} entries (#{skipped} skipped)."}
           ]
         }
+
+      %{"type" => "ok", "embedded" => embedded} = resp ->
+        parts = ["Re-embedded #{embedded} entries."]
+        parts = if resp["failed"], do: parts ++ ["#{resp["failed"]} failed."], else: parts
+        parts = if resp["skipped"], do: parts ++ ["#{resp["skipped"]} skipped (too large)."], else: parts
+        parts = if resp["missing"], do: parts ++ ["#{resp["missing"]} missing embeddings."], else: parts
+        parts = if resp["dry_run"], do: ["[dry-run] " | parts], else: parts
+        parts = if resp["message"], do: parts ++ [resp["message"]], else: parts
+        %{"content" => [%{"type" => "text", "text" => Enum.join(parts, " ")}]}
 
       %{"type" => "ok", "before" => before, "after" => after_count} ->
         %{
