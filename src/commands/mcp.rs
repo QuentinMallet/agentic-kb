@@ -93,6 +93,7 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
         "search" => handle_search(&id, &req, paths, emb),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
+        "expire" => handle_expire(&id, &req, paths, emb),
         "rebuild" => handle_rebuild(&id, paths, emb),
         _ => json!({
             "id": id,
@@ -354,4 +355,59 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 
     json!({"id": id, "type": "ok", "rebuilt": total})
+}
+
+fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
+        Some(i) => i.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"}),
+    };
+    let reason = req.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    // Guard: refuse to expire permanent entries unless force=true
+    if !force {
+        let permanent: Option<i64> = conn
+            .query_row(
+                "SELECT permanent FROM entries WHERE id=?1",
+                params![entry_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if permanent == Some(1) {
+            return json!({
+                "id": id, "type": "error", "code": "permanent_guard",
+                "message": format!("entry '{}' is permanent; set force=true to expire it", entry_id)
+            });
+        }
+    }
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    let event = json!({
+        "action": "expire",
+        "table": "entries",
+        "id": entry_id,
+        "reason": reason,
+        "ts": ts,
+        "session": "mcp",
+    });
+
+    if let Err(e) = events::append_event(&paths.events, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    if let Err(e) = db::apply_event(&conn, emb, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    json!({"id": id, "type": "ok", "expired": entry_id})
 }

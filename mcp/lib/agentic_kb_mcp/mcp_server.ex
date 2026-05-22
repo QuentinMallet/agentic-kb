@@ -84,6 +84,22 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_expire",
+      "description" => "Mark an entry as stale (expired). Permanent entries require force=true.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "entry_id" => %{"type" => "string", "description" => "Entry ID to expire"},
+          "reason" => %{"type" => "string", "description" => "Reason for expiration"},
+          "force" => %{
+            "type" => "boolean",
+            "description" => "Force expiration of permanent entries (default false)"
+          }
+        },
+        "required" => ["entry_id"]
+      }
+    },
+    %{
       "name" => "kb_rebuild",
       "description" => "Rebuild the embedding index by replaying all events",
       "inputSchema" => %{
@@ -232,6 +248,16 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_expire", args, _state) do
+    req =
+      %{"method" => "expire", "id" => gen_id()}
+      |> put_if_present("entry_id", args["entry_id"])
+      |> put_if_present("reason", args["reason"])
+      |> put_if_present("force", args["force"])
+
+    port_call_to_content(req)
+  end
+
   defp dispatch_tool("kb_rebuild", _args, _state) do
     req = %{"method" => "rebuild", "id" => gen_id()}
     port_call_to_content(req)
@@ -262,6 +288,9 @@ defmodule AgenticKbMcp.McpServer do
 
       %{"type" => "ok", "entry_id" => entry_id} ->
         %{"content" => [%{"type" => "text", "text" => "Added entry #{entry_id}."}]}
+
+      %{"type" => "ok", "expired" => expired_id} ->
+        %{"content" => [%{"type" => "text", "text" => "Expired entry #{expired_id}."}]}
 
       %{"type" => "ok"} ->
         %{"content" => [%{"type" => "text", "text" => "OK"}]}
