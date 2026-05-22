@@ -545,22 +545,11 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
 }
 
 fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
-    let evts_before = match events::read_events(&paths.events) {
-        Ok(e) => e.len(),
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
     let compact_cmd = crate::commands::compact::Compact;
-    if let Err(e) = compact_cmd.execute_with_paths(paths) {
-        return json!({"id":id,"type":"error","code":"compact_error","message":e.to_string()});
+    match compact_cmd.execute_with_paths(paths) {
+        Ok((before, after)) => json!({"id": id, "type": "ok", "before": before, "after": after}),
+        Err(e) => json!({"id":id,"type":"error","code":"compact_error","message":e.to_string()}),
     }
-
-    let evts_after = match events::read_events(&paths.events) {
-        Ok(e) => e.len(),
-        Err(_) => 0,
-    };
-
-    json!({"id": id, "type": "ok", "before": evts_before, "after": evts_after})
 }
 
 fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {

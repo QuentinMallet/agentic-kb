@@ -25,11 +25,13 @@ impl Runnable for Compact {
 impl Compact {
     /// Execute the compact command.
     pub fn execute(&self) -> anyhow::Result<()> {
-        self.execute_with_paths(&config::Paths::discover()?)
+        let (before, after) = self.execute_with_paths(&config::Paths::discover()?)?;
+        println!("compacted: {} events -> {}", before, after);
+        Ok(())
     }
 
     /// Execute with explicit paths (for testing).
-    pub fn execute_with_paths(&self, paths: &config::Paths) -> anyhow::Result<()> {
+    pub fn execute_with_paths(&self, paths: &config::Paths) -> anyhow::Result<(usize, usize)> {
         let _lock = acquire_lock(&paths.lock)?;
         let evts = events::read_events(&paths.events)?;
         let original_count = evts.len();
@@ -103,12 +105,7 @@ impl Compact {
         }
         fs::rename(&tmp, &paths.events)?;
 
-        println!(
-            "compacted: {} events -> {}",
-            original_count,
-            compacted.len()
-        );
-        Ok(())
+        Ok((original_count, compacted.len()))
     }
 }
 
