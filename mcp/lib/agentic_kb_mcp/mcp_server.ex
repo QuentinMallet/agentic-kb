@@ -115,6 +115,14 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_compact",
+      "description" => "Compact the event log by squashing superseded events",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{}
+      }
+    },
+    %{
       "name" => "kb_rebuild",
       "description" => "Rebuild the embedding index by replaying all events",
       "inputSchema" => %{
@@ -281,6 +289,11 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_compact", _args, _state) do
+    req = %{"method" => "compact", "id" => gen_id()}
+    port_call_to_content(req)
+  end
+
   defp dispatch_tool("kb_rebuild", _args, _state) do
     req = %{"method" => "rebuild", "id" => gen_id()}
     port_call_to_content(req)
@@ -303,6 +316,13 @@ defmodule AgenticKbMcp.McpServer do
         %{
           "content" => [
             %{"type" => "text", "text" => "Imported #{imported} entries (#{skipped} skipped)."}
+          ]
+        }
+
+      %{"type" => "ok", "before" => before, "after" => after_count} ->
+        %{
+          "content" => [
+            %{"type" => "text", "text" => "Compacted: #{before} events -> #{after_count}."}
           ]
         }
 
