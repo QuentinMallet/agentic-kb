@@ -97,6 +97,9 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
         "stale_check" => handle_stale_check(&id, &req, paths),
         "compact" => handle_compact(&id, paths),
         "reembed" => handle_reembed(&id, &req, paths, emb),
+        "run" => handle_run(&id, &req, paths, emb),
+        "test_add" => handle_test_add(&id, &req, paths, emb),
+        "tests" => handle_tests(&id, &req, paths),
         "rebuild" => handle_rebuild(&id, paths, emb),
         _ => json!({
             "id": id,
@@ -358,6 +361,124 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 
     json!({"id": id, "type": "ok", "rebuilt": total})
+}
+
+fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let test_id = match req.get("test_id").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing test_id"}),
+    };
+    let result = match req.get("result").and_then(|v| v.as_str()) {
+        Some(r) if r == "pass" || r == "fail" => r.to_string(),
+        _ => return json!({"id":id,"type":"error","code":"parse_error","message":"result must be 'pass' or 'fail'"}),
+    };
+    let adapter = req.get("adapter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let detail = req.get("detail").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let event = json!({
+        "action": "insert", "table": "run_history",
+        "test_id": test_id, "result": result,
+        "adapter": adapter, "detail": detail,
+        "ts": ts, "run_id": run_id, "session": "mcp",
+    });
+
+    if let Err(e) = events::append_event(&paths.events, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    if let Err(e) = db::apply_event(&conn, emb, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    json!({"id": id, "type": "ok", "run_id": run_id, "test_id": test_id, "result": result})
+}
+
+fn handle_test_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let app = match req.get("app").and_then(|v| v.as_str()) {
+        Some(a) => a.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing app"}),
+    };
+    let name = match req.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing name"}),
+    };
+    let protocol = match req.get("protocol").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing protocol"}),
+    };
+    let config_str = match req.get("config").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing config"}),
+    };
+
+    let test_id = req.get("test_id").and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}-{}", app, name.replace(' ', "-")));
+
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    let event = json!({
+        "action": "upsert", "table": "test_cases",
+        "id": test_id, "app": app, "name": name,
+        "protocol": protocol, "config": config_str,
+        "version_ref": null, "ts": ts, "session": "mcp",
+    });
+
+    if let Err(e) = events::append_event(&paths.events, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    if let Err(e) = db::apply_event(&conn, emb, &event) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    json!({"id": id, "type": "ok", "test_id": test_id})
+}
+
+fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let app_filter = req.get("app").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let results: Vec<Value> = if let Some(ref app) = app_filter {
+        let mut stmt = conn.prepare(
+            "SELECT id, app, name, protocol FROM test_cases WHERE app=?1 AND is_stale=0 ORDER BY name"
+        ).unwrap();
+        stmt.query_map(params![app], |r| {
+            Ok(json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
+                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, app, name, protocol FROM test_cases WHERE is_stale=0 ORDER BY app, name"
+        ).unwrap();
+        stmt.query_map([], |r| {
+            Ok(json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
+                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}))
+        }).unwrap().filter_map(|r| r.ok()).collect()
+    };
+
+    json!({"id": id, "type": "result", "test_cases": results, "count": results.len()})
 }
 
 fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {

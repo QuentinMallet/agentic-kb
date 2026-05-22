@@ -115,6 +115,45 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_run",
+      "description" => "Record a test run result",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "test_id" => %{"type" => "string", "description" => "Test case ID"},
+          "result" => %{"type" => "string", "enum" => ["pass", "fail"], "description" => "Test result"},
+          "adapter" => %{"type" => "string", "description" => "Adapter used (e.g. browser, rust_tool)"},
+          "detail" => %{"type" => "string", "description" => "Detail message"}
+        },
+        "required" => ["test_id", "result"]
+      }
+    },
+    %{
+      "name" => "kb_test_add",
+      "description" => "Add or update a test case definition",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "app" => %{"type" => "string", "description" => "Application name"},
+          "name" => %{"type" => "string", "description" => "Test name"},
+          "protocol" => %{"type" => "string", "description" => "Protocol: browser | rust_tool"},
+          "config" => %{"type" => "string", "description" => "JSON config blob"},
+          "test_id" => %{"type" => "string", "description" => "Test case ID (auto-generated if omitted)"}
+        },
+        "required" => ["app", "name", "protocol", "config"]
+      }
+    },
+    %{
+      "name" => "kb_tests",
+      "description" => "List test cases (optionally filtered by app)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "app" => %{"type" => "string", "description" => "Filter by application name"}
+        }
+      }
+    },
+    %{
       "name" => "kb_reembed",
       "description" => "Re-embed entries missing embeddings (e.g. written with KB_NO_EMBED=1)",
       "inputSchema" => %{
@@ -306,6 +345,37 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_run", args, _state) do
+    req =
+      %{"method" => "run", "id" => gen_id()}
+      |> put_if_present("test_id", args["test_id"])
+      |> put_if_present("result", args["result"])
+      |> put_if_present("adapter", args["adapter"])
+      |> put_if_present("detail", args["detail"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_test_add", args, _state) do
+    req =
+      %{"method" => "test_add", "id" => gen_id()}
+      |> put_if_present("app", args["app"])
+      |> put_if_present("name", args["name"])
+      |> put_if_present("protocol", args["protocol"])
+      |> put_if_present("config", args["config"])
+      |> put_if_present("test_id", args["test_id"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_tests", args, _state) do
+    req =
+      %{"method" => "tests", "id" => gen_id()}
+      |> put_if_present("app", args["app"])
+
+    port_call_to_content(req)
+  end
+
   defp dispatch_tool("kb_reembed", args, _state) do
     req =
       %{"method" => "reembed", "id" => gen_id()}
@@ -369,6 +439,25 @@ defmodule AgenticKbMcp.McpServer do
 
       %{"type" => "ok", "expired" => expired_id} ->
         %{"content" => [%{"type" => "text", "text" => "Expired entry #{expired_id}."}]}
+
+      %{"type" => "ok", "run_id" => run_id, "test_id" => test_id, "result" => result} ->
+        %{"content" => [%{"type" => "text", "text" => "Recorded run #{run_id}: #{test_id} -> #{result}."}]}
+
+      %{"type" => "ok", "test_id" => test_id} when not is_nil(test_id) ->
+        %{"content" => [%{"type" => "text", "text" => "Added test case #{test_id}."}]}
+
+      %{"type" => "result", "test_cases" => cases, "count" => count} ->
+        text =
+          if cases == [] do
+            "(no test cases)"
+          else
+            header = "#{count} test case(s):\n\n"
+            details = Enum.map_join(cases, "\n", fn tc ->
+              "#{tc["app"]}/#{tc["name"]}  [#{tc["protocol"]}]  id=#{tc["id"]}"
+            end)
+            header <> details
+          end
+        %{"content" => [%{"type" => "text", "text" => text}]}
 
       %{"type" => "result", "stale" => stale, "checked" => checked} ->
         text =
