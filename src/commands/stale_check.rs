@@ -46,13 +46,15 @@ impl StaleCheck {
                 file.clone()
             };
 
+            // Escape LIKE wildcards so paths containing % or _ match literally
+            let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
             let mut stmt = conn.prepare(
                 "SELECT id, summary, version_ref, path FROM entries
-                 WHERE (path = ?1 OR path LIKE '%' || ?1 OR ?1 LIKE '%' || path)
+                 WHERE (path = ?1 OR path LIKE '%' || ?2 || '%' ESCAPE '\\' OR ?1 LIKE '%' || path)
                    AND version_ref IS NOT NULL AND is_stale = 0",
             )?;
             let rows: Vec<_> = stmt
-                .query_map(params![rel_path], |r| {
+                .query_map(params![rel_path, like_safe], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,

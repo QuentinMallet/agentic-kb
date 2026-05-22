@@ -62,7 +62,7 @@ impl Run {
         let embedder = crate::components::embedder::NoopEmbedder;
         db::apply_event(&conn, &embedder, &event)?;
 
-        println!("recorded run {}  {} -> {}", &run_id[..8], self.test_id, self.result);
+        println!("recorded run {}  {} -> {}", run_id.get(..8).unwrap_or(&run_id), self.test_id, self.result);
         Ok(())
     }
 }
