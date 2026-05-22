@@ -38,7 +38,7 @@ defmodule AgenticKbMcp.PortManager do
       Port.open({:spawn_executable, kb_bin}, [
         :binary,
         :use_stdio,
-        {:line, 1_048_576},
+        {:line, 10_485_760},
         {:args, ["mcp", "--db", db_path]}
       ])
 

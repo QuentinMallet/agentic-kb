@@ -126,6 +126,10 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
+    // Cap content per entry to prevent port line buffer overflow (10MB limit).
+    // 8000 chars per entry * 50 entries = 400KB typical, well under the limit.
+    const MAX_CONTENT_CHARS: usize = 8000;
+
     match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
             let entries: Vec<Value> = results
@@ -133,10 +137,15 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
                 .map(|e| {
                     let tags: Value =
                         serde_json::from_str(&e.tags).unwrap_or(Value::Array(vec![]));
+                    let content = if e.content.len() > MAX_CONTENT_CHARS {
+                        format!("{}...(truncated)", &e.content[..MAX_CONTENT_CHARS])
+                    } else {
+                        e.content
+                    };
                     json!({
                         "path": e.path,
                         "summary": e.summary,
-                        "content": e.content,
+                        "content": content,
                         "tags": tags,
                         "score": e.score,
                         "id": e.id,
