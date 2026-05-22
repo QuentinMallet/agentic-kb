@@ -23,6 +23,14 @@ defmodule AgenticKbMcp.McpServer do
             "type" => "string",
             "enum" => ["hybrid", "fts", "semantic"],
             "description" => "Search mode (default: hybrid)"
+          },
+          "path_prefix" => %{
+            "type" => "string",
+            "description" => "Filter results to entries whose path starts with this prefix"
+          },
+          "tag" => %{
+            "type" => "string",
+            "description" => "Filter results to entries that have this exact tag"
           }
         },
         "required" => ["query"]
@@ -44,6 +52,14 @@ defmodule AgenticKbMcp.McpServer do
             "type" => "array",
             "items" => %{"type" => "string"},
             "description" => "Topic tags"
+          },
+          "permanent" => %{
+            "type" => "boolean",
+            "description" => "Mark entry as permanent (survives compact and resists expire)"
+          },
+          "replace_path" => %{
+            "type" => "boolean",
+            "description" => "Expire all existing entries at this path before inserting"
           }
         },
         "required" => ["path", "summary", "content"]
@@ -65,6 +81,101 @@ defmodule AgenticKbMcp.McpServer do
           }
         },
         "required" => ["path"]
+      }
+    },
+    %{
+      "name" => "kb_stale_check",
+      "description" => "Check if KB entries for given files are stale (file changed since entry was recorded)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "files" => %{
+            "type" => "array",
+            "items" => %{"type" => "string"},
+            "description" => "File paths to check for stale KB entries"
+          }
+        },
+        "required" => ["files"]
+      }
+    },
+    %{
+      "name" => "kb_expire",
+      "description" => "Mark an entry as stale (expired). Permanent entries require force=true.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "entry_id" => %{"type" => "string", "description" => "Entry ID to expire"},
+          "reason" => %{"type" => "string", "description" => "Reason for expiration"},
+          "force" => %{
+            "type" => "boolean",
+            "description" => "Force expiration of permanent entries (default false)"
+          }
+        },
+        "required" => ["entry_id"]
+      }
+    },
+    %{
+      "name" => "kb_run",
+      "description" => "Record a test run result",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "test_id" => %{"type" => "string", "description" => "Test case ID"},
+          "result" => %{"type" => "string", "enum" => ["pass", "fail"], "description" => "Test result"},
+          "adapter" => %{"type" => "string", "description" => "Adapter used (e.g. browser, rust_tool)"},
+          "detail" => %{"type" => "string", "description" => "Detail message"}
+        },
+        "required" => ["test_id", "result"]
+      }
+    },
+    %{
+      "name" => "kb_test_add",
+      "description" => "Add or update a test case definition",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "app" => %{"type" => "string", "description" => "Application name"},
+          "name" => %{"type" => "string", "description" => "Test name"},
+          "protocol" => %{"type" => "string", "description" => "Protocol: browser | rust_tool"},
+          "config" => %{"type" => "string", "description" => "JSON config blob"},
+          "test_id" => %{"type" => "string", "description" => "Test case ID (auto-generated if omitted)"}
+        },
+        "required" => ["app", "name", "protocol", "config"]
+      }
+    },
+    %{
+      "name" => "kb_tests",
+      "description" => "List test cases (optionally filtered by app)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "app" => %{"type" => "string", "description" => "Filter by application name"}
+        }
+      }
+    },
+    %{
+      "name" => "kb_reembed",
+      "description" => "Re-embed entries missing embeddings (e.g. written with KB_NO_EMBED=1)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "dry_run" => %{
+            "type" => "boolean",
+            "description" => "Show what would be re-embedded without writing (default false)"
+          },
+          "max_chars" => %{
+            "type" => "integer",
+            "description" => "Skip entries exceeding this char limit (default 1800)"
+          }
+        }
+      }
+    },
+    %{
+      "name" => "kb_compact",
+      "description" => "Compact the event log by squashing superseded events",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{}
       }
     },
     %{
@@ -188,6 +299,8 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("query", args["query"])
       |> put_if_present("limit", args["limit"])
       |> put_if_present("mode", args["mode"])
+      |> put_if_present("path_prefix", args["path_prefix"])
+      |> put_if_present("tag", args["tag"])
 
     port_call_to_content(req)
   end
@@ -199,6 +312,8 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("summary", args["summary"])
       |> put_if_present("content", args["content"])
       |> put_if_present("tags", args["tags"])
+      |> put_if_present("permanent", args["permanent"])
+      |> put_if_present("replace_path", args["replace_path"])
 
     port_call_to_content(req)
   end
@@ -209,6 +324,69 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("path", args["path"])
       |> put_if_present("upsert", args["upsert"])
 
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_stale_check", args, _state) do
+    req =
+      %{"method" => "stale_check", "id" => gen_id()}
+      |> put_if_present("files", args["files"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_expire", args, _state) do
+    req =
+      %{"method" => "expire", "id" => gen_id()}
+      |> put_if_present("entry_id", args["entry_id"])
+      |> put_if_present("reason", args["reason"])
+      |> put_if_present("force", args["force"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_run", args, _state) do
+    req =
+      %{"method" => "run", "id" => gen_id()}
+      |> put_if_present("test_id", args["test_id"])
+      |> put_if_present("result", args["result"])
+      |> put_if_present("adapter", args["adapter"])
+      |> put_if_present("detail", args["detail"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_test_add", args, _state) do
+    req =
+      %{"method" => "test_add", "id" => gen_id()}
+      |> put_if_present("app", args["app"])
+      |> put_if_present("name", args["name"])
+      |> put_if_present("protocol", args["protocol"])
+      |> put_if_present("config", args["config"])
+      |> put_if_present("test_id", args["test_id"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_tests", args, _state) do
+    req =
+      %{"method" => "tests", "id" => gen_id()}
+      |> put_if_present("app", args["app"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_reembed", args, _state) do
+    req =
+      %{"method" => "reembed", "id" => gen_id()}
+      |> put_if_present("dry_run", args["dry_run"])
+      |> put_if_present("max_chars", args["max_chars"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_compact", _args, _state) do
+    req = %{"method" => "compact", "id" => gen_id()}
     port_call_to_content(req)
   end
 
@@ -237,11 +415,66 @@ defmodule AgenticKbMcp.McpServer do
           ]
         }
 
+      %{"type" => "ok", "embedded" => embedded} = resp ->
+        parts = ["Re-embedded #{embedded} entries."]
+        parts = if resp["failed"], do: parts ++ ["#{resp["failed"]} failed."], else: parts
+        parts = if resp["skipped"], do: parts ++ ["#{resp["skipped"]} skipped (too large)."], else: parts
+        parts = if resp["missing"], do: parts ++ ["#{resp["missing"]} missing embeddings."], else: parts
+        parts = if resp["dry_run"], do: ["[dry-run] " | parts], else: parts
+        parts = if resp["message"], do: parts ++ [resp["message"]], else: parts
+        %{"content" => [%{"type" => "text", "text" => Enum.join(parts, " ")}]}
+
+      %{"type" => "ok", "before" => before, "after" => after_count} ->
+        %{
+          "content" => [
+            %{"type" => "text", "text" => "Compacted: #{before} events -> #{after_count}."}
+          ]
+        }
+
       %{"type" => "ok", "rebuilt" => rebuilt} ->
         %{"content" => [%{"type" => "text", "text" => "Rebuilt #{rebuilt} entries."}]}
 
       %{"type" => "ok", "entry_id" => entry_id} ->
         %{"content" => [%{"type" => "text", "text" => "Added entry #{entry_id}."}]}
+
+      %{"type" => "ok", "expired" => expired_id} ->
+        %{"content" => [%{"type" => "text", "text" => "Expired entry #{expired_id}."}]}
+
+      %{"type" => "ok", "run_id" => run_id, "test_id" => test_id, "result" => result} ->
+        %{"content" => [%{"type" => "text", "text" => "Recorded run #{run_id}: #{test_id} -> #{result}."}]}
+
+      %{"type" => "ok", "test_id" => test_id} when not is_nil(test_id) ->
+        %{"content" => [%{"type" => "text", "text" => "Added test case #{test_id}."}]}
+
+      %{"type" => "result", "test_cases" => cases, "count" => count} ->
+        text =
+          if cases == [] do
+            "(no test cases)"
+          else
+            header = "#{count} test case(s):\n\n"
+            details = Enum.map_join(cases, "\n", fn tc ->
+              "#{tc["app"]}/#{tc["name"]}  [#{tc["protocol"]}]  id=#{tc["id"]}"
+            end)
+            header <> details
+          end
+        %{"content" => [%{"type" => "text", "text" => text}]}
+
+      %{"type" => "result", "stale" => stale, "checked" => checked} ->
+        text =
+          if stale == [] do
+            "Checked #{checked} file(s): all KB entries are up to date."
+          else
+            header = "Found #{length(stale)} stale entry/entries (#{checked} file(s) checked):\n\n"
+
+            details =
+              Enum.map_join(stale, "\n", fn e ->
+                "STALE [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}  (#{e["commits_behind"]} commit(s) ago)"
+              end)
+
+            header <> details
+          end
+
+        %{"content" => [%{"type" => "text", "text" => text}]}
 
       %{"type" => "ok"} ->
         %{"content" => [%{"type" => "text", "text" => "OK"}]}

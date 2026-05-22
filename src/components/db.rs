@@ -101,18 +101,25 @@ pub fn apply_event(
             let version_ref = event["version_ref"].as_str();
             let ts = event["ts"].as_str().unwrap_or("");
             let permanent = event["permanent"].as_bool().unwrap_or(false) as i32;
+            let is_stale = event["is_stale"].as_bool().unwrap_or(false) as i32;
 
             conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)
+                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
                  ON CONFLICT(id) DO UPDATE SET
                    path=excluded.path, summary=excluded.summary,
                    content=excluded.content, tags=excluded.tags,
                    version_ref=excluded.version_ref,
                    permanent=excluded.permanent,
-                   is_stale=0, updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, ts],
+                   is_stale=excluded.is_stale, updated_at=excluded.updated_at",
+                params![id, path, summary, content, tags, version_ref, permanent, is_stale, ts],
             )?;
+
+            // Stale entries: clean up FTS/embeddings so they don't appear in search
+            if is_stale == 1 {
+                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                return Ok(());
+            }
 
             let rowid: i64 = conn.query_row(
                 "SELECT rowid FROM entries WHERE id=?1",
@@ -146,6 +153,8 @@ pub fn apply_event(
                 "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
                 params![id],
             )?;
+            // Remove from FTS so expired entries don't appear in search
+            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
         }
 
         ("upsert", "test_cases") => {
@@ -433,5 +442,105 @@ mod tests {
             })
             .unwrap();
         assert_eq!(is_stale, 1);
+    }
+
+    #[test]
+    fn test_apply_event_expire_cleans_fts() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "fts1", "path": "src/auth.rs", "summary": "auth module",
+            "content": "handles JWT tokens", "tags": ["auth"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Verify FTS entry exists before expire
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1);
+
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "fts1"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        // FTS entry must be gone after expire
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "expire must remove entry from FTS index");
+    }
+
+    #[test]
+    fn test_apply_event_upsert_with_is_stale_true() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Upsert with is_stale=true (as produced by compact after expire)
+        let event = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "stale1",
+            "path": "src/lib.rs",
+            "summary": "stale entry",
+            "content": "content",
+            "tags": ["rust"],
+            "version_ref": "abc123",
+            "ts": "2024-01-01T00:00:00Z",
+            "is_stale": true
+        });
+        apply_event(&conn, &embedder, &event).unwrap();
+
+        // Entry must be stale in DB
+        let is_stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id='stale1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_stale, 1, "upsert with is_stale=true must persist staleness");
+
+        // FTS must NOT contain the stale entry
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE id='stale1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 0, "stale entries must not appear in FTS index");
+    }
+
+    #[test]
+    fn test_apply_event_upsert_without_is_stale_defaults_false() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Old-format event without is_stale field
+        let event = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "old1",
+            "path": "src/lib.rs",
+            "summary": "old entry",
+            "content": "content",
+            "tags": ["rust"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &event).unwrap();
+
+        let is_stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id='old1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_stale, 0, "events without is_stale must default to active");
     }
 }

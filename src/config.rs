@@ -45,18 +45,27 @@ pub struct Paths {
 
 impl Paths {
     /// Walk up from cwd to find the repo root (has a .state/ directory).
+    /// Prefers `agent-kb/agent-kb.db` (symlink convention) but falls back to
+    /// `.state/agent-kb/agent-kb.db` when the symlink is absent (e.g. worktrees).
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut dir: &Path = &cwd;
         loop {
             if dir.join(".state").is_dir() {
+                let symlink_db = dir.join("agent-kb").join("agent-kb.db");
+                let state_db = dir.join(".state").join("agent-kb").join("agent-kb.db");
+                let db = if symlink_db.exists() {
+                    symlink_db
+                } else {
+                    state_db
+                };
                 return Ok(Paths {
                     lock: dir.join(".state").join(".lock"),
                     events: dir
                         .join(".state")
                         .join("agent-kb")
                         .join("agent-kb-events.jsonl"),
-                    db: dir.join("agent-kb").join("agent-kb.db"),
+                    db,
                     fastembed_cache: model_cache_dir(),
                 });
             }

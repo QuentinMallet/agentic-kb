@@ -11,9 +11,15 @@ defmodule AgenticKbMcp.Application do
         raise "KB_BIN not set and 'kb' not found in PATH"
 
     db_path =
-      case AgenticKbMcp.DbDiscovery.discover() do
-        {:ok, path} -> path
-        {:error, :not_found} -> nil
+      case System.get_env("KB_DB_PATH") do
+        nil ->
+          case AgenticKbMcp.DbDiscovery.discover() do
+            {:ok, path} -> path
+            {:error, :not_found} -> nil
+          end
+
+        path ->
+          if File.exists?(path), do: path, else: nil
       end
 
     children =
