@@ -84,6 +84,21 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_stale_check",
+      "description" => "Check if KB entries for given files are stale (file changed since entry was recorded)",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "files" => %{
+            "type" => "array",
+            "items" => %{"type" => "string"},
+            "description" => "File paths to check for stale KB entries"
+          }
+        },
+        "required" => ["files"]
+      }
+    },
+    %{
       "name" => "kb_expire",
       "description" => "Mark an entry as stale (expired). Permanent entries require force=true.",
       "inputSchema" => %{
@@ -248,6 +263,14 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_stale_check", args, _state) do
+    req =
+      %{"method" => "stale_check", "id" => gen_id()}
+      |> put_if_present("files", args["files"])
+
+    port_call_to_content(req)
+  end
+
   defp dispatch_tool("kb_expire", args, _state) do
     req =
       %{"method" => "expire", "id" => gen_id()}
@@ -291,6 +314,23 @@ defmodule AgenticKbMcp.McpServer do
 
       %{"type" => "ok", "expired" => expired_id} ->
         %{"content" => [%{"type" => "text", "text" => "Expired entry #{expired_id}."}]}
+
+      %{"type" => "result", "stale" => stale, "checked" => checked} ->
+        text =
+          if stale == [] do
+            "Checked #{checked} file(s): all KB entries are up to date."
+          else
+            header = "Found #{length(stale)} stale entry/entries (#{checked} file(s) checked):\n\n"
+
+            details =
+              Enum.map_join(stale, "\n", fn e ->
+                "STALE [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}  (#{e["commits_behind"]} commit(s) ago)"
+              end)
+
+            header <> details
+          end
+
+        %{"content" => [%{"type" => "text", "text" => text}]}
 
       %{"type" => "ok"} ->
         %{"content" => [%{"type" => "text", "text" => "OK"}]}

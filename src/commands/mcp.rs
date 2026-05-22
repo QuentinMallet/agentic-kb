@@ -94,6 +94,7 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
+        "stale_check" => handle_stale_check(&id, &req, paths),
         "rebuild" => handle_rebuild(&id, paths, emb),
         _ => json!({
             "id": id,
@@ -355,6 +356,78 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 
     json!({"id": id, "type": "ok", "rebuilt": total})
+}
+
+fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let files: Vec<String> = match req.get("files") {
+        Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+        _ => return json!({"id":id,"type":"error","code":"parse_error","message":"missing files array"}),
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let repo_root = config::git_repo_root();
+    let mut stale_entries: Vec<Value> = Vec::new();
+
+    for file in &files {
+        let rel_path = if let Some(ref root) = repo_root {
+            let p = std::path::Path::new(file);
+            if p.is_absolute() {
+                p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
+            } else {
+                file.clone()
+            }
+        } else {
+            file.clone()
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT id, summary, version_ref, path FROM entries
+             WHERE (path = ?1 OR path LIKE '%' || ?1 OR ?1 LIKE '%' || path)
+               AND version_ref IS NOT NULL AND is_stale = 0",
+        ) {
+            Ok(s) => s,
+            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        };
+
+        let rows: Vec<(String, String, String, String)> = stmt
+            .query_map(params![rel_path], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                ))
+            })
+            .unwrap_or_else(|_| panic!("query failed"))
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (entry_id, summary, version_ref, stored_path) in rows {
+            let mut cmd = std::process::Command::new("git");
+            if let Some(ref root) = repo_root {
+                cmd.arg("-C").arg(root);
+            }
+            cmd.args(["log", "--oneline", &format!("{}..HEAD", version_ref), "--", &stored_path]);
+            if let Ok(out) = cmd.output() {
+                if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                    let commits = std::str::from_utf8(&out.stdout).unwrap_or("").lines().count();
+                    stale_entries.push(json!({
+                        "id": entry_id,
+                        "path": stored_path,
+                        "summary": summary,
+                        "version_ref": version_ref,
+                        "commits_behind": commits,
+                    }));
+                }
+            }
+        }
+    }
+
+    json!({"id": id, "type": "result", "stale": stale_entries, "checked": files.len()})
 }
 
 fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
