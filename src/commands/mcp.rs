@@ -167,9 +167,50 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     let summary = req.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let tags = req.get("tags").cloned().unwrap_or(Value::Array(vec![]));
+    let permanent = req.get("permanent").and_then(|v| v.as_bool()).unwrap_or(false);
+    let replace_path = req.get("replace_path").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let entry_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
+
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    // --replace-path: expire existing non-stale entries at this path before inserting
+    if replace_path {
+        let existing_ids: Vec<String> = {
+            let mut stmt = match conn.prepare(
+                "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
+            ) {
+                Ok(s) => s,
+                Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+            };
+            stmt.query_map(params![path], |r| r.get(0))
+                .unwrap_or_else(|_| panic!("query failed"))
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for old_id in existing_ids {
+            let expire_ev = json!({
+                "action": "expire", "table": "entries",
+                "id": old_id, "reason": "replaced by MCP kb_add replace_path",
+                "ts": ts, "session": "mcp",
+            });
+            if let Err(e) = events::append_event(&paths.events, &expire_ev) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            if let Err(e) = db::apply_event(&conn, emb, &expire_ev) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+        }
+    }
 
     let event = json!({
         "action": "upsert",
@@ -180,23 +221,14 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         "content": content,
         "tags": tags,
         "version_ref": null,
+        "permanent": permanent,
         "ts": ts,
         "session": "mcp",
     });
 
-    let _lock = match acquire_lock(&paths.lock) {
-        Ok(l) => l,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
     if let Err(e) = events::append_event(&paths.events, &event) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
 
     if let Err(e) = db::apply_event(&conn, emb, &event) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});

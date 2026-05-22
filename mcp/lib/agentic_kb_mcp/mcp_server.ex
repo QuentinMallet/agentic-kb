@@ -44,6 +44,14 @@ defmodule AgenticKbMcp.McpServer do
             "type" => "array",
             "items" => %{"type" => "string"},
             "description" => "Topic tags"
+          },
+          "permanent" => %{
+            "type" => "boolean",
+            "description" => "Mark entry as permanent (survives compact and resists expire)"
+          },
+          "replace_path" => %{
+            "type" => "boolean",
+            "description" => "Expire all existing entries at this path before inserting"
           }
         },
         "required" => ["path", "summary", "content"]
@@ -199,6 +207,8 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("summary", args["summary"])
       |> put_if_present("content", args["content"])
       |> put_if_present("tags", args["tags"])
+      |> put_if_present("permanent", args["permanent"])
+      |> put_if_present("replace_path", args["replace_path"])
 
     port_call_to_content(req)
   end
