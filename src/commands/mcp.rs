@@ -689,3 +689,167 @@ fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
 
     json!({"id": id, "type": "ok", "expired": entry_id})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::embedder::NoopEmbedder;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn setup() -> (tempfile::TempDir, config::Paths, NoopEmbedder) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        fs::create_dir_all(root.join("agent-kb")).unwrap();
+        let paths = config::Paths::from_root(root);
+        (dir, paths, NoopEmbedder)
+    }
+
+    #[test]
+    fn test_handle_add_basic() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("t1");
+        let req = json!({"method":"add","id":"t1","path":"test/a","summary":"sum","content":"body","tags":["t"]});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert!(resp["entry_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_handle_add_permanent() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("t2");
+        let req = json!({"method":"add","id":"t2","path":"test/b","summary":"s","content":"c","tags":[],"permanent":true});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let entry_id = resp["entry_id"].as_str().unwrap();
+        let perm: i64 = conn.query_row(
+            &format!("SELECT permanent FROM entries WHERE id='{}'", entry_id), [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(perm, 1);
+    }
+
+    #[test]
+    fn test_handle_add_replace_path() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("t3");
+        // Add first entry
+        let req1 = json!({"method":"add","id":"t3","path":"test/c","summary":"old","content":"old","tags":[]});
+        let r1 = handle_add(&id, &req1, &paths, &emb);
+        let old_id = r1["entry_id"].as_str().unwrap().to_string();
+
+        // Replace
+        let req2 = json!({"method":"add","id":"t3b","path":"test/c","summary":"new","content":"new","tags":[],"replace_path":true});
+        handle_add(&id, &req2, &paths, &emb);
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let stale: i64 = conn.query_row(
+            &format!("SELECT is_stale FROM entries WHERE id='{}'", old_id), [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(stale, 1, "old entry must be stale after replace_path");
+    }
+
+    #[test]
+    fn test_handle_search_with_filters() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("s1");
+        // Add entries
+        let req_add = json!({"method":"add","id":"s1","path":"src/auth","summary":"auth mod","content":"jwt","tags":["auth"]});
+        handle_add(&id, &req_add, &paths, &emb);
+        let req_add2 = json!({"method":"add","id":"s2","path":"docs/readme","summary":"docs","content":"readme","tags":["docs"]});
+        handle_add(&id, &req_add2, &paths, &emb);
+
+        // Search with path_prefix filter
+        let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
+        let resp = handle_search(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "result");
+        let entries = resp["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
+    }
+
+    #[test]
+    fn test_handle_expire_basic() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("e1");
+        let req_add = json!({"method":"add","id":"e1","path":"test/x","summary":"s","content":"c","tags":[]});
+        let r = handle_add(&id, &req_add, &paths, &emb);
+        let entry_id = r["entry_id"].as_str().unwrap();
+
+        let req = json!({"method":"expire","id":"e2","entry_id":entry_id});
+        let resp = handle_expire(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert_eq!(resp["expired"].as_str().unwrap(), entry_id);
+    }
+
+    #[test]
+    fn test_handle_expire_permanent_guard() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("pg1");
+        let req_add = json!({"method":"add","id":"pg1","path":"test/perm","summary":"s","content":"c","tags":[],"permanent":true});
+        let r = handle_add(&id, &req_add, &paths, &emb);
+        let entry_id = r["entry_id"].as_str().unwrap();
+
+        // Without force → error
+        let req = json!({"method":"expire","id":"pg2","entry_id":entry_id});
+        let resp = handle_expire(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "permanent_guard");
+
+        // With force → ok
+        let req2 = json!({"method":"expire","id":"pg3","entry_id":entry_id,"force":true});
+        let resp2 = handle_expire(&id, &req2, &paths, &emb);
+        assert_eq!(resp2["type"], "ok");
+    }
+
+    #[test]
+    fn test_handle_compact() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("c1");
+        // Add 3 entries with same id → compact should squash
+        for i in 0..3 {
+            let ev = json!({"action":"upsert","table":"entries","id":"dup","path":"a","summary":format!("v{i}"),"content":"c","tags":[],"ts":"2024-01-01T00:00:00Z"});
+            events::append_event(&paths.events, &ev).unwrap();
+            let conn = db::open_db(&paths.db).unwrap();
+            db::apply_event(&conn, &emb, &ev).unwrap();
+        }
+
+        let resp = handle_compact(&id, &paths);
+        assert_eq!(resp["type"], "ok");
+        assert_eq!(resp["before"], 3);
+        assert_eq!(resp["after"], 1);
+    }
+
+    #[test]
+    fn test_handle_test_add_and_tests() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("ta1");
+        let req = json!({"method":"test_add","id":"ta1","app":"myapp","name":"login test","protocol":"browser","config":"{}"});
+        let resp = handle_test_add(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert!(resp["test_id"].as_str().is_some());
+
+        // List tests
+        let req2 = json!({"method":"tests","id":"ta2","app":"myapp"});
+        let resp2 = handle_tests(&id, &req2, &paths);
+        assert_eq!(resp2["type"], "result");
+        assert_eq!(resp2["count"], 1);
+    }
+
+    #[test]
+    fn test_handle_run() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("r1");
+        // Add test case first
+        let req_tc = json!({"method":"test_add","id":"r1","app":"myapp","name":"t1","protocol":"browser","config":"{}"});
+        let tc = handle_test_add(&id, &req_tc, &paths, &emb);
+        let test_id = tc["test_id"].as_str().unwrap();
+
+        let req = json!({"method":"run","id":"r2","test_id":test_id,"result":"pass","detail":"all green"});
+        let resp = handle_run(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert_eq!(resp["result"], "pass");
+    }
+}
