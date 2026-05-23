@@ -85,17 +85,25 @@ defmodule AgenticKbMcp.McpServer do
     },
     %{
       "name" => "kb_stale_check",
-      "description" => "Check if KB entries for given files are stale (file changed since entry was recorded)",
+      "description" => "Check if KB entries are stale. Supports two lookup modes: (1) file-based — finds entries whose path overlaps and checks whether the file changed since recording; (2) commit-based — finds entries recorded at specific commit SHAs (useful at end of epic to surface entries that were current when the code was written). Use blame=true to auto-extract commit SHAs from changed files via git blame.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
           "files" => %{
             "type" => "array",
             "items" => %{"type" => "string"},
-            "description" => "File paths to check for stale KB entries"
+            "description" => "File paths to check for stale KB entries (by path match + git log)"
+          },
+          "commits" => %{
+            "type" => "array",
+            "items" => %{"type" => "string"},
+            "description" => "Commit SHAs to find KB entries recorded at those exact commits"
+          },
+          "blame" => %{
+            "type" => "boolean",
+            "description" => "Run git blame on files to discover commit SHAs, then surface KB entries recorded at those commits for review (default false)"
           }
-        },
-        "required" => ["files"]
+        }
       }
     },
     %{
@@ -331,6 +339,8 @@ defmodule AgenticKbMcp.McpServer do
     req =
       %{"method" => "stale_check", "id" => gen_id()}
       |> put_if_present("files", args["files"])
+      |> put_if_present("commits", args["commits"])
+      |> put_if_present("blame", args["blame"])
 
     port_call_to_content(req)
   end
@@ -459,19 +469,41 @@ defmodule AgenticKbMcp.McpServer do
           end
         %{"content" => [%{"type" => "text", "text" => text}]}
 
-      %{"type" => "result", "stale" => stale, "checked" => checked} ->
+      %{"type" => "result", "stale" => stale, "checked" => checked} = resp ->
+        review = Map.get(resp, "review", [])
+
         text =
-          if stale == [] do
-            "Checked #{checked} file(s): all KB entries are up to date."
-          else
-            header = "Found #{length(stale)} stale entry/entries (#{checked} file(s) checked):\n\n"
+          cond do
+            stale == [] and review == [] ->
+              "Checked #{checked} file(s): all KB entries are up to date."
 
-            details =
-              Enum.map_join(stale, "\n", fn e ->
-                "STALE [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}  (#{e["commits_behind"]} commit(s) ago)"
-              end)
+            true ->
+              parts =
+                if stale != [] do
+                  [
+                    "Found #{length(stale)} stale entry/entries (#{checked} file(s) checked):\n\n" <>
+                      Enum.map_join(stale, "\n", fn e ->
+                        "STALE [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}  (#{e["commits_behind"]} commit(s) ago)"
+                      end)
+                  ]
+                else
+                  []
+                end
 
-            header <> details
+              parts =
+                if review != [] do
+                  parts ++
+                    [
+                      "Found #{length(review)} entry/entries for review (matched blame/commits):\n\n" <>
+                        Enum.map_join(review, "\n", fn e ->
+                          "REVIEW [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}"
+                        end)
+                    ]
+                else
+                  parts
+                end
+
+              Enum.join(parts, "\n\n")
           end
 
         %{"content" => [%{"type" => "text", "text" => text}]}

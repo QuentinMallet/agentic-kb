@@ -549,26 +549,35 @@ fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &config::Paths) -> Value {
-    let files: Vec<String> = match req.get("files") {
-        Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
-        _ => return json!({"id":id,"type":"error","code":"parse_error","message":"missing files array"}),
-    };
+    use crate::commands::stale_check::{commits_since, extract_blame_shas, normalize_path};
+    use std::collections::HashSet;
+
+    let files: Vec<String> = req
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let explicit_commits: Vec<String> = req
+        .get("commits")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let blame = req.get("blame").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if files.is_empty() && explicit_commits.is_empty() {
+        return json!({"id":id,"type":"error","code":"parse_error","message":"provide files or commits"});
+    }
 
     let repo_root = config::git_repo_root();
     let mut stale_entries: Vec<Value> = Vec::new();
+    let mut review_entries: Vec<Value> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
+    // -- File-based path matching (existing behaviour) --
     for file in &files {
-        let rel_path = if let Some(ref root) = repo_root {
-            let p = Path::new(file);
-            if p.is_absolute() {
-                p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
-            } else {
-                file.clone()
-            }
-        } else {
-            file.clone()
-        };
-
+        let rel_path = normalize_path(file, repo_root.as_deref());
         // Escape LIKE wildcards so paths containing % or _ match literally
         let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
         let mut stmt = match conn.prepare(
@@ -594,27 +603,81 @@ fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &confi
         };
 
         for (entry_id, summary, version_ref, stored_path) in rows {
-            let mut cmd = std::process::Command::new("git");
-            if let Some(ref root) = repo_root {
-                cmd.arg("-C").arg(root);
+            if seen_ids.contains(&entry_id) {
+                continue;
             }
-            cmd.args(["log", "--oneline", &format!("{}..HEAD", version_ref), "--", &stored_path]);
-            if let Ok(out) = cmd.output() {
-                if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-                    let commits = std::str::from_utf8(&out.stdout).unwrap_or("").lines().count();
+            if let Some(count) = commits_since(&version_ref, &stored_path, repo_root.as_deref()) {
+                if count > 0 {
+                    seen_ids.insert(entry_id.clone());
                     stale_entries.push(json!({
                         "id": entry_id,
                         "path": stored_path,
                         "summary": summary,
                         "version_ref": version_ref,
-                        "commits_behind": commits,
+                        "commits_behind": count,
                     }));
                 }
             }
         }
     }
 
-    json!({"id": id, "type": "result", "stale": stale_entries, "checked": files.len()})
+    // -- Commit-based lookup (new behaviour) --
+    // Collect explicit commits + blame-derived commits from changed files.
+    let mut all_commits: HashSet<String> = explicit_commits.into_iter().collect();
+    if blame {
+        for file in &files {
+            all_commits.extend(extract_blame_shas(file, repo_root.as_deref()));
+        }
+    }
+
+    if !all_commits.is_empty() {
+        let commits: Vec<String> = all_commits.into_iter().collect();
+        let placeholders = (1..=commits.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, summary, version_ref, path FROM entries
+             WHERE version_ref IN ({placeholders}) AND is_stale = 0"
+        );
+        let rows: Vec<(String, String, String, String)> = match conn.prepare(&sql) {
+            Ok(mut stmt) => {
+                match stmt.query_map(rusqlite::params_from_iter(commits.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                }) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+                }
+            }
+            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        };
+
+        for (entry_id, summary, version_ref, stored_path) in rows {
+            if seen_ids.contains(&entry_id) {
+                continue;
+            }
+            seen_ids.insert(entry_id.clone());
+            review_entries.push(json!({
+                "id": entry_id,
+                "path": stored_path,
+                "summary": summary,
+                "version_ref": version_ref,
+            }));
+        }
+    }
+
+    json!({
+        "id": id,
+        "type": "result",
+        "stale": stale_entries,
+        "review": review_entries,
+        "checked": files.len(),
+    })
 }
 
 fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
@@ -903,18 +966,51 @@ mod tests {
         let conn = db::open_db(&paths.db).unwrap();
         db::apply_event(&conn, &emb, &ev).unwrap();
 
-        // stale_check returns "result" type and "stale" array
+        // stale_check returns "result" type and "stale" + "review" arrays
         // In a tempdir (no git repo), git log fails gracefully → no entries flagged stale
         let req_sc = json!({"method":"stale_check","id":"sc2","files":["src/old.rs"]});
         let resp = handle_stale_check(&id, &req_sc, &conn, &paths);
         assert_eq!(resp["type"], "result");
         assert!(resp["stale"].as_array().is_some());
+        assert!(resp["review"].as_array().is_some());
         assert_eq!(resp["checked"], 1);
 
-        // stale_check with missing files param → error
+        // stale_check with no files and no commits → error
         let req_bad = json!({"method":"stale_check","id":"sc3"});
         let resp_bad = handle_stale_check(&id, &req_bad, &conn, &paths);
         assert_eq!(resp_bad["type"], "error");
         assert_eq!(resp_bad["code"], "parse_error");
+    }
+
+    #[test]
+    fn test_handle_stale_check_by_commit() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("sc4");
+
+        // Insert entry with a specific version_ref (commit SHA)
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let ev = json!({
+            "action":"upsert","table":"entries","id":"sc-commit-entry",
+            "path":"architecture/normatix","summary":"normatix arch","content":"details","tags":[],
+            "version_ref":sha,"ts":"2024-01-01T00:00:00Z","session":"test"
+        });
+        events::append_event(&paths.events, &ev).unwrap();
+        let conn = db::open_db(&paths.db).unwrap();
+        db::apply_event(&conn, &emb, &ev).unwrap();
+
+        // Query by exact commit SHA → entry appears in review list
+        let req = json!({"method":"stale_check","id":"sc5","commits":[sha]});
+        let resp = handle_stale_check(&id, &req, &conn, &paths);
+        assert_eq!(resp["type"], "result");
+        let review = resp["review"].as_array().unwrap();
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0]["id"], "sc-commit-entry");
+        assert_eq!(review[0]["version_ref"], sha);
+
+        // Unknown SHA → empty review
+        let req2 = json!({"method":"stale_check","id":"sc6","commits":["0000000000000000000000000000000000000000"]});
+        let resp2 = handle_stale_check(&id, &req2, &conn, &paths);
+        assert_eq!(resp2["type"], "result");
+        assert_eq!(resp2["review"].as_array().unwrap().len(), 0);
     }
 }
