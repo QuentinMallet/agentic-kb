@@ -228,7 +228,7 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         "summary": summary,
         "content": content,
         "tags": tags,
-        "version_ref": null,
+        "version_ref": config::git_head_sha(),
         "permanent": permanent,
         "ts": ts,
         "session": "mcp",
@@ -956,7 +956,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("sc1");
 
-        // Insert entry with version_ref directly via events (handle_add hardcodes null)
+        // Insert entry with a specific version_ref directly via events (bypasses git HEAD auto-capture)
         let ev = json!({
             "action":"upsert","table":"entries","id":"sc-entry",
             "path":"src/old.rs","summary":"old fn","content":"c","tags":[],
