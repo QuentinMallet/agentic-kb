@@ -3,7 +3,10 @@
 pub mod add;
 pub mod compact;
 pub mod expire;
+pub mod import_cmd;
+pub mod ingest;
 pub mod mcp;
+pub mod older_than;
 pub mod reembed;
 pub mod rebuild;
 pub mod run;
@@ -41,6 +44,12 @@ pub enum KbCmd {
     TestAdd(test_add::TestAdd),
     /// Record a test run result
     Run(run::Run),
+    /// Chunk a long document into KB entries
+    Ingest(ingest::Ingest),
+    /// Bulk-import KB entries from a JSON seed file (with stamp-gating)
+    Import(import_cmd::Import),
+    /// List KB paths whose latest upsert is older than N days (TSV output)
+    OlderThan(older_than::OlderThan),
 }
 
 /// Entry point for the application.
