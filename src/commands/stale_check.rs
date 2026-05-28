@@ -124,13 +124,18 @@ impl StaleCheck {
 ///      with one or more such commits are flagged stale.
 ///
 ///   2. Commit-based lookup → [`StaleCheckReport::review`]:  collect explicit
-///      `commits` plus (if `blame`) commit SHAs discovered from
-///      `git blame --porcelain` over each input file, then find KB entries
-///      recorded at those SHAs.
+///      `commits` plus (if `blame`) commit SHAs from
+///      [`commits_that_touched_file`] over each input file, then find KB
+///      entries recorded at those SHAs.
 ///
 /// The `unreachable` bucket is reserved for the T5 work (br-yyb.6); it is
 /// always empty in the current implementation but the field is materialised
 /// here so callers can already wire it through their renderers.
+///
+/// T3 (br-yyb.4): per-file path matching is split into a fast-path exact
+/// match (uses `idx_entries_path`) plus a substring fallback (full scan).
+/// Both prepared statements are hoisted out of the file loop so SQLite
+/// statement compilation runs once per call, not once per input file.
 pub fn run_stale_check(
     conn: &Connection,
     files: &[String],
@@ -145,16 +150,34 @@ pub fn run_stale_check(
     let mut seen_ids: HashSet<String> = HashSet::new();
 
     // -- Pass 1: file-based path matching --
+    //
+    // Two prepared statements, hoisted outside the file loop:
+    //  * `fast_path` — `path = ?1` — uses idx_entries_path (O(log N) lookup).
+    //  * `substring_fallback` — leading-wildcard LIKE — still scans, but only
+    //    runs when the exact-match fast-path returns nothing.  This preserves
+    //    the original "input path contains entry path as a suffix" semantics
+    //    without paying for a full scan when the exact match already
+    //    answered the query.
+    let mut fast_path = conn.prepare(
+        "SELECT id, summary, version_ref, path FROM entries
+         WHERE path = ?1
+           AND version_ref IS NOT NULL AND is_stale = 0",
+    )?;
+    let mut substring_fallback = conn.prepare(
+        "SELECT id, summary, version_ref, path FROM entries
+         WHERE (path LIKE '%' || ?1 || '%' ESCAPE '\\' OR ?2 LIKE '%' || path)
+           AND path != ?2
+           AND version_ref IS NOT NULL AND is_stale = 0",
+    )?;
+
     for file in files {
         let rel_path = normalize_path(file, repo_root);
         let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
-        let mut stmt = conn.prepare(
-            "SELECT id, summary, version_ref, path FROM entries
-             WHERE (path = ?1 OR path LIKE '%' || ?2 || '%' ESCAPE '\\' OR ?1 LIKE '%' || path)
-               AND version_ref IS NOT NULL AND is_stale = 0",
-        )?;
-        let rows: Vec<(String, String, String, String)> = stmt
-            .query_map(params![rel_path, like_safe], |r| {
+
+        // Collect rows from both queries: fast-path first (index hit), then
+        // fallback for substring/suffix matches the exact-match cannot reach.
+        let mut rows: Vec<(String, String, String, String)> = fast_path
+            .query_map(params![rel_path], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -164,6 +187,18 @@ pub fn run_stale_check(
             })?
             .filter_map(|r| r.ok())
             .collect();
+        rows.extend(
+            substring_fallback
+                .query_map(params![like_safe, rel_path], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                    ))
+                })?
+                .filter_map(|r| r.ok()),
+        );
 
         for (id, summary, version_ref, stored_path) in rows {
             if seen_ids.contains(&id) {
@@ -416,6 +451,27 @@ mod tests {
 
         // foo and bar SHAs are disjoint sets
         assert!(foo_shas.is_disjoint(&bar_shas));
+    }
+
+    /// Regression test for T3 (br-yyb.4): the fast-path query must use the
+    /// `idx_entries_path` index instead of a full table scan.
+    #[test]
+    fn fast_path_query_uses_idx_entries_path() {
+        let conn = db::open_db_memory().expect("memory db");
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, summary, version_ref, path FROM entries
+                 WHERE path = ?1
+                   AND version_ref IS NOT NULL AND is_stale = 0",
+                params!["x"],
+                |r| r.get::<_, String>(3),
+            )
+            .expect("explain query plan");
+        assert!(
+            plan.contains("idx_entries_path"),
+            "expected idx_entries_path in query plan, got: {plan}"
+        );
     }
 
     #[test]

@@ -74,6 +74,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             ts       TEXT DEFAULT (datetime('now')),
             run_id   TEXT
         );
+
+        -- T3 (br-yyb.4): index supporting the fast-path exact-match lookup in
+        -- stale-check.  `path = ?` queries use this index; the substring
+        -- fallback (`path LIKE '%x%'` and `? LIKE '%' || path`) still scans.
+        -- Additive: `IF NOT EXISTS` keeps existing DBs working without a
+        -- schema_version bump.
+        CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
         "#,
     )?;
     // Migration: add `permanent` column to existing DBs that pre-date this field.
