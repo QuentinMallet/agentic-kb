@@ -549,8 +549,7 @@ fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &config::Paths) -> Value {
-    use crate::commands::stale_check::{commits_since, extract_blame_shas, normalize_path};
-    use std::collections::HashSet;
+    use crate::commands::stale_check::run_stale_check;
 
     let files: Vec<String> = req
         .get("files")
@@ -571,112 +570,50 @@ fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &confi
     }
 
     let repo_root = config::git_repo_root();
-    let mut stale_entries: Vec<Value> = Vec::new();
-    let mut review_entries: Vec<Value> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let report = match run_stale_check(conn, &files, &explicit_commits, blame, repo_root.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
-    // -- File-based path matching (existing behaviour) --
-    for file in &files {
-        let rel_path = normalize_path(file, repo_root.as_deref());
-        // Escape LIKE wildcards so paths containing % or _ match literally
-        let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
-        let mut stmt = match conn.prepare(
-            "SELECT id, summary, version_ref, path FROM entries
-             WHERE (path = ?1 OR path LIKE '%' || ?2 || '%' ESCAPE '\\' OR ?1 LIKE '%' || path)
-               AND version_ref IS NOT NULL AND is_stale = 0",
-        ) {
-            Ok(s) => s,
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-        };
-
-        let rows: Vec<(String, String, String, String)> = match stmt
-            .query_map(params![rel_path, like_safe], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
-                ))
-            }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-        };
-
-        for (entry_id, summary, version_ref, stored_path) in rows {
-            if seen_ids.contains(&entry_id) {
-                continue;
-            }
-            if let Some(count) = commits_since(&version_ref, &stored_path, repo_root.as_deref()) {
-                if count > 0 {
-                    seen_ids.insert(entry_id.clone());
-                    stale_entries.push(json!({
-                        "id": entry_id,
-                        "path": stored_path,
-                        "summary": summary,
-                        "version_ref": version_ref,
-                        "commits_behind": count,
-                    }));
-                }
-            }
-        }
-    }
-
-    // -- Commit-based lookup (new behaviour) --
-    // Collect explicit commits + blame-derived commits from changed files.
-    let mut all_commits: HashSet<String> = explicit_commits.into_iter().collect();
-    if blame {
-        for file in &files {
-            all_commits.extend(extract_blame_shas(file, repo_root.as_deref()));
-        }
-    }
-
-    if !all_commits.is_empty() {
-        let commits: Vec<String> = all_commits.into_iter().collect();
-        let placeholders = (1..=commits.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT id, summary, version_ref, path FROM entries
-             WHERE version_ref IN ({placeholders}) AND is_stale = 0"
-        );
-        let rows: Vec<(String, String, String, String)> = match conn.prepare(&sql) {
-            Ok(mut stmt) => {
-                match stmt.query_map(rusqlite::params_from_iter(commits.iter()), |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                }) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-                }
-            }
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-        };
-
-        for (entry_id, summary, version_ref, stored_path) in rows {
-            if seen_ids.contains(&entry_id) {
-                continue;
-            }
-            seen_ids.insert(entry_id.clone());
-            review_entries.push(json!({
-                "id": entry_id,
-                "path": stored_path,
-                "summary": summary,
-                "version_ref": version_ref,
-            }));
-        }
-    }
+    let stale: Vec<Value> = report
+        .stale
+        .iter()
+        .map(|e| json!({
+            "id": e.id,
+            "path": e.path,
+            "summary": e.summary,
+            "version_ref": e.version_ref,
+            "commits_behind": e.commits_behind,
+        }))
+        .collect();
+    let review: Vec<Value> = report
+        .review
+        .iter()
+        .map(|e| json!({
+            "id": e.id,
+            "path": e.path,
+            "summary": e.summary,
+            "version_ref": e.version_ref,
+        }))
+        .collect();
+    let unreachable: Vec<Value> = report
+        .unreachable
+        .iter()
+        .map(|e| json!({
+            "id": e.id,
+            "path": e.path,
+            "summary": e.summary,
+            "version_ref": e.version_ref,
+        }))
+        .collect();
 
     json!({
         "id": id,
         "type": "result",
-        "stale": stale_entries,
-        "review": review_entries,
-        "checked": files.len(),
+        "stale": stale,
+        "review": review,
+        "unreachable": unreachable,
+        "checked": report.checked,
     })
 }
 

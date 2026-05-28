@@ -1,12 +1,62 @@
 //! `stale-check` subcommand
+//!
+//! Both the CLI subcommand and the MCP `kb_stale_check` handler call into the
+//! shared [`run_stale_check`] helper.  The CLI renders [`StaleCheckReport`] to
+//! stdout; the MCP handler serialises it to JSON.  No SQL or git subprocess
+//! invocation should be duplicated between the two call sites.
 
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::path::Path;
+
+/// A KB entry whose file has changed since the entry's `version_ref`.
+#[derive(Debug, Clone)]
+pub struct StaleEntry {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub version_ref: String,
+    pub commits_behind: usize,
+}
+
+/// A KB entry whose `version_ref` matches a commit we are surfacing for review
+/// (either an explicit `--commits` value or one discovered via `--blame`).
+#[derive(Debug, Clone)]
+pub struct ReviewEntry {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub version_ref: String,
+}
+
+/// A KB entry whose `version_ref` cannot be resolved from the current HEAD
+/// (deleted branch, garbage-collected commit, KB on an orphan branch).
+///
+/// Distinguished from "not stale" so callers can flag it for manual review
+/// instead of silently treating it as current.  Currently always empty; T5
+/// (br-yyb.6) will populate it.
+#[derive(Debug, Clone)]
+pub struct UnreachableEntry {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub version_ref: String,
+}
+
+/// Bucketed result of a stale-check run.  CLI renders to STALE/REVIEW/UNKNOWN
+/// lines; MCP renders to JSON arrays.
+#[derive(Debug, Default)]
+pub struct StaleCheckReport {
+    pub stale: Vec<StaleEntry>,
+    pub review: Vec<ReviewEntry>,
+    pub unreachable: Vec<UnreachableEntry>,
+    /// Number of input files checked (echoed back in the MCP response).
+    pub checked: usize,
+}
 
 /// Check if kb entries for given files (or commits) are stale.
 ///
@@ -51,92 +101,164 @@ impl StaleCheck {
         let paths = config::Paths::discover()?;
         let conn = db::open_db(&paths.db)?;
         let repo_root = config::git_repo_root();
-        let mut found_any = false;
-        let mut seen_ids: HashSet<String> = HashSet::new();
 
-        // -- File-based path matching (existing behaviour) --
-        for file in &self.files {
-            let rel_path = normalize_path(file, repo_root.as_deref());
-            let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
-            let mut stmt = conn.prepare(
-                "SELECT id, summary, version_ref, path FROM entries
-                 WHERE (path = ?1 OR path LIKE '%' || ?2 || '%' ESCAPE '\\' OR ?1 LIKE '%' || path)
-                   AND version_ref IS NOT NULL AND is_stale = 0",
-            )?;
-            let rows: Vec<(String, String, String, String)> = stmt
-                .query_map(params![rel_path, like_safe], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+        let report = run_stale_check(
+            &conn,
+            &self.files,
+            &self.commits,
+            self.blame,
+            repo_root.as_deref(),
+        )?;
 
-            for (id, summary, version_ref, stored_path) in rows {
-                if seen_ids.contains(&id) {
-                    continue;
-                }
-                if let Some(count) = commits_since(&version_ref, &stored_path, repo_root.as_deref()) {
-                    if count > 0 {
-                        println!(
-                            "STALE  [{stored_path}] {summary}  id={id}  recorded-at={version_ref}  ({count} commit{} ago)",
-                            if count == 1 { "" } else { "s" }
-                        );
-                        seen_ids.insert(id);
-                        found_any = true;
-                    }
-                }
-            }
-        }
-
-        // -- Commit-based lookup (new behaviour) --
-        let mut all_commits: HashSet<String> = self.commits.iter().cloned().collect();
-        if self.blame {
-            for file in &self.files {
-                all_commits.extend(extract_blame_shas(file, repo_root.as_deref()));
-            }
-        }
-
-        if !all_commits.is_empty() {
-            let commits: Vec<String> = all_commits.into_iter().collect();
-            let placeholders = (1..=commits.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT id, summary, version_ref, path FROM entries
-                 WHERE version_ref IN ({placeholders}) AND is_stale = 0"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows: Vec<(String, String, String, String)> = stmt
-                .query_map(rusqlite::params_from_iter(commits.iter()), |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            for (id, summary, version_ref, stored_path) in rows {
-                if seen_ids.contains(&id) {
-                    continue;
-                }
-                println!("REVIEW [{stored_path}] {summary}  id={id}  recorded-at={version_ref}  (matches blame/commit)");
-                seen_ids.insert(id);
-                found_any = true;
-            }
-        }
-
-        if !found_any {
-            println!("ok");
-        }
+        render_cli(&report);
         Ok(())
+    }
+}
+
+/// Shared orchestration for the CLI subcommand and the MCP `kb_stale_check`
+/// handler.  Performs two passes:
+///
+///   1. File-based path matching → [`StaleCheckReport::stale`]:  for each
+///      input file, find KB entries whose `path` overlaps, then count commits
+///      touching that path since the entry's recorded `version_ref`.  Entries
+///      with one or more such commits are flagged stale.
+///
+///   2. Commit-based lookup → [`StaleCheckReport::review`]:  collect explicit
+///      `commits` plus (if `blame`) commit SHAs discovered from
+///      `git blame --porcelain` over each input file, then find KB entries
+///      recorded at those SHAs.
+///
+/// The `unreachable` bucket is reserved for the T5 work (br-yyb.6); it is
+/// always empty in the current implementation but the field is materialised
+/// here so callers can already wire it through their renderers.
+pub fn run_stale_check(
+    conn: &Connection,
+    files: &[String],
+    explicit_commits: &[String],
+    blame: bool,
+    repo_root: Option<&Path>,
+) -> anyhow::Result<StaleCheckReport> {
+    let mut report = StaleCheckReport {
+        checked: files.len(),
+        ..Default::default()
+    };
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    // -- Pass 1: file-based path matching --
+    for file in files {
+        let rel_path = normalize_path(file, repo_root);
+        let like_safe = rel_path.replace('%', "\\%").replace('_', "\\_");
+        let mut stmt = conn.prepare(
+            "SELECT id, summary, version_ref, path FROM entries
+             WHERE (path = ?1 OR path LIKE '%' || ?2 || '%' ESCAPE '\\' OR ?1 LIKE '%' || path)
+               AND version_ref IS NOT NULL AND is_stale = 0",
+        )?;
+        let rows: Vec<(String, String, String, String)> = stmt
+            .query_map(params![rel_path, like_safe], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, summary, version_ref, stored_path) in rows {
+            if seen_ids.contains(&id) {
+                continue;
+            }
+            if let Some(count) = commits_since(&version_ref, &stored_path, repo_root) {
+                if count > 0 {
+                    seen_ids.insert(id.clone());
+                    report.stale.push(StaleEntry {
+                        id,
+                        path: stored_path,
+                        summary,
+                        version_ref,
+                        commits_behind: count,
+                    });
+                }
+            }
+        }
+    }
+
+    // -- Pass 2: commit-based lookup --
+    let mut all_commits: HashSet<String> = explicit_commits.iter().cloned().collect();
+    if blame {
+        for file in files {
+            all_commits.extend(extract_blame_shas(file, repo_root));
+        }
+    }
+
+    if !all_commits.is_empty() {
+        let commits: Vec<String> = all_commits.into_iter().collect();
+        let placeholders = (1..=commits.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, summary, version_ref, path FROM entries
+             WHERE version_ref IN ({placeholders}) AND is_stale = 0"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, String, String, String)> = stmt
+            .query_map(rusqlite::params_from_iter(commits.iter()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for (id, summary, version_ref, stored_path) in rows {
+            if seen_ids.contains(&id) {
+                continue;
+            }
+            seen_ids.insert(id.clone());
+            report.review.push(ReviewEntry {
+                id,
+                path: stored_path,
+                summary,
+                version_ref,
+            });
+        }
+    }
+
+    Ok(report)
+}
+
+/// Render a [`StaleCheckReport`] to stdout in the CLI's line-oriented format.
+fn render_cli(report: &StaleCheckReport) {
+    let mut found_any = false;
+    for e in &report.stale {
+        let plural = if e.commits_behind == 1 { "" } else { "s" };
+        println!(
+            "STALE  [{}] {}  id={}  recorded-at={}  ({} commit{} ago)",
+            e.path, e.summary, e.id, e.version_ref, e.commits_behind, plural
+        );
+        found_any = true;
+    }
+    for e in &report.review {
+        println!(
+            "REVIEW [{}] {}  id={}  recorded-at={}  (matches blame/commit)",
+            e.path, e.summary, e.id, e.version_ref
+        );
+        found_any = true;
+    }
+    for e in &report.unreachable {
+        println!(
+            "UNKNOWN [{}] {}  id={}  recorded-at={}  (version_ref unreachable from HEAD)",
+            e.path, e.summary, e.id, e.version_ref
+        );
+        found_any = true;
+    }
+    if !found_any {
+        println!("ok");
     }
 }
 
