@@ -143,11 +143,21 @@ pub fn run_stale_check(
     blame: bool,
     repo_root: Option<&Path>,
 ) -> anyhow::Result<StaleCheckReport> {
+    use std::collections::HashMap;
+
     let mut report = StaleCheckReport {
         checked: files.len(),
         ..Default::default()
     };
     let mut seen_ids: HashSet<String> = HashSet::new();
+    // T4 (br-yyb.5): memoise `commits_since` results by (version_ref, path).
+    // Many KB entries record the same `version_ref` (e.g. when a coding session
+    // recorded a batch of entries at one HEAD), and they often share a stored
+    // path.  Without memoisation the call fans out one git subprocess per
+    // matched row.  With memoisation it collapses to one subprocess per
+    // distinct (version_ref, path) tuple — observed reduction on normatix:
+    // ~60 entries → 4 distinct tuples → 4 subprocesses.
+    let mut count_cache: HashMap<(String, String), Option<usize>> = HashMap::new();
 
     // -- Pass 1: file-based path matching --
     //
@@ -204,7 +214,11 @@ pub fn run_stale_check(
             if seen_ids.contains(&id) {
                 continue;
             }
-            if let Some(count) = commits_since(&version_ref, &stored_path, repo_root) {
+            let key = (version_ref.clone(), stored_path.clone());
+            let count = *count_cache.entry(key).or_insert_with(|| {
+                commits_since(&version_ref, &stored_path, repo_root)
+            });
+            if let Some(count) = count {
                 if count > 0 {
                     seen_ids.insert(id.clone());
                     report.stale.push(StaleEntry {
@@ -345,20 +359,28 @@ pub fn normalize_path(file: &str, repo_root: Option<&Path>) -> String {
     file.to_string()
 }
 
-/// Returns the number of commits touching `path` since `version_ref`, or None
-/// if git is unavailable / the range is invalid.
+/// Returns the number of commits touching `path` since `version_ref`, or
+/// `None` if git failed or the range is empty.
+///
+/// T4 (br-yyb.5): uses `git rev-list --count VERSION..HEAD -- path` which
+/// returns a single integer line — no commit object formatting, no message
+/// materialisation — instead of `git log --oneline` (the prior implementation
+/// formatted every commit just to count newlines).
+///
+/// Callers that have many entries sharing the same `(version_ref, path)`
+/// tuple should dedupe before invoking this; see [`run_stale_check`].
 pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) -> Option<usize> {
     let mut cmd = std::process::Command::new("git");
     if let Some(root) = repo_root {
         cmd.arg("-C").arg(root);
     }
-    cmd.args(["log", "--oneline", &format!("{version_ref}..HEAD"), "--", path]);
+    cmd.args(["rev-list", "--count", &format!("{version_ref}..HEAD"), "--", path]);
     let out = cmd.output().ok()?;
-    if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-        Some(std::str::from_utf8(&out.stdout).unwrap_or("").lines().count())
-    } else {
-        None
+    if !out.status.success() {
+        return None;
     }
+    let count_str = std::str::from_utf8(&out.stdout).ok()?.trim();
+    count_str.parse::<usize>().ok()
 }
 
 #[cfg(test)]
@@ -472,6 +494,55 @@ mod tests {
             plan.contains("idx_entries_path"),
             "expected idx_entries_path in query plan, got: {plan}"
         );
+    }
+
+    /// Regression test for T4 (br-yyb.5): `commits_since` returns an integer
+    /// from `git rev-list --count`, not a hand-counted log line set.
+    #[test]
+    fn commits_since_counts_commits_between_ref_and_head() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+
+        // c1: baseline
+        std::fs::write(dir.join("foo.rs"), "v1\n").unwrap();
+        git(dir, &["add", "foo.rs"]);
+        git(dir, &["commit", "-q", "-m", "c1"]);
+        let c1 = String::from_utf8(
+            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Two more commits touching foo.rs
+        for tag in ["c2", "c3"] {
+            std::fs::write(dir.join("foo.rs"), format!("v{tag}\n")).unwrap();
+            git(dir, &["add", "foo.rs"]);
+            git(dir, &["commit", "-q", "-m", tag]);
+        }
+        // One commit touching only bar.rs (must NOT be counted for foo.rs)
+        std::fs::write(dir.join("bar.rs"), "x\n").unwrap();
+        git(dir, &["add", "bar.rs"]);
+        git(dir, &["commit", "-q", "-m", "bar"]);
+
+        assert_eq!(commits_since(&c1, "foo.rs", Some(dir)), Some(2));
+        assert_eq!(commits_since(&c1, "bar.rs", Some(dir)), Some(1));
+    }
+
+    #[test]
+    fn commits_since_returns_none_for_unknown_ref() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("x"), "x").unwrap();
+        git(dir, &["add", "x"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+
+        // SHA that does not exist in this repo → git rev-list exits non-zero
+        // → caller distinguishes via Option<usize>::None.
+        let ghost = "0000000000000000000000000000000000000000";
+        assert_eq!(commits_since(ghost, "x", Some(dir)), None);
     }
 
     #[test]
