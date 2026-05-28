@@ -58,14 +58,22 @@ pub struct StaleCheckReport {
     pub checked: usize,
 }
 
-/// Check if kb entries for given files (or commits) are stale.
+/// Check if KB entries for given files (or commits) are stale.
 ///
-/// Two lookup modes:
-///   1. File-based (existing): pass file paths; finds entries whose KB path
-///      overlaps and checks whether the file changed since the entry was recorded.
-///   2. Commit-based (new): pass `--commits` or `--blame` to find entries
-///      recorded *at* specific commit SHAs — useful at the end of an epic to
-///      surface KB entries that were current when the changed code was written.
+/// Output line prefixes:
+///   STALE   — entry's file has changed since its recorded version_ref
+///   REVIEW  — entry was recorded at one of the supplied commit SHAs
+///   UNKNOWN — entry's recorded version_ref is unreachable from current HEAD
+///             (deleted branch, garbage-collected commit, orphan-branch KB)
+///
+/// Two lookup modes (can be combined):
+///   1. File-based: pass file paths; finds entries whose KB path overlaps
+///      and checks whether the file changed since the entry was recorded.
+///      Unreachable refs are surfaced as UNKNOWN, not silently skipped.
+///   2. Commit-based: pass `--commits` or `--blame` to find entries
+///      recorded *at* specific commit SHAs.  With `--blame`, the SHA set
+///      is "commits that touched the file" (`git log --pretty=%H -- file`),
+///      not the file's full blame line history.
 #[derive(Command, Debug, Parser)]
 pub struct StaleCheck {
     /// File paths to check for stale KB entries (by path match + git log)
@@ -76,8 +84,9 @@ pub struct StaleCheck {
     #[arg(long = "commits", value_delimiter = ',')]
     pub commits: Vec<String>,
 
-    /// Run git blame on files to discover relevant commit SHAs, then surface
-    /// KB entries recorded at those commits for review
+    /// Discover commit SHAs from the input files' commit history
+    /// (`git log --pretty=%H -- file`) and surface KB entries recorded at
+    /// those commits for review
     #[arg(long, default_value_t = false)]
     pub blame: bool,
 }
