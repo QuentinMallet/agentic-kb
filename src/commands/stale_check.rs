@@ -151,18 +151,30 @@ pub fn extract_blame_shas(file: &str, repo_root: Option<&Path>) -> HashSet<Strin
     }
     cmd.args(["blame", "--porcelain", file]);
     match cmd.output() {
-        Ok(out) if out.status.success() => std::str::from_utf8(&out.stdout)
-            .unwrap_or("")
-            .lines()
-            .filter(|line| {
-                line.len() > 40
-                    && line[..40].chars().all(|c| c.is_ascii_hexdigit())
-                    && line.as_bytes().get(40) == Some(&b' ')
-            })
-            .map(|line| line[..40].to_string())
-            .collect(),
+        Ok(out) if out.status.success() => parse_blame_shas(&out.stdout),
         _ => HashSet::new(),
     }
+}
+
+/// Parse SHAs from raw `git blame --porcelain` stdout bytes.
+///
+/// Uses byte-level filtering so that header lines containing multi-byte UTF-8
+/// (e.g. an em-dash in a commit `summary`) cannot panic when slicing the
+/// 40-byte SHA prefix.
+pub fn parse_blame_shas(stdout: &[u8]) -> HashSet<String> {
+    stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| {
+            line.len() > 40
+                && line[..40].iter().all(u8::is_ascii_hexdigit)
+                && line[40] == b' '
+        })
+        .map(|line| {
+            // The 40-byte slice is guaranteed ASCII by the predicate above,
+            // so from_utf8_lossy is a zero-cost conversion here.
+            String::from_utf8_lossy(&line[..40]).into_owned()
+        })
+        .collect()
 }
 
 /// Relativize an absolute path against the repo root (no-op for relative paths).
@@ -189,5 +201,69 @@ pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) ->
         Some(std::str::from_utf8(&out.stdout).unwrap_or("").lines().count())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the UTF-8 panic introduced in 0ee49f5.
+    ///
+    /// Real-world `git blame --porcelain` output contains header lines like
+    /// `summary feat: Clever Cloud deployment — strip ...` where byte 40 falls
+    /// inside the em-dash multibyte sequence. The previous `line[..40]` str
+    /// slice panicked: "end byte index 40 is not a char boundary; it is inside
+    /// '—' (bytes 38..41)".
+    #[test]
+    fn parse_blame_shas_does_not_panic_on_multibyte_header_lines() {
+        // Synthetic porcelain blob: one valid SHA hunk header, plus headers
+        // whose first 40 bytes straddle a multi-byte char.
+        let blob = concat!(
+            "a1b2c3d4e5f6789012345678901234567890abcd 1 1 1\n",
+            "author Test\n",
+            // 40th byte falls inside the em-dash (3 bytes).
+            "summary feat: Clever Cloud deployment — strip Horde/libcluster, add CC config\n",
+            // 40th byte is inside the leading multi-byte glyph.
+            "previous 0123456789012345678901234567890123456789 src/€uro_check.rs\n",
+            "filename foo.rs\n",
+            "\tactual line content\n",
+        )
+        .as_bytes();
+
+        let shas = parse_blame_shas(blob);
+        assert_eq!(shas.len(), 1, "expected only the SHA header to match");
+        assert!(shas.contains("a1b2c3d4e5f6789012345678901234567890abcd"));
+    }
+
+    #[test]
+    fn parse_blame_shas_collects_unique_shas() {
+        let blob = concat!(
+            "a1b2c3d4e5f6789012345678901234567890abcd 1 1 1\n",
+            "\tline 1\n",
+            "a1b2c3d4e5f6789012345678901234567890abcd 2 2\n",
+            "\tline 2\n",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 3 3 1\n",
+            "\tline 3\n",
+        )
+        .as_bytes();
+
+        let shas = parse_blame_shas(blob);
+        assert_eq!(shas.len(), 2);
+        assert!(shas.contains("a1b2c3d4e5f6789012345678901234567890abcd"));
+        assert!(shas.contains("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"));
+    }
+
+    #[test]
+    fn parse_blame_shas_rejects_non_hex_prefixes() {
+        // Lines whose first 40 chars contain a non-hex byte must be ignored,
+        // even when the 41st byte is a space.
+        let blob = b"NOT_A_SHA_NOT_A_SHA_NOT_A_SHA_NOT_A_SHA_ 1 1 1\nignored\n";
+        assert!(parse_blame_shas(blob).is_empty());
+    }
+
+    #[test]
+    fn parse_blame_shas_handles_empty_input() {
+        assert!(parse_blame_shas(b"").is_empty());
     }
 }
