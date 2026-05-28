@@ -85,7 +85,7 @@ defmodule AgenticKbMcp.McpServer do
     },
     %{
       "name" => "kb_stale_check",
-      "description" => "Check if KB entries are stale. Supports two lookup modes: (1) file-based — finds entries whose path overlaps and checks whether the file changed since recording; (2) commit-based — finds entries recorded at specific commit SHAs (useful at end of epic to surface entries that were current when the code was written). Use blame=true to auto-extract commit SHAs from changed files via git blame.",
+      "description" => "Check if KB entries are stale.\n\nReturns three buckets:\n  * stale — entries whose file changed since the entry's recorded version_ref (file-based pass).\n  * review — entries recorded at one of the supplied commit SHAs (commit-based pass; sources: explicit `commits` array plus, if blame=true, every commit that touched the input files).\n  * unreachable — entries whose recorded version_ref does not exist in the local repo (deleted branch, garbage-collected commit, orphan-branch KB pointing at a vanished SHA). Surface these for manual review instead of silently treating them as not-stale.\n\nWith blame=true, the SHA set is the commits that touched the input files (`git log --pretty=%H -- file`), not the file's full blame line history.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -101,7 +101,7 @@ defmodule AgenticKbMcp.McpServer do
           },
           "blame" => %{
             "type" => "boolean",
-            "description" => "Run git blame on files to discover commit SHAs, then surface KB entries recorded at those commits for review (default false)"
+            "description" => "Discover commit SHAs from the input files' commit history (`git log --pretty=%H -- file`), then surface KB entries recorded at those commits for review (default false)"
           }
         }
       }
@@ -471,10 +471,15 @@ defmodule AgenticKbMcp.McpServer do
 
       %{"type" => "result", "stale" => stale, "checked" => checked} = resp ->
         review = Map.get(resp, "review", [])
+        # T5 (br-yyb.6): the rust side now distinguishes "ref unreachable from
+        # HEAD" from "no commits since recording" and reports the former in a
+        # third bucket. Older rust binaries omit the key — default to [] so
+        # the formatter stays backward-compatible during a rolling upgrade.
+        unreachable = Map.get(resp, "unreachable", [])
 
         text =
           cond do
-            stale == [] and review == [] ->
+            stale == [] and review == [] and unreachable == [] ->
               "Checked #{checked} file(s): all KB entries are up to date."
 
             true ->
@@ -497,6 +502,19 @@ defmodule AgenticKbMcp.McpServer do
                       "Found #{length(review)} entry/entries for review (matched blame/commits):\n\n" <>
                         Enum.map_join(review, "\n", fn e ->
                           "REVIEW [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}"
+                        end)
+                    ]
+                else
+                  parts
+                end
+
+              parts =
+                if unreachable != [] do
+                  parts ++
+                    [
+                      "Found #{length(unreachable)} entry/entries with unreachable version_ref (recorded at a commit not reachable from current HEAD — deleted branch, GC, or orphan-branch KB):\n\n" <>
+                        Enum.map_join(unreachable, "\n", fn e ->
+                          "UNKNOWN [#{e["path"]}] #{e["summary"]}  id=#{e["id"]}  recorded-at=#{e["version_ref"]}"
                         end)
                     ]
                 else

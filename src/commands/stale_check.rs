@@ -158,6 +158,9 @@ pub fn run_stale_check(
     // distinct (version_ref, path) tuple — observed reduction on normatix:
     // ~60 entries → 4 distinct tuples → 4 subprocesses.
     let mut count_cache: HashMap<(String, String), Option<usize>> = HashMap::new();
+    // T5 (br-yyb.6): memoise `ref_exists` results so unreachable refs are
+    // probed once per distinct version_ref across all matched rows.
+    let mut ref_cache: HashMap<String, bool> = HashMap::new();
 
     // -- Pass 1: file-based path matching --
     //
@@ -212,6 +215,24 @@ pub fn run_stale_check(
 
         for (id, summary, version_ref, stored_path) in rows {
             if seen_ids.contains(&id) {
+                continue;
+            }
+            // T5 (br-yyb.6): probe ref existence first.  If the recorded
+            // `version_ref` is unreachable (deleted branch, GC'd commit,
+            // orphan-branch KB), surface in the `unreachable` bucket instead
+            // of letting `commits_since` return `None` (indistinguishable
+            // from "no commits since" at the call site).
+            let reachable = *ref_cache
+                .entry(version_ref.clone())
+                .or_insert_with(|| ref_exists(&version_ref, repo_root));
+            if !reachable {
+                seen_ids.insert(id.clone());
+                report.unreachable.push(UnreachableEntry {
+                    id,
+                    path: stored_path,
+                    summary,
+                    version_ref,
+                });
                 continue;
             }
             let key = (version_ref.clone(), stored_path.clone());
@@ -383,6 +404,26 @@ pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) ->
     count_str.parse::<usize>().ok()
 }
 
+/// Returns whether `version_ref` exists in the local repository.
+///
+/// T5 (br-yyb.6): used by [`run_stale_check`] to distinguish "no commits
+/// since" (ref reachable, file unchanged) from "ref unreachable" (recorded
+/// SHA gone — deleted branch, orphan-branch KB, garbage-collected commit).
+/// The latter is surfaced via [`StaleCheckReport::unreachable`] instead of
+/// being silently treated as not-stale.
+///
+/// Implementation: `git cat-file -e <ref>` — cheap probe, no object payload
+/// emitted, single fork+exec per distinct `version_ref` when memoised by
+/// the caller.
+pub fn ref_exists(version_ref: &str, repo_root: Option<&Path>) -> bool {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(root) = repo_root {
+        cmd.arg("-C").arg(root);
+    }
+    cmd.args(["cat-file", "-e", version_ref]);
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +584,91 @@ mod tests {
         // → caller distinguishes via Option<usize>::None.
         let ghost = "0000000000000000000000000000000000000000";
         assert_eq!(commits_since(ghost, "x", Some(dir)), None);
+    }
+
+    /// Regression test for T5 (br-yyb.6): an entry whose `version_ref`
+    /// cannot be resolved in the local repo is surfaced in the `unreachable`
+    /// bucket rather than silently treated as not-stale.
+    #[test]
+    fn run_stale_check_routes_unreachable_version_ref_to_unreachable_bucket() {
+        use crate::components::db::open_db_memory;
+        use rusqlite::params;
+
+        // Fixture repo: one commit, one tracked file.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("seed.rs"), "x").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+
+        // KB: one entry whose version_ref is a SHA that does not exist in
+        // the fixture repo.  The path matches `seed.rs` exactly so the
+        // fast-path query returns the row, then ref_exists denies it.
+        let conn = open_db_memory().unwrap();
+        let ghost = "0000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", ghost],
+        )
+        .unwrap();
+
+        let report = run_stale_check(
+            &conn,
+            &["seed.rs".to_string()],
+            &[],
+            false,
+            Some(dir),
+        )
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 0, "must not be marked stale");
+        assert_eq!(report.review.len(), 0);
+        assert_eq!(report.unreachable.len(), 1, "must land in unreachable");
+        assert_eq!(report.unreachable[0].id, "e1");
+        assert_eq!(report.unreachable[0].version_ref, ghost);
+    }
+
+    /// Reachable refs do not get routed to `unreachable`.
+    #[test]
+    fn run_stale_check_does_not_flag_reachable_ref_as_unreachable() {
+        use crate::components::db::open_db_memory;
+        use rusqlite::params;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("seed.rs"), "x").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+        let head = String::from_utf8(
+            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let conn = open_db_memory().unwrap();
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", &head],
+        )
+        .unwrap();
+
+        let report = run_stale_check(
+            &conn,
+            &["seed.rs".to_string()],
+            &[],
+            false,
+            Some(dir),
+        )
+        .unwrap();
+
+        // Ref is at HEAD with no diverging commits — not stale, not unreachable.
+        assert_eq!(report.unreachable.len(), 0);
+        assert_eq!(report.stale.len(), 0);
     }
 
     #[test]
