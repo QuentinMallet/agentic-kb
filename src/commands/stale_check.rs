@@ -188,7 +188,7 @@ pub fn run_stale_check(
     let mut all_commits: HashSet<String> = explicit_commits.iter().cloned().collect();
     if blame {
         for file in files {
-            all_commits.extend(extract_blame_shas(file, repo_root));
+            all_commits.extend(commits_that_touched_file(file, repo_root));
         }
     }
 
@@ -262,40 +262,40 @@ fn render_cli(report: &StaleCheckReport) {
     }
 }
 
-/// Extract unique commit SHAs referenced in `git blame --porcelain` output for a file.
+/// Returns the set of commit SHAs that touched `file` in its full history.
 ///
-/// In porcelain format each blame hunk opens with a 40-hex-char SHA followed by
-/// a space and line numbers.  Content lines start with a tab — they won't match.
-pub fn extract_blame_shas(file: &str, repo_root: Option<&Path>) -> HashSet<String> {
+/// Replaces the previous `extract_blame_shas` (T2, br-yyb.3): porcelain blame
+/// emitted SHAs from every line of history including unrelated commits that
+/// happened to author a line via merge resolution, inflating the input to the
+/// downstream `version_ref IN (...)` query for large files.  `git log
+/// --pretty=%H -- <file>` returns exactly the commits that modified the file,
+/// matching the docstring of the `blame=true` mode ("surface KB entries that
+/// were current when the changed code was written").
+///
+/// Output is one 40-hex-char SHA per line; we collect into a `HashSet` to dedupe
+/// merge SHAs that touched the file via multiple paths.
+pub fn commits_that_touched_file(file: &str, repo_root: Option<&Path>) -> HashSet<String> {
     let mut cmd = std::process::Command::new("git");
     if let Some(root) = repo_root {
         cmd.arg("-C").arg(root);
     }
-    cmd.args(["blame", "--porcelain", file]);
+    cmd.args(["log", "--pretty=%H", "--", file]);
     match cmd.output() {
-        Ok(out) if out.status.success() => parse_blame_shas(&out.stdout),
+        Ok(out) if out.status.success() => parse_log_hashes(&out.stdout),
         _ => HashSet::new(),
     }
 }
 
-/// Parse SHAs from raw `git blame --porcelain` stdout bytes.
+/// Parse 40-hex SHAs from `git log --pretty=%H` stdout.
 ///
-/// Uses byte-level filtering so that header lines containing multi-byte UTF-8
-/// (e.g. an em-dash in a commit `summary`) cannot panic when slicing the
-/// 40-byte SHA prefix.
-pub fn parse_blame_shas(stdout: &[u8]) -> HashSet<String> {
+/// Each output line is exactly one SHA (no headers, no content).  Defensive
+/// byte-level filtering rejects anything that is not a clean 40-hex-char line,
+/// so an unexpected git version or locale cannot crash the helper.
+pub fn parse_log_hashes(stdout: &[u8]) -> HashSet<String> {
     stdout
         .split(|&b| b == b'\n')
-        .filter(|line| {
-            line.len() > 40
-                && line[..40].iter().all(u8::is_ascii_hexdigit)
-                && line[40] == b' '
-        })
-        .map(|line| {
-            // The 40-byte slice is guaranteed ASCII by the predicate above,
-            // so from_utf8_lossy is a zero-cost conversion here.
-            String::from_utf8_lossy(&line[..40]).into_owned()
-        })
+        .filter(|line| line.len() == 40 && line.iter().all(u8::is_ascii_hexdigit))
+        .map(|line| String::from_utf8_lossy(line).into_owned())
         .collect()
 }
 
@@ -329,63 +329,106 @@ pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Regression test for the UTF-8 panic introduced in 0ee49f5.
-    ///
-    /// Real-world `git blame --porcelain` output contains header lines like
-    /// `summary feat: Clever Cloud deployment — strip ...` where byte 40 falls
-    /// inside the em-dash multibyte sequence. The previous `line[..40]` str
-    /// slice panicked: "end byte index 40 is not a char boundary; it is inside
-    /// '—' (bytes 38..41)".
-    #[test]
-    fn parse_blame_shas_does_not_panic_on_multibyte_header_lines() {
-        // Synthetic porcelain blob: one valid SHA hunk header, plus headers
-        // whose first 40 bytes straddle a multi-byte char.
-        let blob = concat!(
-            "a1b2c3d4e5f6789012345678901234567890abcd 1 1 1\n",
-            "author Test\n",
-            // 40th byte falls inside the em-dash (3 bytes).
-            "summary feat: Clever Cloud deployment — strip Horde/libcluster, add CC config\n",
-            // 40th byte is inside the leading multi-byte glyph.
-            "previous 0123456789012345678901234567890123456789 src/€uro_check.rs\n",
-            "filename foo.rs\n",
-            "\tactual line content\n",
-        )
-        .as_bytes();
-
-        let shas = parse_blame_shas(blob);
-        assert_eq!(shas.len(), 1, "expected only the SHA header to match");
-        assert!(shas.contains("a1b2c3d4e5f6789012345678901234567890abcd"));
-    }
+    use std::process::Command;
+    use tempfile::TempDir;
 
     #[test]
-    fn parse_blame_shas_collects_unique_shas() {
+    fn parse_log_hashes_collects_unique_shas() {
         let blob = concat!(
-            "a1b2c3d4e5f6789012345678901234567890abcd 1 1 1\n",
-            "\tline 1\n",
-            "a1b2c3d4e5f6789012345678901234567890abcd 2 2\n",
-            "\tline 2\n",
-            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef 3 3 1\n",
-            "\tline 3\n",
+            "a1b2c3d4e5f6789012345678901234567890abcd\n",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+            "a1b2c3d4e5f6789012345678901234567890abcd\n", // dupe
         )
         .as_bytes();
-
-        let shas = parse_blame_shas(blob);
+        let shas = parse_log_hashes(blob);
         assert_eq!(shas.len(), 2);
         assert!(shas.contains("a1b2c3d4e5f6789012345678901234567890abcd"));
         assert!(shas.contains("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"));
     }
 
     #[test]
-    fn parse_blame_shas_rejects_non_hex_prefixes() {
-        // Lines whose first 40 chars contain a non-hex byte must be ignored,
-        // even when the 41st byte is a space.
-        let blob = b"NOT_A_SHA_NOT_A_SHA_NOT_A_SHA_NOT_A_SHA_ 1 1 1\nignored\n";
-        assert!(parse_blame_shas(blob).is_empty());
+    fn parse_log_hashes_rejects_malformed_lines() {
+        let blob = concat!(
+            "a1b2c3d4e5f6789012345678901234567890abcd\n",        // ok
+            "TOOSHORT\n",                                         // wrong length
+            "a1b2c3d4e5f6789012345678901234567890abcd abc def\n", // trailing junk
+            "ZZb2c3d4e5f6789012345678901234567890abcd\n",        // non-hex
+        )
+        .as_bytes();
+        let shas = parse_log_hashes(blob);
+        assert_eq!(shas.len(), 1);
+        assert!(shas.contains("a1b2c3d4e5f6789012345678901234567890abcd"));
     }
 
     #[test]
-    fn parse_blame_shas_handles_empty_input() {
-        assert!(parse_blame_shas(b"").is_empty());
+    fn parse_log_hashes_handles_empty_input() {
+        assert!(parse_log_hashes(b"").is_empty());
+    }
+
+    /// Run a git command in a tempdir, panicking on failure.  Used by the
+    /// fixture-based integration tests below.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .expect("git available");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Regression test for T2 (br-yyb.3): `blame=true` semantics.
+    ///
+    /// Build a tempdir repo with file history vs unrelated history; assert
+    /// that `commits_that_touched_file` returns exactly the commits that
+    /// touched the file, *not* every commit in the repository.
+    #[test]
+    fn commits_that_touched_file_only_returns_commits_touching_that_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+
+        // 3 commits touching foo.rs
+        for i in 1..=3 {
+            std::fs::write(dir.join("foo.rs"), format!("foo v{i}\n")).unwrap();
+            git(dir, &["add", "foo.rs"]);
+            git(dir, &["commit", "-q", "-m", &format!("foo {i}")]);
+        }
+        // 2 unrelated commits touching bar.rs only
+        for i in 1..=2 {
+            std::fs::write(dir.join("bar.rs"), format!("bar v{i}\n")).unwrap();
+            git(dir, &["add", "bar.rs"]);
+            git(dir, &["commit", "-q", "-m", &format!("bar {i}")]);
+        }
+
+        let foo_shas = commits_that_touched_file("foo.rs", Some(dir));
+        assert_eq!(
+            foo_shas.len(),
+            3,
+            "exactly the 3 foo.rs commits should appear, not the 5 total"
+        );
+
+        let bar_shas = commits_that_touched_file("bar.rs", Some(dir));
+        assert_eq!(bar_shas.len(), 2);
+
+        // foo and bar SHAs are disjoint sets
+        assert!(foo_shas.is_disjoint(&bar_shas));
+    }
+
+    #[test]
+    fn commits_that_touched_file_handles_missing_file_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("seed"), "x").unwrap();
+        git(dir, &["add", "seed"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+
+        // git log -- nonexistent returns empty stdout with success exit
+        let shas = commits_that_touched_file("does_not_exist.rs", Some(dir));
+        assert!(shas.is_empty());
     }
 }
