@@ -49,6 +49,25 @@ pub struct UnreachableEntry {
 
 /// Bucketed result of a stale-check run.  CLI renders to STALE/REVIEW/UNKNOWN
 /// lines; MCP renders to JSON arrays.
+///
+/// **Bucket precedence (each entry appears in at most one bucket).** The
+/// orchestrator processes Pass 1 (file-based) then Pass 2 (commit-based),
+/// and tracks already-bucketed ids in a `seen_ids` set.  First write wins,
+/// so the precedence is:
+///
+///   1. `unreachable` — Pass 1 routes an entry here whenever its
+///      `version_ref` cannot be resolved from HEAD; Pass 2 does the same
+///      for explicit/blame SHAs that no longer exist locally.
+///   2. `stale` — Pass 1 promotes here only for refs that ARE reachable
+///      and have `commits_behind > 0` for the stored path.
+///   3. `review` — Pass 2 lands the remainder (reachable refs that match
+///      the explicit/blame commit set and have not already been bucketed
+///      by Pass 1).
+///
+/// As a consequence: an entry that both has a changed file AND matches an
+/// explicit/blame SHA will only appear in `stale` (Pass 1 fires first); an
+/// entry with an unreachable ref will only appear in `unreachable`,
+/// regardless of which pass surfaced it.
 #[derive(Debug, Default)]
 pub struct StaleCheckReport {
     pub stale: Vec<StaleEntry>,
@@ -298,13 +317,31 @@ pub fn run_stale_check(
             if seen_ids.contains(&id) {
                 continue;
             }
+            // I1 (post-impl review): Pass 2 also routes unreachable refs to
+            // the `unreachable` bucket.  An explicit `--commits` SHA or a
+            // blame-discovered SHA may point at a commit that no longer
+            // exists in the local repo (typo, remote-only branch, GC).
+            // Matching entries should be flagged unreachable, not surfaced
+            // as if their context were intact.
+            let reachable = *ref_cache
+                .entry(version_ref.clone())
+                .or_insert_with(|| ref_exists(&version_ref, repo_root));
             seen_ids.insert(id.clone());
-            report.review.push(ReviewEntry {
-                id,
-                path: stored_path,
-                summary,
-                version_ref,
-            });
+            if reachable {
+                report.review.push(ReviewEntry {
+                    id,
+                    path: stored_path,
+                    summary,
+                    version_ref,
+                });
+            } else {
+                report.unreachable.push(UnreachableEntry {
+                    id,
+                    path: stored_path,
+                    summary,
+                    version_ref,
+                });
+            }
         }
     }
 
@@ -379,6 +416,16 @@ pub fn parse_log_hashes(stdout: &[u8]) -> HashSet<String> {
 }
 
 /// Relativize an absolute path against the repo root (no-op for relative paths).
+///
+/// **Note on encoding.** Input is already `&str`, so the relative-path
+/// no-op case is fully lossless.  In the absolute-path branch the path is
+/// strip-prefixed and then converted back via `to_string_lossy`, which
+/// replaces invalid UTF-8 byte sequences with `U+FFFD`.  This is
+/// intentional and safe for stale-check: KB entry paths are stored as
+/// UTF-8, so a path containing non-UTF-8 bytes can never match an
+/// existing entry regardless of how it is normalised — the lossy
+/// substitution only changes the query string for paths that would have
+/// returned zero rows anyway.
 pub fn normalize_path(file: &str, repo_root: Option<&Path>) -> String {
     if let Some(root) = repo_root {
         let p = Path::new(file);
@@ -637,6 +684,47 @@ mod tests {
         assert_eq!(report.unreachable.len(), 1, "must land in unreachable");
         assert_eq!(report.unreachable[0].id, "e1");
         assert_eq!(report.unreachable[0].version_ref, ghost);
+    }
+
+    /// I1 (post-impl review): Pass-2 commit-based lookup also routes
+    /// unreachable refs to the `unreachable` bucket.  Without this, an
+    /// explicit `--commits` SHA that no longer exists locally would
+    /// silently surface the matched entry as `review`, hiding the fact
+    /// that the referenced commit is gone.
+    #[test]
+    fn run_stale_check_routes_unreachable_explicit_commit_to_unreachable_bucket() {
+        use crate::components::db::open_db_memory;
+        use rusqlite::params;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("x"), "x").unwrap();
+        git(dir, &["add", "x"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+
+        let conn = open_db_memory().unwrap();
+        let ghost = "0000000000000000000000000000000000000000";
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "x", "test entry", "body", "[]", ghost],
+        )
+        .unwrap();
+
+        let report = run_stale_check(
+            &conn,
+            &[],                          // no files — Pass 2 only
+            &[ghost.to_string()],         // explicit unreachable commit
+            false,
+            Some(dir),
+        )
+        .unwrap();
+
+        assert_eq!(report.review.len(), 0, "must not be marked review");
+        assert_eq!(report.stale.len(), 0);
+        assert_eq!(report.unreachable.len(), 1, "must land in unreachable");
+        assert_eq!(report.unreachable[0].id, "e1");
     }
 
     /// Reachable refs do not get routed to `unreachable`.

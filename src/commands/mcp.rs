@@ -935,19 +935,35 @@ mod tests {
         let conn = db::open_db(&paths.db).unwrap();
         db::apply_event(&conn, &emb, &ev).unwrap();
 
-        // Query by exact commit SHA → entry appears in review list
+        // Query by exact commit SHA → entry surfaces somewhere.
+        //
+        // Whether it lands in `review` or `unreachable` depends on whether
+        // the SHA is reachable from HEAD in the test runner's cwd (post-I1
+        // fix routes unreachable refs from Pass 2 into `unreachable`).  The
+        // SHA used here is synthetic (`deadbeef…`), so in practice it lands
+        // in `unreachable`; assert flexibly so the test passes regardless
+        // of where cargo is invoked from.
         let req = json!({"method":"stale_check","id":"sc5","commits":[sha]});
         let resp = handle_stale_check(&id, &req, &conn, &paths);
         assert_eq!(resp["type"], "result");
         let review = resp["review"].as_array().unwrap();
-        assert_eq!(review.len(), 1);
-        assert_eq!(review[0]["id"], "sc-commit-entry");
-        assert_eq!(review[0]["version_ref"], sha);
+        let unreachable = resp["unreachable"].as_array().unwrap();
+        assert_eq!(
+            review.len() + unreachable.len(),
+            1,
+            "entry must appear in exactly one bucket"
+        );
+        let bucket = if !review.is_empty() { review } else { unreachable };
+        assert_eq!(bucket[0]["id"], "sc-commit-entry");
+        assert_eq!(bucket[0]["version_ref"], sha);
 
-        // Unknown SHA → empty review
+        // Unknown SHA → no matching entry in either review or unreachable
+        // (the SQL query filters by version_ref IN (...), so no row → no
+        // bucket assignment).
         let req2 = json!({"method":"stale_check","id":"sc6","commits":["0000000000000000000000000000000000000000"]});
         let resp2 = handle_stale_check(&id, &req2, &conn, &paths);
         assert_eq!(resp2["type"], "result");
         assert_eq!(resp2["review"].as_array().unwrap().len(), 0);
+        assert_eq!(resp2["unreachable"].as_array().unwrap().len(), 0);
     }
 }
