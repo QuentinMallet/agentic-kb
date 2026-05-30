@@ -31,29 +31,74 @@ impl Rebuild {
     }
 
     /// Execute with explicit paths and embedder (for testing).
+    ///
+    /// Three-phase algorithm so concurrent writes are never blocked for more
+    /// than a brief lock-acquisition at either end:
+    ///
+    /// 1. Snapshot (brief lock): record event count N, release lock.
+    /// 2. Replay (no lock): replay events 1..N into `agent-kb.db.tmp`.
+    ///    MCP writes continue normally against the live DB during this phase.
+    /// 3. Catch-up + swap (brief lock): apply events N+1..M written during
+    ///    phase 2, then atomically rename tmp into place.
     pub fn execute_with(
         &self,
         paths: &config::Paths,
         embedder: &dyn Embedder,
     ) -> anyhow::Result<()> {
+        // Phase 1: snapshot event count under a brief lock.
+        let snapshot_len = {
+            let _lock = acquire_lock(&paths.lock)?;
+            events::read_events(&paths.events)?.len()
+        };
+
+        // Phase 2: replay snapshot into a tmp DB — no lock held.
+        let tmp_db = paths.db.with_extension("db.tmp");
+        let _ = fs::remove_file(&tmp_db);
+        {
+            // Stop at snapshot_len so we never encounter a partial tail line
+            // that a concurrent writer may be mid-writing after Phase 1 released the lock.
+            let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
+            let to_replay = evts.len();
+            let conn = db::open_db(&tmp_db)?;
+            // DELETE journal avoids WAL files on the tmp path, simplifying the
+            // rename step (no companion files to move or orphan).
+            conn.execute_batch("PRAGMA journal_mode=DELETE")?;
+            eprintln!("replaying {} events...", to_replay);
+            for event in &evts[..to_replay] {
+                db::apply_event(&conn, embedder, event)
+                    .with_context(|| format!("apply event: {}", event))?;
+            }
+        }
+
+        // Phase 3: catch-up and atomic swap under lock.
         let _lock = acquire_lock(&paths.lock)?;
-
-        // Drop the DB so we start from a clean slate.
-        if paths.db.exists() {
-            fs::remove_file(&paths.db)?;
-            let db_str = paths.db.to_string_lossy();
-            let _ = fs::remove_file(format!("{}-wal", db_str));
-            let _ = fs::remove_file(format!("{}-shm", db_str));
+        let all_evts = events::read_events(&paths.events)?;
+        let catchup = &all_evts[snapshot_len.min(all_evts.len())..];
+        if !catchup.is_empty() {
+            eprintln!("catching up {} new event(s)...", catchup.len());
+            let conn = db::open_db(&tmp_db)?;
+            conn.execute_batch("PRAGMA journal_mode=DELETE")?;
+            for event in catchup {
+                db::apply_event(&conn, embedder, event)
+                    .with_context(|| format!("apply event (catch-up): {}", event))?;
+            }
         }
 
-        let conn = db::open_db(&paths.db)?;
-        let evts = events::read_events(&paths.events)?;
-
-        eprintln!("replaying {} events...", evts.len());
-        for event in &evts {
-            db::apply_event(&conn, embedder, event)
-                .with_context(|| format!("apply event: {}", event))?;
-        }
+        // Remove old WAL/SHM before rename. This is required: the tmp DB uses
+        // journal_mode=DELETE (no WAL), so if the old WAL files remain after
+        // the rename, new SQLite connections would attempt WAL recovery against
+        // the rebuilt DB, producing corruption or an error.
+        // Safety (Linux): the per-request connection model means no MCP handler
+        // holds a connection across the lock boundary, so no reader has the WAL
+        // open when we unlink it. On Linux, any FD open at unlink time remains
+        // valid (the inode persists until the last close), so this is safe even
+        // if a reader opened just before the lock was acquired. fs::rename then
+        // atomically replaces the DB file in one syscall.
+        let db_str = paths.db.to_string_lossy();
+        let _ = fs::remove_file(format!("{}-wal", db_str));
+        let _ = fs::remove_file(format!("{}-shm", db_str));
+        fs::rename(&tmp_db, &paths.db)
+            .with_context(|| "rename rebuilt DB into place")?;
 
         eprintln!("rebuild complete");
         Ok(())

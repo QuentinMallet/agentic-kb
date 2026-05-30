@@ -11,7 +11,7 @@ use crate::config;
 use abscissa_core::{Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -64,17 +64,13 @@ impl Mcp {
         println!("{ready}");
         io::stdout().flush()?;
 
-        // Open a persistent connection for read-only handlers; write handlers
-        // open their own connection under the file lock.
-        let conn = db::open_db(&paths.db)?;
-
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let response = handle_request(&line, &paths, &conn, emb.as_ref());
+            let response = handle_request(&line, &paths, emb.as_ref());
             println!("{response}");
             io::stdout().flush()?;
         }
@@ -82,7 +78,7 @@ impl Mcp {
     }
 }
 
-fn handle_request(line: &str, paths: &config::Paths, conn: &Connection, emb: &dyn embedder::Embedder) -> Value {
+fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -94,16 +90,16 @@ fn handle_request(line: &str, paths: &config::Paths, conn: &Connection, emb: &dy
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "search" => handle_search(&id, &req, conn, emb),
+        "search" => handle_search(&id, &req, paths, emb),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
-        "stale_check" => handle_stale_check(&id, &req, conn, paths),
+        "stale_check" => handle_stale_check(&id, &req, paths),
         "compact" => handle_compact(&id, paths),
         "reembed" => handle_reembed(&id, &req, paths, emb),
         "run" => handle_run(&id, &req, paths, emb),
         "test_add" => handle_test_add(&id, &req, paths, emb),
-        "tests" => handle_tests(&id, &req, conn),
+        "tests" => handle_tests(&id, &req, paths),
         "rebuild" => handle_rebuild(&id, paths, emb),
         _ => json!({
             "id": id,
@@ -114,7 +110,7 @@ fn handle_request(line: &str, paths: &config::Paths, conn: &Connection, emb: &dy
     }
 }
 
-fn handle_search(id: &Value, req: &Value, conn: &Connection, emb: &dyn embedder::Embedder) -> Value {
+fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
     let query = match req.get("query").and_then(|q| q.as_str()) {
         Some(q) => q.to_string(),
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"}),
@@ -132,11 +128,16 @@ fn handle_search(id: &Value, req: &Value, conn: &Connection, emb: &dyn embedder:
         tag_filter,
     };
 
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
     // Cap content per entry to prevent port line buffer overflow (10MB limit).
     // 8000 chars per entry * 50 entries = 400KB typical, well under the limit.
     const MAX_CONTENT_CHARS: usize = 8000;
 
-    match db::search_entries(conn, emb, &query, &opts) {
+    match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
             let entries: Vec<Value> = results
                 .into_iter()
@@ -326,42 +327,16 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
 }
 
 fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
-    use std::fs;
-
-    let _lock = match acquire_lock(&paths.lock) {
-        Ok(l) => l,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    if paths.db.exists() {
-        let _ = fs::remove_file(&paths.db);
-        let db_str = paths.db.to_string_lossy();
-        let _ = fs::remove_file(format!("{}-wal", db_str));
-        let _ = fs::remove_file(format!("{}-shm", db_str));
-    }
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let evts = match events::read_events(&paths.events) {
-        Ok(e) => e,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let total = evts.len();
-    for (i, event) in evts.iter().enumerate() {
-        // Progress goes to stderr — stdout is the MCP response channel
-        eprintln!("kb: rebuild {}/{}", i + 1, total);
-        let _ = io::stderr().flush();
-
-        if let Err(e) = db::apply_event(&conn, emb, event) {
-            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    use crate::commands::rebuild::Rebuild;
+    match (Rebuild).execute_with(paths, emb) {
+        Ok(()) => {
+            let rebuilt = events::read_events(&paths.events)
+                .map(|e| e.len())
+                .unwrap_or(0);
+            json!({"id": id, "type": "ok", "rebuilt": rebuilt})
         }
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
-
-    json!({"id": id, "type": "ok", "rebuilt": total})
 }
 
 fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
@@ -453,7 +428,11 @@ fn handle_test_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn emb
     json!({"id": id, "type": "ok", "test_id": test_id})
 }
 
-fn handle_tests(id: &Value, req: &Value, conn: &Connection) -> Value {
+fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
     let app_filter = req.get("app").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let results: Vec<Value> = if let Some(ref app) = app_filter {
@@ -548,7 +527,7 @@ fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
     }
 }
 
-fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &config::Paths) -> Value {
+fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     use crate::commands::stale_check::run_stale_check;
 
     let files: Vec<String> = req
@@ -569,8 +548,12 @@ fn handle_stale_check(id: &Value, req: &Value, conn: &Connection, _paths: &confi
         return json!({"id":id,"type":"error","code":"parse_error","message":"provide files or commits"});
     }
 
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
     let repo_root = config::git_repo_root();
-    let report = match run_stale_check(conn, &files, &explicit_commits, blame, repo_root.as_deref()) {
+    let report = match run_stale_check(&conn, &files, &explicit_commits, blame, repo_root.as_deref()) {
         Ok(r) => r,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -744,9 +727,8 @@ mod tests {
         handle_add(&id, &req_add2, &paths, &emb);
 
         // Search with path_prefix filter
-        let conn = db::open_db(&paths.db).unwrap();
         let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
-        let resp = handle_search(&id, &req, &conn, &emb);
+        let resp = handle_search(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
@@ -815,8 +797,7 @@ mod tests {
 
         // List tests
         let req2 = json!({"method":"tests","id":"ta2","app":"myapp"});
-        let conn = db::open_db(&paths.db).unwrap();
-        let resp2 = handle_tests(&id, &req2, &conn);
+        let resp2 = handle_tests(&id, &req2, &paths);
         assert_eq!(resp2["type"], "result");
         assert_eq!(resp2["count"], 1);
     }
@@ -906,7 +887,7 @@ mod tests {
         // stale_check returns "result" type and "stale" + "review" arrays
         // In a tempdir (no git repo), git log fails gracefully → no entries flagged stale
         let req_sc = json!({"method":"stale_check","id":"sc2","files":["src/old.rs"]});
-        let resp = handle_stale_check(&id, &req_sc, &conn, &paths);
+        let resp = handle_stale_check(&id, &req_sc, &paths);
         assert_eq!(resp["type"], "result");
         assert!(resp["stale"].as_array().is_some());
         assert!(resp["review"].as_array().is_some());
@@ -914,7 +895,7 @@ mod tests {
 
         // stale_check with no files and no commits → error
         let req_bad = json!({"method":"stale_check","id":"sc3"});
-        let resp_bad = handle_stale_check(&id, &req_bad, &conn, &paths);
+        let resp_bad = handle_stale_check(&id, &req_bad, &paths);
         assert_eq!(resp_bad["type"], "error");
         assert_eq!(resp_bad["code"], "parse_error");
     }
@@ -944,7 +925,7 @@ mod tests {
         // in `unreachable`; assert flexibly so the test passes regardless
         // of where cargo is invoked from.
         let req = json!({"method":"stale_check","id":"sc5","commits":[sha]});
-        let resp = handle_stale_check(&id, &req, &conn, &paths);
+        let resp = handle_stale_check(&id, &req, &paths);
         assert_eq!(resp["type"], "result");
         let review = resp["review"].as_array().unwrap();
         let unreachable = resp["unreachable"].as_array().unwrap();
@@ -961,7 +942,7 @@ mod tests {
         // (the SQL query filters by version_ref IN (...), so no row → no
         // bucket assignment).
         let req2 = json!({"method":"stale_check","id":"sc6","commits":["0000000000000000000000000000000000000000"]});
-        let resp2 = handle_stale_check(&id, &req2, &conn, &paths);
+        let resp2 = handle_stale_check(&id, &req2, &paths);
         assert_eq!(resp2["type"], "result");
         assert_eq!(resp2["review"].as_array().unwrap().len(), 0);
         assert_eq!(resp2["unreachable"].as_array().unwrap().len(), 0);

@@ -400,9 +400,15 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
+  defp dispatch_tool("kb_rebuild", _args, %{db_path: nil}) do
+    text_error(
+      "No agent-kb.db found. Run `kb init` or `/project-init` to initialise the knowledge base for this project."
+    )
+  end
+
   defp dispatch_tool("kb_rebuild", _args, _state) do
-    req = %{"method" => "rebuild", "id" => gen_id()}
-    port_call_to_content(req)
+    AgenticKbMcp.PortManager.rebuild_async()
+    %{"content" => [%{"type" => "text", "text" => "Rebuild started in background. Reads continue normally; writes queue until complete."}]}
   end
 
   defp dispatch_tool(name, _args, _state) do

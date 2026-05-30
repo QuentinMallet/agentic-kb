@@ -20,9 +20,19 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   @doc "Send a request map to the Rust port and wait for the response map."
-  @spec call_port(map()) :: map()
-  def call_port(request) do
-    GenServer.call(__MODULE__, {:request, request}, @call_timeout)
+  @spec call_port(map(), timeout()) :: map()
+  def call_port(request, timeout \\ @call_timeout) do
+    GenServer.call(__MODULE__, {:request, request, timeout}, timeout)
+  end
+
+  @doc """
+  Spawn `kb rebuild` as a separate OS process and return immediately.
+  The subprocess acquires the file lock, so concurrent writes queue safely.
+  Reads through the normal port continue unblocked during the rebuild.
+  """
+  @spec rebuild_async() :: :ok
+  def rebuild_async do
+    GenServer.cast(__MODULE__, :rebuild_async)
   end
 
   # ---------------------------------------------------------------------------
@@ -44,7 +54,7 @@ defmodule AgenticKbMcp.PortManager do
 
     case await_ready(port) do
       :ok ->
-        {:ok, %{port: port, db_path: db_path}}
+        {:ok, %{port: port, db_path: db_path, kb_bin: kb_bin}}
 
       {:error, reason} ->
         {:stop, reason}
@@ -52,10 +62,33 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   @impl true
-  def handle_call({:request, request}, _from, %{port: port} = state) do
+  def handle_cast(:rebuild_async, %{kb_bin: kb_bin, db_path: db_path} = state) do
+    # Derive repo root: <root>/agent-kb/agent-kb.db → <root>
+    repo_root = db_path |> Path.dirname() |> Path.dirname()
+    log = Path.join(Path.dirname(db_path), "rebuild.log")
+    # Shell double-fork: sh (port child) exits immediately after backgrounding
+    # kb rebuild. The grandchild is adopted by init and survives BEAM shutdown,
+    # so the agent can quit as soon as this cast returns.
+    # KB_BIN and LOG are passed via env to avoid shell injection.
+    {_output, exit_code} =
+      System.cmd("sh", ["-c", ~s("$KB_BIN" rebuild >"$LOG" 2>&1 &)],
+        cd: repo_root,
+        env: [{"KB_BIN", kb_bin}, {"LOG", log}]
+      )
+
+    if exit_code == 0 do
+      Logger.info("kb rebuild started in background (log: #{log})")
+    else
+      Logger.error("kb rebuild: sh exited #{exit_code} — rebuild may not have started (log: #{log})")
+    end
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call({:request, request, timeout}, _from, %{port: port} = state) do
     line = json_encode!(request) <> "\n"
     Port.command(port, line)
-    response = collect_response(port, request["id"])
+    response = collect_response(port, request["id"], timeout)
     {:reply, response, state}
   end
 
@@ -101,13 +134,15 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   # Collect response lines, accumulating progress events until a final response.
-  defp collect_response(port, id) do
+  # Each progress event resets the per-receive window, so long rebuilds stay alive
+  # as long as the Rust side emits at least one progress tick within `timeout` ms.
+  defp collect_response(port, id, timeout) do
     receive do
       {^port, {:data, {:eol, line}}} ->
         case json_decode(line) do
           {:ok, %{"type" => "progress"} = prog} ->
             Logger.debug("kb progress: processed=#{prog["processed"]}/#{prog["total"]}")
-            collect_response(port, id)
+            collect_response(port, id, timeout)
 
           {:ok, response} ->
             response
@@ -121,7 +156,7 @@ defmodule AgenticKbMcp.PortManager do
             }
         end
     after
-      @call_timeout ->
+      timeout ->
         %{"id" => id, "type" => "error", "code" => "timeout", "message" => "port timed out"}
     end
   end
