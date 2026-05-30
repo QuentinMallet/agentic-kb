@@ -108,71 +108,119 @@ impl Rebuild {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::embedder::NoopEmbedder;
-    use crate::components::events::append_event;
+    use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
     use rusqlite::Connection;
     use std::fs;
     use std::process::Command as Cmd;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    fn setup_repo() -> (tempfile::TempDir, Paths) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init", "-b", "master"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "T"],
+        ] {
+            Cmd::new("git").args(&args).current_dir(root).output().unwrap();
+        }
+        fs::write(root.join("R"), "i").unwrap();
+        Cmd::new("git").args(["add", "."]).current_dir(root).output().unwrap();
+        Cmd::new("git").args(["commit", "-m", "i"]).current_dir(root).output().unwrap();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        (dir, paths)
+    }
+
+    fn upsert(id: &str, idx: u32) -> serde_json::Value {
+        serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": id, "path": format!("p{idx}.rs"), "summary": "s",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    fn count_entries(paths: &Paths) -> i64 {
+        Connection::open(&paths.db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap()
+    }
 
     #[test]
     fn test_cmd_rebuild_from_events() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        Cmd::new("git")
-            .args(["init", "-b", "master"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Cmd::new("git")
-            .args(["config", "user.email", "t@t"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Cmd::new("git")
-            .args(["config", "user.name", "T"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        fs::write(root.join("R"), "i").unwrap();
-        Cmd::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Cmd::new("git")
-            .args(["commit", "-m", "i"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(root);
-        let embedder = NoopEmbedder;
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+        events::append_event(&paths.events, &upsert("rb1", 1)).unwrap();
+        events::append_event(&paths.events, &upsert("rb2", 2)).unwrap();
+        Rebuild.execute_with(&paths, &emb).unwrap();
+        assert_eq!(count_entries(&paths), 2);
+    }
 
-        // Write events directly to JSONL
-        let e1 = serde_json::json!({
-            "action": "upsert", "table": "entries",
-            "id": "rb1", "path": "a.rs", "summary": "first",
-            "content": "content1", "tags": [], "ts": "2024-01-01T00:00:00Z"
+    /// DB cleared (e.g. corrupted or missing) — rebuild reconstructs from event log.
+    #[test]
+    fn test_rebuild_restores_cleared_db() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+
+        for i in 0..10u32 {
+            let e = upsert(&format!("id{i}"), i);
+            events::append_event(&paths.events, &e).unwrap();
+            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+        }
+        assert_eq!(count_entries(&paths), 10);
+
+        // Corrupt DB
+        Connection::open(&paths.db)
+            .unwrap()
+            .execute("DELETE FROM entries", [])
+            .unwrap();
+        assert_eq!(count_entries(&paths), 0);
+
+        Rebuild.execute_with(&paths, &emb).unwrap();
+        assert_eq!(count_entries(&paths), 10, "rebuild must restore all events");
+    }
+
+    /// Events written concurrently with Phase 2 (lock-free replay) must appear
+    /// in the final DB.  Because exact interleaving is non-deterministic, we
+    /// run a second rebuild after all threads join to guarantee convergence:
+    /// after any rebuild, DB = Materialize(all events in log).
+    #[test]
+    fn test_rebuild_concurrent_writes_converge() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+
+        for i in 0..20u32 {
+            let e = upsert(&format!("base{i}"), i);
+            events::append_event(&paths.events, &e).unwrap();
+            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+        }
+
+        let events_path = paths.events.clone();
+        let writer = thread::spawn(move || {
+            // Brief sleep to maximise overlap with Phase 2 (lock-free replay).
+            thread::sleep(Duration::from_micros(50));
+            for i in 0..10u32 {
+                let e = upsert(&format!("extra{i}"), i + 100);
+                events::append_event(&events_path, &e).unwrap();
+            }
         });
-        let e2 = serde_json::json!({
-            "action": "upsert", "table": "entries",
-            "id": "rb2", "path": "b.rs", "summary": "second",
-            "content": "content2", "tags": [], "ts": "2024-01-01T00:00:00Z"
-        });
-        append_event(&paths.events, &e1).unwrap();
-        append_event(&paths.events, &e2).unwrap();
 
-        // Rebuild
-        let cmd = Rebuild;
-        cmd.execute_with(&paths, &embedder).unwrap();
+        Rebuild.execute_with(&paths, &emb).unwrap();
+        writer.join().unwrap();
 
-        // Verify DB has both entries
-        let conn = Connection::open(&paths.db).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
+        // All 30 events are now in the log.  A second rebuild converges the DB.
+        Rebuild.execute_with(&paths, &emb).unwrap();
+
+        let log_len = events::read_events(&paths.events).unwrap().len() as i64;
+        assert_eq!(log_len, 30);
+        assert_eq!(
+            count_entries(&paths),
+            log_len,
+            "DB must equal Materialize(log) after rebuild"
+        );
     }
 }
