@@ -193,28 +193,28 @@ StartWrite(p, event) ==
     /\ pc[p] = "idle"
     /\ pc'      = [pc      EXCEPT ![p] = "write_acquiring"]
     /\ pending' = [pending EXCEPT ![p] = event]
-    /\ UNCHANGED <<log, db, lock_holder>>
+    /\ UNCHANGED <<log, db, lock_holder, snap_len>>
 
 WriteAcquire(p) ==
     /\ pc[p]       = "write_acquiring"
     /\ lock_holder = "none"
     /\ lock_holder' = p
     /\ pc'          = [pc EXCEPT ![p] = "write_appending"]
-    /\ UNCHANGED <<log, db, pending>>
+    /\ UNCHANGED <<log, db, pending, snap_len>>
 
 WriteAppend(p) ==
     /\ pc[p]       = "write_appending"
     /\ lock_holder = p
     /\ log' = Append(log, pending[p])
     /\ pc'  = [pc EXCEPT ![p] = "write_materializing"]
-    /\ UNCHANGED <<db, lock_holder, pending>>
+    /\ UNCHANGED <<db, lock_holder, pending, snap_len>>
 
 WriteMaterialize(p) ==
     /\ pc[p]       = "write_materializing"
     /\ lock_holder = p
     /\ db' = ApplyEvent(db, log[Len(log)])
     /\ pc' = [pc EXCEPT ![p] = "write_releasing"]
-    /\ UNCHANGED <<log, lock_holder, pending>>
+    /\ UNCHANGED <<log, lock_holder, pending, snap_len>>
 
 WriteRelease(p) ==
     /\ pc[p]       = "write_releasing"
@@ -222,28 +222,28 @@ WriteRelease(p) ==
     /\ lock_holder' = "none"
     /\ pc'          = [pc EXCEPT ![p] = "idle"]
     /\ pending'     = [pending EXCEPT ![p] = NoEvent]
-    /\ UNCHANGED <<log, db>>
+    /\ UNCHANGED <<log, db, snap_len>>
 
 (* ──────────────────────────── Rebuild protocol ─────────────────────────── *)
 
 StartRebuild(p) ==
     /\ pc[p] = "idle"
     /\ pc'   = [pc EXCEPT ![p] = "rebuild_acquiring"]
-    /\ UNCHANGED <<log, db, lock_holder, pending>>
+    /\ UNCHANGED <<log, db, lock_holder, pending, snap_len>>
 
 RebuildAcquire(p) ==
     /\ pc[p]       = "rebuild_acquiring"
     /\ lock_holder = "none"
     /\ lock_holder' = p
     /\ pc'          = [pc EXCEPT ![p] = "rebuild_dropping"]
-    /\ UNCHANGED <<log, db, pending>>
+    /\ UNCHANGED <<log, db, pending, snap_len>>
 
 RebuildDrop(p) ==
     /\ pc[p]       = "rebuild_dropping"
     /\ lock_holder = p
     /\ db' = EmptyDB
     /\ pc' = [pc EXCEPT ![p] = "rebuild_replaying"]
-    /\ UNCHANGED <<log, lock_holder, pending>>
+    /\ UNCHANGED <<log, lock_holder, pending, snap_len>>
 
 RebuildReplay(p) ==
     /\ pc[p]       = "rebuild_replaying"
@@ -251,21 +251,78 @@ RebuildReplay(p) ==
     /\ db'          = Materialize(log)
     /\ lock_holder' = "none"
     /\ pc'          = [pc EXCEPT ![p] = "idle"]
-    /\ UNCHANGED <<log, pending>>
+    /\ UNCHANGED <<log, pending, snap_len>>
+
+(* ──────────── 3-phase non-blocking rebuild protocol ────────────────────── *)
+(*
+   Phase 1 (brief lock): acquire lock, snapshot Len(log), release.
+   Phase 2 (no lock):    replay log[1..snap_len] into tmp (abstract: no db change).
+                         Concurrent writes continue — WriteThroughInvariant holds
+                         throughout because writes maintain db = Materialize(log).
+   Phase 3 (brief lock): acquire lock, apply catch-up log[snap_len+1..Len(log)]
+                         to tmp, then atomically swap tmp → db.
+                         Result: db = Materialize(log) (since snap+catchup = full log).
+*)
+
+StartRebuild3(p) ==
+    /\ pc[p] = "idle"
+    /\ pc' = [pc EXCEPT ![p] = "rebuild3_snap_acq"]
+    /\ UNCHANGED <<log, db, lock_holder, pending, snap_len>>
+
+Rebuild3SnapAcquire(p) ==
+    /\ pc[p]        = "rebuild3_snap_acq"
+    /\ lock_holder  = "none"
+    /\ lock_holder' = p
+    /\ snap_len'    = [snap_len EXCEPT ![p] = Len(log)]
+    /\ pc'          = [pc EXCEPT ![p] = "rebuild3_snap_rel"]
+    /\ UNCHANGED <<log, db, pending>>
+
+Rebuild3SnapRelease(p) ==
+    /\ pc[p]        = "rebuild3_snap_rel"
+    /\ lock_holder  = p
+    /\ lock_holder' = "none"
+    /\ pc'          = [pc EXCEPT ![p] = "rebuild3_offlock"]
+    /\ UNCHANGED <<log, db, pending, snap_len>>
+
+\* Phase 2: process holds no lock; it replays into a local tmp (not modelled as
+\* a state variable — only the final swap in Phase 3 affects db).  Writes by
+\* other processes continue normally and maintain WriteThroughInvariant.
+Rebuild3OfflockReplay(p) ==
+    /\ pc[p] = "rebuild3_offlock"
+    /\ pc'   = [pc EXCEPT ![p] = "rebuild3_cu_acq"]
+    /\ UNCHANGED <<log, db, lock_holder, pending, snap_len>>
+
+Rebuild3CatchupAcquire(p) ==
+    /\ pc[p]        = "rebuild3_cu_acq"
+    /\ lock_holder  = "none"
+    /\ lock_holder' = p
+    /\ pc'          = [pc EXCEPT ![p] = "rebuild3_cu_apply"]
+    /\ UNCHANGED <<log, db, pending, snap_len>>
+
+\* Apply catch-up events (log[snap_len+1..Len(log)]) to tmp, then atomically
+\* replace db with tmp.  Under the lock no new writes can occur, so
+\* Materialize(log[1..snap_len[p]]) + catch-up = Materialize(log).
+Rebuild3CatchupApply(p) ==
+    /\ pc[p]        = "rebuild3_cu_apply"
+    /\ lock_holder  = p
+    /\ db'          = Materialize(log)
+    /\ lock_holder' = "none"
+    /\ pc'          = [pc EXCEPT ![p] = "idle"]
+    /\ UNCHANGED <<log, pending, snap_len>>
 
 (* ──────────────────────────── Compact protocol ─────────────────────────── *)
 
 StartCompact(p) ==
     /\ pc[p] = "idle"
     /\ pc'   = [pc EXCEPT ![p] = "compact_acquiring"]
-    /\ UNCHANGED <<log, db, lock_holder, pending>>
+    /\ UNCHANGED <<log, db, lock_holder, pending, snap_len>>
 
 CompactAcquire(p) ==
     /\ pc[p]       = "compact_acquiring"
     /\ lock_holder = "none"
     /\ lock_holder' = p
     /\ pc'          = [pc EXCEPT ![p] = "compact_running"]
-    /\ UNCHANGED <<log, db, pending>>
+    /\ UNCHANGED <<log, db, pending, snap_len>>
 
 CompactRun(p) ==
     /\ pc[p]       = "compact_running"
@@ -273,7 +330,7 @@ CompactRun(p) ==
     /\ log'         = CompactedLog(log)
     /\ lock_holder' = "none"
     /\ pc'          = [pc EXCEPT ![p] = "idle"]
-    /\ UNCHANGED <<db, pending>>
+    /\ UNCHANGED <<db, pending, snap_len>>
 
 (* ──────────────────────────── Next / Spec ──────────────────────────────── *)
 
@@ -286,9 +343,15 @@ Next ==
         \/ RebuildAcquire(p)
         \/ RebuildDrop(p)
         \/ RebuildReplay(p)
+        \/ StartRebuild(p)
+        \/ StartRebuild3(p)
+        \/ Rebuild3SnapAcquire(p)
+        \/ Rebuild3SnapRelease(p)
+        \/ Rebuild3OfflockReplay(p)
+        \/ Rebuild3CatchupAcquire(p)
+        \/ Rebuild3CatchupApply(p)
         \/ CompactAcquire(p)
         \/ CompactRun(p)
-        \/ StartRebuild(p)
         \/ StartCompact(p)
         \/ \E id \in EntryIds, d \in DataVals : StartWrite(p, UpsertEvent(id, d))
         \/ \E id \in EntryIds               : StartWrite(p, ExpireEvent(id))
@@ -330,5 +393,9 @@ WriteEventuallyCompletes ==
 RebuildEventuallyCompletes ==
     \A p \in Procs :
         pc[p] = "rebuild_acquiring" ~> pc[p] = "idle"
+
+Rebuild3EventuallyCompletes ==
+    \A p \in Procs :
+        pc[p] = "rebuild3_snap_acq" ~> pc[p] = "idle"
 
 =============================================================================
