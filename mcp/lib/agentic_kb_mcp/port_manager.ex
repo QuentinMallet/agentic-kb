@@ -25,6 +25,16 @@ defmodule AgenticKbMcp.PortManager do
     GenServer.call(__MODULE__, {:request, request, timeout}, timeout)
   end
 
+  @doc """
+  Spawn `kb rebuild` as a separate OS process and return immediately.
+  The subprocess acquires the file lock, so concurrent writes queue safely.
+  Reads through the normal port continue unblocked during the rebuild.
+  """
+  @spec rebuild_async() :: :ok
+  def rebuild_async do
+    GenServer.cast(__MODULE__, :rebuild_async)
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -44,11 +54,26 @@ defmodule AgenticKbMcp.PortManager do
 
     case await_ready(port) do
       :ok ->
-        {:ok, %{port: port, db_path: db_path}}
+        {:ok, %{port: port, db_path: db_path, kb_bin: kb_bin}}
 
       {:error, reason} ->
         {:stop, reason}
     end
+  end
+
+  @impl true
+  def handle_cast(:rebuild_async, %{kb_bin: kb_bin, db_path: db_path} = state) do
+    # Derive repo root: <root>/agent-kb/agent-kb.db → <root>
+    repo_root = db_path |> Path.dirname() |> Path.dirname()
+    Task.start(fn ->
+      case System.cmd(kb_bin, ["rebuild"], cd: repo_root, stderr_to_stdout: true) do
+        {output, 0} ->
+          Logger.info("kb rebuild complete: #{String.trim(output)}")
+        {output, code} ->
+          Logger.error("kb rebuild failed (exit #{code}): #{String.trim(output)}")
+      end
+    end)
+    {:noreply, state}
   end
 
   @impl true
