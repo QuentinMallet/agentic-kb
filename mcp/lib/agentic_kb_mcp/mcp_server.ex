@@ -402,7 +402,17 @@ defmodule AgenticKbMcp.McpServer do
 
   defp dispatch_tool("kb_rebuild", _args, _state) do
     req = %{"method" => "rebuild", "id" => gen_id()}
-    port_call_to_content(req)
+    Task.start(fn ->
+      case AgenticKbMcp.PortManager.call_port(req, :infinity) do
+        %{"type" => "ok", "rebuilt" => n} ->
+          Logger.info("kb_rebuild complete: replayed #{n} events")
+        %{"type" => "error", "message" => msg} ->
+          Logger.error("kb_rebuild failed: #{msg}")
+        other ->
+          Logger.warning("kb_rebuild unexpected response: #{inspect(other)}")
+      end
+    end)
+    %{"content" => [%{"type" => "text", "text" => "Rebuild started in background. Other KB operations will queue until complete."}]}
   end
 
   defp dispatch_tool(name, _args, _state) do

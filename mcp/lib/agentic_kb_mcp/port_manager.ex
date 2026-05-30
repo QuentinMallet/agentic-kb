@@ -20,9 +20,9 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   @doc "Send a request map to the Rust port and wait for the response map."
-  @spec call_port(map()) :: map()
-  def call_port(request) do
-    GenServer.call(__MODULE__, {:request, request}, @call_timeout)
+  @spec call_port(map(), timeout()) :: map()
+  def call_port(request, timeout \\ @call_timeout) do
+    GenServer.call(__MODULE__, {:request, request, timeout}, timeout)
   end
 
   # ---------------------------------------------------------------------------
@@ -52,10 +52,10 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   @impl true
-  def handle_call({:request, request}, _from, %{port: port} = state) do
+  def handle_call({:request, request, timeout}, _from, %{port: port} = state) do
     line = json_encode!(request) <> "\n"
     Port.command(port, line)
-    response = collect_response(port, request["id"])
+    response = collect_response(port, request["id"], timeout)
     {:reply, response, state}
   end
 
@@ -101,13 +101,15 @@ defmodule AgenticKbMcp.PortManager do
   end
 
   # Collect response lines, accumulating progress events until a final response.
-  defp collect_response(port, id) do
+  # Each progress event resets the per-receive window, so long rebuilds stay alive
+  # as long as the Rust side emits at least one progress tick within `timeout` ms.
+  defp collect_response(port, id, timeout) do
     receive do
       {^port, {:data, {:eol, line}}} ->
         case json_decode(line) do
           {:ok, %{"type" => "progress"} = prog} ->
             Logger.debug("kb progress: processed=#{prog["processed"]}/#{prog["total"]}")
-            collect_response(port, id)
+            collect_response(port, id, timeout)
 
           {:ok, response} ->
             response
@@ -121,7 +123,7 @@ defmodule AgenticKbMcp.PortManager do
             }
         end
     after
-      @call_timeout ->
+      timeout ->
         %{"id" => id, "type" => "error", "code" => "timeout", "message" => "port timed out"}
     end
   end
