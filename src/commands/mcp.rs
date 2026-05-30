@@ -122,12 +122,14 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
     let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
 
+    let inline_verify_k = req.get("inline_verify_k").and_then(|v| v.as_u64()).unwrap_or(limit as u64) as usize;
     let opts = db::SearchOptions {
         limit,
         do_fts: mode == "fts" || mode == "hybrid",
         do_semantic: mode == "semantic" || mode == "hybrid",
         path_prefix,
         tag_filter,
+        inline_verify_k,
     };
 
     let conn = match db::open_db(&paths.db) {
@@ -152,6 +154,21 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
                     } else {
                         e.content
                     };
+                    let evidence: Vec<Value> = e
+                        .evidence
+                        .into_iter()
+                        .map(|ev| {
+                            json!({
+                                "id": ev.id,
+                                "kind": ev.kind,
+                                "citation_path": ev.citation_path,
+                                "citation_sha": ev.citation_sha,
+                                "citation_hash": ev.citation_hash,
+                                "citation_excerpt": ev.citation_excerpt,
+                                "verified": ev.verified,
+                            })
+                        })
+                        .collect();
                     json!({
                         "path": e.path,
                         "summary": e.summary,
@@ -160,6 +177,7 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
                         "score": e.score,
                         "id": e.id,
                         "source": e.source,
+                        "evidence": evidence,
                     })
                 })
                 .collect();

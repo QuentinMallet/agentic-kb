@@ -1,7 +1,7 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
-use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob};
+use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob, Evidence};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::fs;
@@ -379,6 +379,9 @@ pub struct SearchOptions {
     pub path_prefix: Option<String>,
     /// Only return entries that have this exact tag.
     pub tag_filter: Option<String>,
+    /// Maximum number of results to verify inline (AC18 narrow-K fallback).
+    /// Results beyond this count get `verified: null`. Default: 10.
+    pub inline_verify_k: usize,
 }
 
 impl Default for SearchOptions {
@@ -389,8 +392,21 @@ impl Default for SearchOptions {
             do_semantic: true,
             path_prefix: None,
             tag_filter: None,
+            inline_verify_k: 10,
         }
     }
+}
+
+/// An evidence row attached to a search result, with inline verification flag.
+pub struct SearchEvidence {
+    pub id: String,
+    pub kind: String,
+    pub citation_path: Option<String>,
+    pub citation_sha: Option<String>,
+    pub citation_hash: String,
+    pub citation_excerpt: Option<String>,
+    /// `Some(true/false)` if verified inline; `None` if skipped by narrow-K fallback.
+    pub verified: Option<bool>,
 }
 
 /// A single result entry returned by `search_entries`.
@@ -405,6 +421,53 @@ pub struct SearchEntry {
     pub score: f32,
     /// `"fts"` or `"semantic"`.
     pub source: &'static str,
+    /// Evidence rows with inline verification results.
+    pub evidence: Vec<SearchEvidence>,
+}
+
+/// Fetch all evidence rows for the given entry IDs.
+/// Returns a map from entry_id to Vec<Evidence>.
+fn fetch_evidence_for_entries(
+    conn: &Connection,
+    entry_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<Evidence>>> {
+    let mut map: std::collections::HashMap<String, Vec<Evidence>> =
+        std::collections::HashMap::new();
+    if entry_ids.is_empty() {
+        return Ok(map);
+    }
+    // Build parameterized IN clause
+    let placeholders: String = entry_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
+         FROM evidence WHERE entry_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Evidence> = stmt
+        .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
+            Ok(Evidence {
+                id: r.get(0)?,
+                entry_id: r.get(1)?,
+                kind: r.get(2)?,
+                citation_path: r.get(3)?,
+                citation_sha: r.get(4)?,
+                citation_hash: r.get(5).unwrap_or_default(),
+                citation_excerpt: r.get(6)?,
+                derived_from: r.get(7)?,
+                recorded_at: r.get(8)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    for ev in rows {
+        map.entry(ev.entry_id.clone()).or_default().push(ev);
+    }
+    Ok(map)
 }
 
 /// Shared hybrid search used by both the CLI and MCP handler.
@@ -467,6 +530,7 @@ pub fn search_entries(
                 tags,
                 score: 1.0,
                 source: "fts",
+                evidence: vec![],
             });
         }
     }
@@ -515,6 +579,7 @@ pub fn search_entries(
                 tags,
                 score: sim,
                 source: "semantic",
+                evidence: vec![],
             });
         }
 
@@ -527,7 +592,94 @@ pub fn search_entries(
         }
     }
 
+    // Fetch evidence rows for all result entries and attach with inline verification.
+    let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
+
+    // Discover repo root: walk up from CWD looking for .git directory.
+    let repo_root = find_repo_root();
+
+    let verify_count = opts.inline_verify_k.min(entries.len());
+
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
+        let do_verify = idx < verify_count;
+
+        if ev_rows.is_empty() {
+            entry.evidence = vec![];
+            continue;
+        }
+
+        if do_verify {
+            // Verify all evidence rows for this entry in parallel using thread::scope.
+            // ADR-C: explicit std::thread, not rayon.
+            let verified: Vec<bool> = std::thread::scope(|s| {
+                let handles: Vec<_> = ev_rows
+                    .iter()
+                    .map(|ev| {
+                        s.spawn(|| {
+                            if let Some(ref root) = repo_root {
+                                crate::components::verification::verify_evidence(ev, root)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or(false))
+                    .collect()
+            });
+
+            entry.evidence = ev_rows
+                .into_iter()
+                .zip(verified.into_iter())
+                .map(|(ev, v)| SearchEvidence {
+                    id: ev.id,
+                    kind: ev.kind,
+                    citation_path: ev.citation_path,
+                    citation_sha: ev.citation_sha,
+                    citation_hash: ev.citation_hash,
+                    citation_excerpt: ev.citation_excerpt,
+                    verified: Some(v),
+                })
+                .collect();
+        } else {
+            // Beyond inline_verify_k: return evidence metadata with verified=null.
+            entry.evidence = ev_rows
+                .into_iter()
+                .map(|ev| SearchEvidence {
+                    id: ev.id,
+                    kind: ev.kind,
+                    citation_path: ev.citation_path,
+                    citation_sha: ev.citation_sha,
+                    citation_hash: ev.citation_hash,
+                    citation_excerpt: ev.citation_excerpt,
+                    verified: None,
+                })
+                .collect();
+        }
+    }
+
     Ok(entries)
+}
+
+/// Walk up from CWD to find a directory containing `.git`.
+/// Returns None if not found (e.g. in tempdir tests).
+fn find_repo_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir: &Path = &cwd;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return None,
+        }
+    }
 }
 
 #[cfg(test)]
