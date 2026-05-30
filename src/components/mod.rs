@@ -3,3 +3,4 @@
 pub mod db;
 pub mod embedder;
 pub mod events;
+pub mod verification;
