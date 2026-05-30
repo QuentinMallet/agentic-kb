@@ -8,7 +8,32 @@ use crate::models::Evidence;
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+/// Safely join `rel` onto `repo_root`, rejecting any path that escapes the root.
+///
+/// Rejects: absolute paths, any `..` / root / prefix components.
+/// Canonicalizes both sides and verifies containment.
+/// Returns `None` on any rejection or I/O error during canonicalization.
+fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return None;
+    }
+    for c in rel_path.components() {
+        match c {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            _ => {}
+        }
+    }
+    let candidate = repo_root.join(rel_path);
+    let canon_root = repo_root.canonicalize().ok()?;
+    let canon_cand = candidate.canonicalize().ok()?;
+    if !canon_cand.starts_with(&canon_root) {
+        return None;
+    }
+    Some(canon_cand)
+}
 
 /// Parse a citation_path of shape "src/foo.rs:42-58" into (path, start, end).
 /// Returns Err if format is invalid. Byte offsets, NOT line numbers.
@@ -63,7 +88,10 @@ pub fn verify_evidence(ev: &Evidence, repo_root: &Path) -> Result<bool> {
 
     let (file_rel, start, end) = parse_citation_path(raw_path)?;
 
-    let file_abs = repo_root.join(file_rel);
+    let file_abs = match safe_join(repo_root, file_rel) {
+        Some(p) => p,
+        None => return Ok(false), // path traversal or escape attempt → false per AC16
+    };
     let bytes = match fs::read(&file_abs) {
         Ok(b) => b,
         Err(_) => return Ok(false), // missing file or I/O error → false per AC16
@@ -223,6 +251,61 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), prefixed_hash, "code");
         assert_eq!(verify_evidence(&ev, dir).unwrap(), true);
+    }
+
+    #[test]
+    fn test_verify_evidence_rejects_absolute_path() {
+        use std::fs as stdfs;
+        let dir = tempfile::tempdir().unwrap();
+        // Ensure /etc/passwd is not read; citation_path points outside repo_root.
+        let ev = make_evidence(
+            Some("/etc/passwd:0-10".to_string()),
+            "sha256:anything".to_string(),
+            "code",
+        );
+        // Must return Ok(false) — no panic, no Err, no read outside repo.
+        assert_eq!(verify_evidence(&ev, dir.path()).unwrap(), false);
+        // Confirm we did not create any artifact inside the tempdir from this call.
+        assert_eq!(stdfs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_verify_evidence_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file outside the tempdir to make sure it can't be reached.
+        let outer = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outer.path(), b"secret").unwrap();
+
+        let ev = make_evidence(
+            Some("../escape.txt:0-5".to_string()),
+            "sha256:anything".to_string(),
+            "code",
+        );
+        assert_eq!(verify_evidence(&ev, dir.path()).unwrap(), false);
+    }
+
+    #[test]
+    fn test_verify_evidence_rejects_root_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ev = make_evidence(
+            Some("/:0-1".to_string()),
+            "sha256:anything".to_string(),
+            "code",
+        );
+        assert_eq!(verify_evidence(&ev, dir.path()).unwrap(), false);
+    }
+
+    #[test]
+    fn test_safe_join_accepts_repo_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("probe.txt");
+        std::fs::write(&file_path, b"data").unwrap();
+
+        let result = safe_join(dir.path(), "probe.txt");
+        assert!(result.is_some());
+        // Canonical path must be inside the tempdir.
+        let canon = result.unwrap();
+        assert!(canon.starts_with(dir.path().canonicalize().unwrap()));
     }
 
     #[test]
