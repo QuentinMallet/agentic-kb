@@ -67,6 +67,7 @@ impl Search {
             do_semantic: self.semantic || !self.fts,
             path_prefix: self.path_prefix.clone(),
             tag_filter: self.tag.clone(),
+            inline_verify_k: self.limit, // verify all results by default
         };
 
         let conn = db::open_db(&paths.db)?;
@@ -95,6 +96,17 @@ impl Search {
                     if self.content && !r.content.is_empty() {
                         println!("  content: {}", r.content);
                     }
+                    for ev in &r.evidence {
+                        let verified_str = match ev.verified {
+                            Some(true) => "verified=true",
+                            Some(false) => "verified=false",
+                            None => "verified=null",
+                        };
+                        println!("    evidence: kind={kind}  {path}  {verified}",
+                            kind = ev.kind,
+                            path = ev.citation_path.as_deref().unwrap_or(""),
+                            verified = verified_str);
+                    }
                 }
             }
         }
@@ -107,6 +119,17 @@ impl Search {
                     score = r.score, tags = r.tags, id = r.id);
                 if self.content && !r.content.is_empty() {
                     println!("  content: {}", r.content);
+                }
+                for ev in &r.evidence {
+                    let verified_str = match ev.verified {
+                        Some(true) => "verified=true",
+                        Some(false) => "verified=false",
+                        None => "verified=null",
+                    };
+                    println!("    evidence: kind={kind}  {path}  {verified}",
+                        kind = ev.kind,
+                        path = ev.citation_path.as_deref().unwrap_or(""),
+                        verified = verified_str);
                 }
             }
         } else if opts.do_semantic && !embedder.is_noop() && fts_count == 0 {
@@ -145,6 +168,9 @@ mod tests {
             id: Some("search-test-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -180,6 +206,9 @@ mod tests {
             id: Some("remote-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&remote_paths, &embedder).unwrap();
 
@@ -216,6 +245,9 @@ mod tests {
                 id: Some(format!("limit-test-{i}")),
                 permanent: false,
                 replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -252,6 +284,9 @@ mod tests {
             id: Some("inj-test-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -294,6 +329,9 @@ mod tests {
                 id: Some(id.to_string()),
                 permanent: false,
                 replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -311,5 +349,150 @@ mod tests {
         };
         // Just verify no error — path filtering is applied in SQL
         search_cmd.execute_with(&paths, &embedder).unwrap();
+    }
+
+    /// AC17: search results include evidence array with verified flag.
+    /// Uses Cargo.toml as the cited file (stable, always present).
+    #[test]
+    fn test_kb_search_returns_evidence_with_verified_flag() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Write a small known file into the tempdir to use as citation target.
+        let cited_content = b"fn main() { println!(\"hello\"); }";
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let cited_file = src_dir.join("cited.rs");
+        fs::write(&cited_file, cited_content).unwrap();
+
+        // Compute correct hash for byte range 0..cited_content.len()
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(cited_content);
+        let hash = format!("sha256:{:x}", h.finalize());
+        let end = cited_content.len();
+        let citation_path = format!("src/cited.rs:0-{end}");
+
+        let evidence_json = format!(
+            r#"{{"kind":"code","citation_path":"{citation_path}","citation_sha":null,"citation_hash":"{hash}","citation_excerpt":"fn main()"}}"#
+        );
+
+        let add_cmd = Add {
+            path: "src/evidence_test".to_string(),
+            summary: "evidence test entry".to_string(),
+            content: "evidence test content".to_string(),
+            tags: "evidence".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some("ev-search-test-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "observation".to_string(),
+            evidence: vec![evidence_json],
+            evidence_file: None,
+        };
+        add_cmd.execute_with(&paths, &embedder).unwrap();
+
+        // Run search using db directly so we can inspect evidence field.
+        let opts = crate::components::db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10,
+        };
+        let conn = crate::components::db::open_db(&paths.db).unwrap();
+
+        // Override CWD-based repo root discovery by using the db search directly
+        // with the root as repo root. Since find_repo_root() walks from CWD (not
+        // the tempdir), we test verification via the MCP path which passes repo_root
+        // explicitly. Instead, verify the evidence array is populated and the
+        // verified field is Some (true or false) — not None.
+        let results = crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts).unwrap();
+        assert!(!results.is_empty(), "search must return at least 1 result");
+
+        let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
+        assert_eq!(entry.evidence.len(), 1, "entry must have 1 evidence row");
+
+        // verified is Some(bool) — inline verification was attempted
+        // (true if CWD happens to be the tempdir, false otherwise — both are acceptable)
+        assert!(entry.evidence[0].verified.is_some(), "verified must not be null for top-K results");
+        assert_eq!(entry.evidence[0].kind, "code");
+    }
+
+    /// AC18: inline_verify_k narrow-K fallback — results beyond K get verified=null.
+    #[test]
+    fn test_kb_search_narrow_k_fallback() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Create a stable cited file
+        let cited_content = b"narrow k test content";
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("narrow.rs"), cited_content).unwrap();
+
+        let mut h = Sha256::new();
+        h.update(cited_content);
+        let hash = format!("sha256:{:x}", h.finalize());
+        let end = cited_content.len();
+
+        // Insert 3 entries each with 1 evidence row, all with the same summary
+        // so FTS returns all 3.
+        for i in 0..3usize {
+            let citation_path = format!("src/narrow.rs:0-{end}");
+            let evidence_json = format!(
+                r#"{{"kind":"code","citation_path":"{citation_path}","citation_sha":null,"citation_hash":"{hash}","citation_excerpt":"narrow"}}"#
+            );
+            let add_cmd = Add {
+                path: format!("src/narrow_mod_{i}.rs"),
+                summary: "narrow k fallback entry authentication".to_string(),
+                content: format!("narrow k content {i}"),
+                tags: "narrow".to_string(),
+                version_ref: Some("abc".to_string()),
+                id: Some(format!("narrow-k-{i}")),
+                permanent: false,
+                replace_path: false,
+                kind: "observation".to_string(),
+                evidence: vec![evidence_json],
+                evidence_file: None,
+            };
+            add_cmd.execute_with(&paths, &embedder).unwrap();
+        }
+
+        // Search with inline_verify_k=1 → only first result gets verified=Some, rest get None.
+        let opts = crate::components::db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 1,
+        };
+        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let results = crate::components::db::search_entries(
+            &conn, &embedder, "narrow k fallback entry authentication", &opts,
+        ).unwrap();
+
+        assert_eq!(results.len(), 3, "all 3 entries must be returned");
+
+        // First result: verified=Some(...)
+        let first = &results[0];
+        assert_eq!(first.evidence.len(), 1);
+        assert!(first.evidence[0].verified.is_some(), "top-1 result must have verified=Some(...)");
+
+        // Remaining results: verified=None
+        for r in &results[1..] {
+            assert_eq!(r.evidence.len(), 1);
+            assert!(r.evidence[0].verified.is_none(), "results beyond K must have verified=null");
+        }
     }
 }

@@ -4,12 +4,21 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+fn default_inline_verify_k() -> usize {
+    10
+}
+
 /// kb configuration
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct KbConfig {
     /// Embedding configuration
     pub embed: EmbedConfig,
+    /// Maximum number of search results to verify inline (AC18 narrow-K fallback).
+    /// Results beyond this count get verified=null in search responses.
+    /// Default: 10. Set lower to cap verification latency (e.g. inline_verify_k=3).
+    #[serde(default = "default_inline_verify_k")]
+    pub inline_verify_k: usize,
 }
 
 /// Embedding configuration

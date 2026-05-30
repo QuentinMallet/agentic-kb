@@ -112,6 +112,9 @@ impl Import {
                 id: None,
                 permanent,
                 replace_path: true,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             cmd.execute_with(&paths, embedder.as_ref())?;
             imported += 1;
@@ -226,6 +229,9 @@ mod tests {
                 id: None,
                 permanent: false,
                 replace_path: true,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             add.execute_with(&paths, &embedder).unwrap();
         }
