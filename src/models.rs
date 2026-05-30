@@ -37,6 +37,14 @@ pub fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn default_kind() -> String {
+    "belief".to_string()
+}
+
+fn default_evidence_status() -> String {
+    "n/a".to_string()
+}
+
 /// A knowledge base entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
@@ -55,6 +63,50 @@ pub struct Entry {
     /// Whether this entry survives compact/expire cycles
     #[serde(default)]
     pub permanent: bool,
+    /// Entry kind: observation | belief | procedure | convention | memory
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Evidence status: missing | present | n/a
+    #[serde(default = "default_evidence_status")]
+    pub evidence_status: String,
+}
+
+/// A piece of evidence attached to a KB entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Evidence {
+    /// Unique evidence ID
+    pub id: String,
+    /// ID of the KB entry this evidence supports
+    pub entry_id: String,
+    /// Evidence kind: code | test | command | user | derived
+    pub kind: String,
+    /// Relative path to the cited file
+    pub citation_path: Option<String>,
+    /// Git commit SHA of the cited file at record time
+    pub citation_sha: Option<String>,
+    /// Content hash of the cited file at record time
+    pub citation_hash: String,
+    /// Short excerpt from the cited artifact
+    pub citation_excerpt: Option<String>,
+    /// ID of the evidence this was derived from (for kind=derived)
+    pub derived_from: Option<String>,
+    /// Timestamp when evidence was recorded
+    pub recorded_at: Option<String>,
+}
+
+/// A record of an audit run for a KB entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditRun {
+    /// Auto-increment primary key
+    pub id: Option<i64>,
+    /// ID of the KB entry audited
+    pub entry_id: String,
+    /// Timestamp of the audit
+    pub audited_at: Option<String>,
+    /// Audit verdict: true | false
+    pub verdict: String,
+    /// Reference to supporting evidence
+    pub evidence_ref: Option<String>,
 }
 
 /// A test case definition.
