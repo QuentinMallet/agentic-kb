@@ -145,6 +145,9 @@ mod tests {
             id: Some("search-test-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -180,6 +183,9 @@ mod tests {
             id: Some("remote-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&remote_paths, &embedder).unwrap();
 
@@ -216,6 +222,9 @@ mod tests {
                 id: Some(format!("limit-test-{i}")),
                 permanent: false,
                 replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -252,6 +261,9 @@ mod tests {
             id: Some("inj-test-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -294,6 +306,9 @@ mod tests {
                 id: Some(id.to_string()),
                 permanent: false,
                 replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }

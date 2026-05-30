@@ -1,12 +1,15 @@
 //! `add` subcommand
 
+use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
 use crate::components::db;
 use crate::components::embedder;
 use crate::components::events;
 use crate::config;
+use crate::models::Evidence;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::params;
+use serde_json::Value;
 
 /// Add or update a knowledge entry
 #[derive(Command, Debug, Parser)]
@@ -36,6 +39,15 @@ pub struct Add {
     /// Useful for idempotent re-ingestion (e.g. kb-ingest chunk updates).
     #[arg(long, default_value_t = false)]
     pub replace_path: bool,
+    /// Entry kind: observation | belief | procedure | convention | memory
+    #[arg(long, default_value = "belief")]
+    pub kind: String,
+    /// Evidence row as a JSON object (repeatable; mutually exclusive with --evidence-file)
+    #[arg(long, conflicts_with = "evidence_file")]
+    pub evidence: Vec<String>,
+    /// Path to a JSON file containing an array of evidence objects (mutually exclusive with --evidence)
+    #[arg(long, conflicts_with = "evidence")]
+    pub evidence_file: Option<String>,
 }
 
 impl Runnable for Add {
@@ -61,18 +73,45 @@ impl Add {
         paths: &config::Paths,
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
+        // Parse evidence rows from --evidence flags or --evidence-file.
+        let evidence_rows: Vec<Value> = if let Some(ref file_path) = self.evidence_file {
+            let raw = std::fs::read_to_string(file_path)
+                .map_err(|e| anyhow::anyhow!("read --evidence-file '{file_path}': {e}"))?;
+            serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("parse --evidence-file '{file_path}': {e}"))?
+        } else {
+            self.evidence
+                .iter()
+                .map(|s| {
+                    serde_json::from_str(s)
+                        .map_err(|e| anyhow::anyhow!("parse --evidence JSON: {e}"))
+                })
+                .collect::<anyhow::Result<Vec<Value>>>()?
+        };
+
+        // Validate kind + evidence before acquiring the lock.
+        validate_kb_add_inputs(&self.kind, &evidence_rows)?;
+
+        // Compute write-time evidence_status and emit soft-mandate warning.
+        let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
+
         let _lock = acquire_lock(&paths.lock)?;
         let id = self
             .id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
-        let tags_json: serde_json::Value = serde_json::json!(
+        let tags_json: Value = serde_json::json!(
             self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>()
         );
         let ts = chrono::Utc::now().to_rfc3339();
         let session =
             std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+
+        // Soft-mandate warning (AC10).
+        if evidence_status == "missing" {
+            eprintln!("kb: entry {id} kind={} has no evidence; evidence_status=missing", self.kind);
+        }
 
         // Open DB once; used for both the optional path-replace step and the upsert.
         let conn = db::open_db(&paths.db)?;
@@ -85,7 +124,6 @@ impl Add {
                 let mut stmt = conn.prepare(
                     "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
                 )?;
-                // Bind to named variable so stmt is not borrowed at end-of-block
                 let ids: Vec<String> = stmt
                     .query_map(params![self.path], |r| r.get(0))?
                     .filter_map(|r| r.ok())
@@ -106,7 +144,8 @@ impl Add {
             }
         }
 
-        let event = serde_json::json!({
+        // Build Add event (carries kind + evidence_status).
+        let add_event = serde_json::json!({
             "action": "upsert",
             "table": "entries",
             "id": id,
@@ -116,12 +155,41 @@ impl Add {
             "tags": tags_json,
             "version_ref": version_ref,
             "permanent": self.permanent,
+            "kind": self.kind,
+            "evidence_status": evidence_status,
             "ts": ts,
             "session": session,
         });
 
-        events::append_event(&paths.events, &event)?;
-        db::apply_event(&conn, embedder, &event)?;
+        // Build EvidenceAdd events (one per evidence row).
+        let evidence_events: Vec<Value> = evidence_rows
+            .iter()
+            .map(|ev| {
+                let evidence = Evidence {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    entry_id: id.clone(),
+                    kind: ev.get("kind").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
+                    citation_path: ev.get("citation_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    citation_sha: ev.get("citation_sha").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    citation_hash: ev.get("citation_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    citation_excerpt: ev.get("citation_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    derived_from: ev.get("derived_from").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    recorded_at: Some(ts.clone()),
+                };
+                events::evidence_add_event(&id, &evidence, version_ref.as_deref())
+            })
+            .collect();
+
+        // Atomic batch: Add event + N EvidenceAdd events under the held lock (AC12).
+        let mut batch = vec![add_event.clone()];
+        batch.extend(evidence_events.iter().cloned());
+        events::append_events_batch(&paths.events, &batch)?;
+
+        // Apply each event to the DB (also under lock).
+        db::apply_event(&conn, embedder, &add_event)?;
+        for ev in &evidence_events {
+            db::apply_event(&conn, embedder, ev)?;
+        }
 
         println!("added  {} ({})", self.path, id);
         Ok(())
@@ -221,6 +289,22 @@ mod tests {
         (dir, paths)
     }
 
+    fn make_add(path: &str, id: &str) -> Add {
+        Add {
+            path: path.to_string(),
+            summary: "test entry".to_string(),
+            content: "content".to_string(),
+            tags: "rust,test".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some(id.to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        }
+    }
+
     #[test]
     fn test_cmd_add_writes_event_and_db_row() {
         let dir = tempdir().unwrap();
@@ -229,16 +313,7 @@ mod tests {
         let paths = Paths::from_root(root);
         let embedder = NoopEmbedder;
 
-        let cmd = Add {
-            path: "src/lib.rs".to_string(),
-            summary: "test entry".to_string(),
-            content: "content".to_string(),
-            tags: "rust,test".to_string(),
-            version_ref: Some("abc123".to_string()),
-            id: Some("test-id-1".to_string()),
-            permanent: false,
-            replace_path: false,
-        };
+        let cmd = make_add("src/lib.rs", "test-id-1");
         cmd.execute_with(&paths, &embedder).unwrap();
 
         // Verify JSONL event was written
@@ -276,6 +351,9 @@ mod tests {
             id: Some("perm-test-1".to_string()),
             permanent: true,
             replace_path: false,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -299,6 +377,9 @@ mod tests {
             id: Some("perm-test-2".to_string()),
             permanent: false,
             replace_path: false,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
@@ -370,6 +451,9 @@ mod tests {
             id: Some("rp-old".to_string()),
             permanent: false,
             replace_path: false,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
         };
         cmd1.execute_with(&paths, &embedder).unwrap();
 
@@ -383,6 +467,9 @@ mod tests {
             id: Some("rp-new".to_string()),
             permanent: false,
             replace_path: true,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
@@ -433,6 +520,9 @@ mod tests {
             id: None,
             permanent: false,
             replace_path: false,
+            kind: "belief".to_string(),
+            evidence: vec![],
+            evidence_file: None,
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -445,5 +535,182 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version_ref, Some(expected_sha));
+    }
+
+    // ---- New tests for L-write lane ----
+
+    #[test]
+    fn test_kb_add_default_kind_is_belief() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        let cmd = make_add("src/lib.rs", "kind-default-1");
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT kind FROM entries WHERE id='kind-default-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "belief");
+    }
+
+    #[test]
+    fn test_kb_add_rejects_invalid_kind() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        let cmd = Add {
+            path: "src/lib.rs".to_string(),
+            summary: "test".to_string(),
+            content: "content".to_string(),
+            tags: "test".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("bad-kind-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "fact".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        };
+        let err = cmd.execute_with(&paths, &embedder).unwrap_err();
+        assert!(err.to_string().contains("invalid kind 'fact'"));
+    }
+
+    #[test]
+    fn test_kb_add_rejects_non_code_evidence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        let cmd = Add {
+            path: "src/lib.rs".to_string(),
+            summary: "test".to_string(),
+            content: "content".to_string(),
+            tags: "test".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("bad-ev-kind-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "observation".to_string(),
+            evidence: vec![r#"{"kind":"test","citation_hash":"sha256:abc"}"#.to_string()],
+            evidence_file: None,
+        };
+        let err = cmd.execute_with(&paths, &embedder).unwrap_err();
+        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code only"));
+    }
+
+    #[test]
+    fn test_kb_add_soft_mandate_warns_on_missing_evidence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // observation with no evidence → evidence_status="missing" in DB
+        let cmd = Add {
+            path: "src/lib.rs".to_string(),
+            summary: "test".to_string(),
+            content: "content".to_string(),
+            tags: "test".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("soft-mandate-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "observation".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        };
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let evidence_status: String = conn
+            .query_row(
+                "SELECT evidence_status FROM entries WHERE id='soft-mandate-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_status, "missing");
+    }
+
+    #[test]
+    fn test_kb_add_with_evidence_writes_atomic_batch() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        let cmd = Add {
+            path: "src/lib.rs".to_string(),
+            summary: "test".to_string(),
+            content: "content".to_string(),
+            tags: "test".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("batch-ev-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "observation".to_string(),
+            evidence: vec![
+                r#"{"kind":"code","citation_path":"src/foo.rs:1-10","citation_sha":"abc","citation_hash":"sha256:aaa","citation_excerpt":"fn foo() {}"}"#.to_string(),
+                r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_sha":"abc","citation_hash":"sha256:bbb","citation_excerpt":"fn bar() {}"}"#.to_string(),
+            ],
+            evidence_file: None,
+        };
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        // Verify events.jsonl has Add followed by 2 EvidenceAdd events
+        let events_content = fs::read_to_string(&paths.events).unwrap();
+        let lines: Vec<&str> = events_content.lines().collect();
+        // Should have 3 lines: 1 upsert + 2 evidence_add
+        assert_eq!(lines.len(), 3, "expected 3 event lines (1 add + 2 evidence_add)");
+
+        let ev0: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev0["action"], "upsert");
+        assert_eq!(ev0["table"], "entries");
+        assert_eq!(ev0["id"], "batch-ev-1");
+        assert_eq!(ev0["kind"], "observation");
+        assert_eq!(ev0["evidence_status"], "present");
+
+        let ev1: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(ev1["action"], "evidence_add");
+        assert_eq!(ev1["entry_id"], "batch-ev-1");
+
+        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(ev2["action"], "evidence_add");
+        assert_eq!(ev2["entry_id"], "batch-ev-1");
+
+        // Verify evidence rows in DB
+        let conn = Connection::open(&paths.db).unwrap();
+        let ev_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='batch-ev-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ev_count, 2);
+
+        let evidence_status: String = conn
+            .query_row(
+                "SELECT evidence_status FROM entries WHERE id='batch-ev-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_status, "present");
     }
 }
