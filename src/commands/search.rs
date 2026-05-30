@@ -61,6 +61,11 @@ impl Search {
         paths: &config::Paths,
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
+        // CLI: repo_root left None; search_entries falls back to find_repo_root()
+        // walking from CWD, which is correct for the CLI invocation pattern (user
+        // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
+        // via root_from_db (mcp.rs:40-45) because MCP CWD is typically '/' and CWD
+        // discovery would fail.
         let opts = db::SearchOptions {
             limit: self.limit,
             do_fts: self.fts || !self.semantic,
