@@ -13,7 +13,7 @@ defmodule AgenticKbMcp.McpServer do
   @tools [
     %{
       "name" => "kb_search",
-      "description" => "Search the agent knowledge base (FTS + semantic hybrid)",
+      "description" => "Search the agent knowledge base (FTS + semantic hybrid). Each result includes an `evidence` array; each evidence row has `{id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, verified}` where `verified` is bool (HEAD byte-hash match) or null (deferred — outside `inline_verify_k` budget).",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -31,6 +31,10 @@ defmodule AgenticKbMcp.McpServer do
           "tag" => %{
             "type" => "string",
             "description" => "Filter results to entries that have this exact tag"
+          },
+          "inline_verify_k" => %{
+            "type" => "integer",
+            "description" => "How many top results to inline-verify (byte-hash check vs HEAD). Default equals `limit`. Results beyond this budget have `verified=null`."
           }
         },
         "required" => ["query"]
@@ -38,7 +42,7 @@ defmodule AgenticKbMcp.McpServer do
     },
     %{
       "name" => "kb_add",
-      "description" => "Add or update a knowledge entry in the agent knowledge base",
+      "description" => "Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are tagged `evidence_status=\"missing\"` and a warning is emitted to stderr.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -60,6 +64,27 @@ defmodule AgenticKbMcp.McpServer do
           "replace_path" => %{
             "type" => "boolean",
             "description" => "Expire all existing entries at this path before inserting"
+          },
+          "kind" => %{
+            "type" => "string",
+            "enum" => ["observation", "belief", "procedure", "convention", "memory"],
+            "description" => "Entry kind (default: belief). Controls evidence soft-mandate: observation, belief, and procedure without evidence are tagged evidence_status=missing."
+          },
+          "evidence" => %{
+            "type" => "array",
+            "description" => "Evidence citations (default: []). Phase 1 accepts kind=\"code\" only; other kinds are rejected with an error naming Phase 2. Each item: {kind, citation_path, citation_sha, citation_hash, citation_excerpt?, derived_from?}.",
+            "items" => %{
+              "type" => "object",
+              "properties" => %{
+                "kind" => %{"type" => "string", "description" => "Evidence kind. Phase 1: must be \"code\"."},
+                "citation_path" => %{"type" => "string", "description" => "File path and optional line range, e.g. src/foo.rs:42-58"},
+                "citation_sha" => %{"type" => "string", "description" => "Git commit SHA of the cited file revision"},
+                "citation_hash" => %{"type" => "string", "description" => "sha256: hash of the cited byte range for inline verification"},
+                "citation_excerpt" => %{"type" => "string", "description" => "Short verbatim excerpt from the cited location (optional)"},
+                "derived_from" => %{"type" => "string", "description" => "ID of a parent evidence row this row is derived from (optional)"}
+              },
+              "required" => ["kind", "citation_path", "citation_sha", "citation_hash"]
+            }
           }
         },
         "required" => ["path", "summary", "content"]
@@ -309,6 +334,7 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("mode", args["mode"])
       |> put_if_present("path_prefix", args["path_prefix"])
       |> put_if_present("tag", args["tag"])
+      |> put_if_present("inline_verify_k", args["inline_verify_k"])
 
     port_call_to_content(req)
   end
@@ -322,6 +348,8 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("tags", args["tags"])
       |> put_if_present("permanent", args["permanent"])
       |> put_if_present("replace_path", args["replace_path"])
+      |> put_if_present("kind", args["kind"])
+      |> put_if_present("evidence", args["evidence"])
 
     port_call_to_content(req)
   end
