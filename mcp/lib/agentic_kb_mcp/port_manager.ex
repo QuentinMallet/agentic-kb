@@ -65,14 +65,16 @@ defmodule AgenticKbMcp.PortManager do
   def handle_cast(:rebuild_async, %{kb_bin: kb_bin, db_path: db_path} = state) do
     # Derive repo root: <root>/agent-kb/agent-kb.db → <root>
     repo_root = db_path |> Path.dirname() |> Path.dirname()
-    Task.start(fn ->
-      case System.cmd(kb_bin, ["rebuild"], cd: repo_root, stderr_to_stdout: true) do
-        {output, 0} ->
-          Logger.info("kb rebuild complete: #{String.trim(output)}")
-        {output, code} ->
-          Logger.error("kb rebuild failed (exit #{code}): #{String.trim(output)}")
-      end
-    end)
+    log = Path.join(Path.dirname(db_path), "rebuild.log")
+    # Shell double-fork: sh (port child) exits immediately after backgrounding
+    # kb rebuild. The grandchild is adopted by init and survives BEAM shutdown,
+    # so the agent can quit as soon as this cast returns.
+    # KB_BIN and LOG are passed via env to avoid shell injection.
+    System.cmd("sh", ["-c", ~s("$KB_BIN" rebuild >"$LOG" 2>&1 &)],
+      cd: repo_root,
+      env: [{"KB_BIN", kb_bin}, {"LOG", log}]
+    )
+    Logger.info("kb rebuild started in background (log: #{log})")
     {:noreply, state}
   end
 
