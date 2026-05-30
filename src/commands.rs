@@ -1,6 +1,7 @@
 //! kb Subcommands
 
 pub mod add;
+pub mod add_validation;
 pub mod compact;
 pub mod expire;
 pub mod import_cmd;
