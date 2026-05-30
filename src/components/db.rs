@@ -7,6 +7,45 @@ use rusqlite::{params, Connection};
 use std::fs;
 use std::path::Path;
 
+/// Compute the `evidence_status` value for an entry based on its kind and
+/// the number of evidence rows currently linked to it.
+///
+/// Rules (L2 soft-mandate):
+/// - kind IN ('observation','belief','procedure') AND evidence_count > 0 → 'present'
+/// - kind IN ('observation','belief','procedure') AND evidence_count = 0 → 'missing'
+/// - all other kinds (convention, memory, or unknown) → 'n/a'
+/// - Legacy entries that have never had an explicit kind event retain their
+///   column DEFAULT ('belief'), so they will compute 'missing' once evidence
+///   processing begins.  Callers that want to preserve 'n/a' for truly legacy
+///   rows should check the current status before calling this helper.
+pub fn compute_evidence_status(conn: &Connection, entry_id: &str) -> Result<String> {
+    let kind: String = conn
+        .query_row(
+            "SELECT COALESCE(kind, 'belief') FROM entries WHERE id=?1",
+            params![entry_id],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("compute_evidence_status: entry not found: {entry_id}"))?;
+
+    let evidence_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
+        params![entry_id],
+        |r| r.get(0),
+    )?;
+
+    let status = match kind.as_str() {
+        "observation" | "belief" | "procedure" => {
+            if evidence_count > 0 {
+                "present"
+            } else {
+                "missing"
+            }
+        }
+        _ => "n/a",
+    };
+    Ok(status.to_string())
+}
+
 /// Open (or create) the SQLite database at the given path.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
@@ -86,6 +125,35 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // Migration: add `permanent` column to existing DBs that pre-date this field.
     // SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.37; ignore "duplicate column" error.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN permanent INTEGER DEFAULT 0;");
+    // Migration: add `kind` and `evidence_status` columns (Phase 1 defensibility).
+    // Legacy entries default to kind='belief', evidence_status='n/a' via column DEFAULT.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT DEFAULT 'belief';");
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
+    // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS evidence (
+            id               TEXT PRIMARY KEY,
+            entry_id         TEXT NOT NULL,
+            kind             TEXT NOT NULL CHECK(kind IN ('code','test','command','user','derived')),
+            citation_path    TEXT,
+            citation_sha     TEXT,
+            citation_hash    TEXT NOT NULL,
+            citation_excerpt TEXT,
+            derived_from     TEXT,
+            recorded_at      TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_entry_id ON evidence(entry_id);
+
+        CREATE TABLE IF NOT EXISTS audit_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id     TEXT NOT NULL,
+            audited_at   TEXT DEFAULT (datetime('now')),
+            verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
+            evidence_ref TEXT
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -109,17 +177,24 @@ pub fn apply_event(
             let ts = event["ts"].as_str().unwrap_or("");
             let permanent = event["permanent"].as_bool().unwrap_or(false) as i32;
             let is_stale = event["is_stale"].as_bool().unwrap_or(false) as i32;
+            // Legacy events without kind/evidence_status fields default to
+            // 'belief' / 'n/a' — matching the column DEFAULT for pre-migration rows.
+            let kind = event["kind"].as_str().unwrap_or("belief");
+            let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
 
             conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
+                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)
                  ON CONFLICT(id) DO UPDATE SET
                    path=excluded.path, summary=excluded.summary,
                    content=excluded.content, tags=excluded.tags,
                    version_ref=excluded.version_ref,
                    permanent=excluded.permanent,
-                   is_stale=excluded.is_stale, updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, is_stale, ts],
+                   is_stale=excluded.is_stale,
+                   kind=excluded.kind,
+                   evidence_status=excluded.evidence_status,
+                   updated_at=excluded.updated_at",
+                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, ts],
             )?;
 
             // Stale entries: clean up FTS/embeddings so they don't appear in search
@@ -195,6 +270,95 @@ pub fn apply_event(
                  VALUES(?1,?2,?3,?4,?5,?6)",
                 params![test_id, result, adapter, detail, ts, run_id],
             )?;
+        }
+
+        ("evidence_add", "evidence") => {
+            let ev = &event["evidence"];
+            let ev_id = ev["id"].as_str().context("evidence_add: missing evidence.id")?;
+            let entry_id = event["entry_id"].as_str().context("evidence_add: missing entry_id")?;
+
+            // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
+            let entry_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !entry_exists {
+                return Ok(());
+            }
+
+            let kind = ev["kind"].as_str().context("evidence_add: missing evidence.kind")?;
+            let citation_path = ev["citation_path"].as_str();
+            let citation_sha = ev["citation_sha"].as_str();
+            let citation_hash = ev["citation_hash"]
+                .as_str()
+                .context("evidence_add: missing evidence.citation_hash")?;
+            let citation_excerpt = ev["citation_excerpt"].as_str();
+            let derived_from = ev["derived_from"].as_str();
+            let recorded_at = ev["recorded_at"].as_str();
+
+            conn.execute(
+                "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
+            )?;
+
+            // Update evidence_status on the parent entry via the soft-mandate helper.
+            // Preserve 'n/a' for truly legacy entries (those that have no explicit kind
+            // event — detected by kind column still holding the column default 'belief'
+            // AND evidence_status still holding 'n/a' AND this being the first evidence row).
+            let current_status: String = conn
+                .query_row(
+                    "SELECT COALESCE(evidence_status, 'n/a') FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "n/a".to_string());
+            // Only update if the entry was already explicitly tracked (status != 'n/a')
+            // OR if after this insert there is more than 1 evidence row (meaning the
+            // entry had prior evidence, so it was already out of legacy-untouched state).
+            let ev_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
+                params![entry_id],
+                |r| r.get(0),
+            )?;
+            if current_status != "n/a" || ev_count > 1 {
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
+            }
+        }
+
+        ("evidence_expire", "evidence") => {
+            let ev_id = event["evidence_id"].as_str().context("evidence_expire: missing evidence_id")?;
+            let entry_id = event["entry_id"].as_str().context("evidence_expire: missing entry_id")?;
+
+            conn.execute(
+                "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
+                params![ev_id, entry_id],
+            )?;
+
+            // Recompute evidence_status if the parent entry exists.
+            let entry_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if entry_exists {
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
+            }
         }
 
         _ => {} // unknown event — skip silently
@@ -385,6 +549,57 @@ mod tests {
         assert!(tables.contains(&"test_cases".to_string()));
         assert!(tables.contains(&"run_history".to_string()));
         assert!(tables.contains(&"entries_emb".to_string()));
+        assert!(tables.contains(&"evidence".to_string()));
+        assert!(tables.contains(&"audit_runs".to_string()));
+    }
+
+    #[test]
+    fn test_apply_event_legacy_entries_get_belief_and_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Replay a legacy upsert event with no kind or evidence_status fields.
+        let legacy1 = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "legacy1",
+            "path": "old/path.md",
+            "summary": "legacy entry one",
+            "content": "some old content",
+            "tags": ["old"],
+            "ts": "2023-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &legacy1).unwrap();
+
+        let (kind, evidence_status): (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(kind,'belief'), COALESCE(evidence_status,'n/a') FROM entries WHERE id='legacy1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "belief", "legacy entry must default to kind='belief'");
+        assert_eq!(evidence_status, "n/a", "legacy entry must default to evidence_status='n/a'");
+
+        // Replay a second legacy entry.
+        let legacy2 = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "legacy2",
+            "path": "old/other.md",
+            "summary": "legacy entry two",
+            "content": "more old content",
+            "tags": [],
+            "ts": "2023-01-02T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &legacy2).unwrap();
+
+        // audit_runs table must be untouched — zero rows (L4 boundary: audit_runs
+        // is DB-only, never written by event replay).
+        let audit_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 0, "audit_runs must be untouched after legacy event replay (L4 boundary)");
     }
 
     #[test]
