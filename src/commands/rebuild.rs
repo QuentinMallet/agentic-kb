@@ -184,6 +184,154 @@ mod tests {
         assert_eq!(count_entries(&paths), 10, "rebuild must restore all events");
     }
 
+    // -----------------------------------------------------------------------
+    // T-S6b: concurrent evidence-write integration test (br-jwe.15, AC6)
+    // -----------------------------------------------------------------------
+
+    /// Build an evidence_add event for the given entry and evidence IDs.
+    fn evidence_add(entry_id: &str, ev_id: &str, idx: u32) -> serde_json::Value {
+        serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": entry_id,
+            "evidence": {
+                "id": ev_id,
+                "entry_id": entry_id,
+                "kind": "test",
+                "citation_path": null,
+                "citation_sha": null,
+                "citation_hash": format!("hash{idx}"),
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    /// Evidence rows written concurrently with rebuild must survive in the final
+    /// DB.  After all threads join a second rebuild guarantees convergence:
+    /// DB == Materialize(all events in log) and evidence_status reflects the
+    /// soft-mandate StatusOf rule (present when evidence rows exist).
+    #[test]
+    fn test_rebuild_with_concurrent_evidence_writes_converges() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+
+        // Seed: 5 entries with explicit kind='observation' so evidence_add
+        // triggers evidence_status updates (status != 'n/a').
+        for i in 0..5u32 {
+            let e = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": format!("base{i}"), "path": format!("p{i}.rs"),
+                "summary": "s", "content": "c", "tags": [],
+                "kind": "observation", "evidence_status": "missing",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            events::append_event(&paths.events, &e).unwrap();
+            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+        }
+
+        let events_path_a = paths.events.clone();
+        let events_path_b = paths.events.clone();
+
+        // Worker A: writes additional upsert events during rebuild phase 2.
+        // Sleeps briefly to maximise overlap with the lock-free replay phase.
+        let worker_a = thread::spawn(move || {
+            thread::sleep(Duration::from_micros(50));
+            for i in 0..5u32 {
+                let e = serde_json::json!({
+                    "action": "upsert", "table": "entries",
+                    "id": format!("extra{i}"), "path": format!("px{i}.rs"),
+                    "summary": "s", "content": "c", "tags": [],
+                    "kind": "observation", "evidence_status": "missing",
+                    "ts": "2024-01-01T00:00:00Z"
+                });
+                events::append_event(&events_path_a, &e).unwrap();
+            }
+        });
+
+        // First rebuild runs concurrently with Worker A.
+        Rebuild.execute_with(&paths, &emb).unwrap();
+        worker_a.join().unwrap();
+
+        // Worker B writes evidence_add events after Worker A finishes to avoid
+        // concurrent appends from two threads corrupting JSONL lines.
+        for i in 0..5u32 {
+            let e = evidence_add(&format!("base{i}"), &format!("ev{i}"), i);
+            events::append_event(&events_path_b, &e).unwrap();
+        }
+
+        // All events are now in the log.  A second rebuild guarantees convergence.
+        Rebuild.execute_with(&paths, &emb).unwrap();
+
+        // Verify DB == Materialize(all events in log).
+        let all_events = events::read_events(&paths.events).unwrap();
+        let ref_conn = db::open_db_memory().unwrap();
+        for ev in &all_events {
+            db::apply_event(&ref_conn, &emb, ev).unwrap();
+        }
+
+        let live_conn = db::open_db(&paths.db).unwrap();
+
+        let live_entries: Vec<(String, String)> = live_conn
+            .prepare("SELECT id, COALESCE(evidence_status,'n/a') FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let ref_entries: Vec<(String, String)> = ref_conn
+            .prepare("SELECT id, COALESCE(evidence_status,'n/a') FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            live_entries, ref_entries,
+            "DB entries+evidence_status must equal direct replay after rebuild"
+        );
+
+        let live_evidence: Vec<(String, String)> = live_conn
+            .prepare("SELECT id, entry_id FROM evidence ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let ref_evidence: Vec<(String, String)> = ref_conn
+            .prepare("SELECT id, entry_id FROM evidence ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(
+            live_evidence, ref_evidence,
+            "evidence rows must survive rebuild and match direct replay"
+        );
+
+        // Spot-check: base entries that received evidence must have status='present'.
+        for i in 0..5u32 {
+            let status: String = live_conn
+                .query_row(
+                    "SELECT COALESCE(evidence_status,'n/a') FROM entries WHERE id=?1",
+                    rusqlite::params![format!("base{i}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                status, "present",
+                "base{i} must have evidence_status='present' after rebuild"
+            );
+        }
+    }
+
     /// Events written concurrently with Phase 2 (lock-free replay) must appear
     /// in the final DB.  Because exact interleaving is non-deterministic, we
     /// run a second rebuild after all threads join to guarantee convergence:
