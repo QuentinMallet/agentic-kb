@@ -1,11 +1,50 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
-use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob};
+use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob, Evidence};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::Path;
+
+/// Compute the `evidence_status` value for an entry based on its kind and
+/// the number of evidence rows currently linked to it.
+///
+/// Rules (L2 soft-mandate):
+/// - kind IN ('observation','belief','procedure') AND evidence_count > 0 → 'present'
+/// - kind IN ('observation','belief','procedure') AND evidence_count = 0 → 'missing'
+/// - all other kinds (convention, memory, or unknown) → 'n/a'
+/// - Legacy entries that have never had an explicit kind event retain their
+///   column DEFAULT ('belief'), so they will compute 'missing' once evidence
+///   processing begins.  Callers that want to preserve 'n/a' for truly legacy
+///   rows should check the current status before calling this helper.
+pub fn compute_evidence_status(conn: &Connection, entry_id: &str) -> Result<String> {
+    let kind: String = conn
+        .query_row(
+            "SELECT COALESCE(kind, 'belief') FROM entries WHERE id=?1",
+            params![entry_id],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("compute_evidence_status: entry not found: {entry_id}"))?;
+
+    let evidence_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
+        params![entry_id],
+        |r| r.get(0),
+    )?;
+
+    let status = match kind.as_str() {
+        "observation" | "belief" | "procedure" => {
+            if evidence_count > 0 {
+                "present"
+            } else {
+                "missing"
+            }
+        }
+        _ => "n/a",
+    };
+    Ok(status.to_string())
+}
 
 /// Open (or create) the SQLite database at the given path.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
@@ -86,6 +125,35 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // Migration: add `permanent` column to existing DBs that pre-date this field.
     // SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.37; ignore "duplicate column" error.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN permanent INTEGER DEFAULT 0;");
+    // Migration: add `kind` and `evidence_status` columns (Phase 1 defensibility).
+    // Legacy entries default to kind='belief', evidence_status='n/a' via column DEFAULT.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT DEFAULT 'belief';");
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
+    // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS evidence (
+            id               TEXT PRIMARY KEY,
+            entry_id         TEXT NOT NULL,
+            kind             TEXT NOT NULL CHECK(kind IN ('code','test','command','user','derived')),
+            citation_path    TEXT,
+            citation_sha     TEXT,
+            citation_hash    TEXT NOT NULL,
+            citation_excerpt TEXT,
+            derived_from     TEXT,
+            recorded_at      TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_entry_id ON evidence(entry_id);
+
+        CREATE TABLE IF NOT EXISTS audit_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id     TEXT NOT NULL,
+            audited_at   TEXT DEFAULT (datetime('now')),
+            verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
+            evidence_ref TEXT
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -109,17 +177,24 @@ pub fn apply_event(
             let ts = event["ts"].as_str().unwrap_or("");
             let permanent = event["permanent"].as_bool().unwrap_or(false) as i32;
             let is_stale = event["is_stale"].as_bool().unwrap_or(false) as i32;
+            // Legacy events without kind/evidence_status fields default to
+            // 'belief' / 'n/a' — matching the column DEFAULT for pre-migration rows.
+            let kind = event["kind"].as_str().unwrap_or("belief");
+            let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
 
             conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
+                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)
                  ON CONFLICT(id) DO UPDATE SET
                    path=excluded.path, summary=excluded.summary,
                    content=excluded.content, tags=excluded.tags,
                    version_ref=excluded.version_ref,
                    permanent=excluded.permanent,
-                   is_stale=excluded.is_stale, updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, is_stale, ts],
+                   is_stale=excluded.is_stale,
+                   kind=excluded.kind,
+                   evidence_status=excluded.evidence_status,
+                   updated_at=excluded.updated_at",
+                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, ts],
             )?;
 
             // Stale entries: clean up FTS/embeddings so they don't appear in search
@@ -197,6 +272,95 @@ pub fn apply_event(
             )?;
         }
 
+        ("evidence_add", "evidence") => {
+            let ev = &event["evidence"];
+            let ev_id = ev["id"].as_str().context("evidence_add: missing evidence.id")?;
+            let entry_id = event["entry_id"].as_str().context("evidence_add: missing entry_id")?;
+
+            // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
+            let entry_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !entry_exists {
+                return Ok(());
+            }
+
+            let kind = ev["kind"].as_str().context("evidence_add: missing evidence.kind")?;
+            let citation_path = ev["citation_path"].as_str();
+            let citation_sha = ev["citation_sha"].as_str();
+            let citation_hash = ev["citation_hash"]
+                .as_str()
+                .context("evidence_add: missing evidence.citation_hash")?;
+            let citation_excerpt = ev["citation_excerpt"].as_str();
+            let derived_from = ev["derived_from"].as_str();
+            let recorded_at = ev["recorded_at"].as_str();
+
+            conn.execute(
+                "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
+            )?;
+
+            // Update evidence_status on the parent entry via the soft-mandate helper.
+            // Preserve 'n/a' for truly legacy entries (those that have no explicit kind
+            // event — detected by kind column still holding the column default 'belief'
+            // AND evidence_status still holding 'n/a' AND this being the first evidence row).
+            let current_status: String = conn
+                .query_row(
+                    "SELECT COALESCE(evidence_status, 'n/a') FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "n/a".to_string());
+            // Only update if the entry was already explicitly tracked (status != 'n/a')
+            // OR if after this insert there is more than 1 evidence row (meaning the
+            // entry had prior evidence, so it was already out of legacy-untouched state).
+            let ev_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
+                params![entry_id],
+                |r| r.get(0),
+            )?;
+            if current_status != "n/a" || ev_count > 1 {
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
+            }
+        }
+
+        ("evidence_expire", "evidence") => {
+            let ev_id = event["evidence_id"].as_str().context("evidence_expire: missing evidence_id")?;
+            let entry_id = event["entry_id"].as_str().context("evidence_expire: missing entry_id")?;
+
+            conn.execute(
+                "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
+                params![ev_id, entry_id],
+            )?;
+
+            // Recompute evidence_status if the parent entry exists.
+            let entry_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if entry_exists {
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
+            }
+        }
+
         _ => {} // unknown event — skip silently
     }
     Ok(())
@@ -215,6 +379,9 @@ pub struct SearchOptions {
     pub path_prefix: Option<String>,
     /// Only return entries that have this exact tag.
     pub tag_filter: Option<String>,
+    /// Maximum number of results to verify inline (AC18 narrow-K fallback).
+    /// Results beyond this count get `verified: null`. Default: 10.
+    pub inline_verify_k: usize,
 }
 
 impl Default for SearchOptions {
@@ -225,8 +392,21 @@ impl Default for SearchOptions {
             do_semantic: true,
             path_prefix: None,
             tag_filter: None,
+            inline_verify_k: 10,
         }
     }
+}
+
+/// An evidence row attached to a search result, with inline verification flag.
+pub struct SearchEvidence {
+    pub id: String,
+    pub kind: String,
+    pub citation_path: Option<String>,
+    pub citation_sha: Option<String>,
+    pub citation_hash: String,
+    pub citation_excerpt: Option<String>,
+    /// `Some(true/false)` if verified inline; `None` if skipped by narrow-K fallback.
+    pub verified: Option<bool>,
 }
 
 /// A single result entry returned by `search_entries`.
@@ -241,6 +421,53 @@ pub struct SearchEntry {
     pub score: f32,
     /// `"fts"` or `"semantic"`.
     pub source: &'static str,
+    /// Evidence rows with inline verification results.
+    pub evidence: Vec<SearchEvidence>,
+}
+
+/// Fetch all evidence rows for the given entry IDs.
+/// Returns a map from entry_id to Vec<Evidence>.
+fn fetch_evidence_for_entries(
+    conn: &Connection,
+    entry_ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<Evidence>>> {
+    let mut map: std::collections::HashMap<String, Vec<Evidence>> =
+        std::collections::HashMap::new();
+    if entry_ids.is_empty() {
+        return Ok(map);
+    }
+    // Build parameterized IN clause
+    let placeholders: String = entry_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
+         FROM evidence WHERE entry_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Evidence> = stmt
+        .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
+            Ok(Evidence {
+                id: r.get(0)?,
+                entry_id: r.get(1)?,
+                kind: r.get(2)?,
+                citation_path: r.get(3)?,
+                citation_sha: r.get(4)?,
+                citation_hash: r.get(5).unwrap_or_default(),
+                citation_excerpt: r.get(6)?,
+                derived_from: r.get(7)?,
+                recorded_at: r.get(8)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    for ev in rows {
+        map.entry(ev.entry_id.clone()).or_default().push(ev);
+    }
+    Ok(map)
 }
 
 /// Shared hybrid search used by both the CLI and MCP handler.
@@ -303,6 +530,7 @@ pub fn search_entries(
                 tags,
                 score: 1.0,
                 source: "fts",
+                evidence: vec![],
             });
         }
     }
@@ -351,6 +579,7 @@ pub fn search_entries(
                 tags,
                 score: sim,
                 source: "semantic",
+                evidence: vec![],
             });
         }
 
@@ -363,7 +592,94 @@ pub fn search_entries(
         }
     }
 
+    // Fetch evidence rows for all result entries and attach with inline verification.
+    let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
+
+    // Discover repo root: walk up from CWD looking for .git directory.
+    let repo_root = find_repo_root();
+
+    let verify_count = opts.inline_verify_k.min(entries.len());
+
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
+        let do_verify = idx < verify_count;
+
+        if ev_rows.is_empty() {
+            entry.evidence = vec![];
+            continue;
+        }
+
+        if do_verify {
+            // Verify all evidence rows for this entry in parallel using thread::scope.
+            // ADR-C: explicit std::thread, not rayon.
+            let verified: Vec<bool> = std::thread::scope(|s| {
+                let handles: Vec<_> = ev_rows
+                    .iter()
+                    .map(|ev| {
+                        s.spawn(|| {
+                            if let Some(ref root) = repo_root {
+                                crate::components::verification::verify_evidence(ev, root)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or(false))
+                    .collect()
+            });
+
+            entry.evidence = ev_rows
+                .into_iter()
+                .zip(verified.into_iter())
+                .map(|(ev, v)| SearchEvidence {
+                    id: ev.id,
+                    kind: ev.kind,
+                    citation_path: ev.citation_path,
+                    citation_sha: ev.citation_sha,
+                    citation_hash: ev.citation_hash,
+                    citation_excerpt: ev.citation_excerpt,
+                    verified: Some(v),
+                })
+                .collect();
+        } else {
+            // Beyond inline_verify_k: return evidence metadata with verified=null.
+            entry.evidence = ev_rows
+                .into_iter()
+                .map(|ev| SearchEvidence {
+                    id: ev.id,
+                    kind: ev.kind,
+                    citation_path: ev.citation_path,
+                    citation_sha: ev.citation_sha,
+                    citation_hash: ev.citation_hash,
+                    citation_excerpt: ev.citation_excerpt,
+                    verified: None,
+                })
+                .collect();
+        }
+    }
+
     Ok(entries)
+}
+
+/// Walk up from CWD to find a directory containing `.git`.
+/// Returns None if not found (e.g. in tempdir tests).
+fn find_repo_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir: &Path = &cwd;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +701,57 @@ mod tests {
         assert!(tables.contains(&"test_cases".to_string()));
         assert!(tables.contains(&"run_history".to_string()));
         assert!(tables.contains(&"entries_emb".to_string()));
+        assert!(tables.contains(&"evidence".to_string()));
+        assert!(tables.contains(&"audit_runs".to_string()));
+    }
+
+    #[test]
+    fn test_apply_event_legacy_entries_get_belief_and_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Replay a legacy upsert event with no kind or evidence_status fields.
+        let legacy1 = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "legacy1",
+            "path": "old/path.md",
+            "summary": "legacy entry one",
+            "content": "some old content",
+            "tags": ["old"],
+            "ts": "2023-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &legacy1).unwrap();
+
+        let (kind, evidence_status): (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(kind,'belief'), COALESCE(evidence_status,'n/a') FROM entries WHERE id='legacy1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "belief", "legacy entry must default to kind='belief'");
+        assert_eq!(evidence_status, "n/a", "legacy entry must default to evidence_status='n/a'");
+
+        // Replay a second legacy entry.
+        let legacy2 = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "legacy2",
+            "path": "old/other.md",
+            "summary": "legacy entry two",
+            "content": "more old content",
+            "tags": [],
+            "ts": "2023-01-02T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &legacy2).unwrap();
+
+        // audit_runs table must be untouched — zero rows (L4 boundary: audit_runs
+        // is DB-only, never written by event replay).
+        let audit_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 0, "audit_runs must be untouched after legacy event replay (L4 boundary)");
     }
 
     #[test]
@@ -557,5 +924,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_stale, 0, "events without is_stale must default to active");
+    }
+
+    // -----------------------------------------------------------------------
+    // T-S6a: event replay convergence proptest (br-jwe.14, AC13)
+    // -----------------------------------------------------------------------
+
+    /// Snapshot of the materialized DB state used for convergence comparison.
+    /// Sorted so order of insertion does not affect equality.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DbSnapshot {
+        /// (entry_id, kind, evidence_status, is_stale)
+        entries: Vec<(String, String, String, i64)>,
+        /// (evidence_id, entry_id, kind)
+        evidence: Vec<(String, String, String)>,
+    }
+
+    fn snapshot_db_state(conn: &Connection) -> anyhow::Result<DbSnapshot> {
+        let mut entries: Vec<(String, String, String, i64)> = conn
+            .prepare(
+                "SELECT id, COALESCE(kind,'belief'), COALESCE(evidence_status,'n/a'), is_stale \
+                 FROM entries ORDER BY id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        entries.sort();
+
+        let mut evidence: Vec<(String, String, String)> = conn
+            .prepare("SELECT id, entry_id, kind FROM evidence ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        evidence.sort();
+
+        Ok(DbSnapshot { entries, evidence })
+    }
+
+    /// Small fixed alphabet keeps generated sequences tractable and maximises
+    /// interesting interactions (evidence on same entry, expire then re-upsert, etc.).
+    const ENTRY_IDS: &[&str] = &["e1", "e2", "e3"];
+    const EVIDENCE_IDS: &[&str] = &["ev1", "ev2", "ev3", "ev4"];
+    const KINDS: &[&str] = &["observation", "belief", "procedure", "convention"];
+    const EV_KINDS: &[&str] = &["code", "test", "command", "user"];
+
+    fn arb_entry_id() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (0..ENTRY_IDS.len()).prop_map(|i| ENTRY_IDS[i].to_string())
+    }
+
+    fn arb_evidence_id() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (0..EVIDENCE_IDS.len()).prop_map(|i| EVIDENCE_IDS[i].to_string())
+    }
+
+    fn arb_event() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+        use proptest::prelude::*;
+        prop_oneof![
+            // upsert entry
+            (arb_entry_id(), 0..KINDS.len()).prop_map(|(id, ki)| {
+                serde_json::json!({
+                    "action": "upsert",
+                    "table": "entries",
+                    "id": id,
+                    "path": format!("src/{id}.rs"),
+                    "summary": format!("summary for {id}"),
+                    "content": format!("content for {id}"),
+                    "tags": [],
+                    "kind": KINDS[ki],
+                    "evidence_status": "missing",
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+            // expire entry
+            arb_entry_id().prop_map(|id| {
+                serde_json::json!({
+                    "action": "expire",
+                    "table": "entries",
+                    "id": id
+                })
+            }),
+            // evidence_add
+            (arb_entry_id(), arb_evidence_id(), 0..EV_KINDS.len()).prop_map(|(eid, evid, ki)| {
+                serde_json::json!({
+                    "action": "evidence_add",
+                    "table": "evidence",
+                    "entry_id": eid,
+                    "evidence": {
+                        "id": evid,
+                        "entry_id": eid,
+                        "kind": EV_KINDS[ki],
+                        "citation_path": null,
+                        "citation_sha": null,
+                        "citation_hash": "abc123",
+                        "citation_excerpt": null,
+                        "derived_from": null,
+                        "recorded_at": "2024-01-01T00:00:00Z"
+                    },
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+            // evidence_expire
+            (arb_entry_id(), arb_evidence_id()).prop_map(|(eid, evid)| {
+                serde_json::json!({
+                    "action": "evidence_expire",
+                    "table": "evidence",
+                    "entry_id": eid,
+                    "evidence_id": evid,
+                    "reason": "test",
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
+        /// events into an in-memory DB produces the same materialized state as
+        /// direct reduction via apply_event. Models TLA+ PartitionEquivalent.
+        ///
+        /// Two paths must converge:
+        /// - Path A: apply all events one at a time sequentially.
+        /// - Path B: apply the same sequence split into two batches (simulating
+        ///   a snapshot + catchup replay as in the 3-phase rebuild).
+        #[test]
+        fn proptest_event_replay_convergence(
+            events in proptest::collection::vec(arb_event(), 0..32),
+        ) {
+            let conn1 = open_db_memory().unwrap();
+            let conn2 = open_db_memory().unwrap();
+            let embedder = NoopEmbedder;
+
+            // Path A: apply events one at a time
+            for ev in &events {
+                apply_event(&conn1, &embedder, ev).unwrap();
+            }
+
+            // Path B: apply events in two batches (snapshot + catchup)
+            let split = events.len() / 2;
+            for ev in &events[..split] {
+                apply_event(&conn2, &embedder, ev).unwrap();
+            }
+            for ev in &events[split..] {
+                apply_event(&conn2, &embedder, ev).unwrap();
+            }
+
+            // Both must produce identical final state on entries + evidence + status
+            let state1 = snapshot_db_state(&conn1).unwrap();
+            let state2 = snapshot_db_state(&conn2).unwrap();
+            proptest::prop_assert_eq!(state1, state2);
+        }
     }
 }

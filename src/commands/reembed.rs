@@ -145,6 +145,9 @@ mod tests {
             id: Some("re-test-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -172,6 +175,9 @@ mod tests {
             id: Some("re-large-1".to_string()),
             permanent: false,
             replace_path: false,
+                kind: "belief".to_string(),
+                evidence: vec![],
+                evidence_file: None,
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 

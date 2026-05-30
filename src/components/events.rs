@@ -1,9 +1,77 @@
 //! Event log operations (JSONL append + read)
 
+use crate::models::Evidence;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+
+/// Build an `evidence_add` event payload.
+///
+/// The caller is responsible for appending to the event log under the existing
+/// flock (see ADR-B).  `version_ref` is the git HEAD SHA at the time of the
+/// write, or `None` when unavailable.
+pub fn evidence_add_event(
+    entry_id: &str,
+    evidence: &Evidence,
+    version_ref: Option<&str>,
+) -> serde_json::Value {
+    let ts = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "action": "evidence_add",
+        "table": "evidence",
+        "entry_id": entry_id,
+        "evidence": {
+            "id": evidence.id,
+            "entry_id": evidence.entry_id,
+            "kind": evidence.kind,
+            "citation_path": evidence.citation_path,
+            "citation_sha": evidence.citation_sha,
+            "citation_hash": evidence.citation_hash,
+            "citation_excerpt": evidence.citation_excerpt,
+            "derived_from": evidence.derived_from,
+            "recorded_at": evidence.recorded_at,
+        },
+        "version_ref": version_ref,
+        "ts": ts,
+    })
+}
+
+/// Build an `evidence_expire` event payload.
+pub fn evidence_expire_event(entry_id: &str, evidence_id: &str, reason: &str) -> serde_json::Value {
+    let ts = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "action": "evidence_expire",
+        "table": "evidence",
+        "entry_id": entry_id,
+        "evidence_id": evidence_id,
+        "reason": reason,
+        "ts": ts,
+    })
+}
+
+/// Append multiple events to the JSONL log in one pass.
+///
+/// The caller must hold the flock before calling (same contract as
+/// [`append_event`]).  Each event is written as a separate `writeln!` to
+/// preserve the one-JSON-object-per-line invariant that `read_events` relies on.
+pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if let Some(p) = events_path.parent() {
+        fs::create_dir_all(p)?;
+    }
+    let mut f = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(events_path)
+        .with_context(|| format!("open events {}", events_path.display()))?;
+    for event in events {
+        writeln!(f, "{}", serde_json::to_string(event)?)?;
+    }
+    Ok(())
+}
 
 /// Append a single event to the JSONL log.
 pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()> {
