@@ -327,44 +327,16 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
 }
 
 fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
-    use std::fs;
-
-    let _lock = match acquire_lock(&paths.lock) {
-        Ok(l) => l,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    if paths.db.exists() {
-        let _ = fs::remove_file(&paths.db);
-        let db_str = paths.db.to_string_lossy();
-        let _ = fs::remove_file(format!("{}-wal", db_str));
-        let _ = fs::remove_file(format!("{}-shm", db_str));
-    }
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let evts = match events::read_events(&paths.events) {
-        Ok(e) => e,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let total = evts.len();
-    for (i, event) in evts.iter().enumerate() {
-        if let Err(e) = db::apply_event(&conn, emb, event) {
-            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    use crate::commands::rebuild::Rebuild;
+    match (Rebuild).execute_with(paths, emb) {
+        Ok(()) => {
+            let rebuilt = events::read_events(&paths.events)
+                .map(|e| e.len())
+                .unwrap_or(0);
+            json!({"id": id, "type": "ok", "rebuilt": rebuilt})
         }
-        // Emit progress every 50 events so the Elixir collect_response timer keeps resetting.
-        if (i + 1) % 50 == 0 || i + 1 == total {
-            let progress = json!({"type": "progress", "processed": i + 1, "total": total});
-            println!("{progress}");
-            let _ = io::stdout().flush();
-        }
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
-
-    json!({"id": id, "type": "ok", "rebuilt": total})
 }
 
 fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {

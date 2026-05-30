@@ -21,6 +21,14 @@ pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()>
 
 /// Read all events from a JSONL file.
 pub fn read_events(events_path: &Path) -> Result<Vec<serde_json::Value>> {
+    read_events_up_to(events_path, usize::MAX)
+}
+
+/// Read at most `max` events from a JSONL file, stopping before any partial
+/// tail line that a concurrent writer may be mid-writing.  Used by Phase 2 of
+/// the 3-phase rebuild to stay within the Phase-1 snapshot without encountering
+/// a partially-written line appended after the snapshot lock was released.
+pub fn read_events_up_to(events_path: &Path, max: usize) -> Result<Vec<serde_json::Value>> {
     if !events_path.exists() {
         return Ok(vec![]);
     }
@@ -28,6 +36,9 @@ pub fn read_events(events_path: &Path) -> Result<Vec<serde_json::Value>> {
     let reader = BufReader::new(f);
     let mut events = Vec::new();
     for (i, line) in reader.lines().enumerate() {
+        if events.len() >= max {
+            break;
+        }
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {

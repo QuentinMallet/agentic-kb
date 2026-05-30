@@ -70,11 +70,17 @@ defmodule AgenticKbMcp.PortManager do
     # kb rebuild. The grandchild is adopted by init and survives BEAM shutdown,
     # so the agent can quit as soon as this cast returns.
     # KB_BIN and LOG are passed via env to avoid shell injection.
-    System.cmd("sh", ["-c", ~s("$KB_BIN" rebuild >"$LOG" 2>&1 &)],
-      cd: repo_root,
-      env: [{"KB_BIN", kb_bin}, {"LOG", log}]
-    )
-    Logger.info("kb rebuild started in background (log: #{log})")
+    {_output, exit_code} =
+      System.cmd("sh", ["-c", ~s("$KB_BIN" rebuild >"$LOG" 2>&1 &)],
+        cd: repo_root,
+        env: [{"KB_BIN", kb_bin}, {"LOG", log}]
+      )
+
+    if exit_code == 0 do
+      Logger.info("kb rebuild started in background (log: #{log})")
+    else
+      Logger.error("kb rebuild: sh exited #{exit_code} — rebuild may not have started (log: #{log})")
+    end
     {:noreply, state}
   end
 
