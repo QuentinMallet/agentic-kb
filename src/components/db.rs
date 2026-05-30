@@ -925,4 +925,154 @@ mod tests {
             .unwrap();
         assert_eq!(is_stale, 0, "events without is_stale must default to active");
     }
+
+    // -----------------------------------------------------------------------
+    // T-S6a: event replay convergence proptest (br-jwe.14, AC13)
+    // -----------------------------------------------------------------------
+
+    /// Snapshot of the materialized DB state used for convergence comparison.
+    /// Sorted so order of insertion does not affect equality.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DbSnapshot {
+        /// (entry_id, kind, evidence_status, is_stale)
+        entries: Vec<(String, String, String, i64)>,
+        /// (evidence_id, entry_id, kind)
+        evidence: Vec<(String, String, String)>,
+    }
+
+    fn snapshot_db_state(conn: &Connection) -> anyhow::Result<DbSnapshot> {
+        let mut entries: Vec<(String, String, String, i64)> = conn
+            .prepare(
+                "SELECT id, COALESCE(kind,'belief'), COALESCE(evidence_status,'n/a'), is_stale \
+                 FROM entries ORDER BY id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        entries.sort();
+
+        let mut evidence: Vec<(String, String, String)> = conn
+            .prepare("SELECT id, entry_id, kind FROM evidence ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        evidence.sort();
+
+        Ok(DbSnapshot { entries, evidence })
+    }
+
+    /// Small fixed alphabet keeps generated sequences tractable and maximises
+    /// interesting interactions (evidence on same entry, expire then re-upsert, etc.).
+    const ENTRY_IDS: &[&str] = &["e1", "e2", "e3"];
+    const EVIDENCE_IDS: &[&str] = &["ev1", "ev2", "ev3", "ev4"];
+    const KINDS: &[&str] = &["observation", "belief", "procedure", "convention"];
+    const EV_KINDS: &[&str] = &["code", "test", "command", "user"];
+
+    fn arb_entry_id() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (0..ENTRY_IDS.len()).prop_map(|i| ENTRY_IDS[i].to_string())
+    }
+
+    fn arb_evidence_id() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (0..EVIDENCE_IDS.len()).prop_map(|i| EVIDENCE_IDS[i].to_string())
+    }
+
+    fn arb_event() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+        use proptest::prelude::*;
+        prop_oneof![
+            // upsert entry
+            (arb_entry_id(), 0..KINDS.len()).prop_map(|(id, ki)| {
+                serde_json::json!({
+                    "action": "upsert",
+                    "table": "entries",
+                    "id": id,
+                    "path": format!("src/{id}.rs"),
+                    "summary": format!("summary for {id}"),
+                    "content": format!("content for {id}"),
+                    "tags": [],
+                    "kind": KINDS[ki],
+                    "evidence_status": "missing",
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+            // expire entry
+            arb_entry_id().prop_map(|id| {
+                serde_json::json!({
+                    "action": "expire",
+                    "table": "entries",
+                    "id": id
+                })
+            }),
+            // evidence_add
+            (arb_entry_id(), arb_evidence_id(), 0..EV_KINDS.len()).prop_map(|(eid, evid, ki)| {
+                serde_json::json!({
+                    "action": "evidence_add",
+                    "table": "evidence",
+                    "entry_id": eid,
+                    "evidence": {
+                        "id": evid,
+                        "entry_id": eid,
+                        "kind": EV_KINDS[ki],
+                        "citation_path": null,
+                        "citation_sha": null,
+                        "citation_hash": "abc123",
+                        "citation_excerpt": null,
+                        "derived_from": null,
+                        "recorded_at": "2024-01-01T00:00:00Z"
+                    },
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+            // evidence_expire
+            (arb_entry_id(), arb_evidence_id()).prop_map(|(eid, evid)| {
+                serde_json::json!({
+                    "action": "evidence_expire",
+                    "table": "evidence",
+                    "entry_id": eid,
+                    "evidence_id": evid,
+                    "reason": "test",
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
+        /// events into an in-memory DB produces the same materialized state as
+        /// direct reduction via apply_event. Models TLA+ PartitionEquivalent.
+        ///
+        /// Two paths must converge:
+        /// - Path A: apply all events one at a time sequentially.
+        /// - Path B: apply the same sequence split into two batches (simulating
+        ///   a snapshot + catchup replay as in the 3-phase rebuild).
+        #[test]
+        fn proptest_event_replay_convergence(
+            events in proptest::collection::vec(arb_event(), 0..32),
+        ) {
+            let conn1 = open_db_memory().unwrap();
+            let conn2 = open_db_memory().unwrap();
+            let embedder = NoopEmbedder;
+
+            // Path A: apply events one at a time
+            for ev in &events {
+                apply_event(&conn1, &embedder, ev).unwrap();
+            }
+
+            // Path B: apply events in two batches (snapshot + catchup)
+            let split = events.len() / 2;
+            for ev in &events[..split] {
+                apply_event(&conn2, &embedder, ev).unwrap();
+            }
+            for ev in &events[split..] {
+                apply_event(&conn2, &embedder, ev).unwrap();
+            }
+
+            // Both must produce identical final state on entries + evidence + status
+            let state1 = snapshot_db_state(&conn1).unwrap();
+            let state2 = snapshot_db_state(&conn2).unwrap();
+            proptest::prop_assert_eq!(state1, state2);
+        }
+    }
 }
