@@ -1,5 +1,4 @@
 //! Embedder trait and implementations
-#![allow(unsafe_code)] // candle VarBuilder::from_mmaped_safetensors requires unsafe
 
 use anyhow::Result;
 use std::io::Write;
@@ -41,12 +40,14 @@ struct CandleInner {
     tokenizer: tokenizers::Tokenizer,
 }
 
-// SAFETY: CandleInner (BertModel + Tokenizer) may contain non-Send raw pointers
-// internally, but all access is serialized through the Mutex<Option<CandleInner>>
-// in embed(). The MCP server and CLI are single-threaded; the Mutex ensures no
-// concurrent access even if callers change in the future.
-unsafe impl Send for CandleEmbedder {}
-unsafe impl Sync for CandleEmbedder {}
+// Send + Sync auto-derive from candle-core (default-features = false) + tokenizers.
+// Locked in by the assertion below: if a future feature flip (e.g. enabling
+// `candle-core/cuda`) reintroduces a thread-bound storage type, this fails to
+// compile rather than silently allowing UB across threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CandleEmbedder>();
+};
 
 impl CandleEmbedder {
     /// Create a new CandleEmbedder. Does NOT load the model yet.
@@ -110,6 +111,11 @@ impl CandleEmbedder {
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
         let device = Device::Cpu;
+        // SAFETY: weights_path is the HuggingFace cache file written via tmp +
+        // atomic rename in download_hf_file. It must not be mutated for the
+        // lifetime of any Tensor mmapped against it; no code path in this crate
+        // writes to the cache after download_hf_file returns.
+        #[allow(unsafe_code)]
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 &[weights_path],
