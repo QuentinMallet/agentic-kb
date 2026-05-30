@@ -30,7 +30,20 @@
      (3) materialize event into SQLite DB
      (4) release lock
 
-   Rebuild protocol (3 steps):
+   Rebuild protocol — 3-phase non-blocking (replaces old single-lock rebuild):
+     Phase 1 (brief lock):
+       (1) acquire lock
+       (2) record snap_len = Len(log)
+       (3) release lock
+     Phase 2 (no lock — writes continue against live DB):
+       (4) replay log[1..snap_len] into tmp DB (abstract: no state change to db)
+     Phase 3 (brief lock):
+       (5) acquire lock
+       (6) apply catch-up log[snap_len+1..Len(log)] to tmp, then db := tmp
+       (7) release lock
+     Result: db = Materialize(log) — WriteThroughInvariant restored.
+
+   Old blocking rebuild (kept for reference — single lock for full replay):
      (1) acquire lock
      (2) drop DB (set to empty)
      (3) replay full log → fresh DB, then release lock
@@ -87,9 +100,10 @@ VARIABLES
     db,          \* [EntryIds -> AbsentEntry | PresentEntry(...)]
     lock_holder, \* Procs \cup {"none"}
     pending,     \* [Procs -> NoEvent | UpsertEvent | ExpireEvent]
-    pc           \* [Procs -> ProcStep]
+    pc,          \* [Procs -> ProcStep]
+    snap_len     \* [Procs -> Nat] — Phase-1 snapshot length for 3-phase rebuild
 
-vars == <<log, db, lock_holder, pending, pc>>
+vars == <<log, db, lock_holder, pending, pc, snap_len>>
 
 \* TLC state-space bound: only explore states with log length <= MaxLogLen.
 \* Keeps the state space finite; invariants hold for all log lengths.
@@ -100,6 +114,9 @@ ProcSteps == {
     "write_acquiring",    "write_appending",
     "write_materializing","write_releasing",
     "rebuild_acquiring",  "rebuild_dropping",  "rebuild_replaying",
+    "rebuild3_snap_acq",  "rebuild3_snap_rel",
+    "rebuild3_offlock",
+    "rebuild3_cu_acq",    "rebuild3_cu_apply",
     "compact_acquiring",  "compact_running"
 }
 
@@ -111,6 +128,7 @@ TypeInvariant ==
     /\ \A p \in Procs : pc[p] \in ProcSteps
     /\ \A p \in Procs : pending[p].action \in PendingActions
     /\ \A id \in EntryIds : db[id].type \in DBTypes
+    /\ \A p \in Procs : snap_len[p] \in Nat
 
 (* ──────────────────────────── Materialization ──────────────────────────── *)
 
@@ -167,6 +185,7 @@ Init ==
     /\ lock_holder = "none"
     /\ pending     = [p \in Procs |-> NoEvent]
     /\ pc          = [p \in Procs |-> "idle"]
+    /\ snap_len    = [p \in Procs |-> 0]
 
 (* ──────────────────────────── Write protocol ───────────────────────────── *)
 
