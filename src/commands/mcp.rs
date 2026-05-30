@@ -6,8 +6,10 @@
 //! Protocol: see .omc/specs/agentic-kb-port-protocol.md
 
 use crate::commands::add::{acquire_lock, make_embedder};
+use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
 use crate::components::{db, embedder, events};
 use crate::config;
+use crate::models::Evidence;
 use abscissa_core::{Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
@@ -167,6 +169,25 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     }
 }
 
+/// MCP kb_add handler.
+///
+/// Accepts optional `kind` (default "belief") and `evidence` (array of objects,
+/// default []).  Evidence objects must have `kind="code"` (Phase 1 only; other
+/// kinds deferred to Phase 2 per L6 / AC9).
+///
+/// Kind enum: observation | belief | procedure | convention | memory
+///
+/// Evidence object shape:
+/// ```json
+/// {
+///   "kind": "code",
+///   "citation_path": "src/foo.rs:42-58",
+///   "citation_sha": "abc123",
+///   "citation_hash": "sha256:...",
+///   "citation_excerpt": "fn foo() { ... }",
+///   "derived_from": null
+/// }
+/// ```
 fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
     let path = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -177,9 +198,28 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     let tags = req.get("tags").cloned().unwrap_or(Value::Array(vec![]));
     let permanent = req.get("permanent").and_then(|v| v.as_bool()).unwrap_or(false);
     let replace_path = req.get("replace_path").and_then(|v| v.as_bool()).unwrap_or(false);
+    let kind = req.get("kind").and_then(|v| v.as_str()).unwrap_or("belief").to_string();
+    let evidence_rows: Vec<Value> = req
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Validate kind enum and evidence constraints before acquiring the lock.
+    if let Err(e) = validate_kb_add_inputs(&kind, &evidence_rows) {
+        return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
+    }
+
+    let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
     let entry_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
+    let version_ref = config::git_head_sha();
+
+    // Soft-mandate warning (AC10).
+    if evidence_status == "missing" {
+        eprintln!("kb: entry {entry_id} kind={kind} has no evidence; evidence_status=missing");
+    }
 
     let _lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -191,7 +231,7 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    // --replace-path: expire existing non-stale entries at this path before inserting
+    // replace_path: expire existing non-stale entries at this path before inserting.
     if replace_path {
         let existing_ids: Vec<String> = {
             let mut stmt = match conn.prepare(
@@ -221,7 +261,8 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         }
     }
 
-    let event = json!({
+    // Build Add event (carries kind + evidence_status).
+    let add_event = json!({
         "action": "upsert",
         "table": "entries",
         "id": entry_id,
@@ -229,18 +270,48 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         "summary": summary,
         "content": content,
         "tags": tags,
-        "version_ref": config::git_head_sha(),
+        "version_ref": version_ref,
         "permanent": permanent,
+        "kind": kind,
+        "evidence_status": evidence_status,
         "ts": ts,
         "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
+    // Build EvidenceAdd events (one per evidence row).
+    let evidence_events: Vec<Value> = evidence_rows
+        .iter()
+        .map(|ev| {
+            let evidence = Evidence {
+                id: uuid::Uuid::new_v4().to_string(),
+                entry_id: entry_id.clone(),
+                kind: ev.get("kind").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
+                citation_path: ev.get("citation_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                citation_sha: ev.get("citation_sha").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                citation_hash: ev.get("citation_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                citation_excerpt: ev.get("citation_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                derived_from: ev.get("derived_from").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                recorded_at: Some(ts.clone()),
+            };
+            events::evidence_add_event(&entry_id, &evidence, version_ref.as_deref())
+        })
+        .collect();
+
+    // Atomic batch: Add event + N EvidenceAdd events under the held lock (AC12).
+    let mut batch = vec![add_event.clone()];
+    batch.extend(evidence_events.iter().cloned());
+    if let Err(e) = events::append_events_batch(&paths.events, &batch) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Apply each event to the DB (also under lock).
+    if let Err(e) = db::apply_event(&conn, emb, &add_event) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    for ev in &evidence_events {
+        if let Err(e) = db::apply_event(&conn, emb, ev) {
+            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+        }
     }
 
     json!({"id": id, "type": "ok", "entry_id": entry_id})
