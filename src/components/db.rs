@@ -333,32 +333,18 @@ pub fn apply_event(
                 params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
             )?;
 
-            // Update evidence_status on the parent entry via the soft-mandate helper.
-            // Preserve 'n/a' for truly legacy entries (those that have no explicit kind
-            // event — detected by kind column still holding the column default 'belief'
-            // AND evidence_status still holding 'n/a' AND this being the first evidence row).
-            let current_status: String = conn
-                .query_row(
-                    "SELECT COALESCE(evidence_status, 'n/a') FROM entries WHERE id=?1",
-                    params![entry_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or_else(|_| "n/a".to_string());
-            // Only update if the entry was already explicitly tracked (status != 'n/a')
-            // OR if after this insert there is more than 1 evidence row (meaning the
-            // entry had prior evidence, so it was already out of legacy-untouched state).
-            let ev_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
-                params![entry_id],
-                |r| r.get(0),
+            // Recompute evidence_status unconditionally. The prior "preserve n/a for
+            // legacy entries" branch caused incremental-vs-replay divergence: a legacy
+            // upsert (no explicit kind/evidence_status) followed by evidence_add kept
+            // evidence_status='n/a' on the incremental path, while a full rebuild from
+            // the same events would converge to 'present' via compute_evidence_status.
+            // The fix is to always call the soft-mandate helper after an evidence row
+            // change so both paths agree (br-f7y).
+            let new_status = compute_evidence_status(conn, entry_id)?;
+            conn.execute(
+                "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                params![new_status, entry_id],
             )?;
-            if current_status != "n/a" || ev_count > 1 {
-                let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
-            }
         }
 
         ("evidence_expire", "evidence") => {
@@ -1180,6 +1166,22 @@ mod tests {
                     "kind": KINDS[ki],
                     "evidence_status": "missing",
                     "ts": "2024-01-01T00:00:00Z"
+                })
+            }),
+            // legacy upsert (no kind/evidence_status fields — pre-Phase-0 event shape).
+            // Without this variant, the convergence proptest never exercises the
+            // incremental-vs-replay desync the column-default fallback used to hide
+            // (br-f7y).
+            arb_entry_id().prop_map(|id| {
+                serde_json::json!({
+                    "action": "upsert",
+                    "table": "entries",
+                    "id": id,
+                    "path": format!("src/{id}.rs"),
+                    "summary": format!("legacy summary for {id}"),
+                    "content": format!("legacy content for {id}"),
+                    "tags": [],
+                    "ts": "2023-01-01T00:00:00Z"
                 })
             }),
             // expire entry
