@@ -164,6 +164,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
+    // Migration: add updated_at to source_weights for Phase 5 weight tracking.
+    let _ = conn.execute_batch("ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));");
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -195,6 +197,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
             successes   INTEGER NOT NULL DEFAULT 0,
             failures    INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (kind, session_id)
         );
         "#,
