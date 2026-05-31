@@ -133,13 +133,13 @@ pub fn verify_evidence(ev: &Evidence, repo_root: &Path) -> Result<bool> {
     }
 
     // Seek to start position.
-    if let Err(_) = file.seek(SeekFrom::Start(start as u64)) {
+    if file.seek(SeekFrom::Start(start as u64)).is_err() {
         return Ok(false); // seek error → false per AC16
     }
 
     // Read exactly range_size bytes.
     let mut buffer = vec![0u8; range_size as usize];
-    if let Err(_) = file.read_exact(&mut buffer) {
+    if file.read_exact(&mut buffer).is_err() {
         return Ok(false); // read error → false per AC16
     }
 
@@ -397,15 +397,30 @@ mod tests {
         assert_eq!(verify_evidence(&ev, dir).unwrap(), false);
     }
 
+    /// File larger than MAX_FILE_BYTES is rejected.
+    ///
+    /// Uses `File::set_len` to create a sparse file — O(1) on ext4/btrfs/tmpfs
+    /// (no 64 MiB of bytes actually allocated), so the test is fast.
     #[test]
     fn test_verify_evidence_rejects_oversized_file() {
-        // Reject files larger than MAX_FILE_BYTES (64 MiB).
-        // Creating a 65 MiB tempfile is expensive, so we skip this test
-        // in favor of the oversized-range test which covers the same risk surface.
-        // The oversized-range test validates the range check; a parallel
-        // file-size check with similar out-of-bounds logic is redundant.
-        // Document: both checks in verify_evidence follow the pattern of
-        // Ok(false) on limit violation. Ensure metadata.len() >= MAX_FILE_BYTES
-        // returns false; the test harness should verify this separately if needed.
+        use std::fs::File;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("big.bin");
+        let f = File::create(&file_path).unwrap();
+        // 1 byte past the cap — fastest way to trip the metadata().len() check.
+        f.set_len(MAX_FILE_BYTES + 1).unwrap();
+        drop(f);
+
+        // Citation range is within the file but the file itself is oversized.
+        let ev = make_evidence(
+            Some("big.bin:0-10".to_string()),
+            "sha256:anything".to_string(),
+            "code",
+        );
+        assert_eq!(
+            verify_evidence(&ev, dir.path()).unwrap(),
+            false,
+            "files larger than MAX_FILE_BYTES must return Ok(false)"
+        );
     }
 }
