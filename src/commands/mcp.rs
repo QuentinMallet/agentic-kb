@@ -10,7 +10,7 @@ use crate::commands::add_validation::{compute_evidence_status_write, validate_kb
 use crate::components::{db, embedder, events};
 use crate::config;
 use crate::models::Evidence;
-use abscissa_core::{Command, Runnable};
+use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
 use rusqlite::params;
@@ -55,6 +55,12 @@ impl Mcp {
             ..paths
         };
 
+        // br-3gp: read KbConfig::inline_verify_k once at startup so MCP search
+        // requests without an explicit override fall back to the configured cap
+        // (default 10) instead of `limit`, which made AC18's narrow-K cap
+        // unreachable.
+        let inline_verify_k_default = crate::application::APP.config().inline_verify_k;
+
         // Build embedder once; reused for all requests in this session.
         let emb = make_embedder(&paths);
 
@@ -72,7 +78,7 @@ impl Mcp {
             if line.trim().is_empty() {
                 continue;
             }
-            let response = handle_request(&line, &paths, emb.as_ref());
+            let response = handle_request(&line, &paths, emb.as_ref(), inline_verify_k_default);
             println!("{response}");
             io::stdout().flush()?;
         }
@@ -80,7 +86,12 @@ impl Mcp {
     }
 }
 
-fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_request(
+    line: &str,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+    inline_verify_k_default: usize,
+) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -92,7 +103,7 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "search" => handle_search(&id, &req, paths, emb),
+        "search" => handle_search(&id, &req, paths, emb, inline_verify_k_default),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
@@ -112,7 +123,13 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 }
 
-fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_search(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+    inline_verify_k_default: usize,
+) -> Value {
     let query = match req.get("query").and_then(|q| q.as_str()) {
         Some(q) => q.to_string(),
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"}),
@@ -122,7 +139,12 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
     let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let inline_verify_k = req.get("inline_verify_k").and_then(|v| v.as_u64()).unwrap_or(limit as u64) as usize;
+    // br-3gp: request override falls back to KbConfig::inline_verify_k (default
+    // 10) rather than `limit`, so the configured cap is reachable.
+    let inline_verify_k = req
+        .get("inline_verify_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(inline_verify_k_default as u64) as usize;
     let opts = db::SearchOptions {
         limit,
         do_fts: mode == "fts" || mode == "hybrid",
@@ -817,7 +839,7 @@ mod tests {
 
         // Search with path_prefix filter
         let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
-        let resp = handle_search(&id, &req, &paths, &emb);
+        let resp = handle_search(&id, &req, &paths, &emb, 10);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
