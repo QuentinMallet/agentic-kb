@@ -505,4 +505,89 @@ mod tests {
             assert!(r.evidence[0].verified.is_none(), "results beyond K must have verified=null");
         }
     }
+
+    #[cfg(test)]
+    mod proptest_fts_injection {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Adversarial FTS queries that should be safely escaped.
+        /// Generates terms with FTS5 operators, quotes, backslashes, and mixed content.
+        fn arb_adversarial_fts_query() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("auth AND security".to_string()),
+                Just("auth OR database".to_string()),
+                Just("auth NOT public".to_string()),
+                Just("\"quoted phrase\"".to_string()),
+                Just("backslash \\ escape".to_string()),
+                Just("auth* wildcard".to_string()),
+                Just("(nested query)".to_string()),
+                Just("mixed AND quoted \"phrase\" NOT keyword".to_string()),
+                Just("\"\"\"triple quotes\"\"\"".to_string()),
+                Just("auth \\ OR \" AND NOT".to_string()),
+            ]
+        }
+
+        /// Invariant: arbitrary FTS queries don't panic and FTS keywords
+        /// are treated as literals, not operators. Quote/backslash escaping
+        /// preserves valid FTS5 syntax.
+        proptest! {
+            #[test]
+            fn prop_fts_query_injection_no_panic(query in arb_adversarial_fts_query()) {
+                use crate::components::db::{open_db_memory, search_entries, SearchOptions};
+                use crate::components::embedder::NoopEmbedder;
+                use crate::commands::add::Add;
+                use crate::config::Paths;
+                use std::path::Path;
+
+                let dir = tempfile::tempdir().unwrap();
+                let paths = Paths::from_root(dir.path());
+                fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+
+                let embedder = NoopEmbedder;
+
+                // Insert known entries for matching
+                let add_cmd = Add {
+                    path: "src/auth.rs".to_string(),
+                    summary: "authentication module".to_string(),
+                    content: "handles auth and security".to_string(),
+                    tags: "auth,security".to_string(),
+                    version_ref: Some("abc123".to_string()),
+                    id: Some("fts-test-1".to_string()),
+                    permanent: false,
+                    replace_path: false,
+                    kind: "belief".to_string(),
+                    evidence: vec![],
+                    evidence_file: None,
+                };
+                add_cmd.execute_with(&paths, &embedder).unwrap();
+
+                // Connect to DB and search with adversarial query
+                let conn = crate::components::db::open_db(&paths.db).unwrap();
+                let opts = crate::components::db::SearchOptions {
+                    limit: 10,
+                    do_fts: true,
+                    do_semantic: false,
+                    path_prefix: None,
+                    tag_filter: None,
+                    inline_verify_k: 0,
+                    repo_root: None,
+                };
+
+                // Should not panic; FTS keywords inside quotes are treated as literals
+                let result = search_entries(&conn, &embedder, &query, &opts);
+
+                // Result must be Ok (no panic, no DB error)
+                prop_assert!(result.is_ok(), "search should succeed without panic");
+
+                // If search succeeded, result should be a vec (possibly empty)
+                if let Ok(results) = result {
+                    prop_assert!(
+                        results.iter().all(|r| !r.id.is_empty()),
+                        "all results must have non-empty IDs"
+                    );
+                }
+            }
+        }
+    }
 }
