@@ -18,7 +18,7 @@ defmodule AgenticKbMcp.McpServer do
         "type" => "object",
         "properties" => %{
           "query" => %{"type" => "string", "description" => "Search query"},
-          "limit" => %{"type" => "integer", "description" => "Max results (default 10)"},
+          "limit" => %{"type" => "integer", "description" => "Max results (default 10, clamped to 100)"},
           "mode" => %{
             "type" => "string",
             "enum" => ["hybrid", "fts", "semantic"],
@@ -34,7 +34,7 @@ defmodule AgenticKbMcp.McpServer do
           },
           "inline_verify_k" => %{
             "type" => "integer",
-            "description" => "How many top results to inline-verify (byte-hash check vs HEAD). Default equals `limit`. Results beyond this budget have `verified=null`."
+            "description" => "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`), clamped to 20. Results beyond this budget have `verified=null`."
           }
         },
         "required" => ["query"]
