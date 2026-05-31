@@ -265,8 +265,8 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         .cloned()
         .unwrap_or_default();
 
-    // Validate kind enum and evidence constraints before acquiring the lock.
-    if let Err(e) = validate_kb_add_inputs(&kind, &evidence_rows) {
+    // Validate kind enum, tags, and evidence constraints before acquiring the lock.
+    if let Err(e) = validate_kb_add_inputs(&kind, &tags, &evidence_rows) {
         return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
     }
 
@@ -799,6 +799,35 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = config::Paths::from_root(root);
         (dir, paths, NoopEmbedder)
+    }
+
+    // br-9lq (I-2): MCP path must reject malformed tags via validate_kb_add_inputs.
+
+    #[test]
+    fn test_kb_add_mcp_rejects_malformed_tags() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("bad-tags-1");
+
+        // tags is not an array
+        let req = json!({"method":"add","id":"bad-tags-1","path":"test/bt","summary":"s","content":"c","tags":"not-an-array"});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "validation_error");
+        assert!(resp["message"].as_str().unwrap().contains("tags must be a JSON array"));
+
+        // tags contains a non-string element
+        let req2 = json!({"method":"add","id":"bad-tags-2","path":"test/bt2","summary":"s","content":"c","tags":["good", 42]});
+        let resp2 = handle_add(&id, &req2, &paths, &emb);
+        assert_eq!(resp2["type"], "error");
+        assert_eq!(resp2["code"], "validation_error");
+        assert!(resp2["message"].as_str().unwrap().contains("tags[1] must be a string"));
+
+        // tags contains an empty string
+        let req3 = json!({"method":"add","id":"bad-tags-3","path":"test/bt3","summary":"s","content":"c","tags":["good",""]});
+        let resp3 = handle_add(&id, &req3, &paths, &emb);
+        assert_eq!(resp3["type"], "error");
+        assert_eq!(resp3["code"], "validation_error");
+        assert!(resp3["message"].as_str().unwrap().contains("tags[1] must be non-empty"));
     }
 
     #[test]

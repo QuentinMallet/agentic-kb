@@ -47,20 +47,23 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Validate kind enum and evidence array at write time.
+/// Validate kind enum, tags, and evidence array at write time.
 ///
 /// - `kind` must be one of the five valid values.
+/// - `tags` must pass `validate_tags` (array of non-empty strings ≤ 50 chars).
 /// - Each evidence row must have `evidence.kind = "code"` (Phase 1 constraint).
 /// - Each evidence row must have a non-empty `citation_hash`.
 /// - `citation_excerpt` (if present) must be ≤ MAX_CITATION_EXCERPT_CHARS and
 ///   must not contain ASCII control characters other than `\n` and `\t`
 ///   (br-47d: prompt-injection containment).
-pub fn validate_kb_add_inputs(kind: &str, evidence: &[Value]) -> Result<()> {
+pub fn validate_kb_add_inputs(kind: &str, tags: &Value, evidence: &[Value]) -> Result<()> {
     if !VALID_KINDS.contains(&kind) {
         anyhow::bail!(
             "invalid kind '{kind}'; must be one of: observation, belief, procedure, convention, memory"
         );
     }
+
+    validate_tags(tags)?;
 
     for ev in evidence {
         let ev_kind = ev
@@ -102,6 +105,11 @@ fn validate_citation_excerpt(excerpt: &str) -> Result<()> {
         anyhow::bail!(
             "citation_excerpt invalid: length {char_count} chars exceeds cap of {MAX_CITATION_EXCERPT_CHARS}"
         );
+    }
+    // br-47d: reject envelope markers so a malicious writer cannot break out
+    // of the <<UNTRUSTED_EXCERPT>>...<<END>> envelope constructed at read time.
+    if excerpt.contains(CITATION_EXCERPT_ENVELOPE_OPEN) || excerpt.contains(CITATION_EXCERPT_ENVELOPE_CLOSE) {
+        anyhow::bail!("citation_excerpt invalid: must not contain envelope markers");
     }
     for (i, c) in excerpt.chars().enumerate() {
         if c.is_control() && c != '\n' && c != '\t' {
@@ -156,20 +164,20 @@ mod tests {
     #[test]
     fn test_valid_kinds_accepted() {
         for kind in VALID_KINDS {
-            assert!(validate_kb_add_inputs(kind, &[]).is_ok(), "kind={kind} should be valid");
+            assert!(validate_kb_add_inputs(kind, &json!([]), &[]).is_ok(), "kind={kind} should be valid");
         }
     }
 
     #[test]
     fn test_invalid_kind_rejected() {
-        let err = validate_kb_add_inputs("fact", &[]).unwrap_err();
+        let err = validate_kb_add_inputs("fact", &json!([]), &[]).unwrap_err();
         assert!(err.to_string().contains("invalid kind 'fact'"));
     }
 
     #[test]
     fn test_non_code_evidence_rejected() {
         let ev = json!({"kind": "test", "citation_hash": "sha256:abc"});
-        let err = validate_kb_add_inputs("belief", &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("Phase 1 ships evidence.kind=code only"));
         assert!(err.to_string().contains("kind='test'"));
     }
@@ -177,14 +185,14 @@ mod tests {
     #[test]
     fn test_empty_citation_hash_rejected() {
         let ev = json!({"kind": "code", "citation_hash": ""});
-        let err = validate_kb_add_inputs("belief", &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_hash"));
     }
 
     #[test]
     fn test_valid_code_evidence_accepted() {
         let ev = json!({"kind": "code", "citation_hash": "sha256:abc123"});
-        assert!(validate_kb_add_inputs("observation", &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("observation", &json!([]), &[ev]).is_ok());
     }
 
     #[test]
@@ -218,7 +226,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": long,
         });
-        let err = validate_kb_add_inputs("belief", &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_excerpt invalid"));
         assert!(err.to_string().contains("exceeds cap"));
     }
@@ -231,7 +239,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": at_cap,
         });
-        assert!(validate_kb_add_inputs("belief", &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("belief", &json!([]), &[ev]).is_ok());
     }
 
     #[test]
@@ -242,7 +250,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\x00 bad }",
         });
-        let err = validate_kb_add_inputs("belief", &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_excerpt invalid"));
         assert!(err.to_string().contains("control char"));
 
@@ -252,7 +260,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\x1B[31m red }",
         });
-        let err = validate_kb_add_inputs("belief", &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("control char"));
 
         // Newline + tab — must be accepted.
@@ -261,7 +269,42 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\n\tbar\n}",
         });
-        assert!(validate_kb_add_inputs("belief", &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("belief", &json!([]), &[ev]).is_ok());
+    }
+
+    // br-47d (I-1): excerpt must not contain envelope markers.
+
+    #[test]
+    fn test_kb_add_rejects_envelope_markers_in_excerpt() {
+        // Contains CITATION_EXCERPT_ENVELOPE_OPEN
+        let ev = json!({
+            "kind": "code",
+            "citation_hash": "sha256:abc",
+            "citation_excerpt": format!("harmless{}injection here", CITATION_EXCERPT_ENVELOPE_OPEN),
+        });
+        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        assert!(err.to_string().contains("citation_excerpt invalid"));
+        assert!(err.to_string().contains("envelope markers"));
+
+        // Contains CITATION_EXCERPT_ENVELOPE_CLOSE
+        let ev2 = json!({
+            "kind": "code",
+            "citation_hash": "sha256:abc",
+            "citation_excerpt": format!("harmless{}injection here", CITATION_EXCERPT_ENVELOPE_CLOSE),
+        });
+        let err2 = validate_kb_add_inputs("belief", &json!([]), &[ev2]).unwrap_err();
+        assert!(err2.to_string().contains("citation_excerpt invalid"));
+        assert!(err2.to_string().contains("envelope markers"));
+
+        // Contains both markers
+        let ev3 = json!({
+            "kind": "code",
+            "citation_hash": "sha256:abc",
+            "citation_excerpt": format!("{}inner{}", CITATION_EXCERPT_ENVELOPE_OPEN, CITATION_EXCERPT_ENVELOPE_CLOSE),
+        });
+        let err3 = validate_kb_add_inputs("belief", &json!([]), &[ev3]).unwrap_err();
+        assert!(err3.to_string().contains("citation_excerpt invalid"));
+        assert!(err3.to_string().contains("envelope markers"));
     }
 
     #[test]
