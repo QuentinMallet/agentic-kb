@@ -10,7 +10,7 @@ use crate::commands::add_validation::{compute_evidence_status_write, validate_kb
 use crate::components::{db, embedder, events};
 use crate::config;
 use crate::models::Evidence;
-use abscissa_core::{Command, Runnable};
+use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
 use rusqlite::params;
@@ -55,6 +55,12 @@ impl Mcp {
             ..paths
         };
 
+        // br-3gp: read KbConfig::inline_verify_k once at startup so MCP search
+        // requests without an explicit override fall back to the configured cap
+        // (default 10) instead of `limit`, which made AC18's narrow-K cap
+        // unreachable.
+        let inline_verify_k_default = crate::application::APP.config().inline_verify_k;
+
         // Build embedder once; reused for all requests in this session.
         let emb = make_embedder(&paths);
 
@@ -72,7 +78,7 @@ impl Mcp {
             if line.trim().is_empty() {
                 continue;
             }
-            let response = handle_request(&line, &paths, emb.as_ref());
+            let response = handle_request(&line, &paths, emb.as_ref(), inline_verify_k_default);
             println!("{response}");
             io::stdout().flush()?;
         }
@@ -80,7 +86,12 @@ impl Mcp {
     }
 }
 
-fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_request(
+    line: &str,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+    inline_verify_k_default: usize,
+) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
@@ -92,7 +103,7 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "search" => handle_search(&id, &req, paths, emb),
+        "search" => handle_search(&id, &req, paths, emb, inline_verify_k_default),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
@@ -112,7 +123,13 @@ fn handle_request(line: &str, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 }
 
-fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_search(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+    inline_verify_k_default: usize,
+) -> Value {
     let query = match req.get("query").and_then(|q| q.as_str()) {
         Some(q) => q.to_string(),
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"}),
@@ -122,8 +139,19 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
     let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let inline_verify_k = req.get("inline_verify_k").and_then(|v| v.as_u64()).unwrap_or(limit as u64) as usize;
-    // MCP port is typically spawned with CWD=`/` (Elixir PortManager), so
+    // br-3gp: request override falls back to KbConfig::inline_verify_k (default
+    // 10) rather than `limit`, so the configured cap is reachable.
+    let inline_verify_k = req
+        .get("inline_verify_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(inline_verify_k_default as u64) as usize;
+
+    // br-h9g (security I2): clamp untrusted request inputs to prevent
+    // thread::scope amplification (limit * inline_verify_k * evidence_rows).
+    let limit = limit.min(db::MAX_LIMIT);
+    let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
+
+    // br-bhg: MCP port is typically spawned with CWD=`/` (Elixir PortManager), so
     // CWD-based `find_repo_root()` discovery fails. Pass the repo root derived
     // from the explicitly-provided db path (`<root>/agent-kb/agent-kb.db`).
     let repo_root = Some(root_from_db(&paths.db));
@@ -822,10 +850,124 @@ mod tests {
 
         // Search with path_prefix filter
         let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
-        let resp = handle_search(&id, &req, &paths, &emb);
+        let resp = handle_search(&id, &req, &paths, &emb, 10);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
+    }
+
+    /// br-h9g (security I2): a request with limit far above MAX_LIMIT must be
+    /// clamped so the response contains at most MAX_LIMIT entries, capping
+    /// thread::scope amplification.
+    #[test]
+    fn test_search_clamps_limit() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("clamp-limit");
+
+        // Insert MAX_LIMIT + 5 entries with a shared summary token so FTS hits
+        // each row.
+        let n = db::MAX_LIMIT + 5;
+        for i in 0..n {
+            let req_add = json!({
+                "method":"add","id":format!("add-{i}"),
+                "path":format!("src/clamp_{i}.rs"),
+                "summary":"clamp-limit-needle entry",
+                "content":format!("entry {i} body"),
+                "tags":[]
+            });
+            handle_add(&id, &req_add, &paths, &emb);
+        }
+
+        // Request a limit far above MAX_LIMIT.
+        let req = json!({
+            "method":"search","id":"clamp-limit-search",
+            "query":"clamp-limit-needle","mode":"fts","limit":10_000
+        });
+        let resp = handle_search(&id, &req, &paths, &emb, 10);
+        assert_eq!(resp["type"], "result");
+        let entries = resp["entries"].as_array().unwrap();
+        assert!(
+            entries.len() <= db::MAX_LIMIT,
+            "limit must be clamped to MAX_LIMIT={}, got {}",
+            db::MAX_LIMIT, entries.len()
+        );
+    }
+
+    /// br-h9g (security I2): a request with inline_verify_k far above
+    /// MAX_INLINE_VERIFY_K must be clamped so only the first
+    /// MAX_INLINE_VERIFY_K entries have evidence verified inline; the rest
+    /// return verified=null.
+    #[test]
+    fn test_search_clamps_inline_verify_k() {
+        use sha2::{Digest, Sha256};
+
+        let (dir, paths, emb) = setup();
+        let id = json!("clamp-ivk");
+
+        // Create a stable cited file inside the tempdir so the verification
+        // path has a target to load (the result of verification does not
+        // matter — only whether `verified` is Some vs None).
+        let cited_content = b"clamp ivk cited body";
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("ivk.rs"), cited_content).unwrap();
+        let mut h = Sha256::new();
+        h.update(cited_content);
+        let hash = format!("sha256:{:x}", h.finalize());
+        let end = cited_content.len();
+        let citation_path = format!("src/ivk.rs:0-{end}");
+
+        // Insert MAX_INLINE_VERIFY_K + 5 entries each with 1 evidence row,
+        // sharing one FTS-matching token.
+        let n = db::MAX_INLINE_VERIFY_K + 5;
+        for i in 0..n {
+            let evidence_json = json!({
+                "kind":"code",
+                "citation_path": citation_path,
+                "citation_sha": null,
+                "citation_hash": hash,
+                "citation_excerpt": "clamp"
+            });
+            let req_add = json!({
+                "method":"add","id":format!("ivk-{i}"),
+                "path":format!("src/ivk_{i}.rs"),
+                "summary":"clamp-ivk-needle entry",
+                "content":format!("ivk body {i}"),
+                "tags":[],
+                "kind":"observation",
+                "evidence":[evidence_json]
+            });
+            handle_add(&id, &req_add, &paths, &emb);
+        }
+
+        // Request inline_verify_k far above MAX_INLINE_VERIFY_K and a limit
+        // that returns all of them.
+        let req = json!({
+            "method":"search","id":"clamp-ivk-search",
+            "query":"clamp-ivk-needle","mode":"fts",
+            "limit": n,
+            "inline_verify_k": 10_000
+        });
+        let resp = handle_search(&id, &req, &paths, &emb, 10);
+        assert_eq!(resp["type"], "result");
+        let entries = resp["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), n, "all entries must be returned");
+
+        let verified_count = entries
+            .iter()
+            .filter(|e| {
+                e["evidence"].as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|ev| ev.get("verified"))
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            verified_count <= db::MAX_INLINE_VERIFY_K,
+            "inline_verify_k must be clamped to MAX_INLINE_VERIFY_K={}, got {} verified",
+            db::MAX_INLINE_VERIFY_K, verified_count
+        );
     }
 
     #[test]

@@ -7,6 +7,33 @@ use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// ---------------------------------------------------------------------------
+// Resource caps (br-h9g, security I2)
+// ---------------------------------------------------------------------------
+//
+// The MCP entry points are reachable by any local agent that speaks the port
+// protocol, so request inputs must be treated as untrusted. Two amplification
+// vectors motivated these caps:
+//
+//   1. `limit` and `inline_verify_k` together gate how many entries get
+//      verified inline. Each verified entry spawns one OS thread per evidence
+//      row via std::thread::scope, so the worst-case thread fan-out is
+//      `limit * evidence_rows_per_entry`. Without caps, a single malicious
+//      request could exhaust the host's thread budget.
+//
+//   2. `evidence` rows per entry are operator-authored today but could be
+//      bulk-imported tomorrow; bounding the per-entry fetch prevents one
+//      pathological entry from dominating a search response (and its
+//      verification fan-out).
+//
+// Values are deliberately conservative — they sit well above any observed
+// agent workflow (typical limit=10, inline_verify_k=10, evidence rows ~5)
+// while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
+// = 4k verification threads, which the test host tolerates.
+pub const MAX_LIMIT: usize = 100;
+pub const MAX_INLINE_VERIFY_K: usize = 20;
+pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
+
 /// Compute the `evidence_status` value for an entry based on its kind and
 /// the number of evidence rows currently linked to it.
 ///
@@ -437,8 +464,13 @@ pub struct SearchEntry {
     pub evidence: Vec<SearchEvidence>,
 }
 
-/// Fetch all evidence rows for the given entry IDs.
-/// Returns a map from entry_id to Vec<Evidence>.
+/// Fetch evidence rows for the given entry IDs, capped at
+/// `MAX_EVIDENCE_ROWS_PER_ENTRY` per entry (br-h9g, security I2).
+///
+/// Issues one parameterised query per entry so the `LIMIT` clause caps
+/// per-entry rather than across the whole batch. When truncation occurs a
+/// warning is emitted to stderr so operators can see which entries have
+/// excess evidence in their KB.
 fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
@@ -448,36 +480,42 @@ fn fetch_evidence_for_entries(
     if entry_ids.is_empty() {
         return Ok(map);
     }
-    // Build parameterized IN clause
-    let placeholders: String = entry_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
+    // Fetch one extra row so we can detect truncation without an extra COUNT(*).
+    let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
+    let mut stmt = conn.prepare(
         "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
-         FROM evidence WHERE entry_id IN ({placeholders})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<Evidence> = stmt
-        .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
-            Ok(Evidence {
-                id: r.get(0)?,
-                entry_id: r.get(1)?,
-                kind: r.get(2)?,
-                citation_path: r.get(3)?,
-                citation_sha: r.get(4)?,
-                citation_hash: r.get(5).unwrap_or_default(),
-                citation_excerpt: r.get(6)?,
-                derived_from: r.get(7)?,
-                recorded_at: r.get(8)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    for ev in rows {
-        map.entry(ev.entry_id.clone()).or_default().push(ev);
+         FROM evidence
+         WHERE entry_id = ?1
+         ORDER BY recorded_at, id
+         LIMIT ?2",
+    )?;
+    for entry_id in entry_ids {
+        let rows: Vec<Evidence> = stmt
+            .query_map(params![entry_id, probe_limit], |r| {
+                Ok(Evidence {
+                    id: r.get(0)?,
+                    entry_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    citation_path: r.get(3)?,
+                    citation_sha: r.get(4)?,
+                    citation_hash: r.get(5).unwrap_or_default(),
+                    citation_excerpt: r.get(6)?,
+                    derived_from: r.get(7)?,
+                    recorded_at: r.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+            eprintln!(
+                "kb: entry {entry_id} evidence rows truncated to MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                rows.len()
+            );
+            let capped: Vec<Evidence> = rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
+            map.insert(entry_id.clone(), capped);
+        } else if !rows.is_empty() {
+            map.insert(entry_id.clone(), rows);
+        }
     }
     Ok(map)
 }
@@ -938,6 +976,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_stale, 0, "events without is_stale must default to active");
+    }
+
+    /// br-h9g (security I2): fetch_evidence_for_entries must cap rows at
+    /// MAX_EVIDENCE_ROWS_PER_ENTRY even when the underlying table holds more.
+    /// Bounds the thread::scope fan-out in search_entries.
+    #[test]
+    fn test_fetch_evidence_caps_rows_per_entry() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Seed one entry the evidence rows can attach to.
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "cap-host", "path": "src/cap.rs", "summary": "cap host",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Insert MAX_EVIDENCE_ROWS_PER_ENTRY + 50 evidence rows for that entry.
+        let extra = 50;
+        for i in 0..(MAX_EVIDENCE_ROWS_PER_ENTRY + extra) {
+            conn.execute(
+                "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                 VALUES(?1, ?2, 'code', 'sha256:abc', ?3)",
+                params![format!("ev-{i:04}"), "cap-host", format!("2024-01-01T00:00:{:02}Z", i % 60)],
+            ).unwrap();
+        }
+
+        let map = fetch_evidence_for_entries(&conn, &["cap-host".to_string()]).unwrap();
+        let rows = map.get("cap-host").expect("entry must be present");
+        assert_eq!(
+            rows.len(),
+            MAX_EVIDENCE_ROWS_PER_ENTRY,
+            "fetch_evidence_for_entries must truncate to MAX_EVIDENCE_ROWS_PER_ENTRY"
+        );
     }
 
     // -----------------------------------------------------------------------
