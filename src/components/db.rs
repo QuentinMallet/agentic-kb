@@ -157,6 +157,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // Legacy entries default to kind='belief', evidence_status='n/a' via column DEFAULT.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT DEFAULT 'belief';");
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
+    // Migration: add session_id column for Phase 5 audit confidence per-session weighting.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -179,6 +181,13 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
             evidence_ref TEXT
+        );
+        CREATE TABLE IF NOT EXISTS source_weights (
+            kind        TEXT NOT NULL,
+            session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+            successes   INTEGER NOT NULL DEFAULT 0,
+            failures    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (kind, session_id)
         );
         "#,
     )?;
@@ -771,6 +780,50 @@ mod tests {
         assert!(tables.contains(&"entries_emb".to_string()));
         assert!(tables.contains(&"evidence".to_string()));
         assert!(tables.contains(&"audit_runs".to_string()));
+        assert!(tables.contains(&"source_weights".to_string()));
+    }
+
+    #[test]
+    fn test_init_creates_source_weights_table() {
+        let conn = open_db_memory().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(source_weights)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(cols.contains(&"kind".to_string()));
+        assert!(cols.contains(&"session_id".to_string()));
+        assert!(cols.contains(&"successes".to_string()));
+        assert!(cols.contains(&"failures".to_string()));
+    }
+
+    #[test]
+    fn test_init_adds_session_id_column_on_legacy_db() {
+        // Simulate a pre-Phase-5 DB: create entries table without session_id,
+        // then run ensure_schema and confirm the column was added.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entries (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL
+            );"
+        ).unwrap();
+        // Running ensure_schema on this legacy DB must not error.
+        ensure_schema(&conn).unwrap();
+        // Confirm session_id column now exists.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(entries)")
+            .unwrap()
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(cols.contains(&"session_id".to_string()), "session_id must be added to legacy entries table");
     }
 
     #[test]

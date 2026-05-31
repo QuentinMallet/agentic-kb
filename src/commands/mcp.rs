@@ -265,14 +265,14 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         .cloned()
         .unwrap_or_default();
 
+    let entry_id = uuid::Uuid::new_v4().to_string();
+
     // Validate kind enum, tags, and evidence constraints before acquiring the lock.
-    if let Err(e) = validate_kb_add_inputs(&kind, &tags, &evidence_rows) {
+    if let Err(e) = validate_kb_add_inputs(&entry_id, &kind, &tags, &evidence_rows) {
         return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
     }
 
     let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
-
-    let entry_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
     let version_ref = config::git_head_sha();
 
