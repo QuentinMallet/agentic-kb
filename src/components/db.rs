@@ -159,6 +159,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
     // Migration: add session_id column for Phase 5 audit confidence per-session weighting.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
+    // Migration: add run_id to audit_runs for Phase 5 idempotency (INSERT OR IGNORE on unique index).
+    let _ = conn.execute_batch("ALTER TABLE audit_runs ADD COLUMN run_id TEXT;");
+    let _ = conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
+    );
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -177,11 +182,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS audit_runs (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id       TEXT,
             entry_id     TEXT NOT NULL,
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
             evidence_ref TEXT
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry
+            ON audit_runs(run_id, entry_id);
         CREATE TABLE IF NOT EXISTS source_weights (
             kind        TEXT NOT NULL,
             session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
@@ -218,10 +226,11 @@ pub fn apply_event(
             // 'belief' / 'n/a' — matching the column DEFAULT for pre-migration rows.
             let kind = event["kind"].as_str().unwrap_or("belief");
             let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
+            let session_id = event["session_id"].as_str();
 
             conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)
+                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
                  ON CONFLICT(id) DO UPDATE SET
                    path=excluded.path, summary=excluded.summary,
                    content=excluded.content, tags=excluded.tags,
@@ -230,8 +239,9 @@ pub fn apply_event(
                    is_stale=excluded.is_stale,
                    kind=excluded.kind,
                    evidence_status=excluded.evidence_status,
+                   session_id=excluded.session_id,
                    updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, ts],
+                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
             )?;
 
             // Stale entries: clean up FTS/embeddings so they don't appear in search
@@ -458,6 +468,10 @@ pub struct SearchEntry {
     pub source: &'static str,
     /// Evidence rows with inline verification results.
     pub evidence: Vec<SearchEvidence>,
+    /// Beta(1,1) posterior confidence: (s+1)/(s+f+2). Bootstrap value 0.5 when no audits.
+    pub confidence: f32,
+    /// Total audit verdicts recorded for this entry's (kind, session_id) pair.
+    pub audit_n: u32,
 }
 
 /// Fetch evidence rows for the given entry IDs, capped at
@@ -577,6 +591,8 @@ pub fn search_entries(
                 score: 1.0,
                 source: "fts",
                 evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
             });
         }
     }
@@ -626,6 +642,8 @@ pub fn search_entries(
                 score: sim,
                 source: "semantic",
                 evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
             });
         }
 
@@ -640,6 +658,47 @@ pub fn search_entries(
 
     // Fetch evidence rows for all result entries and attach with inline verification.
     let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+
+    // Prefetch source_weights in ONE query (br-ei2.8 AC5: not per-row subquery).
+    // Uses COALESCE(entries.session_id, '__GLOBAL__') to match the write path.
+    let weights_map: std::collections::HashMap<String, (i64, i64)> = if entry_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let placeholders: String = (1..=entry_ids.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT e.id, COALESCE(sw.successes,0), COALESCE(sw.failures,0)
+             FROM entries e
+             LEFT JOIN source_weights sw
+               ON sw.kind = e.kind
+               AND sw.session_id = COALESCE(e.session_id,'__GLOBAL__')
+             WHERE e.id IN ({})",
+            placeholders
+        );
+        match conn.prepare(&sql) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .map(|(id, s, f)| (id, (s, f)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
+
+    // Attach confidence from prefetched weights (Beta(1,1) posterior).
+    for entry in &mut entries {
+        let (s, f) = weights_map.get(&entry.id).copied().unwrap_or((0, 0));
+        entry.confidence = (s + 1) as f32 / (s + f + 2) as f32;
+        entry.audit_n = (s + f) as u32;
+    }
+
     let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
 
     // Resolve repo root: prefer explicit `opts.repo_root` (MCP path — CWD is

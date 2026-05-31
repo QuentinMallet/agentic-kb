@@ -116,6 +116,10 @@ fn handle_request(
         "test_add" => handle_test_add(&id, &req, paths, emb),
         "tests" => handle_tests(&id, &req, paths),
         "rebuild" => handle_rebuild(&id, paths, emb),
+        "audit_run" => handle_audit_run(&id, &req, paths),
+        "audit_record" => handle_audit_record(&id, &req, paths, emb),
+        "audit_report" => handle_audit_report(&id, paths),
+        "provenance" => handle_provenance(&id, &req, paths),
         _ => json!({
             "id": id,
             "type": "error",
@@ -220,6 +224,8 @@ fn handle_search(
                         "id": e.id,
                         "source": e.source,
                         "evidence": evidence,
+                        "confidence": e.confidence,
+                        "audit_n": e.audit_n,
                     })
                 })
                 .collect();
@@ -264,6 +270,7 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let session_id = req.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let entry_id = uuid::Uuid::new_v4().to_string();
 
@@ -321,7 +328,7 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         }
     }
 
-    // Build Add event (carries kind + evidence_status).
+    // Build Add event (carries kind + evidence_status + session_id).
     let add_event = json!({
         "action": "upsert",
         "table": "entries",
@@ -334,6 +341,7 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         "permanent": permanent,
         "kind": kind,
         "evidence_status": evidence_status,
+        "session_id": session_id,
         "ts": ts,
         "session": "mcp",
     });
@@ -784,6 +792,310 @@ fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     }
 
     json!({"id": id, "type": "ok", "expired": entry_id})
+}
+
+fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
+    let sample_size = sample_size.clamp(1, 50) as usize;
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT id, path, summary, evidence_status
+         FROM entries
+         WHERE is_stale=0 AND evidence_status='present'
+         ORDER BY RANDOM()
+         LIMIT ?1",
+    ) {
+        Ok(s) => s,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let samples: Vec<Value> = match stmt.query_map(params![sample_size as i64], |r| {
+        Ok(json!({
+            "id": r.get::<_,String>(0)?,
+            "path": r.get::<_,String>(1)?,
+            "summary": r.get::<_,String>(2)?,
+            "evidence_status": r.get::<_,String>(3)?,
+        }))
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    json!({"id": id, "type": "ok", "run_id": run_id, "samples": samples})
+}
+
+fn handle_audit_record(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
+    let run_id = match req.get("run_id").and_then(|v| v.as_str()) {
+        Some(r) => r.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing run_id"}),
+    };
+
+    let verdicts: Vec<Value> = req
+        .get("verdicts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if verdicts.is_empty() {
+        return json!({"id": id, "type": "ok", "recorded": 0, "expired": 0});
+    }
+
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    let mut recorded = 0u32;
+    let mut expired = 0u32;
+
+    for verdict_obj in &verdicts {
+        let entry_id = match verdict_obj.get("entry_id").and_then(|v| v.as_str()) {
+            Some(e) => e.to_string(),
+            None => continue,
+        };
+        let verdict = verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
+        let note = verdict_obj.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id=?1",
+                params![entry_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !exists {
+            return json!({
+                "id": id, "type": "error",
+                "code": "invalid_entry_id",
+                "message": format!("entry '{}' not found", entry_id)
+            });
+        }
+
+        // JSONL-first ordering invariant: expire event BEFORE audit_runs INSERT
+        if !verdict {
+            let expire_ev = json!({
+                "action": "expire", "table": "entries",
+                "id": entry_id, "reason": "audit verdict=false",
+                "ts": ts, "session": "mcp",
+            });
+            if let Err(e) = events::append_event(&paths.events, &expire_ev) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            if let Err(e) = db::apply_event(&conn, emb, &expire_ev) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            expired += 1;
+        }
+
+        // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
+        let inserted = match conn.execute(
+            "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                run_id,
+                entry_id,
+                if verdict { "true" } else { "false" },
+                note,
+                ts
+            ],
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
+
+        if inserted > 0 {
+            // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
+            let (entry_kind, entry_session_id): (String, String) = conn
+                .query_row(
+                    "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
+                    params![entry_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or_else(|_| ("belief".to_string(), "__GLOBAL__".to_string()));
+
+            let weight_sql = if verdict {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
+            } else {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
+            };
+            let _ = conn.execute(weight_sql, params![entry_kind, entry_session_id]);
+            recorded += 1;
+        }
+    }
+
+    json!({"id": id, "type": "ok", "recorded": recorded, "expired": expired})
+}
+
+fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let per_kind_session: Vec<Value> = {
+        let mut stmt = match conn.prepare(
+            "SELECT e.kind, COALESCE(e.session_id,'__GLOBAL__') AS sid,
+                    SUM(CASE WHEN ar.verdict='true' THEN 1.0 ELSE 0.0 END) / COUNT(*) AS precision,
+                    COUNT(*) AS n
+             FROM audit_runs ar
+             JOIN entries e ON e.id = ar.entry_id
+             GROUP BY e.kind, sid",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
+        let rows: Vec<Value> = match stmt.query_map([], |r| {
+            Ok(json!({
+                "kind": r.get::<_,String>(0)?,
+                "session_id": r.get::<_,String>(1)?,
+                "precision": r.get::<_,f64>(2)?,
+                "n": r.get::<_,i64>(3)?,
+            }))
+        }) {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
+        rows
+    };
+
+    let (last_run_at, total_runs): (Option<String>, i64) = conn
+        .query_row("SELECT MAX(audited_at), COUNT(*) FROM audit_runs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap_or((None, 0));
+
+    json!({
+        "id": id,
+        "type": "result",
+        "per_kind_session_precision": per_kind_session,
+        "last_run_at": last_run_at,
+        "total_runs": total_runs,
+    })
+}
+
+fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
+        Some(e) => e.to_string(),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"})
+        }
+    };
+
+    let max_depth = req
+        .get("max_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(64)
+        .min(1024) as usize;
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let mut graph: Vec<Value> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    // Iterative DFS with Enter/Leave events for correct cycle vs diamond detection.
+    // in_progress tracks nodes on the current DFS path — a back-edge is a true cycle.
+    // visited tracks all completed nodes — a re-encounter is a diamond (skip silently).
+    enum Frame {
+        Enter(String, usize),
+        Leave(String),
+    }
+
+    let mut stack: Vec<Frame> = vec![Frame::Enter(entry_id.clone(), 0)];
+    let mut in_progress: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Leave(node_id) => {
+                in_progress.remove(&node_id);
+            }
+            Frame::Enter(node_id, depth) => {
+                if in_progress.contains(&node_id) {
+                    return json!({
+                        "id": id, "type": "error",
+                        "code": "provenance_cycle_detected",
+                        "message": format!("cycle detected involving entry '{}'", node_id)
+                    });
+                }
+                if visited.contains(&node_id) {
+                    continue; // diamond — already processed via another path
+                }
+                visited.insert(node_id.clone());
+                in_progress.insert(node_id.clone());
+                stack.push(Frame::Leave(node_id.clone()));
+
+                if depth >= max_depth {
+                    truncated = true;
+                    continue;
+                }
+
+                let mut stmt = match conn.prepare(
+                    "SELECT DISTINCT derived_from FROM evidence
+                     WHERE entry_id=?1 AND kind='derived' AND derived_from IS NOT NULL",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                    }
+                };
+
+                let parents: Vec<String> =
+                    match stmt.query_map(params![node_id], |r| r.get(0)) {
+                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                        Err(e) => {
+                            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                        }
+                    };
+
+                if parents.is_empty() && depth > 0 {
+                    roots.push(node_id.clone());
+                }
+
+                for parent_id in parents {
+                    graph.push(json!({"from": node_id, "to": parent_id}));
+                    stack.push(Frame::Enter(parent_id, depth + 1));
+                }
+            }
+        }
+    }
+
+    json!({
+        "id": id,
+        "type": "result",
+        "roots": roots,
+        "graph": graph,
+        "truncated": truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1337,7 +1649,8 @@ mod tests {
                         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         let known = matches!(method,
                             "search" | "add" | "import" | "expire" | "stale_check" |
-                            "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild"
+                            "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild" |
+                            "audit_run" | "audit_record" | "audit_report" | "provenance"
                         );
                         if !known {
                             proptest::prop_assert_eq!(
@@ -1349,6 +1662,555 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ── br-ei2.12: unit tests for new handlers ──────────────────────────────
+
+    fn add_live_entry(paths: &config::Paths, emb: &NoopEmbedder, path: &str, session_id: Option<&str>) -> String {
+        let id = json!(null);
+        let mut req = json!({"path": path, "summary": "s", "content": "c", "tags": [], "kind": "observation",
+                              "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
+        if let Some(sid) = session_id {
+            req["session_id"] = json!(sid);
+        }
+        let resp = handle_add(&id, &req, paths, emb);
+        resp["entry_id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_handle_audit_run_sample_size_clamps() {
+        let (_dir, paths, emb) = setup();
+        // Add 3 live entries with evidence
+        for i in 0..3 {
+            add_live_entry(&paths, &emb, &format!("p/{}", i), None);
+        }
+        let id = json!(null);
+        // sample_size=100 should be clamped to 50 (max) but we only have 3 entries
+        let req = json!({"sample_size": 100});
+        let resp = handle_audit_run(&id, &req, &paths);
+        assert_eq!(resp["type"], "ok");
+        let samples = resp["samples"].as_array().unwrap();
+        assert!(samples.len() <= 3, "can't sample more than available");
+        assert!(resp["run_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_handle_audit_run_excludes_stale() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/stale", None);
+        // Expire it
+        let id = json!(null);
+        let req = json!({"entry_id": eid});
+        handle_expire(&id, &req, &paths, &emb);
+
+        let req2 = json!({"sample_size": 10});
+        let resp = handle_audit_run(&id, &req2, &paths);
+        let samples = resp["samples"].as_array().unwrap();
+        assert!(!samples.iter().any(|s| s["id"] == eid), "stale entry must be excluded");
+    }
+
+    #[test]
+    fn test_handle_audit_run_excludes_no_evidence() {
+        let (_dir, paths, emb) = setup();
+        // Add entry WITHOUT evidence (evidence_status = missing)
+        let id = json!(null);
+        let req = json!({"path": "p/no-ev", "summary": "s", "content": "c", "tags": [], "kind": "convention"});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        let eid = resp["entry_id"].as_str().unwrap().to_string();
+
+        let req2 = json!({"sample_size": 10});
+        let resp2 = handle_audit_run(&id, &req2, &paths);
+        let samples = resp2["samples"].as_array().unwrap();
+        assert!(!samples.iter().any(|s| s["id"] == eid), "entry without evidence must be excluded");
+    }
+
+    #[test]
+    fn test_handle_audit_record_writes_row() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/rec", None);
+        let run_id = "run-001";
+        let id = json!(null);
+        let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert_eq!(resp["recorded"], 1);
+        assert_eq!(resp["expired"], 0);
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+            params![run_id, eid], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_expires_on_false() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/exp", None);
+        let id = json!(null);
+        let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["expired"], 1);
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let stale: i64 = conn.query_row(
+            "SELECT is_stale FROM entries WHERE id=?1", params![eid], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_increments_source_weight() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/sw", None);
+        let id = json!(null);
+        let req = json!({"run_id": "run-003", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        handle_audit_record(&id, &req, &paths, &emb);
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let successes: i64 = conn.query_row(
+            "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(successes, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_idempotent() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/idem", None);
+        let id = json!(null);
+        let req = json!({"run_id": "run-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        handle_audit_record(&id, &req, &paths, &emb);
+        // Replay same (run_id, entry_id) → no-op
+        let resp2 = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp2["type"], "ok");
+        assert_eq!(resp2["recorded"], 0, "replay must be a no-op");
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-idem'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(n, 1, "exactly one row after idempotent replay");
+    }
+
+    #[test]
+    fn test_handle_audit_record_invalid_entry_id() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let req = json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "invalid_entry_id");
+    }
+
+    #[test]
+    fn test_handle_audit_report_empty() {
+        let (_dir, paths, _emb) = setup();
+        let id = json!(null);
+        let resp = handle_audit_report(&id, &paths);
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["per_kind_session_precision"].as_array().unwrap().len(), 0);
+        assert!(resp["last_run_at"].is_null());
+        assert_eq!(resp["total_runs"], 0);
+    }
+
+    #[test]
+    fn test_handle_audit_report_with_mixed_verdicts() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        // Add 4 entries (same kind+session_id), record 3 true + 1 false
+        let eids: Vec<String> = (0..4).map(|i| add_live_entry(&paths, &emb, &format!("p/r{}", i), None)).collect();
+        let verdicts: Vec<Value> = eids.iter().enumerate().map(|(i, eid)| {
+            json!({"entry_id": eid, "verdict": i < 3})
+        }).collect();
+        let req = json!({"run_id": "run-report", "verdicts": verdicts});
+        handle_audit_record(&id, &req, &paths, &emb);
+
+        let resp = handle_audit_report(&id, &paths);
+        assert_eq!(resp["type"], "result");
+        let rows = resp["per_kind_session_precision"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let precision = rows[0]["precision"].as_f64().unwrap();
+        assert!((precision - 0.75).abs() < 1e-6, "3 true / 4 total = 0.75; got {}", precision);
+        assert_eq!(rows[0]["n"], 4);
+        assert!(resp["last_run_at"].as_str().is_some());
+        assert_eq!(resp["total_runs"], 4);
+    }
+
+    #[test]
+    fn test_handle_provenance_one_hop() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        // Add entry A (root)
+        let ra = handle_add(&id, &json!({"path":"p/a","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let a_id = ra["entry_id"].as_str().unwrap().to_string();
+
+        // Add entry B derived from A
+        let rb = handle_add(&id, &json!({
+            "path": "p/b", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+            "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:0"}]
+        }), &paths, &emb);
+        let b_id = rb["entry_id"].as_str().unwrap().to_string();
+
+        let req = json!({"entry_id": b_id});
+        let resp = handle_provenance(&id, &req, &paths);
+        assert_eq!(resp["type"], "result");
+        let roots: Vec<String> = resp["roots"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(roots, vec![a_id.clone()]);
+        let graph = resp["graph"].as_array().unwrap();
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0]["from"], b_id);
+        assert_eq!(graph[0]["to"], a_id);
+    }
+
+    #[test]
+    fn test_handle_provenance_multi_hop() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let ra = handle_add(&id, &json!({"path":"p/a2","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let a_id = ra["entry_id"].as_str().unwrap().to_string();
+        let rb = handle_add(&id, &json!({
+            "path": "p/b2", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+            "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:1"}]
+        }), &paths, &emb);
+        let b_id = rb["entry_id"].as_str().unwrap().to_string();
+        let rc = handle_add(&id, &json!({
+            "path": "p/c2", "summary": "c", "content": "c", "tags": [], "kind": "belief",
+            "evidence": [{"kind": "derived", "derived_from": b_id, "citation_hash": "sha256:2"}]
+        }), &paths, &emb);
+        let c_id = rc["entry_id"].as_str().unwrap().to_string();
+
+        let req = json!({"entry_id": c_id});
+        let resp = handle_provenance(&id, &req, &paths);
+        assert_eq!(resp["type"], "result");
+        let roots: Vec<String> = resp["roots"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(roots, vec![a_id.clone()]);
+        assert_eq!(resp["graph"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_handle_provenance_cycle_detected() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        // Create A with a derived evidence pointing to a future B_ID
+        // Simulate cycle by directly inserting into evidence table
+        let ra = handle_add(&id, &json!({"path":"p/cyc-a","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let a_id = ra["entry_id"].as_str().unwrap().to_string();
+        let rb = handle_add(&id, &json!({"path":"p/cyc-b","summary":"b","content":"b","tags":[],"kind":"convention"}), &paths, &emb);
+        let b_id = rb["entry_id"].as_str().unwrap().to_string();
+
+        // Manually inject cycle: evidence row on A pointing to B, and on B pointing to A
+        let conn = db::open_db(&paths.db).unwrap();
+        let ev_id1 = uuid::Uuid::new_v4().to_string();
+        let ev_id2 = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO evidence(id,entry_id,kind,citation_hash,derived_from) VALUES(?1,?2,'derived','sha256:x',?3)",
+            params![ev_id1, a_id, b_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,entry_id,kind,citation_hash,derived_from) VALUES(?1,?2,'derived','sha256:y',?3)",
+            params![ev_id2, b_id, a_id],
+        ).unwrap();
+
+        let req = json!({"entry_id": a_id});
+        let resp = handle_provenance(&id, &req, &paths);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "provenance_cycle_detected");
+    }
+
+    #[test]
+    fn test_handle_provenance_depth_cap() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        // Build a chain of 5 entries; cap at depth=2 → truncated=true
+        let mut prev_id = {
+            let r = handle_add(&id, &json!({"path":"p/d0","summary":"s","content":"c","tags":[],"kind":"convention"}), &paths, &emb);
+            r["entry_id"].as_str().unwrap().to_string()
+        };
+        for i in 1..5 {
+            let r = handle_add(&id, &json!({
+                "path": format!("p/d{}", i), "summary": "s", "content": "c", "tags": [], "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": prev_id, "citation_hash": format!("sha256:{}", i)}]
+            }), &paths, &emb);
+            prev_id = r["entry_id"].as_str().unwrap().to_string();
+        }
+
+        let req = json!({"entry_id": prev_id, "max_depth": 2});
+        let resp = handle_provenance(&id, &req, &paths);
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["truncated"], true);
+    }
+
+    #[test]
+    fn test_handle_add_session_id_null() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let req = json!({"path":"test/sid","summary":"s","content":"c","tags":[]});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        let eid = resp["entry_id"].as_str().unwrap();
+        let conn = db::open_db(&paths.db).unwrap();
+        let sid: Option<String> = conn.query_row(
+            "SELECT session_id FROM entries WHERE id=?1", params![eid], |r| r.get(0),
+        ).unwrap();
+        assert!(sid.is_none(), "session_id must be NULL when not provided");
+    }
+
+    #[test]
+    fn test_handle_add_session_id_stored() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let req = json!({"path":"test/sid2","summary":"s","content":"c","tags":[],"session_id":"abc"});
+        let resp = handle_add(&id, &req, &paths, &emb);
+        let eid = resp["entry_id"].as_str().unwrap();
+        let conn = db::open_db(&paths.db).unwrap();
+        let sid: Option<String> = conn.query_row(
+            "SELECT session_id FROM entries WHERE id=?1", params![eid], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sid, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn test_search_confidence_bootstrap_value() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/conf0", None);
+        let id = json!(null);
+        let req = json!({"query": "conf0", "mode": "fts"});
+        let resp = handle_search(&id, &req, &paths, &emb, 10);
+        let entries = resp["entries"].as_array().unwrap();
+        let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
+        let conf = entry["confidence"].as_f64().unwrap();
+        assert!((conf - 0.5).abs() < 1e-6, "bootstrap confidence must be 0.5; got {}", conf);
+        assert_eq!(entry["audit_n"], 0);
+    }
+
+    #[test]
+    fn test_search_confidence_after_one_success() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/conf1", None);
+        let id = json!(null);
+        // Record verdict=true
+        let req = json!({"run_id": "run-conf1", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        handle_audit_record(&id, &req, &paths, &emb);
+
+        let req2 = json!({"query": "conf1", "mode": "fts"});
+        let resp = handle_search(&id, &req2, &paths, &emb, 10);
+        let entries = resp["entries"].as_array().unwrap();
+        let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
+        let conf = entry["confidence"].as_f64().unwrap();
+        // (1+1)/(1+0+2) = 2/3
+        assert!((conf - 2.0/3.0).abs() < 1e-5, "expected 2/3; got {}", conf);
+        assert_eq!(entry["audit_n"], 1);
+    }
+
+    #[test]
+    fn test_search_confidence_for_null_session_id() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/conf-null", None); // session_id=NULL
+        let id = json!(null);
+        // Record verdict for this entry (uses COALESCE → __GLOBAL__)
+        let req = json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        handle_audit_record(&id, &req, &paths, &emb);
+
+        // The weight should be stored under __GLOBAL__
+        let conn = db::open_db(&paths.db).unwrap();
+        let s: i64 = conn.query_row(
+            "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(s, 1, "NULL session_id must map to __GLOBAL__ sentinel");
+    }
+
+    // ── br-ei2.13: property-based tests ─────────────────────────────────────
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_confidence_in_unit_interval(
+            s in 0i64..10000,
+            f in 0i64..10000,
+        ) {
+            let confidence = (s + 1) as f32 / (s + f + 2) as f32;
+            proptest::prop_assert!(confidence >= 0.0, "confidence must be >= 0; got {}", confidence);
+            proptest::prop_assert!(confidence <= 1.0, "confidence must be <= 1; got {}", confidence);
+        }
+
+        #[test]
+        fn proptest_confidence_monotone_in_successes(
+            s in 0i64..9999,
+            f in 0i64..10000,
+        ) {
+            let c1 = (s + 1) as f32 / (s + f + 2) as f32;
+            let c2 = (s + 2) as f32 / (s + f + 3) as f32;
+            proptest::prop_assert!(c2 >= c1, "adding verdict=true must not decrease confidence");
+        }
+
+        #[test]
+        fn proptest_confidence_monotone_in_failures(
+            s in 0i64..10000,
+            f in 0i64..9999,
+        ) {
+            let c1 = (s + 1) as f32 / (s + f + 2) as f32;
+            let c2 = (s + 1) as f32 / (s + f + 3) as f32;
+            proptest::prop_assert!(c2 <= c1, "adding verdict=false must not increase confidence");
+        }
+
+        #[test]
+        fn proptest_provenance_random_dag_terminates(
+            // Generate edges as (src_idx, dst_idx) pairs where src > dst to guarantee DAG
+            edges in proptest::collection::vec(
+                (1usize..10, 0usize..9),
+                0..20
+            ),
+        ) {
+            let (_dir, paths, emb) = setup();
+            // Create 10 entries
+            let id = json!(null);
+            let mut entry_ids: Vec<String> = Vec::new();
+            for i in 0..10 {
+                let r = handle_add(&id, &json!({
+                    "path": format!("dag/n{}", i), "summary": "n", "content": "c",
+                    "tags": [], "kind": "convention"
+                }), &paths, &emb);
+                entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
+            }
+            // Add derived edges (src > dst guarantees DAG)
+            let conn = db::open_db(&paths.db).unwrap();
+            for (src, dst) in &edges {
+                if src == dst { continue; }
+                let ev_id = uuid::Uuid::new_v4().to_string();
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO evidence(id,entry_id,kind,citation_hash,derived_from) VALUES(?1,?2,'derived','sha256:0',?3)",
+                    params![ev_id, entry_ids[*src], entry_ids[*dst]],
+                );
+            }
+            // BFS must terminate for all starting entries
+            for eid in &entry_ids {
+                let req = json!({"entry_id": eid, "max_depth": 64});
+                let resp = handle_provenance(&id, &req, &paths);
+                proptest::prop_assert!(
+                    resp["type"] == "result" || resp["code"] == "provenance_cycle_detected",
+                    "provenance must not panic; got: {:?}", resp
+                );
+            }
+        }
+
+        #[test]
+        fn proptest_provenance_cycle_caught(
+            n in 2usize..6,
+        ) {
+            let (_dir, paths, emb) = setup();
+            let id = json!(null);
+            let mut entry_ids: Vec<String> = Vec::new();
+            for i in 0..n {
+                let r = handle_add(&id, &json!({
+                    "path": format!("cyc/n{}", i), "summary": "n", "content": "c", "tags": [], "kind": "convention"
+                }), &paths, &emb);
+                entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
+            }
+            // Create a cycle: 0→1→2→...→n-1→0
+            let conn = db::open_db(&paths.db).unwrap();
+            for i in 0..n {
+                let src = &entry_ids[i];
+                let dst = &entry_ids[(i + 1) % n];
+                let ev_id = uuid::Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT OR IGNORE INTO evidence(id,entry_id,kind,citation_hash,derived_from) VALUES(?1,?2,'derived','sha256:c',?3)",
+                    params![ev_id, src, dst],
+                ).unwrap();
+            }
+            let req = json!({"entry_id": entry_ids[0]});
+            let resp = handle_provenance(&id, &req, &paths);
+            proptest::prop_assert_eq!(&resp["type"], "error");
+            proptest::prop_assert_eq!(&resp["code"], "provenance_cycle_detected");
+        }
+
+        #[test]
+        fn proptest_audit_record_idempotent(
+            n_replays in 2usize..5,
+        ) {
+            let (_dir, paths, emb) = setup();
+            let eid = add_live_entry(&paths, &emb, "p/prop-idem", None);
+            let id = json!(null);
+            let req = json!({"run_id": "run-prop-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
+            // First call
+            handle_audit_record(&id, &req, &paths, &emb);
+            // Replay n times
+            for _ in 0..n_replays {
+                let resp = handle_audit_record(&id, &req, &paths, &emb);
+                proptest::prop_assert_eq!(&resp["recorded"], 0);
+            }
+            let conn = db::open_db(&paths.db).unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-prop-idem'",
+                [], |r| r.get(0),
+            ).unwrap();
+            proptest::prop_assert_eq!(count, 1i64);
+        }
+    }
+
+    // ── br-ei2.14: end-to-end integration test ───────────────────────────────
+
+    #[test]
+    fn test_e2e_audit_flow() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+
+        // Step 1: kb_add — create a live entry with evidence
+        let eid = add_live_entry(&paths, &emb, "e2e/entry", Some("sess-1"));
+
+        // Step 2: kb_audit_run — sample live entries
+        let run_resp = handle_audit_run(&id, &json!({"sample_size": 10}), &paths);
+        assert_eq!(run_resp["type"], "ok");
+        let run_id = run_resp["run_id"].as_str().unwrap().to_string();
+        let samples = run_resp["samples"].as_array().unwrap();
+        assert!(samples.iter().any(|s| s["id"] == eid));
+
+        // Step 3: kb_audit_record verdict=false → entry gone from kb_search
+        let rec_req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let rec_resp = handle_audit_record(&id, &rec_req, &paths, &emb);
+        assert_eq!(rec_resp["expired"], 1);
+
+        let search = handle_search(&id, &json!({"query":"e2e entry","mode":"fts"}), &paths, &emb, 10);
+        let hits = search["entries"].as_array().unwrap();
+        assert!(!hits.iter().any(|e| e["id"] == eid), "expired entry must not appear in search");
+
+        // Step 4: kb_audit_report
+        let report = handle_audit_report(&id, &paths);
+        assert_eq!(report["type"], "result");
+        assert_eq!(report["total_runs"], 1);
+        assert!(report["last_run_at"].as_str().is_some());
+
+        // Step 5: kb_add with derived evidence + kb_provenance
+        let r_root = handle_add(&id, &json!({"path":"e2e/root","summary":"root","content":"r","tags":[],"kind":"convention"}), &paths, &emb);
+        let root_id = r_root["entry_id"].as_str().unwrap().to_string();
+        let r_child = handle_add(&id, &json!({
+            "path": "e2e/child", "summary": "child", "content": "ch", "tags": [], "kind": "belief",
+            "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:e2e"}]
+        }), &paths, &emb);
+        let child_id = r_child["entry_id"].as_str().unwrap().to_string();
+
+        let prov = handle_provenance(&id, &json!({"entry_id": child_id}), &paths);
+        assert_eq!(prov["type"], "result");
+        let roots: Vec<&str> = prov["roots"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(roots, vec![root_id.as_str()]);
+
+        // Step 6: record verdict=true → confidence changes.
+        // Use a fresh session_id ("sess-conf") so this weight bucket starts clean;
+        // sess-1 already has failures=1 from Step 3 and would yield confidence=0.5.
+        let e2 = add_live_entry(&paths, &emb, "e2e/conf", Some("sess-conf"));
+        let req_true = json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
+        handle_audit_record(&id, &req_true, &paths, &emb);
+        let search2 = handle_search(&id, &json!({"query":"e2e conf","mode":"fts"}), &paths, &emb, 10);
+        let entries2 = search2["entries"].as_array().unwrap();
+        if let Some(e) = entries2.iter().find(|e| e["id"] == e2) {
+            let conf = e["confidence"].as_f64().unwrap();
+            assert!(conf > 0.5, "confidence must increase after verdict=true; got {}", conf);
         }
     }
 }

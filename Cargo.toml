@@ -30,6 +30,10 @@ sha2 = "0.10"
 name = "verification"
 harness = false
 
+[[bench]]
+name = "bench_kb_search_confidence"
+harness = false
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.11.0"
