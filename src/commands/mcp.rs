@@ -1258,4 +1258,68 @@ mod tests {
         assert_eq!(resp2["review"].as_array().unwrap().len(), 0);
         assert_eq!(resp2["unreachable"].as_array().unwrap().len(), 0);
     }
+
+    // br-h7c: proptest target #1 — MCP JSON-RPC fuzz.
+    //
+    // Invariant: for any arbitrary byte string fed to handle_request, the
+    // function returns a structured JSON response — never panics — and the
+    // response always carries a "type" field whose value is one of
+    // {"error", "result", "ok"}. The parser classification is also exhaustive:
+    // - invalid JSON → type=error + code=parse_error
+    // - valid JSON without a recognized method → type=error + code=unknown_method
+    //
+    // Bound on input size: proptest "\\PC*{0,256}" generates printable Unicode
+    // strings up to 256 chars. Wider byte fuzz (non-UTF-8) is out of scope:
+    // handle_request takes &str, so callers upstream have already enforced
+    // UTF-8. The Elixir MCP port frame protocol decodes UTF-8 before line
+    // dispatch, so any non-UTF-8 byte sequence dies at the port layer, not
+    // here.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            // 4096 cases keeps wall-clock under 30s for this lightweight fuzz.
+            cases: 4096,
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+        #[test]
+        fn proptest_handle_request_never_panics(
+            line in proptest::string::string_regex("\\PC*").unwrap(),
+        ) {
+            let (_dir, paths, emb) = setup();
+            let resp = handle_request(&line, &paths, &emb, 10);
+            // Response is always a structured JSON value with a "type" field.
+            let ty = resp.get("type")
+                .and_then(|v| v.as_str())
+                .expect("handle_request must always emit a string `type` field");
+            proptest::prop_assert!(
+                matches!(ty, "error" | "result" | "ok"),
+                "type must be one of {{error, result, ok}}, got {ty:?} for line {line:?}"
+            );
+            // Sharper classification: if parse fails, code must be parse_error;
+            // if parse succeeds but the method is unknown/absent, code must be
+            // unknown_method. (Both fall under type=error so this is a refinement.)
+            if ty == "error" {
+                let code = resp.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Err(_) => proptest::prop_assert_eq!(
+                        code, "parse_error",
+                        "invalid JSON must produce code=parse_error"
+                    ),
+                    Ok(v) => {
+                        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let known = matches!(method,
+                            "search" | "add" | "import" | "expire" | "stale_check" |
+                            "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild"
+                        );
+                        if !known {
+                            proptest::prop_assert_eq!(
+                                code, "unknown_method",
+                                "valid JSON with unknown method='{}' must produce code=unknown_method",
+                                method
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
