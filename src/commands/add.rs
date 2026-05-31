@@ -89,8 +89,13 @@ impl Add {
                 .collect::<anyhow::Result<Vec<Value>>>()?
         };
 
-        // Validate kind + evidence before acquiring the lock.
-        validate_kb_add_inputs(&self.kind, &evidence_rows)?;
+        // Build tags JSON before validation so validate_kb_add_inputs can check shape.
+        let tags_json: Value = serde_json::json!(
+            self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>()
+        );
+
+        // Validate kind, tags, and evidence before acquiring the lock.
+        validate_kb_add_inputs(&self.kind, &tags_json, &evidence_rows)?;
 
         // Compute write-time evidence_status and emit soft-mandate warning.
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
@@ -101,9 +106,6 @@ impl Add {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
-        let tags_json: Value = serde_json::json!(
-            self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>()
-        );
         let ts = chrono::Utc::now().to_rfc3339();
         let session =
             std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());

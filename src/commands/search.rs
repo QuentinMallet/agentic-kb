@@ -117,30 +117,32 @@ impl Search {
             }
         }
 
-        if opts.do_semantic && sem_count > 0 {
+        if opts.do_semantic && !embedder.is_noop() {
             println!("=== Semantic results ===");
-            for r in results.iter().filter(|r| r.source == "semantic") {
-                println!("  [{path}] {summary}  sim={score:.4}  tags={tags}  id={id}",
-                    path = r.path, summary = r.summary,
-                    score = r.score, tags = r.tags, id = r.id);
-                if self.content && !r.content.is_empty() {
-                    println!("  content: {}", r.content);
-                }
-                for ev in &r.evidence {
-                    let verified_str = match ev.verified {
-                        Some(true) => "verified=true",
-                        Some(false) => "verified=false",
-                        None => "verified=null",
-                    };
-                    println!("    evidence: kind={kind}  {path}  {verified}",
-                        kind = ev.kind,
-                        path = ev.citation_path.as_deref().unwrap_or(""),
-                        verified = verified_str);
+            let sem_results: Vec<_> = results.iter().filter(|r| r.source == "semantic").collect();
+            if sem_results.is_empty() {
+                println!("  (no results)");
+            } else {
+                for r in sem_results {
+                    println!("  [{path}] {summary}  sim={score:.4}  tags={tags}  id={id}",
+                        path = r.path, summary = r.summary,
+                        score = r.score, tags = r.tags, id = r.id);
+                    if self.content && !r.content.is_empty() {
+                        println!("  content: {}", r.content);
+                    }
+                    for ev in &r.evidence {
+                        let verified_str = match ev.verified {
+                            Some(true) => "verified=true",
+                            Some(false) => "verified=false",
+                            None => "verified=null",
+                        };
+                        println!("    evidence: kind={kind}  {path}  {verified}",
+                            kind = ev.kind,
+                            path = ev.citation_path.as_deref().unwrap_or(""),
+                            verified = verified_str);
+                    }
                 }
             }
-        } else if opts.do_semantic && !embedder.is_noop() && fts_count == 0 {
-            println!("=== Semantic results ===");
-            println!("  (no results)");
         }
 
         let _ = (fts_count, sem_count); // suppress unused warning

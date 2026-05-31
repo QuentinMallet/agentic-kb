@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_LIMIT: usize = 100;
 pub const MAX_INLINE_VERIFY_K: usize = 20;
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
+pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
 
 /// Compute the `evidence_status` value for an entry based on its kind and
 /// the number of evidence rows currently linked to it.
@@ -333,32 +334,18 @@ pub fn apply_event(
                 params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
             )?;
 
-            // Update evidence_status on the parent entry via the soft-mandate helper.
-            // Preserve 'n/a' for truly legacy entries (those that have no explicit kind
-            // event — detected by kind column still holding the column default 'belief'
-            // AND evidence_status still holding 'n/a' AND this being the first evidence row).
-            let current_status: String = conn
-                .query_row(
-                    "SELECT COALESCE(evidence_status, 'n/a') FROM entries WHERE id=?1",
-                    params![entry_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or_else(|_| "n/a".to_string());
-            // Only update if the entry was already explicitly tracked (status != 'n/a')
-            // OR if after this insert there is more than 1 evidence row (meaning the
-            // entry had prior evidence, so it was already out of legacy-untouched state).
-            let ev_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
-                params![entry_id],
-                |r| r.get(0),
+            // Recompute evidence_status unconditionally. The prior "preserve n/a for
+            // legacy entries" branch caused incremental-vs-replay divergence: a legacy
+            // upsert (no explicit kind/evidence_status) followed by evidence_add kept
+            // evidence_status='n/a' on the incremental path, while a full rebuild from
+            // the same events would converge to 'present' via compute_evidence_status.
+            // The fix is to always call the soft-mandate helper after an evidence row
+            // change so both paths agree (br-f7y).
+            let new_status = compute_evidence_status(conn, entry_id)?;
+            conn.execute(
+                "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                params![new_status, entry_id],
             )?;
-            if current_status != "n/a" || ev_count > 1 {
-                let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
-            }
         }
 
         ("evidence_expire", "evidence") => {
@@ -662,7 +649,36 @@ pub fn search_entries(
             continue;
         }
 
-        if do_verify {
+        // br-und: compute total bytes for this entry's evidence rows (br-und security I3)
+        let mut total_bytes: usize = 0;
+        for ev in &ev_rows {
+            if let Some(ref citation_path) = ev.citation_path {
+                // Parse citation_path format "path:start-end" to extract byte range
+                if let Some(colon_idx) = citation_path.rfind(':') {
+                    let range_part = &citation_path[colon_idx + 1..];
+                    if let Some(dash_idx) = range_part.find('-') {
+                        if let (Ok(start), Ok(end)) = (
+                            range_part[..dash_idx].parse::<usize>(),
+                            range_part[dash_idx + 1..].parse::<usize>(),
+                        ) {
+                            if start <= end {
+                                total_bytes = total_bytes.saturating_add(end - start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let budget_exceeded = total_bytes > MAX_PER_ENTRY_BYTES;
+        if budget_exceeded {
+            eprintln!(
+                "kb: entry {} evidence bytes capped at MAX_PER_ENTRY_BYTES={} (had {}); skipping verification",
+                entry.id, MAX_PER_ENTRY_BYTES, total_bytes
+            );
+        }
+
+        if do_verify && !budget_exceeded {
             // Verify all evidence rows for this entry in parallel using thread::scope.
             // ADR-C: explicit std::thread, not rayon.
             let verified: Vec<bool> = std::thread::scope(|s| {
@@ -699,7 +715,7 @@ pub fn search_entries(
                 })
                 .collect();
         } else {
-            // Beyond inline_verify_k: return evidence metadata with verified=null.
+            // Beyond inline_verify_k or budget exceeded: return evidence metadata with verified=null.
             entry.evidence = ev_rows
                 .into_iter()
                 .map(|ev| SearchEvidence {
@@ -1182,6 +1198,22 @@ mod tests {
                     "ts": "2024-01-01T00:00:00Z"
                 })
             }),
+            // legacy upsert (no kind/evidence_status fields — pre-Phase-0 event shape).
+            // Without this variant, the convergence proptest never exercises the
+            // incremental-vs-replay desync the column-default fallback used to hide
+            // (br-f7y).
+            arb_entry_id().prop_map(|id| {
+                serde_json::json!({
+                    "action": "upsert",
+                    "table": "entries",
+                    "id": id,
+                    "path": format!("src/{id}.rs"),
+                    "summary": format!("legacy summary for {id}"),
+                    "content": format!("legacy content for {id}"),
+                    "tags": [],
+                    "ts": "2023-01-01T00:00:00Z"
+                })
+            }),
             // expire entry
             arb_entry_id().prop_map(|id| {
                 serde_json::json!({
@@ -1222,6 +1254,82 @@ mod tests {
                 })
             }),
         ]
+    }
+
+    /// br-und (security I3): search_entries must skip verification for entries
+    /// whose evidence rows sum to >MAX_PER_ENTRY_BYTES, emitting a warning.
+    /// Capping per-entry bytes prevents one pathological entry from exhausting
+    /// memory in search result processing.
+    #[test]
+    fn test_search_caps_evidence_bytes_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create a file to cite
+        let cited_content = b"test file for byte capping";
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/big.rs"), cited_content).unwrap();
+
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(cited_content);
+        let hash = format!("sha256:{:x}", h.finalize());
+
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Upsert one entry
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "byte-cap-test",
+            "path": "src/cap.rs",
+            "summary": "byte cap test",
+            "content": "c",
+            "tags": [],
+            "kind": "observation",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Insert evidence rows that collectively exceed MAX_PER_ENTRY_BYTES.
+        // Each row cites a range; we'll add multiple rows to exceed 8MiB.
+        let huge_range_bytes = 5 * 1024 * 1024; // 5 MiB per row
+        for i in 0..2 {
+            let ev_id = format!("ev-huge-{i}");
+            let citation_path = format!("src/big.rs:0-{}", huge_range_bytes);
+            conn.execute(
+                "INSERT INTO evidence(id, entry_id, kind, citation_path, citation_hash, recorded_at)
+                 VALUES(?1, ?2, 'code', ?3, ?4, ?5)",
+                params![ev_id, "byte-cap-test", citation_path, hash, "2024-01-01T00:00:00Z"],
+            ).unwrap();
+        }
+
+        // Search with inline_verify_k=10 so we'd normally verify
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10,
+            repo_root: Some(root.to_path_buf()),
+        };
+
+        let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
+        assert!(!results.is_empty(), "entry must be in results");
+
+        let entry = results.iter().find(|r| r.id == "byte-cap-test").unwrap();
+        assert_eq!(entry.evidence.len(), 2, "entry must have 2 evidence rows");
+
+        // Both evidence rows should have verified=None because total exceeds cap
+        for ev in &entry.evidence {
+            assert_eq!(
+                ev.verified, None,
+                "evidence must not be verified when entry bytes exceed MAX_PER_ENTRY_BYTES"
+            );
+        }
     }
 
     proptest::proptest! {
