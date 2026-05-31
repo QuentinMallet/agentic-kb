@@ -5,7 +5,34 @@ use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob, Evidence};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Resource caps (br-h9g, security I2)
+// ---------------------------------------------------------------------------
+//
+// The MCP entry points are reachable by any local agent that speaks the port
+// protocol, so request inputs must be treated as untrusted. Two amplification
+// vectors motivated these caps:
+//
+//   1. `limit` and `inline_verify_k` together gate how many entries get
+//      verified inline. Each verified entry spawns one OS thread per evidence
+//      row via std::thread::scope, so the worst-case thread fan-out is
+//      `limit * evidence_rows_per_entry`. Without caps, a single malicious
+//      request could exhaust the host's thread budget.
+//
+//   2. `evidence` rows per entry are operator-authored today but could be
+//      bulk-imported tomorrow; bounding the per-entry fetch prevents one
+//      pathological entry from dominating a search response (and its
+//      verification fan-out).
+//
+// Values are deliberately conservative — they sit well above any observed
+// agent workflow (typical limit=10, inline_verify_k=10, evidence rows ~5)
+// while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
+// = 4k verification threads, which the test host tolerates.
+pub const MAX_LIMIT: usize = 100;
+pub const MAX_INLINE_VERIFY_K: usize = 20;
+pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 
 /// Compute the `evidence_status` value for an entry based on its kind and
 /// the number of evidence rows currently linked to it.
@@ -382,6 +409,17 @@ pub struct SearchOptions {
     /// Maximum number of results to verify inline (AC18 narrow-K fallback).
     /// Results beyond this count get `verified: null`. Default: 10.
     pub inline_verify_k: usize,
+    /// Repository root used for inline evidence verification.
+    ///
+    /// Preferred for MCP and other long-running contexts where the process CWD
+    /// is not the repo (e.g. the MCP port is typically spawned with CWD `/`,
+    /// causing the CWD-based `find_repo_root()` walk to fail). MCP callers
+    /// derive this via `root_from_db()` (see `src/commands/mcp.rs:40-45`).
+    ///
+    /// When `None`, `search_entries` falls back to walking up from CWD via
+    /// `find_repo_root()`. CLI invocations may leave this `None` because the
+    /// user runs the binary from inside the repo tree.
+    pub repo_root: Option<PathBuf>,
 }
 
 impl Default for SearchOptions {
@@ -393,6 +431,7 @@ impl Default for SearchOptions {
             path_prefix: None,
             tag_filter: None,
             inline_verify_k: 10,
+            repo_root: None,
         }
     }
 }
@@ -425,8 +464,13 @@ pub struct SearchEntry {
     pub evidence: Vec<SearchEvidence>,
 }
 
-/// Fetch all evidence rows for the given entry IDs.
-/// Returns a map from entry_id to Vec<Evidence>.
+/// Fetch evidence rows for the given entry IDs, capped at
+/// `MAX_EVIDENCE_ROWS_PER_ENTRY` per entry (br-h9g, security I2).
+///
+/// Issues one parameterised query per entry so the `LIMIT` clause caps
+/// per-entry rather than across the whole batch. When truncation occurs a
+/// warning is emitted to stderr so operators can see which entries have
+/// excess evidence in their KB.
 fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
@@ -436,36 +480,42 @@ fn fetch_evidence_for_entries(
     if entry_ids.is_empty() {
         return Ok(map);
     }
-    // Build parameterized IN clause
-    let placeholders: String = entry_ids
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
+    // Fetch one extra row so we can detect truncation without an extra COUNT(*).
+    let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
+    let mut stmt = conn.prepare(
         "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
-         FROM evidence WHERE entry_id IN ({placeholders})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<Evidence> = stmt
-        .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
-            Ok(Evidence {
-                id: r.get(0)?,
-                entry_id: r.get(1)?,
-                kind: r.get(2)?,
-                citation_path: r.get(3)?,
-                citation_sha: r.get(4)?,
-                citation_hash: r.get(5).unwrap_or_default(),
-                citation_excerpt: r.get(6)?,
-                derived_from: r.get(7)?,
-                recorded_at: r.get(8)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    for ev in rows {
-        map.entry(ev.entry_id.clone()).or_default().push(ev);
+         FROM evidence
+         WHERE entry_id = ?1
+         ORDER BY recorded_at, id
+         LIMIT ?2",
+    )?;
+    for entry_id in entry_ids {
+        let rows: Vec<Evidence> = stmt
+            .query_map(params![entry_id, probe_limit], |r| {
+                Ok(Evidence {
+                    id: r.get(0)?,
+                    entry_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    citation_path: r.get(3)?,
+                    citation_sha: r.get(4)?,
+                    citation_hash: r.get(5).unwrap_or_default(),
+                    citation_excerpt: r.get(6)?,
+                    derived_from: r.get(7)?,
+                    recorded_at: r.get(8)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+            eprintln!(
+                "kb: entry {entry_id} evidence rows truncated to MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                rows.len()
+            );
+            let capped: Vec<Evidence> = rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
+            map.insert(entry_id.clone(), capped);
+        } else if !rows.is_empty() {
+            map.insert(entry_id.clone(), rows);
+        }
     }
     Ok(map)
 }
@@ -596,8 +646,10 @@ pub fn search_entries(
     let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
     let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
 
-    // Discover repo root: walk up from CWD looking for .git directory.
-    let repo_root = find_repo_root();
+    // Resolve repo root: prefer explicit `opts.repo_root` (MCP path — CWD is
+    // typically `/`, so CWD-based discovery fails). Fall back to walking up
+    // from CWD via `find_repo_root()` (CLI path — user runs from inside repo).
+    let repo_root: Option<PathBuf> = opts.repo_root.clone().or_else(find_repo_root);
 
     let verify_count = opts.inline_verify_k.min(entries.len());
 
@@ -668,7 +720,7 @@ pub fn search_entries(
 
 /// Walk up from CWD to find a directory containing `.git`.
 /// Returns None if not found (e.g. in tempdir tests).
-fn find_repo_root() -> Option<std::path::PathBuf> {
+fn find_repo_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir: &Path = &cwd;
     loop {
@@ -924,6 +976,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_stale, 0, "events without is_stale must default to active");
+    }
+
+    /// br-h9g (security I2): fetch_evidence_for_entries must cap rows at
+    /// MAX_EVIDENCE_ROWS_PER_ENTRY even when the underlying table holds more.
+    /// Bounds the thread::scope fan-out in search_entries.
+    #[test]
+    fn test_fetch_evidence_caps_rows_per_entry() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Seed one entry the evidence rows can attach to.
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "cap-host", "path": "src/cap.rs", "summary": "cap host",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Insert MAX_EVIDENCE_ROWS_PER_ENTRY + 50 evidence rows for that entry.
+        let extra = 50;
+        for i in 0..(MAX_EVIDENCE_ROWS_PER_ENTRY + extra) {
+            conn.execute(
+                "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                 VALUES(?1, ?2, 'code', 'sha256:abc', ?3)",
+                params![format!("ev-{i:04}"), "cap-host", format!("2024-01-01T00:00:{:02}Z", i % 60)],
+            ).unwrap();
+        }
+
+        let map = fetch_evidence_for_entries(&conn, &["cap-host".to_string()]).unwrap();
+        let rows = map.get("cap-host").expect("entry must be present");
+        assert_eq!(
+            rows.len(),
+            MAX_EVIDENCE_ROWS_PER_ENTRY,
+            "fetch_evidence_for_entries must truncate to MAX_EVIDENCE_ROWS_PER_ENTRY"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // br-bhg: explicit SearchOptions.repo_root threads through to verification.
+    // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
+    // returns None (or the wrong root), causing verified=false on every row.
+    // -----------------------------------------------------------------------
+
+    /// When `opts.repo_root` is `Some(path)`, inline evidence verification must
+    /// resolve citation_path relative to that path — not relative to whatever
+    /// repo `find_repo_root()` discovers from the current working directory.
+    ///
+    /// Construction: write a cited file under a tempdir at a unique relative
+    /// path that does NOT exist under the test runner's CWD-discovered repo.
+    /// If `search_entries` honors `opts.repo_root`, verification reads bytes
+    /// from `<tempdir>/<rel>` and succeeds. If it falls back to CWD discovery,
+    /// the file is missing under the wrong root and verification returns
+    /// `Some(false)`.
+    #[test]
+    fn test_search_uses_explicit_repo_root_when_cwd_is_unrelated() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Unique relative path so it cannot collide with any file in the real
+        // worktree (the CWD-discovered repo root). If find_repo_root() were
+        // used instead of opts.repo_root, the verifier would look here:
+        //   <real-worktree>/src/__br_bhg_regression_explicit_root__.rs
+        // ...which does not exist, and verified would be Some(false).
+        let rel = "src/__br_bhg_regression_explicit_root__.rs";
+        let cited_content = b"// br-bhg regression: explicit repo_root\n";
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(rel), cited_content).unwrap();
+
+        let mut h = Sha256::new();
+        h.update(cited_content);
+        let hash = format!("sha256:{:x}", h.finalize());
+        let end = cited_content.len();
+
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "br-bhg-regression-1",
+            "path": "regression/br-bhg",
+            "summary": "br-bhg explicit repo_root regression",
+            "content": "regression body for br-bhg explicit repo_root",
+            "tags": ["regression", "br-bhg"],
+            "kind": "observation",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        let evidence_event = serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": "br-bhg-regression-1",
+            "evidence": {
+                "id": "ev-br-bhg-1",
+                "entry_id": "br-bhg-regression-1",
+                "kind": "code",
+                "citation_path": format!("{rel}:0-{end}"),
+                "citation_sha": null,
+                "citation_hash": hash,
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &evidence_event).unwrap();
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10,
+            repo_root: Some(root.to_path_buf()),
+        };
+        let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
+
+        let entry = results
+            .iter()
+            .find(|r| r.id == "br-bhg-regression-1")
+            .expect("entry must be returned by FTS");
+        assert_eq!(entry.evidence.len(), 1, "entry must have exactly 1 evidence row");
+        assert_eq!(
+            entry.evidence[0].verified,
+            Some(true),
+            "explicit opts.repo_root must be used for verification — CWD-based \
+             find_repo_root() would not find the cited file under the tempdir, \
+             so a Some(true) here proves repo_root threading works (MCP cwd=/ fix)"
+        );
     }
 
     // -----------------------------------------------------------------------
