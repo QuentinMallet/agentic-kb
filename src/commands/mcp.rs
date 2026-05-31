@@ -123,6 +123,10 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let inline_verify_k = req.get("inline_verify_k").and_then(|v| v.as_u64()).unwrap_or(limit as u64) as usize;
+    // MCP port is typically spawned with CWD=`/` (Elixir PortManager), so
+    // CWD-based `find_repo_root()` discovery fails. Pass the repo root derived
+    // from the explicitly-provided db path (`<root>/agent-kb/agent-kb.db`).
+    let repo_root = Some(root_from_db(&paths.db));
     let opts = db::SearchOptions {
         limit,
         do_fts: mode == "fts" || mode == "hybrid",
@@ -130,6 +134,7 @@ fn handle_search(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         path_prefix,
         tag_filter,
         inline_verify_k,
+        repo_root,
     };
 
     let conn = match db::open_db(&paths.db) {

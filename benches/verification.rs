@@ -111,6 +111,7 @@ fn bench_kb_search_with_verification(c: &mut Criterion) {
         path_prefix: None,
         tag_filter: None,
         inline_verify_k: 10,
+        repo_root: None,
     };
 
     c.bench_function("bench_kb_search_with_verification", |b| {

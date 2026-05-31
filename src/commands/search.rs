@@ -61,6 +61,11 @@ impl Search {
         paths: &config::Paths,
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
+        // CLI: repo_root left None; search_entries falls back to find_repo_root()
+        // walking from CWD, which is correct for the CLI invocation pattern (user
+        // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
+        // via root_from_db (mcp.rs:40-45) because MCP CWD is typically '/' and CWD
+        // discovery would fail.
         let opts = db::SearchOptions {
             limit: self.limit,
             do_fts: self.fts || !self.semantic,
@@ -68,6 +73,7 @@ impl Search {
             path_prefix: self.path_prefix.clone(),
             tag_filter: self.tag.clone(),
             inline_verify_k: self.limit, // verify all results by default
+            repo_root: None,
         };
 
         let conn = db::open_db(&paths.db)?;
@@ -403,6 +409,7 @@ mod tests {
             path_prefix: None,
             tag_filter: None,
             inline_verify_k: 10,
+            repo_root: None,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
@@ -476,6 +483,7 @@ mod tests {
             path_prefix: None,
             tag_filter: None,
             inline_verify_k: 1,
+            repo_root: None,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
