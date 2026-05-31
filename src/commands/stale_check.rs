@@ -781,4 +781,94 @@ mod tests {
         let shas = commits_that_touched_file("does_not_exist.rs", Some(dir));
         assert!(shas.is_empty());
     }
+
+    #[cfg(test)]
+    mod proptest_stale_check {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        /// Invariant: STALE, REVIEW, UNREACHABLE buckets are pairwise disjoint.
+        /// All entry IDs appear in exactly zero or one bucket.
+        proptest! {
+            #[test]
+            fn prop_stale_check_buckets_are_disjoint(
+                num_files in 0usize..=3,
+            ) {
+                use crate::components::db::open_db_memory;
+                use rusqlite::params;
+
+                let conn = open_db_memory().expect("memory db");
+
+                // Insert a small set of entries with various paths and refs.
+                let entry_ids = vec!["e1", "e2", "e3"];
+                let paths = vec!["a.rs", "b.rs", "c.rs"];
+                let shas = vec![
+                    "a1b2c3d4e5f6789012345678901234567890abcd",
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                    "0000000000000000000000000000000000000000",
+                ];
+
+                for (i, entry_id) in entry_ids.iter().enumerate() {
+                    let path = paths[i % paths.len()];
+                    let version_ref = shas[i % shas.len()];
+                    conn.execute(
+                        "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                        params![entry_id, path, "test", "body", "[]", version_ref],
+                    )
+                    .expect("insert entry");
+                }
+
+                // Run stale_check with a subset of files
+                let files_to_check: Vec<String> = (0..num_files)
+                    .map(|i| paths[i % paths.len()].to_string())
+                    .collect();
+
+                let report = run_stale_check(
+                    &conn,
+                    &files_to_check,
+                    &[],
+                    false,
+                    None,
+                )
+                .expect("run_stale_check");
+
+                // Collect all IDs from each bucket
+                let stale_ids: HashSet<String> =
+                    report.stale.iter().map(|e| e.id.clone()).collect();
+                let review_ids: HashSet<String> =
+                    report.review.iter().map(|e| e.id.clone()).collect();
+                let unreachable_ids: HashSet<String> =
+                    report.unreachable.iter().map(|e| e.id.clone()).collect();
+
+                // Invariant: buckets are pairwise disjoint
+                prop_assert!(
+                    stale_ids.is_disjoint(&review_ids),
+                    "stale and review must be disjoint"
+                );
+                prop_assert!(
+                    stale_ids.is_disjoint(&unreachable_ids),
+                    "stale and unreachable must be disjoint"
+                );
+                prop_assert!(
+                    review_ids.is_disjoint(&unreachable_ids),
+                    "review and unreachable must be disjoint"
+                );
+
+                // Invariant: no entry appears twice (union has same cardinality as sum)
+                let total = stale_ids.len() + review_ids.len() + unreachable_ids.len();
+                let union_size = stale_ids
+                    .union(&review_ids)
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .union(&unreachable_ids)
+                    .count();
+                prop_assert_eq!(
+                    total, union_size,
+                    "entry appears in multiple buckets"
+                );
+            }
+        }
+    }
 }
