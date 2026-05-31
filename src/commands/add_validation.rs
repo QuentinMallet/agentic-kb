@@ -15,6 +15,30 @@ const VALID_KINDS: &[&str] = &[
 /// Kinds that carry an evidence mandate (missing evidence → status="missing").
 const EVIDENCE_MANDATED_KINDS: &[&str] = &["observation", "belief", "procedure"];
 
+/// Validate tags array shape and tag length (br-9lq).
+///
+/// - `tags` must be a JSON array of strings.
+/// - Each tag must be non-empty and <= 50 characters.
+pub fn validate_tags(tags: &Value) -> Result<()> {
+    let arr = tags
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tags must be a JSON array of strings"))?;
+
+    for (idx, tag) in arr.iter().enumerate() {
+        let s = tag.as_str().ok_or_else(|| {
+            anyhow::anyhow!("tags[{}] must be a string", idx)
+        })?;
+        if s.is_empty() {
+            anyhow::bail!("tags[{}] must be non-empty", idx);
+        }
+        if s.len() > 50 {
+            anyhow::bail!("tags[{}] exceeds max length 50: '{s}'", idx);
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate kind enum and evidence array at write time.
 ///
 /// - `kind` must be one of the five valid values.
@@ -126,5 +150,56 @@ mod tests {
     fn test_evidence_status_na() {
         assert_eq!(compute_evidence_status_write("convention", &[]), "n/a");
         assert_eq!(compute_evidence_status_write("memory", &[]), "n/a");
+    }
+
+    // br-9lq: validate_tags shape and length
+
+    #[test]
+    fn test_tags_valid_array_accepted() {
+        let tags = json!(["rust", "testing"]);
+        assert!(validate_tags(&tags).is_ok(), "valid tags array should be accepted");
+    }
+
+    #[test]
+    fn test_tags_empty_array_accepted() {
+        let tags = json!([]);
+        assert!(validate_tags(&tags).is_ok(), "empty tags array should be accepted");
+    }
+
+    #[test]
+    fn test_tags_not_array_rejected() {
+        let tags = json!("just a string");
+        let err = validate_tags(&tags).unwrap_err();
+        assert!(err.to_string().contains("tags must be a JSON array"));
+    }
+
+    #[test]
+    fn test_tags_non_string_element_rejected() {
+        let tags = json!(["rust", 42, "testing"]);
+        let err = validate_tags(&tags).unwrap_err();
+        assert!(err.to_string().contains("tags[1] must be a string"));
+    }
+
+    #[test]
+    fn test_tags_empty_string_rejected() {
+        let tags = json!(["rust", "", "testing"]);
+        let err = validate_tags(&tags).unwrap_err();
+        assert!(err.to_string().contains("tags[1] must be non-empty"));
+    }
+
+    #[test]
+    fn test_tags_length_exceeded_rejected() {
+        let long_tag = "x".repeat(51); // 51 chars, exceeds max 50
+        let tags = json!(["rust", long_tag.as_str()]);
+        let err = validate_tags(&tags).unwrap_err();
+        assert!(err.to_string().contains("exceeds max length 50"));
+        assert!(err.to_string().contains("tags[1]"));
+    }
+
+    #[test]
+    fn test_tags_max_length_accepted() {
+        let max_tag = "x".repeat(50); // exactly 50 chars
+        let tags = json!(["rust", max_tag.as_str()]);
+        assert!(validate_tags(&tags).is_ok(), "tag with max length 50 should be accepted");
     }
 }
