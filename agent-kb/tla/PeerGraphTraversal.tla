@@ -24,6 +24,17 @@
   snapshot isolation are not modelled. The mutual-exclusion guard
   (pc_other # "running") captures the key serialization constraint.
 
+  Scope constraints
+  -----------------
+  - Single-slug-per-epoch: each epoch cleans exactly one slug. Multi-slug
+    cleanup is not modelled; WALConvergence covers one cleanedSlug only.
+  - Both-transactions-per-epoch: Reset requires pc1=done AND pc2=done.
+    Cleanup-only epochs (no sweep triggered) are out of scope. If such
+    epochs exist in the real system, add a CleanupOnlyReset + separate
+    convergence invariant.
+  - SweepIdempotent holds because TickClock is blocked while any
+    transaction is active. This coupling is intentional.
+
   Model (TLC small instance)
   --------------------------
   Repos    <- {"r1", "r2"}
