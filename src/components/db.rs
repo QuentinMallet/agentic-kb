@@ -74,6 +74,15 @@ pub fn compute_evidence_status(conn: &Connection, entry_id: &str) -> Result<Stri
     Ok(status.to_string())
 }
 
+/// Delete expired peer edges and orphaned graphs.
+pub fn sweep_expired_peers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM peers WHERE expires_at IS NOT NULL AND expires_at < datetime('now');
+         DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL);",
+    )?;
+    Ok(())
+}
+
 /// Open (or create) the SQLite database at the given path.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
@@ -83,6 +92,7 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
         .with_context(|| format!("open DB {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     ensure_schema(&conn)?;
+    sweep_expired_peers(&conn)?;
     Ok(conn)
 }
 
@@ -512,6 +522,8 @@ pub struct SearchEntry {
     pub confidence: f32,
     /// Total audit verdicts recorded for this entry's (kind, session_id) pair.
     pub audit_n: u32,
+    /// Originating repo path. `None` means local DB; `Some(path)` means fetched from a peer.
+    pub origin_repo: Option<String>,
 }
 
 /// Fetch evidence rows for the given entry IDs, capped at
@@ -633,6 +645,7 @@ pub fn search_entries(
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
+                origin_repo: None,
             });
         }
     }
@@ -684,6 +697,7 @@ pub fn search_entries(
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
+                origin_repo: None,
             });
         }
 
