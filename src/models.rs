@@ -69,6 +69,9 @@ pub struct Entry {
     /// Evidence status: missing | present | n/a
     #[serde(default = "default_evidence_status")]
     pub evidence_status: String,
+    /// Session ID that created this entry (NULL for legacy entries)
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// A piece of evidence attached to a KB entry.
@@ -141,6 +144,24 @@ pub struct RunRecord {
     pub run_id: Option<String>,
 }
 
+/// Per-(kind × session_id) confidence weight record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SourceWeight {
+    pub kind: String,
+    pub session_id: String,
+    pub successes: i64,
+    pub failures: i64,
+    pub updated_at: String,
+}
+
+/// A single audit verdict for one KB entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditVerdict {
+    pub entry_id: String,
+    pub verdict: bool,
+    pub note: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +221,34 @@ mod tests {
             if a.len() != b.len() {
                 prop_assert_eq!(cosine_similarity(&a, &b), 0.0);
             }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_source_weight_serde_roundtrip(
+            kind in "[a-z]{1,10}",
+            session_id in "[a-z0-9_]{1,20}",
+            successes in 0i64..10000,
+            failures in 0i64..10000,
+            updated_at in "2024-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        ) {
+            let sw = SourceWeight { kind, session_id, successes, failures, updated_at };
+            let json = serde_json::to_string(&sw).unwrap();
+            let recovered: SourceWeight = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(sw, recovered);
+        }
+
+        #[test]
+        fn proptest_audit_verdict_serde_roundtrip(
+            entry_id in "[a-z0-9-]{5,40}",
+            verdict in proptest::bool::ANY,
+            note in proptest::option::of("[a-zA-Z ]{0,50}"),
+        ) {
+            let av = AuditVerdict { entry_id, verdict, note };
+            let json = serde_json::to_string(&av).unwrap();
+            let recovered: AuditVerdict = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(av, recovered);
         }
     }
 

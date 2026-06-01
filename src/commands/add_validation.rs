@@ -51,12 +51,13 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
 ///
 /// - `kind` must be one of the five valid values.
 /// - `tags` must pass `validate_tags` (array of non-empty strings ≤ 50 chars).
-/// - Each evidence row must have `evidence.kind = "code"` (Phase 1 constraint).
+/// - Each evidence row must have `evidence.kind ∈ {"code","derived"}` (Phase 1 constraint).
+/// - For `evidence.kind = "derived"`, `derived_from` must not equal the entry's own id.
 /// - Each evidence row must have a non-empty `citation_hash`.
 /// - `citation_excerpt` (if present) must be ≤ MAX_CITATION_EXCERPT_CHARS and
 ///   must not contain ASCII control characters other than `\n` and `\t`
 ///   (br-47d: prompt-injection containment).
-pub fn validate_kb_add_inputs(kind: &str, tags: &Value, evidence: &[Value]) -> Result<()> {
+pub fn validate_kb_add_inputs(entry_id: &str, kind: &str, tags: &Value, evidence: &[Value]) -> Result<()> {
     if !VALID_KINDS.contains(&kind) {
         anyhow::bail!(
             "invalid kind '{kind}'; must be one of: observation, belief, procedure, convention, memory"
@@ -70,10 +71,19 @@ pub fn validate_kb_add_inputs(kind: &str, tags: &Value, evidence: &[Value]) -> R
             .get("kind")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if ev_kind != "code" {
+        if ev_kind != "code" && ev_kind != "derived" {
             anyhow::bail!(
-                "Phase 1 ships evidence.kind=code only; kind='{ev_kind}' deferred to Phase 2"
+                "Phase 1 ships evidence.kind=code|derived only; kind='{ev_kind}' deferred to Phase 2"
             );
+        }
+        if ev_kind == "derived" {
+            let derived_from = ev
+                .get("derived_from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if derived_from == entry_id {
+                anyhow::bail!("self_loop_provenance: evidence.derived_from must not equal the entry id");
+            }
         }
 
         let hash = ev
@@ -164,35 +174,56 @@ mod tests {
     #[test]
     fn test_valid_kinds_accepted() {
         for kind in VALID_KINDS {
-            assert!(validate_kb_add_inputs(kind, &json!([]), &[]).is_ok(), "kind={kind} should be valid");
+            assert!(validate_kb_add_inputs("", kind, &json!([]), &[]).is_ok(), "kind={kind} should be valid");
         }
     }
 
     #[test]
     fn test_invalid_kind_rejected() {
-        let err = validate_kb_add_inputs("fact", &json!([]), &[]).unwrap_err();
+        let err = validate_kb_add_inputs("", "fact", &json!([]), &[]).unwrap_err();
         assert!(err.to_string().contains("invalid kind 'fact'"));
     }
 
     #[test]
     fn test_non_code_evidence_rejected() {
         let ev = json!({"kind": "test", "citation_hash": "sha256:abc"});
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
-        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code only"));
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
+        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code|derived only"));
         assert!(err.to_string().contains("kind='test'"));
     }
 
     #[test]
     fn test_empty_citation_hash_rejected() {
         let ev = json!({"kind": "code", "citation_hash": ""});
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_hash"));
     }
 
     #[test]
     fn test_valid_code_evidence_accepted() {
         let ev = json!({"kind": "code", "citation_hash": "sha256:abc123"});
-        assert!(validate_kb_add_inputs("observation", &json!([]), &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("", "observation", &json!([]), &[ev]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_allows_kind_derived() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": "other-entry-id",
+            "citation_hash": "sha256:abc123",
+        });
+        assert!(validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_self_loop_derived() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": "my-entry-id",
+            "citation_hash": "sha256:abc",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "belief", &json!([]), &[ev]).unwrap_err();
+        assert!(err.to_string().contains("self_loop_provenance"));
     }
 
     #[test]
@@ -226,7 +257,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": long,
         });
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_excerpt invalid"));
         assert!(err.to_string().contains("exceeds cap"));
     }
@@ -239,7 +270,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": at_cap,
         });
-        assert!(validate_kb_add_inputs("belief", &json!([]), &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("", "belief", &json!([]), &[ev]).is_ok());
     }
 
     #[test]
@@ -250,7 +281,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\x00 bad }",
         });
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_excerpt invalid"));
         assert!(err.to_string().contains("control char"));
 
@@ -260,7 +291,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\x1B[31m red }",
         });
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("control char"));
 
         // Newline + tab — must be accepted.
@@ -269,7 +300,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": "fn foo() {\n\tbar\n}",
         });
-        assert!(validate_kb_add_inputs("belief", &json!([]), &[ev]).is_ok());
+        assert!(validate_kb_add_inputs("", "belief", &json!([]), &[ev]).is_ok());
     }
 
     // br-47d (I-1): excerpt must not contain envelope markers.
@@ -282,7 +313,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": format!("harmless{}injection here", CITATION_EXCERPT_ENVELOPE_OPEN),
         });
-        let err = validate_kb_add_inputs("belief", &json!([]), &[ev]).unwrap_err();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
         assert!(err.to_string().contains("citation_excerpt invalid"));
         assert!(err.to_string().contains("envelope markers"));
 
@@ -292,7 +323,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": format!("harmless{}injection here", CITATION_EXCERPT_ENVELOPE_CLOSE),
         });
-        let err2 = validate_kb_add_inputs("belief", &json!([]), &[ev2]).unwrap_err();
+        let err2 = validate_kb_add_inputs("", "belief", &json!([]), &[ev2]).unwrap_err();
         assert!(err2.to_string().contains("citation_excerpt invalid"));
         assert!(err2.to_string().contains("envelope markers"));
 
@@ -302,7 +333,7 @@ mod tests {
             "citation_hash": "sha256:abc",
             "citation_excerpt": format!("{}inner{}", CITATION_EXCERPT_ENVELOPE_OPEN, CITATION_EXCERPT_ENVELOPE_CLOSE),
         });
-        let err3 = validate_kb_add_inputs("belief", &json!([]), &[ev3]).unwrap_err();
+        let err3 = validate_kb_add_inputs("", "belief", &json!([]), &[ev3]).unwrap_err();
         assert!(err3.to_string().contains("citation_excerpt invalid"));
         assert!(err3.to_string().contains("envelope markers"));
     }
