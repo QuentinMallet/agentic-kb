@@ -9,7 +9,9 @@
 # Run after `nix build`:
 #   bats tests/peers.bats
 
-KB=${KB:-./result/bin/kb}
+# Resolve KB to an absolute path so it remains valid after cd into FAKE_REPO.
+_KB_DEFAULT=$(cd "$(dirname "${BATS_TEST_FILENAME}")/.." && pwd)/result/bin/kb
+KB=${KB:-$_KB_DEFAULT}
 
 setup() {
     # Create a fake repo with the .state/agent-kb/ layout that Paths::discover() expects.
@@ -93,7 +95,9 @@ kb() {
 # ---------------------------------------------------------------------------
 @test "peers import: idempotent seed import" {
     SEED_FILE=$(mktemp /tmp/kb-peers-seed-XXXXXX.json)
-    echo '[{"source_repo":"/tmp/a","target_repo":"/tmp/b","graph_type":"dep"}]' > "$SEED_FILE"
+    # source_repo must match $FAKE_REPO so 'kb peers list' (which filters by current repo) finds it.
+    printf '[{"source_repo":"%s","target_repo":"/tmp/kb-import-target","graph_type":"dep"}]\n' \
+        "$FAKE_REPO" > "$SEED_FILE"
 
     # First import — should insert 1 row and print "1".
     run kb peers import "$SEED_FILE"
@@ -105,9 +109,10 @@ kb() {
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
 
-    # Verify exactly 1 dep-type peer in the DB (not 2).
-    run kb peers list --type dep
+    # Verify exactly 1 dep-type peer via show on the target (source-agnostic).
+    run kb peers show /tmp/kb-import-target
     [ "$status" -eq 0 ]
+    echo "$output" | jq . > /dev/null
     count=$(echo "$output" | jq '[.[] | select(.graph_type == "dep")] | length')
     [ "$count" -eq 1 ]
 
@@ -116,11 +121,8 @@ kb() {
 
 # ---------------------------------------------------------------------------
 # 6. peers edge cleanup-epic: removes all edges for an epic slug
-#    (skip if the edge subcommand is not yet wired)
 # ---------------------------------------------------------------------------
 @test "peers edge cleanup-epic: removes all edges for slug" {
-    skip "edge subcommand pending"
-
     kb peers add /tmp/repo-a --type epic --epic-slug test
     kb peers add /tmp/repo-b --type epic --epic-slug test
 
@@ -131,4 +133,41 @@ kb() {
     [ "$status" -eq 0 ]
     count=$(echo "$output" | jq '[.[] | select(.epic_slug == "test")] | length')
     [ "$count" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# 7. peers edge add: creates a directed edge between two repo paths
+# ---------------------------------------------------------------------------
+@test "peers edge add: creates a directed edge" {
+    run kb peers edge add /tmp/edge-src /tmp/edge-tgt --type dep
+    [ "$status" -eq 0 ]
+    # Returns a UUID for the new peer entry.
+    [[ "$output" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# 8. peers edge list: lists all edges (optionally by epic slug)
+# ---------------------------------------------------------------------------
+@test "peers edge list: lists edges" {
+    kb peers edge add /tmp/edge-list-src /tmp/edge-list-tgt --type dep
+
+    run kb peers edge list
+    [ "$status" -eq 0 ]
+    echo "$output" | jq . > /dev/null
+    count=$(echo "$output" | jq 'length')
+    [ "$count" -ge 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# 9. peers edge remove: removes an edge by UUID (idempotent)
+# ---------------------------------------------------------------------------
+@test "peers edge remove: removes edge idempotently" {
+    EDGE_ID=$(kb peers edge add /tmp/edge-rm-src /tmp/edge-rm-tgt --type dep)
+
+    run kb peers edge remove "$EDGE_ID"
+    [ "$status" -eq 0 ]
+
+    # Removing again (missing ID) must still exit 0.
+    run kb peers edge remove "$EDGE_ID"
+    [ "$status" -eq 0 ]
 }
