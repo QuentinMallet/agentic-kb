@@ -801,6 +801,59 @@ fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     json!({"id": id, "type": "ok", "expired": entry_id})
 }
 
+/// Fetch a random sample of live, auditable entries.
+///
+/// Passes the Statement by value into `and_then` so the closure owns it,
+/// avoiding the borrow-checker constraint where `MappedRows<'_, F>` borrows
+/// the statement until its destructor runs at end-of-scope.
+fn audit_sample_entries(
+    conn: &rusqlite::Connection,
+    sample_size: usize,
+) -> rusqlite::Result<Vec<(String, String, String, String, String)>> {
+    conn.prepare(
+        "SELECT id, path, summary, kind, evidence_status
+         FROM entries
+         WHERE is_stale=0 AND evidence_status='present'
+         ORDER BY RANDOM()
+         LIMIT ?1",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map(params![sample_size as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    })
+}
+
+/// Fetch evidence rows for a single entry as JSON values.
+///
+/// Same owned-statement pattern as `audit_sample_entries`.
+fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value> {
+    conn.prepare(
+        "SELECT id, kind, citation_path, citation_hash FROM evidence WHERE entry_id=?1",
+    )
+    .ok()
+    .and_then(|mut stmt| {
+        stmt.query_map(params![entry_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "citation_path": r.get::<_, Option<String>>(2)?,
+                "citation_hash": r.get::<_, String>(3)?,
+            }))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    })
+    .unwrap_or_default()
+}
+
 fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
     let sample_size = sample_size.clamp(1, 50) as usize;
@@ -815,39 +868,32 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let mut stmt = match conn.prepare(
-        "SELECT id, path, summary, evidence_status
-         FROM entries
-         WHERE is_stale=0 AND evidence_status='present'
-         ORDER BY RANDOM()
-         LIMIT ?1",
-    ) {
-        Ok(s) => s,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let samples: Vec<Value> = match stmt.query_map(params![sample_size as i64], |r| {
-        Ok(json!({
-            "id": r.get::<_,String>(0)?,
-            "path": r.get::<_,String>(1)?,
-            "summary": r.get::<_,String>(2)?,
-            "evidence_status": r.get::<_,String>(3)?,
-        }))
-    }) {
-        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+    let entry_rows = match audit_sample_entries(&conn, sample_size) {
+        Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
-    for s in &samples {
-        if let Some(eid) = s.get("id").and_then(|v| v.as_str()) {
+
+    let samples: Vec<Value> = entry_rows
+        .iter()
+        .map(|(eid, path, summary, kind, evidence_status)| {
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,?3)",
                 params![run_id, eid, ts],
             );
-        }
-    }
+            let evidence = audit_evidence_rows(&conn, eid);
+            json!({
+                "id": eid,
+                "path": path,
+                "summary": summary,
+                "kind": kind,
+                "evidence_status": evidence_status,
+                "evidence": evidence,
+            })
+        })
+        .collect();
 
     json!({"id": id, "type": "ok", "run_id": run_id, "samples": samples})
 }
@@ -1745,6 +1791,21 @@ mod tests {
         let samples = resp["samples"].as_array().unwrap();
         assert!(samples.len() <= 3, "can't sample more than available");
         assert!(resp["run_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_handle_audit_run_sample_includes_kind_and_evidence() {
+        let (_dir, paths, emb) = setup();
+        let _eid = add_live_entry(&paths, &emb, "p/kind-ev", None);
+        let id = json!(null);
+        let resp = handle_audit_run(&id, &json!({"sample_size": 10}), &paths);
+        assert_eq!(resp["type"], "ok");
+        let samples = resp["samples"].as_array().unwrap();
+        assert!(!samples.is_empty());
+        let s = &samples[0];
+        assert!(s["kind"].as_str().is_some(), "sample must include kind");
+        assert!(s["evidence"].is_array(), "sample must include evidence array");
+        assert!(!s["evidence"].as_array().unwrap().is_empty(), "evidence array must have rows");
     }
 
     #[test]
