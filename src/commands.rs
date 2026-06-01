@@ -53,6 +53,7 @@ pub enum KbCmd {
     /// List KB paths whose latest upsert is older than N days (TSV output)
     OlderThan(older_than::OlderThan),
     /// Manage peer repo graph edges
+    #[command(subcommand)]
     Peers(peers::Peers),
 }
 

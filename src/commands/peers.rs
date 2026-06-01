@@ -25,6 +25,9 @@ pub enum Peers {
     Show(PeersShow),
     /// Bulk-import peer relationships from a JSON seed file (idempotent)
     Import(PeersImport),
+    /// Manage directed peer edges (add/list/remove/cleanup-epic)
+    #[command(subcommand)]
+    Edge(PeersEdge),
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +518,272 @@ impl PeersImport {
         fs::write(&stamp_path, "")?;
 
         println!("{added}");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeersEdge (sub-command router)
+// ---------------------------------------------------------------------------
+
+/// Manage directed peer edges (add/list/remove/cleanup-epic)
+#[derive(clap::Parser, Command, Debug, Runnable)]
+pub enum PeersEdge {
+    /// Add a directed edge between two repos
+    Add(PeersEdgeAdd),
+    /// List edges (optionally filtered by epic slug)
+    List(PeersEdgeList),
+    /// Remove an edge by ID (idempotent)
+    Remove(PeersEdgeRemove),
+    /// Delete all edges for an epic slug and orphan-clean graphs
+    CleanupEpic(PeersEdgeCleanupEpic),
+}
+
+// ---------------------------------------------------------------------------
+// PeersEdgeAdd
+// ---------------------------------------------------------------------------
+
+/// Add a directed edge between two repos
+#[derive(Command, Debug, Parser)]
+pub struct PeersEdgeAdd {
+    /// Source repo path
+    pub source_repo: String,
+
+    /// Target repo path
+    pub target_repo: String,
+
+    /// Edge type (e.g. epic or dep)
+    #[arg(long = "type", name = "edge-type")]
+    pub edge_type: String,
+
+    /// Epic slug (optional)
+    #[arg(long)]
+    pub epic_slug: Option<String>,
+
+    /// TTL in days (optional)
+    #[arg(long)]
+    pub ttl_days: Option<u32>,
+}
+
+impl Runnable for PeersEdgeAdd {
+    fn run(&self) {
+        self.execute().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+    }
+}
+
+impl PeersEdgeAdd {
+    pub fn execute(&self) -> anyhow::Result<()> {
+        if self.edge_type != "epic" && self.edge_type != "dep" {
+            anyhow::bail!("--type must be 'epic' or 'dep', got '{}'", self.edge_type);
+        }
+
+        let paths = config::Paths::discover()?;
+        let conn = db::open_db(&paths.db)?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let expires_at: Option<String> = if let Some(days) = self.ttl_days {
+            let val: String = conn.query_row(
+                "SELECT datetime('now', ?1)",
+                params![format!("+{days} days")],
+                |r| r.get(0),
+            )?;
+            Some(val)
+        } else {
+            None
+        };
+
+        // Find or create a matching graph row.
+        let graph_id: String = {
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM graphs WHERE graph_type=?1 AND source_repo=?2 AND \
+                     (epic_slug IS ?3 OR (epic_slug IS NULL AND ?3 IS NULL))",
+                    params![self.edge_type, self.source_repo, self.epic_slug],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            match existing {
+                Some(id) => id,
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO graphs (id, graph_type, epic_slug, source_repo, \
+                         created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            id,
+                            self.edge_type,
+                            self.epic_slug,
+                            self.source_repo,
+                            now,
+                            expires_at,
+                        ],
+                    )?;
+                    id
+                }
+            }
+        };
+
+        let peer_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO peers (id, graph_id, source_repo, target_repo, edge_type, \
+             epic_slug, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                peer_id,
+                graph_id,
+                self.source_repo,
+                self.target_repo,
+                self.edge_type,
+                self.epic_slug,
+                now,
+                expires_at,
+            ],
+        )?;
+
+        println!("{peer_id}");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeersEdgeList
+// ---------------------------------------------------------------------------
+
+/// List edges (optionally filtered by epic slug)
+#[derive(Command, Debug, Parser)]
+pub struct PeersEdgeList {
+    /// Filter by epic slug (optional)
+    #[arg(long)]
+    pub epic_slug: Option<String>,
+}
+
+impl Runnable for PeersEdgeList {
+    fn run(&self) {
+        self.execute().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+    }
+}
+
+impl PeersEdgeList {
+    pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        let conn = db::open_db(&paths.db)?;
+
+        let sql = "SELECT p.id, p.source_repo, p.target_repo, \
+                   g.graph_type, p.epic_slug, p.created_at, p.expires_at \
+                   FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+                   WHERE (?1 IS NULL OR p.epic_slug = ?1)";
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![self.epic_slug], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, src, tgt, gtype, slug, created, expires) = row?;
+            out.push(serde_json::json!({
+                "id": id,
+                "source_repo": src,
+                "target_repo": tgt,
+                "graph_type": gtype,
+                "epic_slug": slug,
+                "created_at": created,
+                "expires_at": expires,
+            }));
+        }
+
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeersEdgeRemove
+// ---------------------------------------------------------------------------
+
+/// Remove an edge by ID (idempotent)
+#[derive(Command, Debug, Parser)]
+pub struct PeersEdgeRemove {
+    /// Edge ID to remove
+    pub edge_id: String,
+}
+
+impl Runnable for PeersEdgeRemove {
+    fn run(&self) {
+        self.execute().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+    }
+}
+
+impl PeersEdgeRemove {
+    pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        let conn = db::open_db(&paths.db)?;
+
+        conn.execute("DELETE FROM peers WHERE id=?1", params![self.edge_id])?;
+
+        // Delete orphaned graphs (graphs with no remaining peer edges).
+        conn.execute(
+            "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
+            [],
+        )?;
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PeersEdgeCleanupEpic
+// ---------------------------------------------------------------------------
+
+/// Delete all edges for an epic slug and orphan-clean graphs
+#[derive(Command, Debug, Parser)]
+pub struct PeersEdgeCleanupEpic {
+    /// Epic slug whose edges should be deleted
+    pub slug: String,
+}
+
+impl Runnable for PeersEdgeCleanupEpic {
+    fn run(&self) {
+        self.execute().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+    }
+}
+
+impl PeersEdgeCleanupEpic {
+    pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        let conn = db::open_db(&paths.db)?;
+
+        conn.execute(
+            "DELETE FROM peers WHERE epic_slug = ?1",
+            params![self.slug],
+        )?;
+
+        // Delete orphaned graphs (graphs with no remaining peer edges).
+        conn.execute(
+            "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
+            [],
+        )?;
+
         Ok(())
     }
 }
