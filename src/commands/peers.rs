@@ -3,6 +3,7 @@
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
+use anyhow::Context;
 use clap::Parser;
 use rusqlite::params;
 use serde_json::json;
@@ -22,6 +23,8 @@ pub enum Peers {
     Remove(PeersRemove),
     /// Show all peer relationships involving a given repo path
     Show(PeersShow),
+    /// Bulk-import peer relationships from a JSON seed file (idempotent)
+    Import(PeersImport),
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +365,158 @@ fn query_peers_by_either_repo(
         }));
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// PeersImport
+// ---------------------------------------------------------------------------
+
+/// Bulk-import peer relationships from a JSON seed file (idempotent)
+#[derive(Command, Debug, Parser)]
+pub struct PeersImport {
+    /// Path to JSON seeds file: array of {source_repo, target_repo, graph_type, epic_slug?, ttl_days?}
+    pub seeds_file: String,
+}
+
+impl Runnable for PeersImport {
+    fn run(&self) {
+        self.execute().unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PeerSeedEntry {
+    source_repo: String,
+    target_repo: String,
+    graph_type: String,
+    epic_slug: Option<String>,
+    ttl_days: Option<u32>,
+}
+
+impl PeersImport {
+    pub fn execute(&self) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::fs;
+
+        let file_bytes = fs::read(&self.seeds_file)
+            .with_context(|| format!("read seeds file: {}", self.seeds_file))?;
+
+        // Stamp check — skip entirely if this exact file content was already imported.
+        let mut hasher = Sha256::new();
+        hasher.update(&file_bytes);
+        let hash_hex = format!("{:x}", hasher.finalize());
+
+        let paths = config::Paths::discover()?;
+        let stamp_path = paths
+            .db
+            .parent()
+            .map(|p| p.join(format!("peers-import-{hash_hex}.stamp")))
+            .ok_or_else(|| anyhow::anyhow!("cannot derive stamp path from db path"))?;
+
+        if stamp_path.exists() {
+            println!("0");
+            return Ok(());
+        }
+
+        let entries: Vec<PeerSeedEntry> = serde_json::from_slice(&file_bytes)
+            .with_context(|| format!("parse seeds file: {}", self.seeds_file))?;
+
+        let conn = db::open_db(&paths.db)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut added = 0usize;
+
+        for entry in &entries {
+            if entry.graph_type != "epic" && entry.graph_type != "dep" {
+                anyhow::bail!(
+                    "--type must be 'epic' or 'dep', got '{}'",
+                    entry.graph_type
+                );
+            }
+
+            // Skip if this peer edge already exists.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM peers WHERE source_repo=?1 AND target_repo=?2 \
+                     AND edge_type='member' \
+                     AND (epic_slug IS ?3 OR (epic_slug IS NULL AND ?3 IS NULL))",
+                    params![entry.source_repo, entry.target_repo, entry.epic_slug],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                continue;
+            }
+
+            // Compute optional expires_at.
+            let expires_at: Option<String> = if let Some(days) = entry.ttl_days {
+                let val: String = conn.query_row(
+                    "SELECT datetime('now', ?1)",
+                    params![format!("+{days} days")],
+                    |r| r.get(0),
+                )?;
+                Some(val)
+            } else {
+                None
+            };
+
+            // Find or create a matching graph row.
+            let graph_id: String = {
+                let existing_graph: Option<String> = conn
+                    .query_row(
+                        "SELECT id FROM graphs WHERE graph_type=?1 AND source_repo=?2 AND \
+                         (epic_slug IS ?3 OR (epic_slug IS NULL AND ?3 IS NULL))",
+                        params![entry.graph_type, entry.source_repo, entry.epic_slug],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+
+                match existing_graph {
+                    Some(id) => id,
+                    None => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        conn.execute(
+                            "INSERT INTO graphs (id, graph_type, epic_slug, source_repo, \
+                             created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                id,
+                                entry.graph_type,
+                                entry.epic_slug,
+                                entry.source_repo,
+                                now,
+                                expires_at,
+                            ],
+                        )?;
+                        id
+                    }
+                }
+            };
+
+            let peer_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO peers (id, graph_id, source_repo, target_repo, edge_type, \
+                 epic_slug, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, 'member', ?5, ?6, ?7)",
+                params![
+                    peer_id,
+                    graph_id,
+                    entry.source_repo,
+                    entry.target_repo,
+                    entry.epic_slug,
+                    now,
+                    expires_at,
+                ],
+            )?;
+            added += 1;
+        }
+
+        // Write stamp file so re-runs are skipped.
+        fs::write(&stamp_path, "")?;
+
+        println!("{added}");
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
