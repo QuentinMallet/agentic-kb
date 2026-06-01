@@ -120,6 +120,9 @@ fn handle_request(
         "audit_record" => handle_audit_record(&id, &req, paths, emb),
         "audit_report" => handle_audit_report(&id, paths),
         "provenance" => handle_provenance(&id, &req, paths),
+        "kb_peers_add" => handle_kb_peers_add(&id, &req, paths),
+        "kb_peers_list" => handle_kb_peers_list(&id, &req, paths),
+        "kb_peers_remove" => handle_kb_peers_remove(&id, &req, paths),
         _ => json!({
             "id": id,
             "type": "error",
@@ -144,6 +147,11 @@ fn handle_search(
     let mode = req.get("mode").and_then(|m| m.as_str()).unwrap_or("hybrid");
     let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
     let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Peer federation params — parsed and accepted but federation is local-only in MCP for now.
+    let _peers: bool = req.get("peers").and_then(|v| v.as_bool()).unwrap_or(false);
+    let _reachable_from: Option<String> = req.get("reachable_from").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let _max_hops: u8 = req.get("max_hops").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
+    let _slug: Option<String> = req.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // br-3gp: request override falls back to KbConfig::inline_verify_k (default
     // 10) rather than `limit`, so the configured cap is reachable.
@@ -1187,6 +1195,161 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         "graph": graph,
         "truncated": truncated,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Peers MCP handlers
+// ---------------------------------------------------------------------------
+
+fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let target_repo = match req.get("target_repo").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing target_repo"}),
+    };
+    let graph_type = match req.get("graph_type").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing graph_type"}),
+    };
+    if graph_type != "epic" && graph_type != "dep" {
+        return json!({"id":id,"type":"error","code":"validation_error","message":"graph_type must be 'epic' or 'dep'"});
+    }
+    let epic_slug: Option<String> = req.get("epic_slug").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let ttl_days: Option<u32> = req.get("ttl_days").and_then(|v| v.as_u64()).map(|n| n as u32);
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let source_repo = root_from_db(&paths.db).to_string_lossy().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let expires_at: Option<String> = if let Some(days) = ttl_days {
+        match conn.query_row(
+            "SELECT datetime('now', ?1)",
+            params![format!("+{days} days")],
+            |r| r.get(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        }
+    } else {
+        None
+    };
+
+    // Find or create graph row.
+    let graph_id: String = {
+        use rusqlite::OptionalExtension;
+        let existing: Option<String> = match conn.query_row(
+            "SELECT id FROM graphs WHERE graph_type=?1 AND source_repo=?2 AND \
+             (epic_slug IS ?3 OR (epic_slug IS NULL AND ?3 IS NULL))",
+            params![graph_type, source_repo, epic_slug],
+            |r| r.get(0),
+        ).optional() {
+            Ok(v) => v,
+            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        };
+        match existing {
+            Some(gid) => gid,
+            None => {
+                let gid = uuid::Uuid::new_v4().to_string();
+                if let Err(e) = conn.execute(
+                    "INSERT INTO graphs (id, graph_type, epic_slug, source_repo, created_at, expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![gid, graph_type, epic_slug, source_repo, now, expires_at],
+                ) {
+                    return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+                }
+                gid
+            }
+        }
+    };
+
+    let peer_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = conn.execute(
+        "INSERT INTO peers (id, graph_id, source_repo, target_repo, edge_type, epic_slug, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, 'member', ?5, ?6, ?7)",
+        params![peer_id, graph_id, source_repo, target_repo, epic_slug, now, expires_at],
+    ) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    json!({"id": id, "type": "ok", "peer_id": peer_id})
+}
+
+fn handle_kb_peers_list(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let graph_type_filter: Option<String> = req
+        .get("graph_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let sql = "SELECT p.id, p.source_repo, p.target_repo, g.graph_type, p.epic_slug, p.expires_at \
+               FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+               WHERE (?1 IS NULL OR g.graph_type = ?1)";
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    let rows: Vec<Value> = match stmt.query_map(params![graph_type_filter], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+        ))
+    }) {
+        Ok(mapped) => mapped
+            .filter_map(|r| r.ok())
+            .map(|(rid, src, tgt, gtype, slug, expires)| {
+                json!({
+                    "id": rid,
+                    "source_repo": src,
+                    "target_repo": tgt,
+                    "graph_type": gtype,
+                    "epic_slug": slug,
+                    "expires_at": expires,
+                })
+            })
+            .collect(),
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    json!({"id": id, "type": "ok", "result": rows})
+}
+
+fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let peer_id = match req.get("peer_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing peer_id"}),
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    if let Err(e) = conn.execute("DELETE FROM peers WHERE id=?1", params![peer_id]) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    // Orphan cleanup: remove graphs with no remaining peer edges.
+    if let Err(e) = conn.execute(
+        "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
+        [],
+    ) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+
+    json!({"id": id, "type": "ok"})
 }
 
 #[cfg(test)]
