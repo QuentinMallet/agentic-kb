@@ -5,6 +5,7 @@ use crate::components::embedder;
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
+use std::collections::HashSet;
 
 /// Search knowledge entries (default: hybrid FTS5 + semantic re-rank)
 #[derive(Command, Debug, Parser)]
@@ -35,6 +36,18 @@ pub struct Search {
     /// Skip peer federation and search only the local DB
     #[arg(long, default_value_t = false)]
     pub local_only: bool,
+    /// Open each registered peer DB and merge results
+    #[arg(long, default_value_t = false)]
+    pub peers: bool,
+    /// Traverse peer graph from this repo path (implies --peers)
+    #[arg(long)]
+    pub reachable_from: Option<String>,
+    /// Max hops for --reachable-from traversal (default: 1)
+    #[arg(long, default_value_t = 1)]
+    pub max_hops: u8,
+    /// Restrict peer traversal to edges with this epic_slug
+    #[arg(long)]
+    pub slug: Option<String>,
 }
 
 impl Runnable for Search {
@@ -80,7 +93,47 @@ impl Search {
         };
 
         let conn = db::open_db(&paths.db)?;
-        let results = db::search_entries(&conn, embedder, &self.query, &opts)?;
+        let local_results = db::search_entries(&conn, embedder, &self.query, &opts)?;
+
+        // Peer federation: collect results from peer DBs and merge.
+        let results = if !self.local_only && (self.peers || self.reachable_from.is_some()) {
+            let peer_paths = collect_peer_paths(&conn, self.reachable_from.as_deref(), self.max_hops, self.slug.as_deref());
+
+            // Deduplicate: local results take priority.
+            let local_ids: HashSet<String> = local_results.iter().map(|r| r.id.clone()).collect();
+            let mut merged = local_results;
+
+            for peer_path in peer_paths {
+                let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
+                let peer_conn = match db::open_db(&peer_db) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("warn: peer {peer_path}: {e}");
+                        continue;
+                    }
+                };
+                let peer_opts = db::SearchOptions {
+                    repo_root: Some(std::path::PathBuf::from(&peer_path)),
+                    ..opts.clone()
+                };
+                match db::search_entries(&peer_conn, embedder, &self.query, &peer_opts) {
+                    Ok(mut peer_results) => {
+                        for r in &mut peer_results {
+                            r.origin_repo = Some(peer_path.clone());
+                        }
+                        for r in peer_results {
+                            if !local_ids.contains(&r.id) {
+                                merged.push(r);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("warn: peer {peer_path} search: {e}"),
+                }
+            }
+            merged
+        } else {
+            local_results
+        };
 
         let mut fts_count = 0usize;
         let mut sem_count = 0usize;
@@ -150,6 +203,112 @@ impl Search {
 
         let _ = (fts_count, sem_count); // suppress unused warning
         Ok(())
+    }
+}
+
+/// Collect peer target_repo paths from the local DB for federation.
+///
+/// If `reachable_from` is set, performs BFS up to `max_hops` hops starting
+/// from that repo. Otherwise returns direct peers (1 hop) of the local DB.
+fn collect_peer_paths(
+    conn: &rusqlite::Connection,
+    reachable_from: Option<&str>,
+    max_hops: u8,
+    slug_filter: Option<&str>,
+) -> Vec<String> {
+    if let Some(start) = reachable_from {
+        bfs_peers(conn, start, max_hops, slug_filter)
+    } else {
+        // Direct peers only (1 hop).
+        query_direct_peers(conn, slug_filter)
+    }
+}
+
+/// Query direct target_repo values from the peers table.
+fn query_direct_peers(
+    conn: &rusqlite::Connection,
+    slug_filter: Option<&str>,
+) -> Vec<String> {
+    let sql = if slug_filter.is_some() {
+        "SELECT DISTINCT target_repo FROM peers WHERE epic_slug = ?1"
+    } else {
+        "SELECT DISTINCT target_repo FROM peers"
+    };
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let rows: Vec<String> = if let Some(slug) = slug_filter {
+        stmt.query_map(rusqlite::params![slug], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        stmt.query_map([], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    rows
+}
+
+/// BFS traversal of peer graph starting from `start_repo` up to `max_hops`.
+fn bfs_peers(
+    conn: &rusqlite::Connection,
+    start_repo: &str,
+    max_hops: u8,
+    slug_filter: Option<&str>,
+) -> Vec<String> {
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(start_repo.to_string());
+    let mut frontier: Vec<String> = vec![start_repo.to_string()];
+    let mut result: Vec<String> = Vec::new();
+
+    for _ in 0..max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next_frontier: Vec<String> = Vec::new();
+        for repo in &frontier {
+            let neighbors = query_neighbors(conn, repo, slug_filter);
+            for neighbor in neighbors {
+                if !visited.contains(&neighbor) {
+                    visited.insert(neighbor.clone());
+                    result.push(neighbor.clone());
+                    next_frontier.push(neighbor);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+    result
+}
+
+/// Query direct neighbors (target_repo) for a given source_repo.
+fn query_neighbors(
+    conn: &rusqlite::Connection,
+    source_repo: &str,
+    slug_filter: Option<&str>,
+) -> Vec<String> {
+    let sql = if slug_filter.is_some() {
+        "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1 AND epic_slug = ?2"
+    } else {
+        "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1"
+    };
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    if let Some(slug) = slug_filter {
+        stmt.query_map(rusqlite::params![source_repo, slug], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        stmt.query_map(rusqlite::params![source_repo], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -315,6 +474,11 @@ mod tests {
                 content: false,
                 path_prefix: None,
                 tag: None,
+                local_only: false,
+                peers: false,
+                reachable_from: None,
+                max_hops: 1,
+                slug: None,
             };
             // Should succeed (no panic, no error)
             let _ = search_cmd.execute_with(&paths, &embedder);

@@ -454,6 +454,7 @@ pub fn apply_event(
 // ---------------------------------------------------------------------------
 
 /// Options for hybrid FTS5 + semantic search.
+#[derive(Clone)]
 pub struct SearchOptions {
     pub limit: usize,
     pub do_fts: bool,
