@@ -226,6 +226,7 @@ fn handle_search(
                         "evidence": evidence,
                         "confidence": e.confidence,
                         "audit_n": e.audit_n,
+                        "origin_repo": e.origin_repo,
                     })
                 })
                 .collect();

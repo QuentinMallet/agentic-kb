@@ -32,6 +32,9 @@ pub struct Search {
     /// Filter results to entries that have this tag
     #[arg(long)]
     pub tag: Option<String>,
+    /// Skip peer federation and search only the local DB
+    #[arg(long, default_value_t = false)]
+    pub local_only: bool,
 }
 
 impl Runnable for Search {
@@ -192,6 +195,7 @@ mod tests {
             content: false,
             path_prefix: None,
             tag: None,
+            local_only: false,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
     }
@@ -230,6 +234,7 @@ mod tests {
             content: false,
             path_prefix: None,
             tag: None,
+            local_only: false,
         };
         search_cmd.execute_with(&remote_paths, &embedder).unwrap();
     }
@@ -270,6 +275,7 @@ mod tests {
             content: false,
             path_prefix: None,
             tag: None,
+            local_only: false,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
     }
@@ -354,6 +360,7 @@ mod tests {
             content: false,
             path_prefix: Some("src/".to_string()),
             tag: None,
+            local_only: false,
         };
         // Just verify no error — path filtering is applied in SQL
         search_cmd.execute_with(&paths, &embedder).unwrap();
