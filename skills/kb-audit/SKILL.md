@@ -103,3 +103,12 @@ Use `kb_provenance` to walk the DAG:
 ```
 
 Response: `{ "roots": [...], "graph": [{ "from": "B", "to": "A" }, ...], "truncated": false }`
+
+When the queried entry has no provenance parents, it is itself the root and appears in `roots`.
+
+## Durability warning
+
+`audit_runs` and `source_weights` are DB-only tables — they are **not** replayed from JSONL events.
+Running `kb_rebuild` recreates the DB from the events file and **erases all audit history and confidence
+weights**. After a rebuild, confidence reverts to the Beta(1,1) bootstrap value (0.5) until audit cycles
+are re-run. Plan accordingly before running `kb_rebuild` on a production KB.

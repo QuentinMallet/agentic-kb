@@ -837,7 +837,12 @@ fn handle_audit_record(
     emb: &dyn embedder::Embedder,
 ) -> Value {
     let run_id = match req.get("run_id").and_then(|v| v.as_str()) {
-        Some(r) => r.to_string(),
+        Some(r) => {
+            if r.is_empty() || r.len() > 128 || r.bytes().any(|b| b < 0x20) {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
+            }
+            r.to_string()
+        }
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing run_id"}),
     };
 
@@ -865,6 +870,19 @@ fn handle_audit_record(
     let mut recorded = 0u32;
     let mut expired = 0u32;
 
+    // Validate ALL entry_ids up front so no expire events are written for a
+    // partially-invalid batch (prevents orphaned expires on retry).
+    for v in &verdicts {
+        if let Some(eid) = v.get("entry_id").and_then(|x| x.as_str()) {
+            let exists: bool = conn
+                .query_row("SELECT COUNT(*) FROM entries WHERE id=?1", params![eid], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) > 0;
+            if !exists {
+                return json!({"id":id,"type":"error","code":"invalid_entry_id","message":format!("entry '{}' not found", eid)});
+            }
+        }
+    }
+
     for verdict_obj in &verdicts {
         let entry_id = match verdict_obj.get("entry_id").and_then(|v| v.as_str()) {
             Some(e) => e.to_string(),
@@ -872,22 +890,6 @@ fn handle_audit_record(
         };
         let verdict = verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
         let note = verdict_obj.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM entries WHERE id=?1",
-                params![entry_id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-        if !exists {
-            return json!({
-                "id": id, "type": "error",
-                "code": "invalid_entry_id",
-                "message": format!("entry '{}' not found", entry_id)
-            });
-        }
 
         // JSONL-first ordering invariant: expire event BEFORE audit_runs INSERT
         if !verdict {
@@ -940,7 +942,9 @@ fn handle_audit_record(
                 "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
                  ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
             };
-            let _ = conn.execute(weight_sql, params![entry_kind, entry_session_id]);
+            if let Err(e) = conn.execute(weight_sql, params![entry_kind, entry_session_id]) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
             recorded += 1;
         }
     }
@@ -1077,7 +1081,7 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                         }
                     };
 
-                if parents.is_empty() && depth > 0 {
+                if parents.is_empty() {
                     roots.push(node_id.clone());
                 }
 
