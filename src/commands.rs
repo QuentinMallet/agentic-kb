@@ -8,6 +8,7 @@ pub mod import_cmd;
 pub mod ingest;
 pub mod mcp;
 pub mod older_than;
+pub mod peers;
 pub mod reembed;
 pub mod rebuild;
 pub mod run;
@@ -51,6 +52,9 @@ pub enum KbCmd {
     Import(import_cmd::Import),
     /// List KB paths whose latest upsert is older than N days (TSV output)
     OlderThan(older_than::OlderThan),
+    /// Manage peer repo graph edges
+    #[command(subcommand)]
+    Peers(peers::Peers),
 }
 
 /// Entry point for the application.

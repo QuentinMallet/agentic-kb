@@ -74,6 +74,15 @@ pub fn compute_evidence_status(conn: &Connection, entry_id: &str) -> Result<Stri
     Ok(status.to_string())
 }
 
+/// Delete expired peer edges and orphaned graphs.
+pub fn sweep_expired_peers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM peers WHERE expires_at IS NOT NULL AND expires_at < datetime('now');
+         DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL);",
+    )?;
+    Ok(())
+}
+
 /// Open (or create) the SQLite database at the given path.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
@@ -83,6 +92,7 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
         .with_context(|| format!("open DB {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     ensure_schema(&conn)?;
+    sweep_expired_peers(&conn)?;
     Ok(conn)
 }
 
@@ -208,6 +218,37 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // AC-P6: peer graph tables (additive; no-op on already-migrated DBs).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS graphs (
+            id          TEXT PRIMARY KEY,
+            graph_type  TEXT NOT NULL CHECK(graph_type IN ('epic','dep')),
+            epic_slug   TEXT,
+            source_repo TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_graphs_source_repo ON graphs(source_repo);
+
+        CREATE TABLE IF NOT EXISTS peers (
+            id          TEXT PRIMARY KEY,
+            graph_id    TEXT REFERENCES graphs(id),
+            source_repo TEXT NOT NULL,
+            target_repo TEXT NOT NULL,
+            edge_type   TEXT NOT NULL DEFAULT 'member',
+            epic_slug   TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_peers_source_repo ON peers(source_repo);
+        CREATE INDEX IF NOT EXISTS idx_peers_target_repo ON peers(target_repo);
+        CREATE INDEX IF NOT EXISTS idx_peers_epic_slug   ON peers(epic_slug);
+        "#,
+    )?;
+    // AC-P6 migrations: add cross-repo provenance columns to entries.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN origin_repo TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN cross_repo_epic TEXT;");
     Ok(())
 }
 
@@ -413,6 +454,7 @@ pub fn apply_event(
 // ---------------------------------------------------------------------------
 
 /// Options for hybrid FTS5 + semantic search.
+#[derive(Clone)]
 pub struct SearchOptions {
     pub limit: usize,
     pub do_fts: bool,
@@ -481,6 +523,8 @@ pub struct SearchEntry {
     pub confidence: f32,
     /// Total audit verdicts recorded for this entry's (kind, session_id) pair.
     pub audit_n: u32,
+    /// Originating repo path. `None` means local DB; `Some(path)` means fetched from a peer.
+    pub origin_repo: Option<String>,
 }
 
 /// Fetch evidence rows for the given entry IDs, capped at
@@ -602,6 +646,7 @@ pub fn search_entries(
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
+                origin_repo: None,
             });
         }
     }
@@ -653,6 +698,7 @@ pub fn search_entries(
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
+                origin_repo: None,
             });
         }
 
