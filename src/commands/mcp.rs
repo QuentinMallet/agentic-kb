@@ -1183,7 +1183,7 @@ mod tests {
     fn test_handle_add_basic() {
         let (_dir, paths, emb) = setup();
         let id = json!("t1");
-        let req = json!({"method":"add","id":"t1","path":"test/a","summary":"sum","content":"body","tags":["t"]});
+        let req = json!({"method":"add","id":"t1","path":"test/a","summary":"sum","content":"body","tags":["t"],"kind":"convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["entry_id"].as_str().is_some());
@@ -1193,7 +1193,7 @@ mod tests {
     fn test_handle_add_permanent() {
         let (_dir, paths, emb) = setup();
         let id = json!("t2");
-        let req = json!({"method":"add","id":"t2","path":"test/b","summary":"s","content":"c","tags":[],"permanent":true});
+        let req = json!({"method":"add","id":"t2","path":"test/b","summary":"s","content":"c","tags":[],"permanent":true,"kind":"convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok");
 
@@ -1210,12 +1210,12 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("t3");
         // Add first entry
-        let req1 = json!({"method":"add","id":"t3","path":"test/c","summary":"old","content":"old","tags":[]});
+        let req1 = json!({"method":"add","id":"t3","path":"test/c","summary":"old","content":"old","tags":[],"kind":"convention"});
         let r1 = handle_add(&id, &req1, &paths, &emb);
         let old_id = r1["entry_id"].as_str().unwrap().to_string();
 
         // Replace
-        let req2 = json!({"method":"add","id":"t3b","path":"test/c","summary":"new","content":"new","tags":[],"replace_path":true});
+        let req2 = json!({"method":"add","id":"t3b","path":"test/c","summary":"new","content":"new","tags":[],"replace_path":true,"kind":"convention"});
         handle_add(&id, &req2, &paths, &emb);
 
         let conn = db::open_db(&paths.db).unwrap();
@@ -1427,7 +1427,7 @@ mod tests {
     fn test_handle_expire_basic() {
         let (_dir, paths, emb) = setup();
         let id = json!("e1");
-        let req_add = json!({"method":"add","id":"e1","path":"test/x","summary":"s","content":"c","tags":[]});
+        let req_add = json!({"method":"add","id":"e1","path":"test/x","summary":"s","content":"c","tags":[],"kind":"convention"});
         let r = handle_add(&id, &req_add, &paths, &emb);
         let entry_id = r["entry_id"].as_str().unwrap();
 
@@ -1441,7 +1441,7 @@ mod tests {
     fn test_handle_expire_permanent_guard() {
         let (_dir, paths, emb) = setup();
         let id = json!("pg1");
-        let req_add = json!({"method":"add","id":"pg1","path":"test/perm","summary":"s","content":"c","tags":[],"permanent":true});
+        let req_add = json!({"method":"add","id":"pg1","path":"test/perm","summary":"s","content":"c","tags":[],"permanent":true,"kind":"convention"});
         let r = handle_add(&id, &req_add, &paths, &emb);
         let entry_id = r["entry_id"].as_str().unwrap();
 
@@ -1512,12 +1512,12 @@ mod tests {
         let id = json!("imp1");
 
         // Add initial entry at path "test/imp"
-        let req_add = json!({"method":"add","id":"imp1","path":"test/imp","summary":"v1","content":"c1","tags":["a"]});
+        let req_add = json!({"method":"add","id":"imp1","path":"test/imp","summary":"v1","content":"c1","tags":["a"],"kind":"convention"});
         handle_add(&id, &req_add, &paths, &emb);
 
         // Write a seeds JSON file with a new entry at same path
         let seeds_path = dir.path().join("seeds.json");
-        let seeds = json!([{"path":"test/imp","summary":"v2","content":"c2","tags":["b"]}]);
+        let seeds = json!([{"path":"test/imp","summary":"v2","content":"c2","tags":["b"],"kind":"convention"}]);
         fs::write(&seeds_path, serde_json::to_string(&seeds).unwrap()).unwrap();
 
         // Import with upsert=false → should skip (path already exists)
@@ -1540,7 +1540,7 @@ mod tests {
         let id = json!("rb1");
 
         // Add some entries via events
-        let req = json!({"method":"add","id":"rb1","path":"test/rb","summary":"s","content":"c","tags":[]});
+        let req = json!({"method":"add","id":"rb1","path":"test/rb","summary":"s","content":"c","tags":[],"kind":"convention"});
         handle_add(&id, &req, &paths, &emb);
 
         // Rebuild should recreate DB from events
@@ -2001,7 +2001,7 @@ mod tests {
     fn test_handle_add_session_id_null() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"path":"test/sid","summary":"s","content":"c","tags":[]});
+        let req = json!({"path":"test/sid","summary":"s","content":"c","tags":[],"kind":"convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();
@@ -2015,7 +2015,7 @@ mod tests {
     fn test_handle_add_session_id_stored() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"path":"test/sid2","summary":"s","content":"c","tags":[],"session_id":"abc"});
+        let req = json!({"path":"test/sid2","summary":"s","content":"c","tags":[],"session_id":"abc","kind":"convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();

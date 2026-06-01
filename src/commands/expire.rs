@@ -113,7 +113,7 @@ mod tests {
             id: Some("expire-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
         };
@@ -155,7 +155,7 @@ mod tests {
             id: Some("perm-expire-1".to_string()),
             permanent: true,
             replace_path: false,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
         };
@@ -189,7 +189,7 @@ mod tests {
             id: Some("perm-expire-2".to_string()),
             permanent: true,
             replace_path: false,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
         };

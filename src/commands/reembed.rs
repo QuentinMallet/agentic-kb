@@ -145,7 +145,7 @@ mod tests {
             id: Some("re-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
         };
@@ -175,7 +175,7 @@ mod tests {
             id: Some("re-large-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
         };
