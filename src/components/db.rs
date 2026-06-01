@@ -200,6 +200,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             updated_at  TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (kind, session_id)
         );
+        CREATE TABLE IF NOT EXISTS audit_run_candidates (
+            run_id     TEXT NOT NULL,
+            entry_id   TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (run_id, entry_id)
+        );
         "#,
     )?;
     Ok(())

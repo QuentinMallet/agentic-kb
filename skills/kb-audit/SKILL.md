@@ -30,6 +30,12 @@ Response: `{ "run_id": "<uuid>", "samples": [...] }`
 `samples` contains only live entries (`is_stale=0`) with evidence present (`evidence_status='present'`).
 `sample_size` is clamped to 1–50. The `run_id` is required for Step 2.
 
+**Audit eligibility:** only entries with `evidence_status='present'` are sampled, which covers
+`kind ∈ {observation, belief, procedure}`. Entries with `kind='convention'` or `kind='memory'`
+have `evidence_status='n/a'` and are never sampled — their `confidence` field stays at the
+Beta(1,1) bootstrap value (0.5) indefinitely. To calibrate conventions, use a separate workflow
+(e.g. team policy review) rather than the evidence-citation audit cycle.
+
 ### Step 2 — Collect verdicts and record
 
 For each sampled entry, verify the cited evidence still accurately supports the summary.

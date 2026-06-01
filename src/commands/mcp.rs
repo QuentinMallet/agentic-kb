@@ -798,6 +798,11 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
     let sample_size = sample_size.clamp(1, 50) as usize;
 
+    let _lock = match acquire_lock(&paths.lock) {
+        Ok(l) => l,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
     let conn = match db::open_db(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -827,6 +832,16 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
+    let ts = chrono::Utc::now().to_rfc3339();
+    for s in &samples {
+        if let Some(eid) = s.get("id").and_then(|v| v.as_str()) {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,?3)",
+                params![run_id, eid, ts],
+            );
+        }
+    }
+
     json!({"id": id, "type": "ok", "run_id": run_id, "samples": samples})
 }
 
@@ -879,6 +894,24 @@ fn handle_audit_record(
                 .unwrap_or(0) > 0;
             if !exists {
                 return json!({"id":id,"type":"error","code":"invalid_entry_id","message":format!("entry '{}' not found", eid)});
+            }
+        }
+    }
+
+    // Validate all (run_id, entry_id) pairs were registered by a prior audit_run call,
+    // preventing replay with an arbitrary run_id that bypasses the sampling step.
+    for v in &verdicts {
+        if let Some(eid) = v.get("entry_id").and_then(|x| x.as_str()) {
+            let in_candidates: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, eid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0) > 0;
+            if !in_candidates {
+                return json!({"id":id,"type":"error","code":"unknown_run_candidates",
+                    "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", eid, run_id)});
             }
         }
     }
@@ -1671,6 +1704,14 @@ mod tests {
 
     // ── br-ei2.12: unit tests for new handlers ──────────────────────────────
 
+    fn seed_audit_candidate(paths: &config::Paths, run_id: &str, entry_id: &str) {
+        let conn = db::open_db(&paths.db).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,datetime('now'))",
+            rusqlite::params![run_id, entry_id],
+        ).unwrap();
+    }
+
     fn add_live_entry(paths: &config::Paths, emb: &NoopEmbedder, path: &str, session_id: Option<&str>) -> String {
         let id = json!(null);
         let mut req = json!({"path": path, "summary": "s", "content": "c", "tags": [], "kind": "observation",
@@ -1734,6 +1775,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/rec", None);
         let run_id = "run-001";
+        seed_audit_candidate(&paths, run_id, &eid);
         let id = json!(null);
         let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
         let resp = handle_audit_record(&id, &req, &paths, &emb);
@@ -1753,6 +1795,7 @@ mod tests {
     fn test_handle_audit_record_expires_on_false() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/exp", None);
+        seed_audit_candidate(&paths, "run-002", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false}]});
         let resp = handle_audit_record(&id, &req, &paths, &emb);
@@ -1769,6 +1812,7 @@ mod tests {
     fn test_handle_audit_record_increments_source_weight() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/sw", None);
+        seed_audit_candidate(&paths, "run-003", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-003", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(&id, &req, &paths, &emb);
@@ -1785,6 +1829,7 @@ mod tests {
     fn test_handle_audit_record_idempotent() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/idem", None);
+        seed_audit_candidate(&paths, "run-idem", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(&id, &req, &paths, &emb);
@@ -1828,6 +1873,7 @@ mod tests {
         let id = json!(null);
         // Add 4 entries (same kind+session_id), record 3 true + 1 false
         let eids: Vec<String> = (0..4).map(|i| add_live_entry(&paths, &emb, &format!("p/r{}", i), None)).collect();
+        for eid in &eids { seed_audit_candidate(&paths, "run-report", eid); }
         let verdicts: Vec<Value> = eids.iter().enumerate().map(|(i, eid)| {
             json!({"entry_id": eid, "verdict": i < 3})
         }).collect();
@@ -1997,6 +2043,7 @@ mod tests {
     fn test_search_confidence_after_one_success() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/conf1", None);
+        seed_audit_candidate(&paths, "run-conf1", &eid);
         let id = json!(null);
         // Record verdict=true
         let req = json!({"run_id": "run-conf1", "verdicts": [{"entry_id": eid, "verdict": true}]});
@@ -2016,6 +2063,7 @@ mod tests {
     fn test_search_confidence_for_null_session_id() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/conf-null", None); // session_id=NULL
+        seed_audit_candidate(&paths, "run-null-sid", &eid);
         let id = json!(null);
         // Record verdict for this entry (uses COALESCE → __GLOBAL__)
         let req = json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
@@ -2139,6 +2187,7 @@ mod tests {
         ) {
             let (_dir, paths, emb) = setup();
             let eid = add_live_entry(&paths, &emb, "p/prop-idem", None);
+            seed_audit_candidate(&paths, "run-prop-idem", &eid);
             let id = json!(null);
             let req = json!({"run_id": "run-prop-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
             // First call
@@ -2208,6 +2257,7 @@ mod tests {
         // Use a fresh session_id ("sess-conf") so this weight bucket starts clean;
         // sess-1 already has failures=1 from Step 3 and would yield confidence=0.5.
         let e2 = add_live_entry(&paths, &emb, "e2e/conf", Some("sess-conf"));
+        seed_audit_candidate(&paths, "run-conf-e2e", &e2);
         let req_true = json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
         handle_audit_record(&id, &req_true, &paths, &emb);
         let search2 = handle_search(&id, &json!({"query":"e2e conf","mode":"fts"}), &paths, &emb, 10);
