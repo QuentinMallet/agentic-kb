@@ -94,17 +94,20 @@ impl Add {
             self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>()
         );
 
+        // Compute id early so the self-loop provenance check in validate_kb_add_inputs
+        // can compare evidence.derived_from against the entry's own id.
+        let id = self
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
         // Validate kind, tags, and evidence before acquiring the lock.
-        validate_kb_add_inputs(&self.kind, &tags_json, &evidence_rows)?;
+        validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
 
         // Compute write-time evidence_status and emit soft-mandate warning.
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
 
         let _lock = acquire_lock(&paths.lock)?;
-        let id = self
-            .id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
         let session =
@@ -610,7 +613,7 @@ mod tests {
             evidence_file: None,
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
-        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code only"));
+        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code|derived only"));
     }
 
     #[test]
