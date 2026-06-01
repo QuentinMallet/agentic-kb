@@ -305,7 +305,7 @@ mod tests {
             permanent: false,
             replace_path: false,
             kind: "belief".to_string(),
-            evidence: vec![],
+            evidence: vec![r#"{"kind":"code","citation_hash":"sha256:abc123"}"#.to_string()],
             evidence_file: None,
         }
     }
@@ -356,7 +356,7 @@ mod tests {
             id: Some("perm-test-1".to_string()),
             permanent: true,
             replace_path: false,
-            kind: "belief".to_string(),
+            kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
@@ -382,7 +382,7 @@ mod tests {
             id: Some("perm-test-2".to_string()),
             permanent: false,
             replace_path: false,
-            kind: "belief".to_string(),
+            kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
@@ -456,7 +456,7 @@ mod tests {
             id: Some("rp-old".to_string()),
             permanent: false,
             replace_path: false,
-            kind: "belief".to_string(),
+            kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
@@ -472,7 +472,7 @@ mod tests {
             id: Some("rp-new".to_string()),
             permanent: false,
             replace_path: true,
-            kind: "belief".to_string(),
+            kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
@@ -525,7 +525,7 @@ mod tests {
             id: None,
             permanent: false,
             replace_path: false,
-            kind: "belief".to_string(),
+            kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
@@ -617,38 +617,30 @@ mod tests {
     }
 
     #[test]
-    fn test_kb_add_soft_mandate_warns_on_missing_evidence() {
+    fn test_kb_add_hard_mandate_rejects_missing_evidence() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         let embedder = NoopEmbedder;
 
-        // observation with no evidence → evidence_status="missing" in DB
+        // observation with no evidence → hard error, entry must not be written
         let cmd = Add {
             path: "src/lib.rs".to_string(),
             summary: "test".to_string(),
             content: "content".to_string(),
             tags: "test".to_string(),
             version_ref: Some("abc".to_string()),
-            id: Some("soft-mandate-1".to_string()),
+            id: Some("hard-mandate-1".to_string()),
             permanent: false,
             replace_path: false,
             kind: "observation".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
-        cmd.execute_with(&paths, &embedder).unwrap();
-
-        let conn = Connection::open(&paths.db).unwrap();
-        let evidence_status: String = conn
-            .query_row(
-                "SELECT evidence_status FROM entries WHERE id='soft-mandate-1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(evidence_status, "missing");
+        let err = cmd.execute_with(&paths, &embedder).unwrap_err();
+        assert!(err.to_string().contains("evidence required for kind='observation'"),
+            "unexpected error: {err}");
     }
 
     #[test]

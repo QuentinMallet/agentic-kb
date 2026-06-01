@@ -112,7 +112,7 @@ impl Import {
                 id: None,
                 permanent,
                 replace_path: true,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
             };
@@ -229,7 +229,7 @@ mod tests {
                 id: None,
                 permanent: false,
                 replace_path: true,
-                kind: "belief".to_string(),
+                kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
             };

@@ -12,7 +12,7 @@ const VALID_KINDS: &[&str] = &[
     "memory",
 ];
 
-/// Kinds that carry an evidence mandate (missing evidence → status="missing").
+/// Kinds that require at least one evidence row at write time.
 const EVIDENCE_MANDATED_KINDS: &[&str] = &["observation", "belief", "procedure"];
 
 /// Maximum allowed length of `citation_excerpt` in characters.
@@ -65,6 +65,12 @@ pub fn validate_kb_add_inputs(entry_id: &str, kind: &str, tags: &Value, evidence
     }
 
     validate_tags(tags)?;
+
+    if EVIDENCE_MANDATED_KINDS.contains(&kind) && evidence.is_empty() {
+        anyhow::bail!(
+            "evidence required for kind='{kind}'; provide at least one evidence row with evidence.kind=code or evidence.kind=derived"
+        );
+    }
 
     for ev in evidence {
         let ev_kind = ev
@@ -173,8 +179,14 @@ mod tests {
 
     #[test]
     fn test_valid_kinds_accepted() {
+        let ev = json!([{"kind": "code", "citation_hash": "sha256:abc123"}]);
         for kind in VALID_KINDS {
-            assert!(validate_kb_add_inputs("", kind, &json!([]), &[]).is_ok(), "kind={kind} should be valid");
+            let evidence = if EVIDENCE_MANDATED_KINDS.contains(kind) {
+                ev.as_array().unwrap().as_slice()
+            } else {
+                &[]
+            };
+            assert!(validate_kb_add_inputs("", kind, &json!([]), evidence).is_ok(), "kind={kind} should be valid");
         }
     }
 
