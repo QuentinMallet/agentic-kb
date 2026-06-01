@@ -1032,4 +1032,193 @@ mod tests {
         assert!(visited.contains("r2"));
         assert!(visited.contains("r3"));
     }
+
+    // -----------------------------------------------------------------------
+    // Proptest suite
+    // -----------------------------------------------------------------------
+
+    proptest::proptest! {
+        /// Roundtrip: insert a peer edge, verify it exists, delete it, verify
+        /// the peers and graphs tables are both empty (no phantom rows).
+        #[test]
+        fn proptest_peer_add_list_remove_roundtrip(
+            target in "[a-z]{3,8}",
+            graph_type in proptest::sample::select(vec!["epic", "dep"]),
+        ) {
+            use proptest::prelude::*;
+            let conn = db::open_db_memory().unwrap();
+            let peer_id = insert_peer(&conn, "source", &target, graph_type, None, None);
+
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM peers WHERE id = ?1",
+                    params![peer_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(count, 1, "peer must exist after insert");
+
+            conn.execute("DELETE FROM peers WHERE id = ?1", params![peer_id])
+                .unwrap();
+            // Orphan-clean graphs
+            conn.execute(
+                "DELETE FROM graphs WHERE id NOT IN \
+                 (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
+                [],
+            )
+            .unwrap();
+
+            let count_after: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM peers WHERE id = ?1",
+                    params![peer_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(count_after, 0, "peer must be gone after delete");
+
+            let graph_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM graphs", [], |r| r.get(0))
+                .unwrap();
+            prop_assert_eq!(graph_count, 0, "orphaned graph must be removed");
+        }
+
+        /// Cycle detection: inserting a cycle of n edges and running
+        /// sweep_expired_peers() terminates and leaves all non-expired edges intact.
+        #[test]
+        fn proptest_cycle_detection_sweep_terminates(
+            n in 2usize..5usize,
+        ) {
+            use proptest::prelude::*;
+            let conn = db::open_db_memory().unwrap();
+
+            // Build a cycle: r0->r1->r2->...->r(n-1)->r0 (no expires_at)
+            for i in 0..n {
+                let src = format!("repo-{}", i);
+                let tgt = format!("repo-{}", (i + 1) % n);
+                insert_peer(&conn, &src, &tgt, "dep", None, None);
+            }
+
+            let before: i64 = conn
+                .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+                .unwrap();
+            prop_assert_eq!(before, n as i64, "all cycle edges must be present before sweep");
+
+            // sweep_expired_peers must terminate (no infinite loop on cyclic graph)
+            db::sweep_expired_peers(&conn).unwrap();
+
+            let after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+                .unwrap();
+            prop_assert_eq!(after, n as i64, "non-expired cycle edges must survive sweep");
+        }
+
+        /// TTL sweep idempotency: sweeping twice yields the same count as sweeping once.
+        /// Expired edges are removed on first sweep; live edges survive both sweeps.
+        #[test]
+        fn proptest_ttl_sweep_idempotency(
+            n_expired in 0usize..4usize,
+            n_live in 0usize..4usize,
+        ) {
+            use proptest::prelude::*;
+            let conn = db::open_db_memory().unwrap();
+
+            for i in 0..n_expired {
+                insert_peer(
+                    &conn,
+                    &format!("exp-src-{}", i),
+                    &format!("exp-tgt-{}", i),
+                    "dep",
+                    None,
+                    Some("2020-01-01T00:00:00Z"),
+                );
+            }
+            for i in 0..n_live {
+                insert_peer(
+                    &conn,
+                    &format!("live-src-{}", i),
+                    &format!("live-tgt-{}", i),
+                    "epic",
+                    None,
+                    None,
+                );
+            }
+
+            db::sweep_expired_peers(&conn).unwrap();
+            let count_after_first: i64 = conn
+                .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+                .unwrap();
+
+            db::sweep_expired_peers(&conn).unwrap();
+            let count_after_second: i64 = conn
+                .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+                .unwrap();
+
+            prop_assert_eq!(count_after_first, count_after_second, "sweep is idempotent");
+            prop_assert_eq!(count_after_first, n_live as i64, "only live edges survive");
+        }
+
+        /// Cleanup-epic: after deleting all edges for a slug, zero rows remain for
+        /// that slug and edges for other slugs are unaffected.
+        #[test]
+        fn proptest_cleanup_epic_removes_all_slug_edges(
+            slug in "[a-z]{3,8}",
+            n_slug in 1usize..5usize,
+            n_other in 0usize..3usize,
+        ) {
+            use proptest::prelude::*;
+            let conn = db::open_db_memory().unwrap();
+
+            for i in 0..n_slug {
+                insert_peer(
+                    &conn,
+                    &format!("src-{}", i),
+                    &format!("tgt-{}", i),
+                    "epic",
+                    Some(&slug),
+                    None,
+                );
+            }
+            for i in 0..n_other {
+                insert_peer(
+                    &conn,
+                    &format!("other-src-{}", i),
+                    &format!("other-tgt-{}", i),
+                    "epic",
+                    Some("other"),
+                    None,
+                );
+            }
+
+            conn.execute(
+                "DELETE FROM peers WHERE epic_slug = ?1",
+                params![slug],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM graphs WHERE id NOT IN \
+                 (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
+                [],
+            )
+            .unwrap();
+
+            let slug_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM peers WHERE epic_slug = ?1",
+                    params![slug],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(slug_count, 0, "all slug edges must be removed");
+
+            let other_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM peers WHERE epic_slug = 'other'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(other_count, n_other as i64, "other slug edges must survive");
+        }
+    }
 }
