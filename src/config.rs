@@ -19,6 +19,15 @@ pub struct KbConfig {
     /// Default: 10. Set lower to cap verification latency (e.g. inline_verify_k=3).
     #[serde(default = "default_inline_verify_k")]
     pub inline_verify_k: usize,
+    /// Default peer traversal depth for dep-type edges. Default: 1.
+    pub dep_depth: Option<u8>,
+}
+
+impl KbConfig {
+    /// Returns the effective dep traversal depth (defaults to 1 when unset).
+    pub fn dep_depth(&self) -> u8 {
+        self.dep_depth.unwrap_or(1)
+    }
 }
 
 /// Embedding configuration
