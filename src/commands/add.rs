@@ -104,7 +104,6 @@ impl Add {
         // Validate kind, tags, and evidence before acquiring the lock.
         validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
 
-        // Compute write-time evidence_status and emit soft-mandate warning.
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
 
         let _lock = acquire_lock(&paths.lock)?;
@@ -112,11 +111,6 @@ impl Add {
         let ts = chrono::Utc::now().to_rfc3339();
         let session =
             std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
-
-        // Soft-mandate warning (AC10).
-        if evidence_status == "missing" {
-            eprintln!("kb: entry {id} kind={} has no evidence; evidence_status=missing", self.kind);
-        }
 
         // Open DB once; used for both the optional path-replace step and the upsert.
         let conn = db::open_db(&paths.db)?;

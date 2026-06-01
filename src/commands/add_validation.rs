@@ -157,8 +157,10 @@ pub fn wrap_citation_excerpt(excerpt: Option<&str>) -> Option<String> {
 /// Compute the write-time evidence_status for an entry.
 ///
 /// Rules (AC10):
-/// - kind in {observation, belief, procedure} + evidence empty  → "missing"
 /// - kind in {observation, belief, procedure} + evidence present → "present"
+/// - kind in {observation, belief, procedure} + evidence empty   → "missing"
+///   (only reachable via legacy event replay; live write paths are gated by
+///    `validate_kb_add_inputs` which hard-rejects empty evidence for these kinds)
 /// - otherwise                                                    → "n/a"
 pub fn compute_evidence_status_write(kind: &str, evidence: &[Value]) -> &'static str {
     if EVIDENCE_MANDATED_KINDS.contains(&kind) {

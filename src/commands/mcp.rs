@@ -283,11 +283,6 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     let ts = chrono::Utc::now().to_rfc3339();
     let version_ref = config::git_head_sha();
 
-    // Soft-mandate warning (AC10).
-    if evidence_status == "missing" {
-        eprintln!("kb: entry {entry_id} kind={kind} has no evidence; evidence_status=missing");
-    }
-
     let _lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -438,6 +433,16 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         let summary = seed.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let content = seed.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tags = seed.get("tags").cloned().unwrap_or(Value::Array(vec![]));
+        let kind = seed.get("kind").and_then(|v| v.as_str()).unwrap_or("convention").to_string();
+        let evidence_rows: Vec<Value> = seed.get("evidence")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Err(e) = validate_kb_add_inputs(&entry_id, &kind, &tags, &evidence_rows) {
+            return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
+        }
+        let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
         let event = json!({
             "action": "upsert",
@@ -447,6 +452,8 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
             "summary": summary,
             "content": content,
             "tags": tags,
+            "kind": kind,
+            "evidence_status": evidence_status,
             "version_ref": null,
             "ts": ts,
             "session": "mcp-import",
@@ -1758,7 +1765,7 @@ mod tests {
     #[test]
     fn test_handle_audit_run_excludes_no_evidence() {
         let (_dir, paths, emb) = setup();
-        // Add entry WITHOUT evidence (evidence_status = missing)
+        // Add entry with kind=convention (evidence_status='n/a') — audit_run must exclude non-present entries
         let id = json!(null);
         let req = json!({"path": "p/no-ev", "summary": "s", "content": "c", "tags": [], "kind": "convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
