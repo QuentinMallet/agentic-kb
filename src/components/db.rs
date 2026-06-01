@@ -208,6 +208,37 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // AC-P6: peer graph tables (additive; no-op on already-migrated DBs).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS graphs (
+            id          TEXT PRIMARY KEY,
+            graph_type  TEXT NOT NULL CHECK(graph_type IN ('epic','dep')),
+            epic_slug   TEXT,
+            source_repo TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_graphs_source_repo ON graphs(source_repo);
+
+        CREATE TABLE IF NOT EXISTS peers (
+            id          TEXT PRIMARY KEY,
+            graph_id    TEXT REFERENCES graphs(id),
+            source_repo TEXT NOT NULL,
+            target_repo TEXT NOT NULL,
+            edge_type   TEXT NOT NULL DEFAULT 'member',
+            epic_slug   TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_peers_source_repo ON peers(source_repo);
+        CREATE INDEX IF NOT EXISTS idx_peers_target_repo ON peers(target_repo);
+        CREATE INDEX IF NOT EXISTS idx_peers_epic_slug   ON peers(epic_slug);
+        "#,
+    )?;
+    // AC-P6 migrations: add cross-repo provenance columns to entries.
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN origin_repo TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN cross_repo_epic TEXT;");
     Ok(())
 }
 
