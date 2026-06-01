@@ -355,6 +355,10 @@ mod tests {
             path_prefix: None,
             tag: None,
             local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
     }
@@ -394,6 +398,10 @@ mod tests {
             path_prefix: None,
             tag: None,
             local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
         };
         search_cmd.execute_with(&remote_paths, &embedder).unwrap();
     }
@@ -435,6 +443,10 @@ mod tests {
             path_prefix: None,
             tag: None,
             local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
     }
@@ -525,6 +537,10 @@ mod tests {
             path_prefix: Some("src/".to_string()),
             tag: None,
             local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
         };
         // Just verify no error — path filtering is applied in SQL
         search_cmd.execute_with(&paths, &embedder).unwrap();
