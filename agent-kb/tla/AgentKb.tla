@@ -386,11 +386,21 @@ LiveCompactionEquivalence ==
     IN /\ LiveIds(matComp) = LiveIds(matOrig)
        /\ \A id \in LiveIds(matOrig) : matComp[id] = matOrig[id]
 
+\* Expired entries are absent (not just stale) in the compacted log's materialized DB.
+\* Directly validates AC: "after compact+rebuild, expired entries do not appear at all."
+PurgedEntriesAreAbsent ==
+    LET matOrig == Materialize(log)
+        matComp == Materialize(CompactedLog(log))
+    IN \A id \in EntryIds :
+        (matOrig[id].type = "present" /\ matOrig[id].stale = TRUE) =>
+        matComp[id].type = "absent"
+
 Invariants ==
     /\ TypeInvariant
     /\ MutualExclusion
     /\ WriteThroughInvariant
     /\ LiveCompactionEquivalence
+    /\ PurgedEntriesAreAbsent
 
 THEOREM Spec => []Invariants
 
