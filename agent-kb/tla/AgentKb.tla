@@ -51,7 +51,8 @@
 
    Compact protocol (2 steps under lock):
      (1) acquire lock
-     (2) replace log with squashed equivalent, then release lock
+     (2) replace log with squashed equivalent (drop expired entries entirely);
+         update db to match; release lock
 
    TLC model (small instance):
      Procs    <- {"p1", "p2"}
@@ -327,9 +328,10 @@ CompactRun(p) ==
     /\ pc[p]       = "compact_running"
     /\ lock_holder = p
     /\ log'         = CompactedLog(log)
+    /\ db'          = Materialize(CompactedLog(log))
     /\ lock_holder' = "none"
     /\ pc'          = [pc EXCEPT ![p] = "idle"]
-    /\ UNCHANGED <<db, pending, snap_len>>
+    /\ UNCHANGED <<pending, snap_len>>
 
 (* ──────────────────────────── Next / Spec ──────────────────────────────── *)
 
