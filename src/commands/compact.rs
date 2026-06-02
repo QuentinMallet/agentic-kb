@@ -42,10 +42,8 @@ impl Compact {
 
         let mut entry_last: HashMap<String, usize> = HashMap::new();
         let mut test_last: HashMap<String, usize> = HashMap::new();
-        // Track the index of the LAST expire per id (not just membership). A
-        // flat set loses ordering, which breaks the upsert→expire→upsert
-        // re-add sequence: the re-upsert would be folded as is_stale=true even
-        // though it superseded the expire (br-joj).
+        // Track index of the LAST expire per id (not just membership) so that
+        // upsert→expire→upsert sequences honour last-write-wins (br-joj).
         let mut expire_last: HashMap<String, usize> = HashMap::new();
         let mut run_indices: Vec<usize> = Vec::new();
 
@@ -72,22 +70,16 @@ impl Compact {
 
         let mut compacted: Vec<serde_json::Value> = Vec::new();
 
-        // Entry upserts (ordered by original position). Entries whose last
-        // expire comes AFTER their last upsert are dropped entirely — a rebuild
-        // that never sees the event produces identical search-visible state
-        // (entry absent == entry with is_stale=1 for all query paths). This
-        // prevents expired entries from accumulating in the log indefinitely.
+        // Entry upserts ordered by original position. Drop entries whose last
+        // expire comes after their last upsert (absent == stale for all query paths).
         let mut entry_pairs: Vec<(usize, &str)> = entry_last
             .iter()
             .map(|(id, &i)| (i, id.as_str()))
             .collect();
-        entry_pairs.sort_by_key(|(i, _)| *i);
+        entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
-            if let Some(&expire_idx) = expire_last.get(id) {
-                if expire_idx > i {
-                    // Expired after last upsert: purge from log entirely.
-                    continue;
-                }
+            if expire_last.get(id).is_some_and(|&e| e > i) {
+                continue;
             }
             compacted.push(evts[i].clone());
         }
@@ -95,15 +87,15 @@ impl Compact {
         // Test case upserts.
         let mut test_pairs: Vec<(usize, String)> =
             test_last.into_iter().map(|(id, i)| (i, id)).collect();
-        test_pairs.sort_by_key(|(i, _)| *i);
+        test_pairs.sort_by_key(|&(i, _)| i);
         for (i, _) in test_pairs {
             compacted.push(evts[i].clone());
         }
 
         // Run history: keep only the last RUN_HISTORY_CAP records (original order).
         let run_start = run_indices.len().saturating_sub(RUN_HISTORY_CAP);
-        for i in &run_indices[run_start..] {
-            compacted.push(evts[*i].clone());
+        for i in run_indices[run_start..].iter().copied() {
+            compacted.push(evts[i].clone());
         }
 
         let tmp = paths.events.with_extension("jsonl.tmp");
