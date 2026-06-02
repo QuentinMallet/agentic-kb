@@ -171,10 +171,9 @@ SetToSeqAux(S, acc) ==
 SetToSeq(S) == SetToSeqAux(S, <<>>)
 
 CompactedLog(events) ==
-    LET finalDB   == Materialize(events)
-        presentIds == {id \in EntryIds : finalDB[id].type = "present"}
-        activeIds  == {id \in presentIds : finalDB[id].stale = FALSE}
-        activeEvs  == {UpsertEvent(id, finalDB[id].data) : id \in activeIds}
+    LET finalDB  == Materialize(events)
+        activeIds == {id \in EntryIds : finalDB[id].type = "present" /\ finalDB[id].stale = FALSE}
+        activeEvs == {UpsertEvent(id, finalDB[id].data) : id \in activeIds}
     IN SetToSeq(activeEvs)
 
 (* ──────────────────────────── Initial state ────────────────────────────── *)
@@ -325,13 +324,18 @@ CompactAcquire(p) ==
     /\ UNCHANGED <<log, db, pending, snap_len>>
 
 CompactRun(p) ==
-    /\ pc[p]       = "compact_running"
-    /\ lock_holder = p
-    /\ log'         = CompactedLog(log)
-    /\ db'          = Materialize(CompactedLog(log))
-    /\ lock_holder' = "none"
-    /\ pc'          = [pc EXCEPT ![p] = "idle"]
-    /\ UNCHANGED <<pending, snap_len>>
+    \* Abstract: compact atomically rewrites log + db under lock.
+    \* In the implementation, the log rewrite (fsync) and DB update happen
+    \* in the same locked section — no intermediate state is externally visible.
+    \* run_history capping (500 events) is an impl detail, not modelled here.
+    LET newLog == CompactedLog(log)
+    IN /\ pc[p]       = "compact_running"
+       /\ lock_holder = p
+       /\ log'         = newLog
+       /\ db'          = Materialize(newLog)
+       /\ lock_holder' = "none"
+       /\ pc'          = [pc EXCEPT ![p] = "idle"]
+       /\ UNCHANGED <<pending, snap_len>>
 
 (* ──────────────────────────── Next / Spec ──────────────────────────────── *)
 
