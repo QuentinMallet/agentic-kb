@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 
+/// Maximum number of `run_history` events to retain after compaction.
+/// Older records beyond this tail are purged.
+const RUN_HISTORY_CAP: usize = 500;
+
 /// Compact the event log (squash superseded events)
 #[derive(Command, Debug, Parser)]
 pub struct Compact;
@@ -68,25 +72,24 @@ impl Compact {
 
         let mut compacted: Vec<serde_json::Value> = Vec::new();
 
-        // Entry upserts (ordered by original position), with stale flag folded in.
+        // Entry upserts (ordered by original position). Entries whose last
+        // expire comes AFTER their last upsert are dropped entirely — a rebuild
+        // that never sees the event produces identical search-visible state
+        // (entry absent == entry with is_stale=1 for all query paths). This
+        // prevents expired entries from accumulating in the log indefinitely.
         let mut entry_pairs: Vec<(usize, &str)> = entry_last
             .iter()
             .map(|(id, &i)| (i, id.as_str()))
             .collect();
         entry_pairs.sort_by_key(|(i, _)| *i);
         for (i, id) in entry_pairs {
-            let mut ev = evts[i].clone();
-            // Last-write-wins: only fold is_stale when the LAST expire for this
-            // id happened AFTER the last upsert. A later re-upsert resurrects
-            // the entry and must not be marked stale (br-joj). The permanent
-            // +force-expire case still fires: there is no re-upsert, so the
-            // expire idx is greater than the upsert idx.
             if let Some(&expire_idx) = expire_last.get(id) {
                 if expire_idx > i {
-                    ev["is_stale"] = serde_json::json!(true);
+                    // Expired after last upsert: purge from log entirely.
+                    continue;
                 }
             }
-            compacted.push(ev);
+            compacted.push(evts[i].clone());
         }
 
         // Test case upserts.
@@ -97,9 +100,10 @@ impl Compact {
             compacted.push(evts[i].clone());
         }
 
-        // Run history (all, original order).
-        for i in run_indices {
-            compacted.push(evts[i].clone());
+        // Run history: keep only the last RUN_HISTORY_CAP records (original order).
+        let run_start = run_indices.len().saturating_sub(RUN_HISTORY_CAP);
+        for i in &run_indices[run_start..] {
+            compacted.push(evts[*i].clone());
         }
 
         let tmp = paths.events.with_extension("jsonl.tmp");
@@ -152,15 +156,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_compact_permanent_entry_with_force_expire_is_marked_stale() {
-        // Regression test: force-expired permanent entries must have is_stale folded
-        // in by compact so they stay gone after a subsequent rebuild.
+    fn test_cmd_compact_force_expired_entry_dropped() {
+        // Force-expired entries must be dropped entirely from the compacted log.
+        // A rebuild that never sees the upsert produces the same search-visible
+        // state as one that sees it with is_stale=true (entry absent in both cases).
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
 
-        // Permanent entry upsert
         let upsert = serde_json::json!({
             "action": "upsert", "table": "entries",
             "id": "perm1", "path": "a.rs", "summary": "perm",
@@ -169,20 +173,16 @@ mod tests {
         });
         append_event(&paths.events, &upsert).unwrap();
 
-        // Expire event — represents a `kb expire --force` call
         let expire = serde_json::json!({
             "action": "expire", "table": "entries",
             "id": "perm1", "ts": "2024-01-01T01:00:00Z"
         });
         append_event(&paths.events, &expire).unwrap();
 
-        let cmd = Compact;
-        cmd.execute_with_paths(&paths).unwrap();
+        Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1);
-        // is_stale must be folded in — entry was force-expired and must not resurrect
-        assert_eq!(after[0]["is_stale"], serde_json::json!(true));
+        assert_eq!(after.len(), 0, "force-expired entry must be purged from the log");
     }
 
     #[test]
@@ -257,22 +257,77 @@ mod tests {
         assert!(after[0]["is_stale"].is_null() || after[0]["is_stale"] == false);
     }
 
+    #[test]
+    fn test_cmd_compact_stale_entries_purged_from_log() {
+        // Expired entries must not appear in the compacted log at all.
+        // A rebuild from the compacted log must produce no entry for them
+        // (absent == stale for all search paths).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        // One live entry, one expired entry.
+        for id in ["live", "dead"] {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": id, "path": format!("src/{id}.rs"), "summary": id,
+                "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            });
+            append_event(&paths.events, &ev).unwrap();
+        }
+        append_event(&paths.events, &serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "dead", "ts": "2024-01-01T01:00:00Z"
+        })).unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(after.len(), 1, "only live entry must remain in log");
+        assert_eq!(after[0]["id"], "live");
+    }
+
+    #[test]
+    fn test_cmd_compact_run_history_capped() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        let over = RUN_HISTORY_CAP + 50;
+        for i in 0..over {
+            let ev = serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "pass",
+                "ts": format!("2024-01-{:02}T00:00:00Z", (i % 28) + 1)
+            });
+            append_event(&paths.events, &ev).unwrap();
+        }
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(
+            after.len(),
+            RUN_HISTORY_CAP,
+            "compact must retain at most RUN_HISTORY_CAP run_history events"
+        );
+    }
+
     // br-h7c: proptest target #4 — expire/compact state machine.
     //
-    // Invariant: compact is a no-op on the materialized state.
+    // Invariant: compact preserves the set of LIVE entries.
     //   ∀ event sequence S ∈ (Upsert | Expire | Compact)*:
-    //     rebuild_materialized(events_after_compact(S))
-    //       == rebuild_materialized(events_pre_compact(S))
+    //     live_entries(rebuild(events_after_compact(S)))
+    //       == live_entries(rebuild(events_pre_compact(S)))
     //
-    // Materialized state = the set of live (non-stale) entry ids after
-    // replaying the event log into a fresh DB. Compact must not resurrect
-    // expired entries (regression for the permanent + force-expire fold-in)
-    // nor erase live ones.
+    // Stale (expired) entries are purged from the log by compact rather than
+    // retained with is_stale=true, so the invariant is scoped to live state only.
+    // Compact must not resurrect expired entries nor erase live ones.
     //
     // br-joj fixed: the generator is now UNRESTRICTED — re-upsert after
     // expire is a valid sequence and compact must honour last-write-wins.
-    // Earlier this filtered through `well_formed` to dodge the bug; that
-    // workaround is gone now that compact.rs tracks expire_last by index.
     //
     // PROPTEST_CASES default tuned to 256 — each case opens a tempdir +
     // replays a small DB. Override via PROPTEST_CASES env var.
@@ -282,7 +337,7 @@ mod tests {
             .. proptest::prelude::ProptestConfig::default()
         })]
         #[test]
-        fn proptest_compact_preserves_materialized_state(
+        fn proptest_compact_preserves_live_state(
             ops in proptest::collection::vec(arb_raw_op(), 0..32),
         ) {
             let dir = tempdir().unwrap();
@@ -314,7 +369,7 @@ mod tests {
                         let after = materialize(&paths);
                         proptest::prop_assert_eq!(
                             before, after,
-                            "compact must preserve materialized state"
+                            "compact must preserve live entry state"
                         );
                     }
                 }
@@ -348,8 +403,10 @@ mod tests {
     }
 
     /// Replay the current event log into a fresh in-memory DB and return the
-    /// sorted set of (id, is_stale) tuples — the materialized state under test.
-    fn materialize(paths: &Paths) -> Vec<(String, bool)> {
+    /// sorted set of live (non-stale) entry IDs — the materialized live state
+    /// under test. Stale entries are excluded because compact purges them from
+    /// the log entirely; their absence after rebuild is correct.
+    fn materialize(paths: &Paths) -> Vec<String> {
         use crate::components::{db, embedder::NoopEmbedder};
 
         let conn = db::open_db_memory().unwrap();
@@ -360,11 +417,9 @@ mod tests {
         }
 
         let mut stmt = conn
-            .prepare("SELECT id, COALESCE(is_stale, 0) FROM entries ORDER BY id")
+            .prepare("SELECT id FROM entries WHERE COALESCE(is_stale, 0) = 0 ORDER BY id")
             .unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
-            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.collect::<Result<Vec<_>, _>>().unwrap()
     }
 }
