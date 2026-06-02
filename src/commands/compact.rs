@@ -72,6 +72,10 @@ impl Compact {
 
         // Entry upserts ordered by original position. Drop entries whose last
         // expire comes after their last upsert (absent == stale for all query paths).
+        // Orphan expire events (expire with no matching upsert in this log) are
+        // implicitly dropped — they never appear in entry_pairs, so they are never
+        // emitted. This is safe: absent == stale, so rebuild from the compacted log
+        // produces identical search-visible state.
         let mut entry_pairs: Vec<(usize, &str)> = entry_last
             .iter()
             .map(|(id, &i)| (i, id.as_str()))
@@ -291,8 +295,10 @@ mod tests {
         for i in 0..over {
             let ev = serde_json::json!({
                 "action": "insert", "table": "run_history",
-                "test_id": "t1", "result": "pass",
-                "ts": format!("2024-01-{:02}T00:00:00Z", (i % 28) + 1)
+                // Encode insertion order in test_id so we can verify which
+                // records survive: the LAST RUN_HISTORY_CAP (oldest 50 trimmed).
+                "test_id": format!("{i}"), "result": "pass",
+                "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
         }
@@ -305,6 +311,45 @@ mod tests {
             RUN_HISTORY_CAP,
             "compact must retain at most RUN_HISTORY_CAP run_history events"
         );
+        // Verify the LAST RUN_HISTORY_CAP records are kept (oldest 50 trimmed).
+        assert_eq!(after[0]["test_id"], "50", "first retained must be event 50");
+        assert_eq!(
+            after[RUN_HISTORY_CAP - 1]["test_id"],
+            format!("{}", over - 1),
+            "last retained must be the most recent event"
+        );
+    }
+
+    #[test]
+    fn test_cmd_compact_orphan_expire_dropped() {
+        // An expire event with no matching upsert in the log is an orphan. Compact
+        // must drop it silently — absent == stale for all query paths. Two cases:
+        //   (a) Pure orphan: expire arrives before any upsert for that id.
+        //   (b) Post-compact orphan: a second expire arrives after a prior compact
+        //       already purged the entry; the second compact must also produce an
+        //       empty log.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        // Case (a): pure orphan expire.
+        append_event(&paths.events, &serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "ghost", "ts": "2024-01-01T00:00:00Z"
+        })).unwrap();
+        Compact.execute_with_paths(&paths).unwrap();
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(after.len(), 0, "pure orphan expire must be dropped");
+
+        // Case (b): post-compact orphan — another expire after log is empty.
+        append_event(&paths.events, &serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "ghost", "ts": "2024-01-01T01:00:00Z"
+        })).unwrap();
+        Compact.execute_with_paths(&paths).unwrap();
+        let after2 = events::read_events(&paths.events).unwrap();
+        assert_eq!(after2.len(), 0, "post-compact orphan expire must also be dropped");
     }
 
     // br-h7c: proptest target #4 — expire/compact state machine.
