@@ -4,9 +4,10 @@
 
    Verified properties
    -------------------
-   MutualExclusion         At most one process holds the write lock.
-   WriteThroughInvariant   When lock is free, db = Materialize(log).
-   CompactionEquivalence   Materialize(CompactedLog(L)) = Materialize(L).
+   MutualExclusion           At most one process holds the write lock.
+   WriteThroughInvariant     When lock is free, db = Materialize(log).
+   LiveCompactionEquivalence CompactedLog(L) preserves all live entries exactly;
+                             expired entries are dropped entirely.
 
    Design notes
    ------------
@@ -151,9 +152,10 @@ MatHelper(events, i) ==
 
 Materialize(events) == MatHelper(events, Len(events))
 
-(* CompactedLog: minimal equivalent log — one upsert per active entry,
-   one upsert+expire pair per stale entry.  Materialize of the result
-   equals Materialize of the original (proved as CompactionEquivalence).
+(* CompactedLog: minimal equivalent log — one upsert per live (non-expired)
+   entry.  Expired entries are dropped entirely: absent == stale for all
+   query paths.  Live entry set and data are preserved exactly
+   (proved as LiveCompactionEquivalence).
 
    All db lookups use .type to distinguish absent from present, avoiding
    any record/string comparison errors in TLC.
@@ -170,12 +172,9 @@ SetToSeq(S) == SetToSeqAux(S, <<>>)
 CompactedLog(events) ==
     LET finalDB   == Materialize(events)
         presentIds == {id \in EntryIds : finalDB[id].type = "present"}
-        staleIds   == {id \in presentIds : finalDB[id].stale = TRUE}
-        activeIds  == presentIds \ staleIds
+        activeIds  == {id \in presentIds : finalDB[id].stale = FALSE}
         activeEvs  == {UpsertEvent(id, finalDB[id].data) : id \in activeIds}
-        staleUps   == {UpsertEvent(id, finalDB[id].data) : id \in staleIds}
-        staleExps  == {ExpireEvent(id)                   : id \in staleIds}
-    IN SetToSeq(activeEvs) \o SetToSeq(staleUps) \o SetToSeq(staleExps)
+    IN SetToSeq(activeEvs)
 
 (* ──────────────────────────── Initial state ────────────────────────────── *)
 
@@ -372,15 +371,20 @@ MutualExclusion ==
 WriteThroughInvariant ==
     lock_holder = "none" => db = Materialize(log)
 
-\* Compaction produces a log with the same materialized state.
-CompactionEquivalence ==
-    Materialize(CompactedLog(log)) = Materialize(log)
+\* Live entries after compaction are exactly the live entries before.
+LiveIds(matDB) == {id \in EntryIds : matDB[id].type = "present" /\ matDB[id].stale = FALSE}
+
+LiveCompactionEquivalence ==
+    LET matOrig == Materialize(log)
+        matComp == Materialize(CompactedLog(log))
+    IN /\ LiveIds(matComp) = LiveIds(matOrig)
+       /\ \A id \in LiveIds(matOrig) : matComp[id] = matOrig[id]
 
 Invariants ==
     /\ TypeInvariant
     /\ MutualExclusion
     /\ WriteThroughInvariant
-    /\ CompactionEquivalence
+    /\ LiveCompactionEquivalence
 
 THEOREM Spec => []Invariants
 
