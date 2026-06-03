@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd .state/agent-kb/tla && tlc AgentKbEvidence -config AgentKbEvidence.cfg -workers 4 -deadlock 2>&1 | tail -40\",\"timeout\":600000,\"description\":\"Re-run TLC with revised spec\"}",
+  "error": "Exit code 1\n/run/current-system/sw/bin/bash: line 1: cd: .state/agent-kb/tla: No such file or directory",
+  "timestamp": "2026-05-30T16:59:06.500Z",
+  "retry_count": 1
+}
