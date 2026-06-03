@@ -51,6 +51,11 @@ impl Compact {
             let action = ev["action"].as_str().unwrap_or("");
             let table = ev["table"].as_str().unwrap_or("");
             let id = ev["id"].as_str().unwrap_or("").to_string();
+            // Warn on structurally malformed events (missing or non-string action/table).
+            // These differ from intentionally-skipped event types (e.g. evidence_add).
+            if !ev["action"].is_string() || !ev["table"].is_string() {
+                eprintln!("compact: warn: event at index {i} missing valid action/table, dropped");
+            }
             match (action, table) {
                 ("upsert", "entries") => {
                     entry_last.insert(id, i);
@@ -108,6 +113,7 @@ impl Compact {
             for ev in &compacted {
                 writeln!(f, "{}", serde_json::to_string(ev)?)?;
             }
+            f.sync_data()?; // flush pages before rename to prevent truncation on crash
         }
         fs::rename(&tmp, &paths.events)?;
 
@@ -318,6 +324,32 @@ mod tests {
             format!("{}", over - 1),
             "last retained must be the most recent event"
         );
+    }
+
+    #[test]
+    fn test_cmd_compact_run_history_at_boundary_not_trimmed() {
+        // At exactly RUN_HISTORY_CAP events, no records should be trimmed.
+        // Guards against an off-by-one in the saturating_sub slice direction.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        for i in 0..RUN_HISTORY_CAP {
+            let ev = serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": format!("{i}"), "result": "pass",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            append_event(&paths.events, &ev).unwrap();
+        }
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(after.len(), RUN_HISTORY_CAP, "exactly RUN_HISTORY_CAP events must not be trimmed");
+        assert_eq!(after[0]["test_id"], "0");
+        assert_eq!(after[RUN_HISTORY_CAP - 1]["test_id"], format!("{}", RUN_HISTORY_CAP - 1));
     }
 
     #[test]
