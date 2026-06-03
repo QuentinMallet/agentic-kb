@@ -1,0 +1,35 @@
+{
+  "agents": [
+    {
+      "agent_id": "ae077e83bc2abc548",
+      "agent_type": "code-reviewer",
+      "started_at": "2026-05-30T16:53:30.138Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-05-30T16:55:15.562Z",
+      "duration_ms": 105424
+    },
+    {
+      "agent_id": "a53942b987249a883",
+      "agent_type": "analyst",
+      "started_at": "2026-05-30T16:54:01.117Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-05-30T16:56:43.011Z",
+      "duration_ms": 161894
+    },
+    {
+      "agent_id": "acbeb5eab78c1661f",
+      "agent_type": "analyst",
+      "started_at": "2026-05-30T17:08:14.561Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-05-30T17:08:55.418Z",
+      "duration_ms": 40857
+    }
+  ],
+  "total_spawned": 3,
+  "total_completed": 3,
+  "total_failed": 0,
+  "last_updated": "2026-05-30T17:08:55.519Z"
+}
