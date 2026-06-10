@@ -9,6 +9,30 @@ use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use std::fs;
 
+/// Test-only hook: when set, `execute_with` waits on this barrier at the
+/// START of Phase 2 (after Phase 1 releases the lock, before replay begins).
+/// This lets tests release rebuild + concurrent writers simultaneously.
+#[cfg(test)]
+static PHASE2_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_phase2_barrier(b: std::sync::Arc<std::sync::Barrier>) {
+    let m = PHASE2_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None));
+    *m.lock().unwrap() = Some(b);
+}
+
+#[cfg(test)]
+fn take_phase2_barrier() -> Option<std::sync::Arc<std::sync::Barrier>> {
+    PHASE2_BARRIER
+        .get()?
+        .lock()
+        .ok()?
+        .take()
+}
+
 /// Replay all events and rebuild agent-kb.db from scratch
 #[derive(Command, Debug, Parser)]
 pub struct Rebuild;
@@ -52,6 +76,11 @@ impl Rebuild {
         };
 
         // Phase 2: replay snapshot into a tmp DB — no lock held.
+        #[cfg(test)]
+        if let Some(barrier) = take_phase2_barrier() {
+            barrier.wait(); // synchronise with concurrent writers in tests
+        }
+
         let tmp_db = paths.db.with_extension("db.tmp");
         let _ = fs::remove_file(&tmp_db);
         {
@@ -370,5 +399,216 @@ mod tests {
             log_len,
             "DB must equal Materialize(log) after rebuild"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T-S6b (Lane C §C1): two simultaneous kb_core::add writers during
+    // Phase 2 lock-free replay window.
+    //
+    // Unlike `test_rebuild_concurrent_writes_converge` (which uses timing),
+    // this test uses a 3-party Barrier to release rebuild + writer-A + writer-B
+    // at the SAME instant, maximising the overlap with Phase 2.
+    //
+    // Acceptance criteria (br-improvement-catalog-23b.8):
+    //   AC1: DB == Materialize(events.jsonl) after a second rebuild.
+    //   AC2: No malformed JSONL line (every line parses as valid JSON).
+    //   AC3: Both writers' entries are present in the final DB.
+    //   AC4: events.jsonl contains all 100 writer events + seeded events.
+    // -----------------------------------------------------------------------
+
+    /// Two concurrent `kb_core::add` writers released simultaneously with
+    /// rebuild Phase 2 via a 3-party Barrier.
+    ///
+    /// Generalises T-S6b (br-jwe.15, AC6) — the prior test sequentialises
+    /// writers to avoid JSONL corruption; this test exercises the real
+    /// contention scenario.
+    #[test]
+    fn test_rebuild_concurrent_mcp_writers_phase2_barrier() {
+        use crate::components::kb_core;
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, paths) = setup_repo();
+        let emb = Arc::new(NoopEmbedder);
+
+        // Seed 20 initial entries so Phase 2 has meaningful work to do.
+        for i in 0..20u32 {
+            let e = upsert(&format!("seed{i}"), i);
+            events::append_event(&paths.events, &e).unwrap();
+            db::apply_event(&db::open_db(&paths.db).unwrap(), emb.as_ref(), &e).unwrap();
+        }
+        let seeded_count = 20usize;
+
+        // 3-party barrier: rebuild + writer-A + writer-B all wait here.
+        let barrier = Arc::new(Barrier::new(3));
+
+        // Register the barrier with the rebuild hook.
+        set_phase2_barrier(Arc::clone(&barrier));
+
+        // Clone path fields for each thread (Paths does not derive Clone).
+        let paths_rebuild = Paths {
+            lock: paths.lock.clone(),
+            events: paths.events.clone(),
+            db: paths.db.clone(),
+            fastembed_cache: paths.fastembed_cache.clone(),
+        };
+        let paths_a = Paths {
+            lock: paths.lock.clone(),
+            events: paths.events.clone(),
+            db: paths.db.clone(),
+            fastembed_cache: paths.fastembed_cache.clone(),
+        };
+        let paths_b = Paths {
+            lock: paths.lock.clone(),
+            events: paths.events.clone(),
+            db: paths.db.clone(),
+            fastembed_cache: paths.fastembed_cache.clone(),
+        };
+
+        // Spawn rebuild thread.
+        let emb_rebuild = Arc::clone(&emb);
+        let rebuild_handle = thread::spawn(move || {
+            Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref())
+        });
+
+        // Writer A: 50 entries with unique IDs, uses kb_core::add.
+        let emb_a = Arc::clone(&emb);
+        let barrier_a = Arc::clone(&barrier);
+        let writer_a = thread::spawn(move || {
+            barrier_a.wait();
+            for i in 0..50u32 {
+                let ts = chrono::Utc::now().to_rfc3339();
+                kb_core::add(
+                    &paths_a,
+                    emb_a.as_ref(),
+                    kb_core::AddArgs {
+                        id: format!("writer-a-{i}"),
+                        path: format!("writer/a/{i}"),
+                        summary: format!("writer A entry {i}"),
+                        content: format!("content a {i}"),
+                        tags: serde_json::json!([]),
+                        version_ref: None,
+                        permanent: false,
+                        replace_path: false,
+                        kind: "belief".to_string(),
+                        evidence_status: "n/a".to_string(),
+                        evidence_rows: vec![],
+                        ts,
+                        session: "mcp".to_string(),
+                        session_id: None,
+                        expire_reason: String::new(),
+                    },
+                )
+                .expect("writer A kb_core::add must succeed");
+            }
+        });
+
+        // Writer B: 50 entries with unique IDs, uses kb_core::add.
+        let emb_b = Arc::clone(&emb);
+        let barrier_b = Arc::clone(&barrier);
+        let writer_b = thread::spawn(move || {
+            barrier_b.wait();
+            for i in 0..50u32 {
+                let ts = chrono::Utc::now().to_rfc3339();
+                kb_core::add(
+                    &paths_b,
+                    emb_b.as_ref(),
+                    kb_core::AddArgs {
+                        id: format!("writer-b-{i}"),
+                        path: format!("writer/b/{i}"),
+                        summary: format!("writer B entry {i}"),
+                        content: format!("content b {i}"),
+                        tags: serde_json::json!([]),
+                        version_ref: None,
+                        permanent: false,
+                        replace_path: false,
+                        kind: "belief".to_string(),
+                        evidence_status: "n/a".to_string(),
+                        evidence_rows: vec![],
+                        ts,
+                        session: "mcp".to_string(),
+                        session_id: None,
+                        expire_reason: String::new(),
+                    },
+                )
+                .expect("writer B kb_core::add must succeed");
+            }
+        });
+
+        // Join all threads.
+        rebuild_handle.join().unwrap().expect("rebuild must succeed");
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        // Second rebuild: guarantees DB == Materialize(all events in log).
+        Rebuild.execute_with(&paths, emb.as_ref()).unwrap();
+
+        // AC2: no malformed JSONL — every line parses as valid JSON.
+        let log_content = std::fs::read_to_string(&paths.events)
+            .expect("events log must be readable");
+        for (idx, line) in log_content.lines().enumerate() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
+                panic!("malformed JSONL at line {}: {e}\n  line: {line:?}", idx + 1)
+            });
+        }
+
+        // AC4: total event count == seeded + 100 writer events.
+        let all_events = events::read_events(&paths.events).unwrap();
+        let expected_total = seeded_count + 100;
+        assert_eq!(
+            all_events.len(),
+            expected_total,
+            "events log must contain {expected_total} events (20 seed + 50 A + 50 B), got {}",
+            all_events.len()
+        );
+
+        // AC1: DB == Materialize(events.jsonl).
+        let ref_conn = db::open_db_memory().unwrap();
+        for ev in &all_events {
+            db::apply_event(&ref_conn, emb.as_ref(), ev).unwrap();
+        }
+        let live_conn = db::open_db(&paths.db).unwrap();
+
+        let live_entries: Vec<String> = live_conn
+            .prepare("SELECT id FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let ref_entries: Vec<String> = ref_conn
+            .prepare("SELECT id FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            live_entries, ref_entries,
+            "AC1: DB must equal Materialize(events.jsonl) after rebuild"
+        );
+
+        // AC3: both writers' entries are present in the final DB.
+        let live_count = live_conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        // 20 seed + 50 writer-a + 50 writer-b = 120 active entries.
+        assert_eq!(
+            live_count, 120,
+            "AC3: final DB must contain all 120 active entries (20 seed + 50 A + 50 B)"
+        );
+
+        // Spot-check: one entry from each writer must be present.
+        for id in &["writer-a-0", "writer-a-49", "writer-b-0", "writer-b-49"] {
+            let n: i64 = live_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "AC3: entry {id} must be present in final DB");
+        }
     }
 }
