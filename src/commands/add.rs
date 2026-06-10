@@ -659,4 +659,68 @@ mod tests {
             .unwrap();
         assert_eq!(evidence_status, "present");
     }
+
+    // ── TDD: session_id propagation (Lane A, A2) ────────────────────────────
+    //
+    // FAILING TEST (pre-implementation):
+    // With OMC_SESSION_ID set, `kb add` must write that value into
+    // entries.session_id.  Before the fix, add.rs passes `session_id: None`
+    // to kb_core::AddArgs, so the column stays NULL.
+    //
+    // Confirmed failing on HEAD: `session_id: None` is hard-coded in
+    // Add::execute_with.
+
+    #[test]
+    fn test_cli_add_propagates_session_id_to_db() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Set OMC_SESSION_ID in the environment for the duration of this test.
+        std::env::set_var("OMC_SESSION_ID", "test123");
+
+        let cmd = Add {
+            path: "src/session_test.rs".to_string(),
+            summary: "session propagation test".to_string(),
+            content: "content".to_string(),
+            tags: "test,session".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some("sess-prop-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        };
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        // Clean up env var.
+        std::env::remove_var("OMC_SESSION_ID");
+
+        // AC2: entries.session_id must be "test123" (NOT NULL).
+        let conn = Connection::open(&paths.db).unwrap();
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM entries WHERE id='sess-prop-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            session_id,
+            Some("test123".to_string()),
+            "entries.session_id must be populated from OMC_SESSION_ID"
+        );
+
+        // AC1: the upsert event in the JSONL must also carry session_id.
+        let events_content = fs::read_to_string(&paths.events).unwrap();
+        let ev: Value = serde_json::from_str(events_content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            ev["session_id"],
+            serde_json::json!("test123"),
+            "upsert event must carry session_id field"
+        );
+    }
 }
