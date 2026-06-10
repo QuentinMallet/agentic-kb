@@ -1312,6 +1312,315 @@ mod tests {
         (dir, paths, NoopEmbedder)
     }
 
+    // ── br-improvement-catalog-23b.9: source_weights / audit_runs state machine proptests ──
+
+    /// Small fixed alphabets keep generated sequences tractable and maximize
+    /// interesting interactions (same kind+session_id bucket, mixed verdicts, etc.).
+    const AUDIT_KINDS: &[&str] = &["observation", "belief", "procedure", "convention", "memory"];
+    // session_id values: two named sessions, one null sentinel (represented as None in the
+    // generator and mapped to None/Some in add_live_entry), and the literal string
+    // "__GLOBAL__" which must NOT be used as a real session_id (it's the NULL sentinel in
+    // source_weights).  We exercise the NULL path via sid_index=0 → None below.
+    const AUDIT_SESSION_IDS: &[Option<&str>] = &[
+        None,              // → COALESCE(session_id,'__GLOBAL__') in source_weights
+        Some("sess-a"),
+        Some("sess-b"),
+    ];
+
+    /// One verdict triple: (kind_index, session_index, verdict_bool).
+    fn arb_audit_verdict_triple() -> impl proptest::strategy::Strategy<Value = (usize, usize, bool)> {
+        use proptest::prelude::*;
+        (
+            0..AUDIT_KINDS.len(),
+            0..AUDIT_SESSION_IDS.len(),
+            any::<bool>(),
+        )
+    }
+
+    /// Add a live entry and register it as an audit_run_candidate.
+    /// Returns (entry_id, resolved_session_id_for_source_weights).
+    fn add_entry_and_seed(
+        paths: &config::Paths,
+        emb: &NoopEmbedder,
+        path: &str,
+        kind: &str,
+        session_id: Option<&str>,
+        run_id: &str,
+    ) -> (String, String) {
+        // Entries need evidence to be included in audit_run samples; we don't use
+        // audit_run here — we seed candidates directly — but evidence is still required
+        // for the entry to be valid.  add_live_entry already adds evidence.
+        // Override kind: add_live_entry hard-codes kind="observation"; we patch via
+        // the low-level event path so the kind column is correct for bucket matching.
+        let id_val = json!(null);
+        let mut req = json!({
+            "path": path,
+            "summary": "s",
+            "content": "c",
+            "tags": [],
+            "kind": kind,
+            "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]
+        });
+        if let Some(sid) = session_id {
+            req["session_id"] = json!(sid);
+        }
+        let resp = handle_add(&id_val, &req, paths, emb);
+        let entry_id = resp["entry_id"].as_str().unwrap().to_string();
+        seed_audit_candidate(paths, run_id, &entry_id);
+        let resolved_sid = session_id.unwrap_or("__GLOBAL__").to_string();
+        (entry_id, resolved_sid)
+    }
+
+    proptest::proptest! {
+        // ── Invariant 1: aggregation correctness ─────────────────────────────
+        // For each (kind, session_id) bucket, source_weights.successes + failures
+        // must equal COUNT(*) FROM audit_runs joined to entries filtered to that bucket.
+        #[test]
+        fn proptest_source_weights_aggregation_correctness(
+            verdicts in proptest::collection::vec(arb_audit_verdict_triple(), 1..8),
+        ) {
+            let (_dir, paths, emb) = setup();
+            let id = json!(null);
+            let run_id = "run-agg";
+
+            // Create one entry per unique (kind, session_id) combination in the generated
+            // verdicts, then record all verdicts.
+            let mut entry_map: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
+            let mut verdict_objs: Vec<serde_json::Value> = Vec::new();
+
+            for (ki, si, verdict) in &verdicts {
+                let kind = AUDIT_KINDS[*ki];
+                let session_id = AUDIT_SESSION_IDS[*si];
+                let key = (kind.to_string(), session_id.unwrap_or("__GLOBAL__").to_string());
+
+                // Each (kind, session_id) gets exactly one entry — multiple verdicts on the
+                // same entry are idempotent (INSERT OR IGNORE), so we create unique paths
+                // to give each verdict triple its own entry.
+                let path = format!("prop/agg/{}/{}/{}", ki, si, verdict);
+                let (entry_id, _) = add_entry_and_seed(&paths, &emb, &path, kind, session_id, run_id);
+                entry_map.entry(key).or_insert_with(|| entry_id.clone());
+                verdict_objs.push(json!({"entry_id": entry_id, "verdict": verdict}));
+            }
+
+            let req = json!({"run_id": run_id, "verdicts": verdict_objs});
+            let resp = handle_audit_record(&id, &req, &paths, &emb);
+            proptest::prop_assert_eq!(&resp["type"], "ok", "handle_audit_record must succeed");
+
+            // Verify: for every (kind, session_id) bucket present in source_weights,
+            // successes + failures == direct count from audit_runs.
+            let conn = db::open_db(&paths.db).unwrap();
+            let buckets: Vec<(String, String, i64, i64)> = conn
+                .prepare("SELECT kind, session_id, successes, failures FROM source_weights")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for (kind, session_id, successes, failures) in &buckets {
+                // Direct count from audit_runs for this (kind, session_id) bucket.
+                // Entries with NULL session_id map to '__GLOBAL__' via COALESCE.
+                let direct_count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM audit_runs ar
+                     JOIN entries e ON e.id = ar.entry_id
+                     WHERE e.kind = ?1
+                       AND COALESCE(e.session_id,'__GLOBAL__') = ?2",
+                    rusqlite::params![kind, session_id],
+                    |r| r.get(0),
+                ).unwrap();
+                let sw_total = successes + failures;
+                proptest::prop_assert_eq!(
+                    sw_total, direct_count,
+                    "bucket ({}, {}): source_weights total {} != audit_runs count {}",
+                    kind, session_id, sw_total, direct_count
+                );
+            }
+        }
+
+        // ── Invariant 2: __GLOBAL__ is the bucket for NULL-session entries ────
+        // The __GLOBAL__ bucket's (successes + failures) for a given kind must equal
+        // COUNT(*) FROM audit_runs for entries with that kind AND NULL session_id.
+        // This confirms __GLOBAL__ is a separate stream, not a union of all sessions.
+        #[test]
+        fn proptest_global_bucket_represents_null_session(
+            null_count in 1usize..5,
+            named_count in 1usize..5,
+            ki in 0..AUDIT_KINDS.len(),
+            verdict_null in proptest::collection::vec(proptest::bool::ANY, 1..5),
+            verdict_named in proptest::collection::vec(proptest::bool::ANY, 1..5),
+        ) {
+            let (_dir, paths, emb) = setup();
+            let id = json!(null);
+            let run_id = "run-global";
+            let kind = AUDIT_KINDS[ki];
+
+            // Add null-session entries for this kind.
+            let null_eids: Vec<String> = (0..null_count).map(|i| {
+                let path = format!("prop/global/null/{}/{}", ki, i);
+                let (eid, _) = add_entry_and_seed(&paths, &emb, &path, kind, None, run_id);
+                eid
+            }).collect();
+
+            // Add named-session entries for this kind.
+            let named_eids: Vec<String> = (0..named_count).map(|i| {
+                let path = format!("prop/global/named/{}/{}", ki, i);
+                let (eid, _) = add_entry_and_seed(&paths, &emb, &path, kind, Some("sess-x"), run_id);
+                eid
+            }).collect();
+
+            // Record verdicts for all entries.
+            let mut verdict_objs: Vec<serde_json::Value> = Vec::new();
+            for (eid, v) in null_eids.iter().zip(verdict_null.iter().cycle()) {
+                verdict_objs.push(json!({"entry_id": eid, "verdict": v}));
+            }
+            for (eid, v) in named_eids.iter().zip(verdict_named.iter().cycle()) {
+                verdict_objs.push(json!({"entry_id": eid, "verdict": v}));
+            }
+            let resp = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": verdict_objs}), &paths, &emb);
+            proptest::prop_assert_eq!(&resp["type"], "ok");
+
+            let conn = db::open_db(&paths.db).unwrap();
+
+            // __GLOBAL__ bucket total must equal only the null-session entries' audit_runs count.
+            let global_total: i64 = conn.query_row(
+                "SELECT COALESCE(successes,0)+COALESCE(failures,0) FROM source_weights
+                 WHERE kind=?1 AND session_id='__GLOBAL__'",
+                rusqlite::params![kind],
+                |r| r.get(0),
+            ).unwrap_or(0);
+
+            let null_audit_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_runs ar
+                 JOIN entries e ON e.id = ar.entry_id
+                 WHERE e.kind=?1 AND e.session_id IS NULL",
+                rusqlite::params![kind],
+                |r| r.get(0),
+            ).unwrap();
+
+            proptest::prop_assert_eq!(
+                global_total, null_audit_count,
+                "__GLOBAL__ bucket ({}) total {} must equal null-session audit_runs count {}",
+                kind, global_total, null_audit_count
+            );
+
+            // Named-session bucket must NOT include the null-session entries.
+            let named_total: i64 = conn.query_row(
+                "SELECT COALESCE(successes,0)+COALESCE(failures,0) FROM source_weights
+                 WHERE kind=?1 AND session_id='sess-x'",
+                rusqlite::params![kind],
+                |r| r.get(0),
+            ).unwrap_or(0);
+
+            let named_audit_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_runs ar
+                 JOIN entries e ON e.id = ar.entry_id
+                 WHERE e.kind=?1 AND e.session_id='sess-x'",
+                rusqlite::params![kind],
+                |r| r.get(0),
+            ).unwrap();
+
+            proptest::prop_assert_eq!(
+                named_total, named_audit_count,
+                "sess-x bucket ({}) total {} must equal named-session audit_runs count {}",
+                kind, named_total, named_audit_count
+            );
+        }
+
+    }
+
+    // ── Invariant 3: commutativity (separate block — capped at 64 cases) ─────
+    // Each case creates 2 full DBs + 2 event journals, so 256 cases × ~9s ≈
+    // 38 min.  64 cases ≈ 10 min keeps CI within a reasonable bound while still
+    // exercising all (kind × session_id × verdict) combinations at scale.
+    // Set PROPTEST_CASES=256 locally to run full coverage.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 64,
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+        // ── Invariant 3: commutativity ────────────────────────────────────────
+        // Applying a set of verdicts in any permutation produces the same final
+        // source_weights state.  We sample a small set (4–8), apply in forward
+        // and reversed order, assert bucket equality.
+        #[test]
+        fn proptest_source_weights_commutativity(
+            verdicts in proptest::collection::vec(arb_audit_verdict_triple(), 4..8),
+        ) {
+            // DB-A: apply verdicts in the generated (forward) order.
+            let (_dir_a, paths_a, emb_a) = setup();
+            // DB-B: apply the same verdicts in reversed order.
+            let (_dir_b, paths_b, emb_b) = setup();
+            let id = json!(null);
+            let run_id = "run-comm";
+
+            // Build a shared list of (path, kind, session_id, verdict) so both DBs get
+            // identical entries (same logical data, different insertion order for audit_record).
+            let items: Vec<(String, &str, Option<&str>, bool)> = verdicts
+                .iter()
+                .enumerate()
+                .map(|(i, (ki, si, v))| (
+                    format!("prop/comm/{}", i),
+                    AUDIT_KINDS[*ki],
+                    AUDIT_SESSION_IDS[*si],
+                    *v,
+                ))
+                .collect();
+
+            // Seed both DBs with identical entries in the same order (order of insertion
+            // doesn't affect source_weights — only the order of audit_record calls does).
+            let mut entry_ids_a: Vec<String> = Vec::new();
+            let mut entry_ids_b: Vec<String> = Vec::new();
+            for (path, kind, session_id, _) in &items {
+                let (eid_a, _) = add_entry_and_seed(&paths_a, &emb_a, path, kind, *session_id, run_id);
+                let (eid_b, _) = add_entry_and_seed(&paths_b, &emb_b, path, kind, *session_id, run_id);
+                entry_ids_a.push(eid_a);
+                entry_ids_b.push(eid_b);
+            }
+
+            // DB-A: apply in forward order.
+            let fwd_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
+                json!({"entry_id": eid, "verdict": v})
+            }).collect();
+            let resp_a = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": fwd_verdicts}), &paths_a, &emb_a);
+            proptest::prop_assert_eq!(&resp_a["type"], "ok", "forward apply must succeed");
+
+            // DB-B: apply in reversed order.
+            let rev_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
+                json!({"entry_id": eid, "verdict": v})
+            }).collect::<Vec<_>>().into_iter().rev().collect();
+            let resp_b = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": rev_verdicts}), &paths_b, &emb_b);
+            proptest::prop_assert_eq!(&resp_b["type"], "ok", "reversed apply must succeed");
+
+            // Compare source_weights buckets across both DBs.
+            // They must be identical (same set of rows, same successes/failures per row).
+            let conn_a = db::open_db(&paths_a.db).unwrap();
+            let conn_b = db::open_db(&paths_b.db).unwrap();
+
+            let mut rows_a: Vec<(String, String, i64, i64)> = conn_a
+                .prepare("SELECT kind, session_id, successes, failures FROM source_weights ORDER BY kind, session_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows_a.sort();
+
+            let mut rows_b: Vec<(String, String, i64, i64)> = conn_b
+                .prepare("SELECT kind, session_id, successes, failures FROM source_weights ORDER BY kind, session_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows_b.sort();
+
+            proptest::prop_assert_eq!(
+                rows_a, rows_b,
+                "source_weights must be identical regardless of verdict insertion order"
+            );
+        }
+    }
+
     // br-9lq (I-2): MCP path must reject malformed tags via validate_kb_add_inputs.
 
     #[test]
