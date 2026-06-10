@@ -90,6 +90,7 @@ impl Search {
             tag_filter: self.tag.clone(),
             inline_verify_k: self.limit, // verify all results by default
             repo_root: None,
+            verify_pool_size: None,
         };
 
         let conn = db::open_db(&paths.db)?;
@@ -592,6 +593,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: None,
+            verify_pool_size: None,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
@@ -666,6 +668,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 1,
             repo_root: None,
+            verify_pool_size: None,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
@@ -752,6 +755,7 @@ mod tests {
                     tag_filter: None,
                     inline_verify_k: 0,
                     repo_root: None,
+                    verify_pool_size: None,
                 };
 
                 // Should not panic; FTS keywords inside quotes are treated as literals
@@ -827,6 +831,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 0,
             repo_root: None,
+            verify_pool_size: None,
         };
 
         let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;

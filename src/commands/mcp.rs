@@ -176,6 +176,7 @@ fn handle_search(
         tag_filter,
         inline_verify_k,
         repo_root,
+        verify_pool_size: None,
     };
 
     let conn = match db::open_db(&paths.db) {

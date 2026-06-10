@@ -26,6 +26,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 uuid = { version = "1", features = ["v4"] }
 half = "2"
 sha2 = "0.10"
+crossbeam-channel = "0.5"
+num_cpus = "1"
 
 [[bench]]
 name = "verification"
