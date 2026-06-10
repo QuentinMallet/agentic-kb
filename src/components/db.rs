@@ -1293,6 +1293,155 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // br-23b.12: batch evidence fetch order-equivalence.
+    //
+    // Reference implementation kept here as a test helper only — matches the
+    // pre-batch per-id loop.  The production fn now issues one query per chunk.
+    // -----------------------------------------------------------------------
+
+    /// Reference loop-based implementation kept for order-equivalence testing.
+    /// Mirrors the pre-batch logic exactly so the test can compare maps.
+    fn fetch_evidence_loop_reference(
+        conn: &Connection,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<Evidence>>> {
+        let mut map: std::collections::HashMap<String, Vec<Evidence>> =
+            std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(map);
+        }
+        let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
+             FROM evidence
+             WHERE entry_id = ?1
+             ORDER BY recorded_at, id
+             LIMIT ?2",
+        )?;
+        for entry_id in entry_ids {
+            let rows: Vec<Evidence> = stmt
+                .query_map(params![entry_id, probe_limit], |r| {
+                    Ok(Evidence {
+                        id: r.get(0)?,
+                        entry_id: r.get(1)?,
+                        kind: r.get(2)?,
+                        citation_path: r.get(3)?,
+                        citation_sha: r.get(4)?,
+                        citation_hash: r.get(5).unwrap_or_default(),
+                        citation_excerpt: r.get(6)?,
+                        derived_from: r.get(7)?,
+                        recorded_at: r.get(8)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+                let capped: Vec<Evidence> =
+                    rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
+                map.insert(entry_id.clone(), capped);
+            } else if !rows.is_empty() {
+                map.insert(entry_id.clone(), rows);
+            }
+        }
+        Ok(map)
+    }
+
+    /// br-23b.12: batched fetch must return a map identical to the reference
+    /// per-id loop for 100 entries × 200 evidence rows each.
+    ///
+    /// Verifies:
+    ///   - same key set
+    ///   - per-entry Vec identical (same order, same fields)
+    ///   - per-entry cap (MAX_EVIDENCE_ROWS_PER_ENTRY) still held
+    #[test]
+    fn test_batch_evidence_order_equivalence() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        const N_ENTRIES: usize = 100;
+        const ROWS_PER_ENTRY: usize = 200; // exactly at the cap
+
+        let entry_ids: Vec<String> = (0..N_ENTRIES)
+            .map(|i| format!("batch-eq-entry-{i:03}"))
+            .collect();
+
+        // Seed N_ENTRIES entries so foreign-key constraints are satisfied.
+        for id in &entry_ids {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": id, "path": format!("batch/{id}"), "summary": id,
+                "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        // Insert exactly ROWS_PER_ENTRY evidence rows per entry, with
+        // deterministic recorded_at so ORDER BY recorded_at, id is stable.
+        for (ei, entry_id) in entry_ids.iter().enumerate() {
+            for ri in 0..ROWS_PER_ENTRY {
+                // Pad seconds/minutes to keep recorded_at unique per row.
+                let mins = ri / 60;
+                let secs = ri % 60;
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', 'sha256:test', ?3)",
+                    params![
+                        format!("ev-{ei:03}-{ri:03}"),
+                        entry_id,
+                        format!("2024-01-01T00:{mins:02}:{secs:02}Z"),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let ref_map = fetch_evidence_loop_reference(&conn, &entry_ids).unwrap();
+        let batch_map = fetch_evidence_for_entries(&conn, &entry_ids).unwrap();
+
+        assert_eq!(
+            ref_map.len(),
+            batch_map.len(),
+            "key count must match: ref={} batch={}",
+            ref_map.len(),
+            batch_map.len()
+        );
+
+        for entry_id in &entry_ids {
+            let ref_rows = ref_map
+                .get(entry_id)
+                .expect("reference map must contain entry");
+            let batch_rows = batch_map
+                .get(entry_id)
+                .expect("batch map must contain entry");
+
+            assert_eq!(
+                ref_rows.len(),
+                batch_rows.len(),
+                "row count mismatch for {entry_id}: ref={} batch={}",
+                ref_rows.len(),
+                batch_rows.len()
+            );
+            assert_eq!(
+                ref_rows.len(),
+                MAX_EVIDENCE_ROWS_PER_ENTRY,
+                "per-entry cap must hold for {entry_id}"
+            );
+
+            for (i, (r, b)) in ref_rows.iter().zip(batch_rows.iter()).enumerate() {
+                assert_eq!(
+                    r.id, b.id,
+                    "row {i} id mismatch for {entry_id}: ref={:?} batch={:?}",
+                    r.id, b.id
+                );
+                assert_eq!(
+                    r.recorded_at, b.recorded_at,
+                    "row {i} recorded_at mismatch for {entry_id}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // br-bhg: explicit SearchOptions.repo_root threads through to verification.
     // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
     // returns None (or the wrong root), causing verified=false on every row.
