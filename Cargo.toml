@@ -34,7 +34,12 @@ harness = false
 name = "bench_kb_search_confidence"
 harness = false
 
+[[bench]]
+name = "bench_search_vs_size"
+harness = false
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.11.0"
+rand = "0.8"
 tempfile = "3.27.0"
