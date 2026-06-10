@@ -1,14 +1,19 @@
 //! `add` subcommand
+//!
+//! This command constructs validated inputs and delegates all event-writing and
+//! DB-apply work to `kb_core::add`.  It does NOT contain any direct calls to
+//! `events::append_event` / `events::append_events_batch` / `db::apply_event`
+//! inside `execute_with` — those are the sole responsibility of `kb_core::add`.
+//!
+//! The `"session"` field written to events by this command is `"cli"`.
+//! The `expire_reason` is `"replaced by --replace-path"`.
 
 use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
-use crate::components::db;
 use crate::components::embedder;
-use crate::components::events;
+use crate::components::kb_core;
 use crate::config;
-use crate::models::Evidence;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use rusqlite::params;
 use serde_json::Value;
 
 /// Add or update a knowledge entry
@@ -105,92 +110,40 @@ impl Add {
         validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
 
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
-
-        let _lock = acquire_lock(&paths.lock)?;
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        // CLI session label.  The CLI does not currently propagate OMC_SESSION_ID
+        // into the per-entry session_id column; that is handled by the
+        // cli-propagate-session-id-to-event-payload task (Lane A, A2).
+        let session = std::env::var("OMC_SESSION_ID")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "cli".to_string());
 
-        // Open DB once; used for both the optional path-replace step and the upsert.
-        let conn = db::open_db(&paths.db)?;
+        // Delegate to kb_core::add — all event-writing and DB-apply logic lives there.
+        let outcome = kb_core::add(
+            paths,
+            embedder,
+            kb_core::AddArgs {
+                id: id.clone(),
+                path: self.path.clone(),
+                summary: self.summary.clone(),
+                content: self.content.clone(),
+                tags: tags_json,
+                version_ref,
+                permanent: self.permanent,
+                replace_path: self.replace_path,
+                kind: self.kind.clone(),
+                evidence_status: evidence_status.to_string(),
+                evidence_rows,
+                ts,
+                session,
+                session_id: None,
+                expire_reason: "replaced by --replace-path".to_string(),
+            },
+        )?;
 
-        // --replace-path: expire all existing non-stale entries at this path before
-        // inserting. Bypasses the permanent guard in expire.rs (the user is explicitly
-        // replacing the entry via kb add --replace-path).
-        if self.replace_path {
-            let existing_ids: Vec<String> = {
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
-                )?;
-                let ids: Vec<String> = stmt
-                    .query_map(params![self.path], |r| r.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                ids
-            };
-            for old_id in existing_ids {
-                let expire_ev = serde_json::json!({
-                    "action": "expire",
-                    "table": "entries",
-                    "id": old_id,
-                    "reason": "replaced by --replace-path",
-                    "ts": ts,
-                    "session": session,
-                });
-                events::append_event(&paths.events, &expire_ev)?;
-                db::apply_event(&conn, embedder, &expire_ev)?;
-            }
-        }
-
-        // Build Add event (carries kind + evidence_status).
-        let add_event = serde_json::json!({
-            "action": "upsert",
-            "table": "entries",
-            "id": id,
-            "path": self.path,
-            "summary": self.summary,
-            "content": self.content,
-            "tags": tags_json,
-            "version_ref": version_ref,
-            "permanent": self.permanent,
-            "kind": self.kind,
-            "evidence_status": evidence_status,
-            "ts": ts,
-            "session": session,
-        });
-
-        // Build EvidenceAdd events (one per evidence row).
-        let evidence_events: Vec<Value> = evidence_rows
-            .iter()
-            .map(|ev| {
-                let evidence = Evidence {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    entry_id: id.clone(),
-                    kind: ev.get("kind").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
-                    citation_path: ev.get("citation_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    citation_sha: ev.get("citation_sha").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    citation_hash: ev.get("citation_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    citation_excerpt: ev.get("citation_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    derived_from: ev.get("derived_from").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    recorded_at: Some(ts.clone()),
-                };
-                events::evidence_add_event(&id, &evidence, version_ref.as_deref())
-            })
-            .collect();
-
-        // Atomic batch: Add event + N EvidenceAdd events under the held lock (AC12).
-        let mut batch = vec![add_event.clone()];
-        batch.extend(evidence_events.iter().cloned());
-        events::append_events_batch(&paths.events, &batch)?;
-
-        // Apply each event to the DB (also under lock).
-        db::apply_event(&conn, embedder, &add_event)?;
-        for ev in &evidence_events {
-            db::apply_event(&conn, embedder, ev)?;
-        }
-
-        println!("added  {} ({})", self.path, id);
+        println!("added  {} ({})", self.path, outcome.entry_id);
         Ok(())
     }
 }
@@ -230,7 +183,7 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::embedder::NoopEmbedder;
+    use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
     use rusqlite::Connection;
     use std::fs;
@@ -633,8 +586,10 @@ mod tests {
             evidence_file: None,
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
-        assert!(err.to_string().contains("evidence required for kind='observation'"),
-            "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("evidence required for kind='observation'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -9,9 +9,8 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
-use crate::components::{db, embedder, events};
+use crate::components::{db, embedder, events, kb_core};
 use crate::config;
-use crate::models::Evidence;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use clap::Parser;
@@ -292,101 +291,31 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     let ts = chrono::Utc::now().to_rfc3339();
     let version_ref = config::git_head_sha();
 
-    let _lock = match acquire_lock(&paths.lock) {
-        Ok(l) => l,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    // replace_path: expire existing non-stale entries at this path before inserting.
-    if replace_path {
-        let existing_ids: Vec<String> = {
-            let mut stmt = match conn.prepare(
-                "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
-            ) {
-                Ok(s) => s,
-                Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-            };
-            let ids: Vec<String> = match stmt.query_map(params![path], |r| r.get(0)) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-            };
-            ids
-        };
-        for old_id in existing_ids {
-            let expire_ev = json!({
-                "action": "expire", "table": "entries",
-                "id": old_id, "reason": "replaced by MCP kb_add replace_path",
-                "ts": ts, "session": "mcp",
-            });
-            if let Err(e) = events::append_event(&paths.events, &expire_ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            if let Err(e) = db::apply_event(&conn, emb, &expire_ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-        }
+    // Delegate all event-writing and DB-apply work to kb_core::add (AC2, AC3).
+    match kb_core::add(
+        paths,
+        emb,
+        kb_core::AddArgs {
+            id: entry_id.clone(),
+            path,
+            summary,
+            content,
+            tags,
+            version_ref,
+            permanent,
+            replace_path,
+            kind,
+            evidence_status: evidence_status.to_string(),
+            evidence_rows,
+            ts,
+            session: "mcp".to_string(),
+            session_id,
+            expire_reason: "replaced by MCP kb_add replace_path".to_string(),
+        },
+    ) {
+        Ok(_) => json!({"id": id, "type": "ok", "entry_id": entry_id}),
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
-
-    // Build Add event (carries kind + evidence_status + session_id).
-    let add_event = json!({
-        "action": "upsert",
-        "table": "entries",
-        "id": entry_id,
-        "path": path,
-        "summary": summary,
-        "content": content,
-        "tags": tags,
-        "version_ref": version_ref,
-        "permanent": permanent,
-        "kind": kind,
-        "evidence_status": evidence_status,
-        "session_id": session_id,
-        "ts": ts,
-        "session": "mcp",
-    });
-
-    // Build EvidenceAdd events (one per evidence row).
-    let evidence_events: Vec<Value> = evidence_rows
-        .iter()
-        .map(|ev| {
-            let evidence = Evidence {
-                id: uuid::Uuid::new_v4().to_string(),
-                entry_id: entry_id.clone(),
-                kind: ev.get("kind").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
-                citation_path: ev.get("citation_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                citation_sha: ev.get("citation_sha").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                citation_hash: ev.get("citation_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                citation_excerpt: ev.get("citation_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                derived_from: ev.get("derived_from").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                recorded_at: Some(ts.clone()),
-            };
-            events::evidence_add_event(&entry_id, &evidence, version_ref.as_deref())
-        })
-        .collect();
-
-    // Atomic batch: Add event + N EvidenceAdd events under the held lock (AC12).
-    let mut batch = vec![add_event.clone()];
-    batch.extend(evidence_events.iter().cloned());
-    if let Err(e) = events::append_events_batch(&paths.events, &batch) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
-
-    // Apply each event to the DB (also under lock).
-    if let Err(e) = db::apply_event(&conn, emb, &add_event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
-    for ev in &evidence_events {
-        if let Err(e) = db::apply_event(&conn, emb, ev) {
-            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-        }
-    }
-
-    json!({"id": id, "type": "ok", "entry_id": entry_id})
 }
 
 fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
@@ -978,6 +907,37 @@ fn handle_audit_record(
         }
     }
 
+    // JSONL-first: collect ALL expire events for false verdicts, append in ONE batch,
+    // then apply to DB.  This eliminates the per-verdict append/apply gap (AC2, AC4).
+    let expire_events: Vec<Value> = verdicts
+        .iter()
+        .filter_map(|v| {
+            let eid = v.get("entry_id").and_then(|x| x.as_str())?;
+            let verdict = v.get("verdict").and_then(|x| x.as_bool()).unwrap_or(false);
+            if verdict {
+                return None;
+            }
+            Some(json!({
+                "action": "expire", "table": "entries",
+                "id": eid, "reason": "audit verdict=false",
+                "ts": ts, "session": "mcp",
+            }))
+        })
+        .collect();
+
+    if !expire_events.is_empty() {
+        if let Err(e) = events::append_events_batch(&paths.events, &expire_events) {
+            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+        }
+        for ev in &expire_events {
+            if let Err(e) = db::apply_event(&conn, emb, ev) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            expired += 1;
+        }
+    }
+
+    // Now process audit_runs inserts and source_weights updates.
     for verdict_obj in &verdicts {
         let entry_id = match verdict_obj.get("entry_id").and_then(|v| v.as_str()) {
             Some(e) => e.to_string(),
@@ -985,22 +945,6 @@ fn handle_audit_record(
         };
         let verdict = verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
         let note = verdict_obj.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-        // JSONL-first ordering invariant: expire event BEFORE audit_runs INSERT
-        if !verdict {
-            let expire_ev = json!({
-                "action": "expire", "table": "entries",
-                "id": entry_id, "reason": "audit verdict=false",
-                "ts": ts, "session": "mcp",
-            });
-            if let Err(e) = events::append_event(&paths.events, &expire_ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            if let Err(e) = db::apply_event(&conn, emb, &expire_ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            expired += 1;
-        }
 
         // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
         let inserted = match conn.execute(
@@ -2498,5 +2442,20 @@ mod tests {
             let conf = e["confidence"].as_f64().unwrap();
             assert!(conf > 0.5, "confidence must increase after verdict=true; got {}", conf);
         }
+    }
+}
+
+/// Test-only re-exports for integration tests in other modules (e.g. kb_core tests).
+#[cfg(test)]
+pub mod tests_api {
+    use super::*;
+
+    pub fn handle_add_for_test(
+        id: &Value,
+        req: &Value,
+        paths: &config::Paths,
+        emb: &dyn embedder::Embedder,
+    ) -> Value {
+        handle_add(id, req, paths, emb)
     }
 }
