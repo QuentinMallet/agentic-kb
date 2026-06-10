@@ -63,27 +63,22 @@ pub struct Paths {
 
 impl Paths {
     /// Walk up from cwd to find the repo root (has a .state/ directory).
-    /// Prefers `agent-kb/agent-kb.db` (symlink convention) but falls back to
-    /// `.state/agent-kb/agent-kb.db` when the symlink is absent (e.g. worktrees).
+    /// Always returns the canonical `.state/agent-kb/agent-kb.db` form, consistent
+    /// with `from_root()`. The `agent-kb/` symlink convention at the repo root is
+    /// intentionally ignored here — symlink-fallback removal is a separate follow-up
+    /// chore (see plan §paths-discover-canonical-form-regression, revision #11).
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut dir: &Path = &cwd;
         loop {
             if dir.join(".state").is_dir() {
-                let symlink_db = dir.join("agent-kb").join("agent-kb.db");
-                let state_db = dir.join(".state").join("agent-kb").join("agent-kb.db");
-                let db = if symlink_db.exists() {
-                    symlink_db
-                } else {
-                    state_db
-                };
                 return Ok(Paths {
                     lock: dir.join(".state").join(".lock"),
                     events: dir
                         .join(".state")
                         .join("agent-kb")
                         .join("agent-kb-events.jsonl"),
-                    db,
+                    db: dir.join(".state").join("agent-kb").join("agent-kb.db"),
                     fastembed_cache: model_cache_dir(),
                 });
             }
@@ -148,6 +143,23 @@ fn model_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// RAII guard that restores cwd on drop (same pattern as add.rs tests).
+    struct CwdGuard(PathBuf);
+    impl CwdGuard {
+        fn set(dir: &Path) -> Self {
+            let orig = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard(orig)
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     #[test]
     fn test_kb_config_default_fields() {
@@ -169,6 +181,105 @@ mod tests {
         assert_eq!(
             paths.db,
             PathBuf::from("/tmp/test-repo/.state/agent-kb/agent-kb.db")
+        );
+    }
+
+    /// Regression test (br-bhg): both `Paths::discover` and `Paths::from_root` must
+    /// return identical canonical `.state/agent-kb/...` form for the same root input.
+    ///
+    /// Acceptance criteria (plan §paths-discover-canonical-form-regression):
+    /// 1. `discover()` and `from_root()` return the same `.db` path.
+    /// 2. Neither path contains `/.agent-kb/` or `/agent-kb/` without the `.state/` prefix.
+    /// 3. The invariant holds even when a symlink `<root>/agent-kb/agent-kb.db` exists
+    ///    (the historically divergent branch in `discover()`).
+    #[test]
+    fn test_canonical_form_discover_matches_from_root_without_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Create the `.state/agent-kb/` structure that `discover()` looks for.
+        let state_db_dir = root.join(".state").join("agent-kb");
+        fs::create_dir_all(&state_db_dir).unwrap();
+        fs::write(state_db_dir.join("agent-kb.db"), b"").unwrap();
+
+        // Change into root so `discover()` finds it.
+        let _guard = CwdGuard::set(root);
+        let discover_paths = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        let from_root_paths = Paths::from_root(root);
+
+        // Both must agree on the db path.
+        assert_eq!(
+            discover_paths.db, from_root_paths.db,
+            "discover() and from_root() must return the same canonical db path"
+        );
+
+        // The db path must be rooted at `.state/agent-kb/`.
+        let db_str = discover_paths.db.to_string_lossy();
+        assert!(
+            db_str.contains("/.state/agent-kb/"),
+            "db path must contain '/.state/agent-kb/', got: {db_str}"
+        );
+
+        // Reject non-canonical variants.
+        assert!(
+            !db_str.contains("/.agent-kb/"),
+            "db path must not contain '/.agent-kb/', got: {db_str}"
+        );
+        // The path segment `/agent-kb/` must always be preceded by `/.state`.
+        let agent_kb_pos = db_str.find("/agent-kb/");
+        let state_agent_kb_pos = db_str.find("/.state/agent-kb/");
+        assert_eq!(
+            agent_kb_pos,
+            state_agent_kb_pos.map(|p| p + 1), // offset by 1 for the leading '/'
+            "'/agent-kb/' in db path must be preceded by '.state', got: {db_str}"
+        );
+    }
+
+    /// Regression test (br-bhg): `discover()` must return the canonical `.state/...` form
+    /// even when a `<root>/agent-kb/agent-kb.db` symlink is present (the historically
+    /// divergent branch).
+    #[test]
+    fn test_canonical_form_discover_with_symlink_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Create the `.state/agent-kb/` structure.
+        let state_db_dir = root.join(".state").join("agent-kb");
+        fs::create_dir_all(&state_db_dir).unwrap();
+        let state_db = state_db_dir.join("agent-kb.db");
+        fs::write(&state_db, b"").unwrap();
+
+        // Create the symlink `<root>/agent-kb/agent-kb.db` that triggers the old branch.
+        let symlink_dir = root.join("agent-kb");
+        fs::create_dir_all(&symlink_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&state_db, symlink_dir.join("agent-kb.db")).unwrap();
+
+        let _guard = CwdGuard::set(root);
+        let discover_paths = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        let from_root_paths = Paths::from_root(root);
+
+        // Both must agree (canonical form), even with symlink present.
+        assert_eq!(
+            discover_paths.db, from_root_paths.db,
+            "discover() and from_root() must return the same canonical db path even when symlink exists"
+        );
+
+        let db_str = discover_paths.db.to_string_lossy();
+        assert!(
+            db_str.contains("/.state/agent-kb/"),
+            "db path must contain '/.state/agent-kb/' even with symlink, got: {db_str}"
+        );
+
+        // Explicitly reject the symlink-based path form.
+        let symlink_path = root.join("agent-kb").join("agent-kb.db").to_string_lossy().to_string();
+        assert_ne!(
+            discover_paths.db.to_string_lossy().as_ref(),
+            symlink_path.as_str(),
+            "discover() must not return the symlink-based path, got: {db_str}"
         );
     }
 }
