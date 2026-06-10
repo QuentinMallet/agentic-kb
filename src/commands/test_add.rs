@@ -49,8 +49,12 @@ impl TestAdd {
             .unwrap_or_else(|| format!("{}-{}", self.app, self.name.replace(' ', "-")));
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        let omc_session_id = std::env::var("OMC_SESSION_ID")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let session = omc_session_id
+            .clone()
+            .unwrap_or_else(|| "cli".to_string());
 
         let event = serde_json::json!({
             "action": "upsert",
@@ -63,6 +67,7 @@ impl TestAdd {
             "version_ref": version_ref,
             "ts": ts,
             "session": session,
+            "session_id": omc_session_id,
         });
 
         events::append_event(&paths.events, &event)?;

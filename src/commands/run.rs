@@ -41,8 +41,12 @@ impl Run {
         let paths = config::Paths::discover()?;
         let _lock = acquire_lock(&paths.lock)?;
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        let omc_session_id = std::env::var("OMC_SESSION_ID")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let session = omc_session_id
+            .clone()
+            .unwrap_or_else(|| "cli".to_string());
         let run_id = uuid::Uuid::new_v4().to_string();
 
         let event = serde_json::json!({
@@ -55,6 +59,7 @@ impl Run {
             "ts": ts,
             "run_id": run_id,
             "session": session,
+            "session_id": omc_session_id,
         });
 
         events::append_event(&paths.events, &event)?;

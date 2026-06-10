@@ -5,7 +5,8 @@
 //! `events::append_event` / `events::append_events_batch` / `db::apply_event`
 //! inside `execute_with` — those are the sole responsibility of `kb_core::add`.
 //!
-//! The `"session"` field written to events by this command is `"cli"`.
+//! The `"session"` field written to events is `$OMC_SESSION_ID` when set, else `"cli"`.
+//! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
 //! The `expire_reason` is `"replaced by --replace-path"`.
 
 use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
@@ -112,12 +113,13 @@ impl Add {
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
-        // CLI session label.  The CLI does not currently propagate OMC_SESSION_ID
-        // into the per-entry session_id column; that is handled by the
-        // cli-propagate-session-id-to-event-payload task (Lane A, A2).
-        let session = std::env::var("OMC_SESSION_ID")
+        // Read OMC_SESSION_ID once: used for both the audit "session" label and
+        // the per-entry session_id column (Phase-5 per-session confidence weighting).
+        let omc_session_id = std::env::var("OMC_SESSION_ID")
             .ok()
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.is_empty());
+        let session = omc_session_id
+            .clone()
             .unwrap_or_else(|| "cli".to_string());
 
         // Delegate to kb_core::add — all event-writing and DB-apply logic lives there.
@@ -138,7 +140,7 @@ impl Add {
                 evidence_rows,
                 ts,
                 session,
-                session_id: None,
+                session_id: omc_session_id,
                 expire_reason: "replaced by --replace-path".to_string(),
             },
         )?;
