@@ -151,8 +151,26 @@ impl Add {
 }
 
 /// Build the appropriate embedder based on KB_NO_EMBED env var.
+///
+/// Prefer `make_embedder_with_opts` at call sites that control `no_embed` explicitly
+/// (e.g. `ingest`, `import`). This wrapper exists for callers that rely on the env var
+/// (e.g. the top-level `add` command invoked via the shell).
 pub fn make_embedder(paths: &config::Paths) -> Box<dyn embedder::Embedder> {
-    if std::env::var("KB_NO_EMBED").is_ok() {
+    make_embedder_with_opts(paths, std::env::var("KB_NO_EMBED").is_ok())
+}
+
+/// Build an embedder with an explicit no-embed flag.
+///
+/// Pass `no_embed=true` to get a `NoopEmbedder` without touching `std::env`.
+/// This avoids `env::set_var` (unsafe in multi-threaded contexts, forbidden by
+/// Rust 2024 Edition) and eliminates cross-talk between parallel test threads.
+///
+/// Constraint: must not break the MCP `make_embedder` path — `make_embedder`
+///             remains as a backwards-compatible wrapper that reads the env var.
+/// Directive: never reintroduce `env::set_var("KB_NO_EMBED", …)` to flip embedder
+///            behaviour; pass `no_embed` explicitly via this function instead.
+pub fn make_embedder_with_opts(paths: &config::Paths, no_embed: bool) -> Box<dyn embedder::Embedder> {
+    if no_embed {
         Box::new(embedder::NoopEmbedder)
     } else {
         Box::new(embedder::CandleEmbedder::new(&paths.fastembed_cache))

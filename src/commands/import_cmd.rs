@@ -16,7 +16,7 @@ const MAX_CONTENT: usize = 9500;
 pub struct Import {
     /// JSON seed file containing an array of KB entries
     pub file: PathBuf,
-    /// Skip embedding (sets KB_NO_EMBED)
+    /// Skip embedding (uses NoopEmbedder; does not mutate KB_NO_EMBED)
     #[arg(long, default_value_t = false)]
     pub no_embed: bool,
     /// Print what would be imported without writing
@@ -59,11 +59,9 @@ impl Import {
         let entries: Vec<serde_json::Value> = serde_json::from_str(&raw)?;
         let paths = config::Paths::discover()?;
 
-        if self.no_embed {
-            // Safety: this is a single-threaded CLI — no races.
-            std::env::set_var("KB_NO_EMBED", "1");
-        }
-        let embedder: Box<dyn embedder::Embedder> = add::make_embedder(&paths);
+        // Construct embedder without env::set_var.
+        // Directive: env::set_var is unsafe in Rust 2024 — never reintroduce.
+        let embedder: Box<dyn embedder::Embedder> = add::make_embedder_with_opts(&paths, self.no_embed);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
 
         let mut imported = 0usize;
@@ -198,9 +196,6 @@ mod tests {
             dry_run: false,
             version_ref: Some("abc123".to_string()),
         };
-        // Set KB_NO_EMBED so the embedder is a noop
-        std::env::set_var("KB_NO_EMBED", "1");
-
         // Can't call execute() easily without path discovery; test inner logic directly
         let raw = fs::read_to_string(&seed_file).unwrap();
         let hash = sha256_hex(raw.as_bytes());
