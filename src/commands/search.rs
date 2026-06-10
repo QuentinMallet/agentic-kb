@@ -135,73 +135,66 @@ impl Search {
             local_results
         };
 
-        let mut fts_count = 0usize;
-        let mut sem_count = 0usize;
-        for r in &results {
-            if r.source == "fts" {
-                fts_count += 1;
-            } else {
-                sem_count += 1;
+        // Determine display mode: RRF hybrid produces unified results;
+        // single-lane modes keep separate FTS / semantic sections.
+        let is_rrf = results.iter().any(|r| r.score_kind == "rrf");
+
+        fn print_entry(r: &db::SearchEntry, show_content: bool) {
+            println!("  [{path}] {summary}  score={score:.6}  score_kind={score_kind}  tags={tags}  id={id}",
+                path = r.path, summary = r.summary,
+                score = r.score, score_kind = r.score_kind,
+                tags = r.tags, id = r.id);
+            if show_content && !r.content.is_empty() {
+                println!("  content: {}", r.content);
+            }
+            for ev in &r.evidence {
+                let verified_str = match ev.verified {
+                    Some(true) => "verified=true",
+                    Some(false) => "verified=false",
+                    None => "verified=null",
+                };
+                println!("    evidence: kind={kind}  {path}  {verified}",
+                    kind = ev.kind,
+                    path = ev.citation_path.as_deref().unwrap_or(""),
+                    verified = verified_str);
             }
         }
 
-        if opts.do_fts {
-            println!("=== FTS results ===");
-            let fts_results: Vec<_> = results.iter().filter(|r| r.source == "fts").collect();
-            if fts_results.is_empty() {
+        if is_rrf {
+            println!("=== Hybrid (RRF) results ===");
+            if results.is_empty() {
                 println!("  (no results)");
             } else {
-                for r in fts_results {
-                    println!("  [{path}] {summary}  tags={tags}  id={id}",
-                        path = r.path, summary = r.summary,
-                        tags = r.tags, id = r.id);
-                    if self.content && !r.content.is_empty() {
-                        println!("  content: {}", r.content);
+                for r in &results {
+                    print_entry(r, self.content);
+                }
+            }
+        } else {
+            if opts.do_fts {
+                println!("=== FTS results ===");
+                let fts_results: Vec<_> = results.iter().filter(|r| r.score_kind == "fts").collect();
+                if fts_results.is_empty() {
+                    println!("  (no results)");
+                } else {
+                    for r in fts_results {
+                        print_entry(r, self.content);
                     }
-                    for ev in &r.evidence {
-                        let verified_str = match ev.verified {
-                            Some(true) => "verified=true",
-                            Some(false) => "verified=false",
-                            None => "verified=null",
-                        };
-                        println!("    evidence: kind={kind}  {path}  {verified}",
-                            kind = ev.kind,
-                            path = ev.citation_path.as_deref().unwrap_or(""),
-                            verified = verified_str);
+                }
+            }
+
+            if opts.do_semantic && !embedder.is_noop() {
+                println!("=== Semantic results ===");
+                let sem_results: Vec<_> = results.iter().filter(|r| r.score_kind == "semantic").collect();
+                if sem_results.is_empty() {
+                    println!("  (no results)");
+                } else {
+                    for r in sem_results {
+                        print_entry(r, self.content);
                     }
                 }
             }
         }
 
-        if opts.do_semantic && !embedder.is_noop() {
-            println!("=== Semantic results ===");
-            let sem_results: Vec<_> = results.iter().filter(|r| r.source == "semantic").collect();
-            if sem_results.is_empty() {
-                println!("  (no results)");
-            } else {
-                for r in sem_results {
-                    println!("  [{path}] {summary}  sim={score:.4}  tags={tags}  id={id}",
-                        path = r.path, summary = r.summary,
-                        score = r.score, tags = r.tags, id = r.id);
-                    if self.content && !r.content.is_empty() {
-                        println!("  content: {}", r.content);
-                    }
-                    for ev in &r.evidence {
-                        let verified_str = match ev.verified {
-                            Some(true) => "verified=true",
-                            Some(false) => "verified=false",
-                            None => "verified=null",
-                        };
-                        println!("    evidence: kind={kind}  {path}  {verified}",
-                            kind = ev.kind,
-                            path = ev.citation_path.as_deref().unwrap_or(""),
-                            verified = verified_str);
-                    }
-                }
-            }
-        }
-
-        let _ = (fts_count, sem_count); // suppress unused warning
         Ok(())
     }
 }
@@ -776,5 +769,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Federated search score_kind round-trip (br-improvement-catalog-23b.5):
+    /// When peer DB results are merged into local results, each peer SearchEntry
+    /// retains the score_kind set by search_entries on the peer DB. The merge path
+    /// only mutates origin_repo — score_kind must be preserved verbatim.
+    #[test]
+    fn test_federated_search_score_kind_preserved_across_peer_merge() {
+        // Build peer KB with one FTS-matchable entry
+        let peer_dir = tempdir().unwrap();
+        let peer_root = peer_dir.path();
+        fs::create_dir_all(peer_root.join(".state/agent-kb")).unwrap();
+        let peer_paths = Paths::from_root(peer_root);
+        let embedder = NoopEmbedder;
+
+        let add_peer = Add {
+            path: "peer/module.rs".to_string(),
+            summary: "peer score_kind roundtrip entry".to_string(),
+            content: "peer body content".to_string(),
+            tags: "peer,scorekind".to_string(),
+            version_ref: Some("peer-sha".to_string()),
+            id: Some("peer-sk-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        };
+        add_peer.execute_with(&peer_paths, &embedder).unwrap();
+
+        // Register local KB + peer edge
+        let local_dir = tempdir().unwrap();
+        let local_root = local_dir.path();
+        fs::create_dir_all(local_root.join(".state/agent-kb")).unwrap();
+        let local_paths = Paths::from_root(local_root);
+
+        let local_conn = crate::components::db::open_db(&local_paths.db).unwrap();
+        let peer_root_str = peer_root.to_str().unwrap().to_string();
+        local_conn.execute(
+            "INSERT INTO graphs(id, graph_type, epic_slug, source_repo, expires_at)
+             VALUES('g1', 'dep', NULL, 'local', NULL)",
+            rusqlite::params![],
+        ).unwrap();
+        local_conn.execute(
+            "INSERT INTO peers(id, graph_id, source_repo, target_repo, edge_type, epic_slug, expires_at)
+             VALUES('p1', 'g1', 'local', ?1, 'dep', NULL, NULL)",
+            rusqlite::params![peer_root_str],
+        ).unwrap();
+
+        // FTS-only search with peers enabled
+        let opts = crate::components::db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+        };
+
+        let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;
+        let peer_conn = crate::components::db::open_db(&peer_db).unwrap();
+        let peer_opts = crate::components::db::SearchOptions {
+            repo_root: Some(std::path::PathBuf::from(&peer_root_str)),
+            ..opts.clone()
+        };
+        let mut peer_results = crate::components::db::search_entries(
+            &peer_conn, &embedder, "peer score_kind roundtrip", &peer_opts,
+        ).unwrap();
+
+        // Simulate the federation merge: set origin_repo, push into merged vec
+        for r in &mut peer_results {
+            r.origin_repo = Some(peer_root_str.clone());
+        }
+
+        // score_kind must survive the origin_repo mutation
+        for r in &peer_results {
+            assert_eq!(
+                r.score_kind, "fts",
+                "peer FTS result must retain score_kind=fts after federation merge, got {}",
+                r.score_kind
+            );
+            assert!(
+                r.origin_repo.is_some(),
+                "origin_repo must be set after peer merge"
+            );
+        }
+        assert!(!peer_results.is_empty(), "peer FTS must return the entry");
     }
 }

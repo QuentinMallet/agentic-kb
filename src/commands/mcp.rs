@@ -230,6 +230,7 @@ fn handle_search(
                         "score": e.score,
                         "id": e.id,
                         "source": e.source,
+                        "score_kind": e.score_kind,
                         "evidence": evidence,
                         "confidence": e.confidence,
                         "audit_n": e.audit_n,
