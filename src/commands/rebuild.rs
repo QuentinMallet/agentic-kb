@@ -450,18 +450,21 @@ mod tests {
             events: paths.events.clone(),
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
+            compact_state: paths.compact_state.clone(),
         };
         let paths_a = Paths {
             lock: paths.lock.clone(),
             events: paths.events.clone(),
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
+            compact_state: paths.compact_state.clone(),
         };
         let paths_b = Paths {
             lock: paths.lock.clone(),
             events: paths.events.clone(),
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
+            compact_state: paths.compact_state.clone(),
         };
 
         // Spawn rebuild thread.
