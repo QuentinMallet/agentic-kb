@@ -227,11 +227,13 @@ mod tests {
             "db path must not contain '/.agent-kb/', got: {db_str}"
         );
         // The path segment `/agent-kb/` must always be preceded by `/.state`.
+        // `/.state/agent-kb/` starts at position P; the `/agent-kb/` inside it
+        // starts at P + len("/.state") = P + 7.
         let agent_kb_pos = db_str.find("/agent-kb/");
         let state_agent_kb_pos = db_str.find("/.state/agent-kb/");
         assert_eq!(
             agent_kb_pos,
-            state_agent_kb_pos.map(|p| p + 1), // offset by 1 for the leading '/'
+            state_agent_kb_pos.map(|p| p + "/.state".len()),
             "'/agent-kb/' in db path must be preceded by '.state', got: {db_str}"
         );
     }
