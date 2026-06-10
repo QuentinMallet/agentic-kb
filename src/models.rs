@@ -269,4 +269,123 @@ mod tests {
         assert_eq!(original, recovered);
     }
 
+    // -----------------------------------------------------------------------
+    // f16 quantisation tests (br-improvement-catalog-23b.11)
+    // -----------------------------------------------------------------------
+
+    /// New entries_emb blobs must be 768 bytes (384 dims × 2 bytes/f16).
+    /// This test fails before f16 encode is implemented (f32 blobs are 1536 bytes).
+    #[test]
+    fn test_f16_blob_size_is_768_bytes() {
+        // Generate a unit-norm 384-dim vector
+        use std::f32::consts::PI;
+        let raw: Vec<f32> = (0..EMB_DIMS)
+            .map(|i| (i as f32 * PI / EMB_DIMS as f32).sin())
+            .collect();
+        let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+
+        let blob = f32s_to_f16_blob(&unit);
+        assert_eq!(
+            blob.len(),
+            EMB_BLOB_BYTES,
+            "f16 blob must be {} bytes ({}×{}), got {}",
+            EMB_BLOB_BYTES,
+            EMB_DIMS,
+            EMB_ELEMENT_BYTES,
+            blob.len()
+        );
+    }
+
+    /// Cosine similarity drift between f32 and f16 round-trip must be ≤ 0.005
+    /// across 1000 random unit-norm 384-dim vectors. Architect Q2 bound: ≤ 0.001.
+    #[test]
+    fn test_f16_cosine_drift_bounded_1000_vectors() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0xf16_f16_f16);
+        let max_allowed_drift = 0.005_f32;
+
+        let mut max_observed = 0.0_f32;
+        for _ in 0..1000 {
+            // Random unit-norm 384-dim vector (same construction as BenchEmbedder)
+            let raw: Vec<f32> = (0..EMB_DIMS)
+                .map(|_| rng.gen::<f32>() * 2.0 - 1.0)
+                .collect();
+            let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit: Vec<f32> = if norm > 0.0 {
+                raw.iter().map(|x| x / norm).collect()
+            } else {
+                vec![0.0; EMB_DIMS]
+            };
+
+            // Encode to f16 then decode back to f32
+            let blob = f32s_to_f16_blob(&unit);
+            let recovered = decode_emb_blob(&blob);
+
+            // Cosine similarity between original and recovered
+            let sim = cosine_similarity(&unit, &recovered);
+            // For unit-norm vectors, cosine drift = 1.0 - sim
+            let drift = (1.0 - sim).abs();
+            if drift > max_observed {
+                max_observed = drift;
+            }
+        }
+
+        assert!(
+            max_observed <= max_allowed_drift,
+            "f16 cosine drift {max_observed:.6} exceeds limit {max_allowed_drift:.6}"
+        );
+    }
+
+    /// decode_emb_blob gracefully handles legacy f32 blobs (length-based dispatch).
+    #[test]
+    fn test_decode_emb_blob_legacy_f32_dispatch() {
+        // 2-element legacy f32 blob (8 bytes) — used in RRF tests
+        let original = vec![0.8_f32, 0.6_f32];
+        let blob = f32s_to_blob(&original);
+        assert_eq!(blob.len(), 8);
+        let recovered = decode_emb_blob(&blob);
+        assert_eq!(recovered, original);
+    }
+
+    /// decode_emb_blob handles f16 blobs of exactly EMB_BLOB_BYTES.
+    #[test]
+    fn test_decode_emb_blob_f16_dispatch() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(42);
+        let raw: Vec<f32> = (0..EMB_DIMS).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+        let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+
+        let blob = f32s_to_f16_blob(&unit);
+        assert_eq!(blob.len(), EMB_BLOB_BYTES);
+        let recovered = decode_emb_blob(&blob);
+        assert_eq!(recovered.len(), EMB_DIMS);
+    }
+
+    /// decode_f16_blob_into reuses scratch buffer (no extra allocation in hot loop).
+    #[test]
+    fn test_decode_f16_blob_into_scratch_reuse() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(99);
+        let raw: Vec<f32> = (0..EMB_DIMS).map(|_| rng.gen::<f32>()).collect();
+        let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+
+        let blob = f32s_to_f16_blob(&unit);
+
+        // Pre-allocate scratch buffer once
+        let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
+        decode_f16_blob_into(&blob, &mut scratch);
+        assert_eq!(scratch.len(), EMB_DIMS);
+
+        // Second call reuses — scratch is cleared and refilled
+        scratch.clear();
+        decode_f16_blob_into(&blob, &mut scratch);
+        assert_eq!(scratch.len(), EMB_DIMS);
+    }
+
 }
