@@ -294,9 +294,16 @@ pub fn apply_event(
                 params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
             )?;
 
-            // Stale entries: clean up FTS/embeddings so they don't appear in search
+            // Stale entries: clean up FTS/embeddings so they don't appear in search.
+            // DELETE entries_emb in the same transaction as the entries write so no
+            // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
             if is_stale == 1 {
                 conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                conn.execute(
+                    "DELETE FROM entries_emb WHERE rowid = \
+                     (SELECT rowid FROM entries WHERE id=?1)",
+                    params![id],
+                )?;
                 return Ok(());
             }
 
@@ -328,12 +335,32 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
-            conn.execute(
-                "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
-                params![id],
-            )?;
-            // Remove from FTS so expired entries don't appear in search
-            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+            // Single transaction: entries UPDATE + FTS DELETE + entries_emb DELETE.
+            // Prevents orphan embedding rows accumulating for stale entries
+            // (br-improvement-catalog-23b.6 GC).
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<()> {
+                conn.execute(
+                    "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
+                    params![id],
+                )?;
+                // Remove from FTS so expired entries don't appear in search
+                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // GC: remove embedding row so entries_emb stays in sync with live entries
+                conn.execute(
+                    "DELETE FROM entries_emb WHERE rowid = \
+                     (SELECT rowid FROM entries WHERE id=?1)",
+                    params![id],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
         }
 
         ("upsert", "test_cases") => {
