@@ -1752,6 +1752,199 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // br-improvement-catalog-23b.6: entries_emb GC on expire and is_stale
+    // -----------------------------------------------------------------------
+
+    /// Regression: insert an entry with a real embedder, expire it, confirm the
+    /// corresponding entries_emb row is deleted in the same transaction.
+    ///
+    /// Uses a FakeEmbedder (returns a fixed non-empty vector) to produce an
+    /// actual entries_emb row on upsert. After expire the row must be gone.
+    #[test]
+    fn test_expire_deletes_entries_emb_row() {
+        use crate::models::f32s_to_blob;
+
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.1_f32, 0.2_f32, 0.3_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Upsert — should write entries_emb row
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-e1",
+            "path": "src/gc_test.rs",
+            "summary": "gc test entry",
+            "content": "some content",
+            "tags": [],
+            "kind": "observation",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // entries_emb row must exist before expire
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(before, 1, "entries_emb row must exist after upsert");
+
+        // Expire
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "emb-gc-e1"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        // entries_emb row must be gone after expire
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(after, 0, "expire must delete the entries_emb row (GC regression)");
+    }
+
+    /// Regression: upsert with is_stale=true must delete any existing entries_emb row.
+    ///
+    /// Simulates the compact path: an entry exists with an embedding, then compact
+    /// replays a stale upsert — the embedding orphan must be cleaned up.
+    #[test]
+    fn test_stale_upsert_deletes_entries_emb_row() {
+        use crate::models::f32s_to_blob;
+
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.4_f32, 0.5_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Upsert live entry — writes entries_emb row
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-stale1",
+            "path": "src/stale_gc.rs",
+            "summary": "stale gc test",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(before, 1, "entries_emb row must exist after live upsert");
+
+        // Stale upsert (as produced by compact for an expired entry)
+        let stale_upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-stale1",
+            "path": "src/stale_gc.rs",
+            "summary": "stale gc test",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "is_stale": true,
+            "ts": "2024-01-02T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &stale_upsert).unwrap();
+
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(after, 0, "is_stale=true upsert must delete entries_emb row (GC regression)");
+    }
+
+    /// Steady-state invariant: after any sequence of upserts and expires,
+    /// COUNT(entries_emb) == COUNT(entries WHERE is_stale=0).
+    ///
+    /// Uses a FakeEmbedder so all live entries get embedding rows written.
+    #[test]
+    fn test_entries_emb_count_equals_live_entries_invariant() {
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0_f32, 0.0_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Insert N=6 entries
+        for i in 0..6_u32 {
+            let ev = serde_json::json!({
+                "action": "upsert",
+                "table": "entries",
+                "id": format!("inv-{i}"),
+                "path": format!("src/inv_{i}.rs"),
+                "summary": format!("invariant entry {i}"),
+                "content": "c",
+                "tags": [],
+                "kind": "belief",
+                "evidence_status": "missing",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        // Expire half (entries 0, 2, 4)
+        for i in (0..6_u32).step_by(2) {
+            let ev = serde_json::json!({
+                "action": "expire",
+                "table": "entries",
+                "id": format!("inv-{i}")
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        let emb_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_emb", [], |r| r.get(0))
+            .unwrap();
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(
+            emb_count, live_count,
+            "steady-state invariant: COUNT(entries_emb)={emb_count} must equal \
+             COUNT(entries WHERE is_stale=0)={live_count}"
+        );
+        // Sanity: N/2 = 3 live entries
+        assert_eq!(live_count, 3, "half the entries should be live");
+    }
+
     proptest::proptest! {
         /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
         /// events into an in-memory DB produces the same materialized state as
