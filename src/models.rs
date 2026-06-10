@@ -1,6 +1,18 @@
 //! Data models and vector math utilities
 
+use half::f16;
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Wire-format constants — single source of truth for entries_emb blob encoding
+// ---------------------------------------------------------------------------
+
+/// Output dimension of BAAI/bge-small-en-v1.5.
+pub const EMB_DIMS: usize = 384;
+/// Bytes per element in the on-disk f16 encoding.
+pub const EMB_ELEMENT_BYTES: usize = 2;
+/// Total byte length of one entries_emb blob.
+pub const EMB_BLOB_BYTES: usize = EMB_DIMS * EMB_ELEMENT_BYTES; // 768
 
 /// Compute cosine similarity between two vectors.
 /// Returns 0.0 if vectors have different lengths (dimension mismatch from
@@ -24,12 +36,79 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Convert f32 slice to little-endian byte blob (for SQLite storage).
+/// Encode f32 slice as little-endian f16 blob (new wire format for entries_emb).
+///
+/// Produces `v.len() * 2` bytes. The canonical entries_emb encoding stores
+/// `EMB_DIMS` elements → `EMB_BLOB_BYTES` bytes total.
+pub fn f32s_to_f16_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * EMB_ELEMENT_BYTES);
+    for &x in v {
+        let h = f16::from_f32(x);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out
+}
+
+/// Decode an entries_emb blob with automatic format dispatch.
+///
+/// - `blob.len() == EMB_BLOB_BYTES` (768): f16 le path (current format)
+/// - any other multiple of 4: f32 le path (legacy format — existing DBs)
+/// - anything else: returns empty vec (corrupt blob; caller gets sim=0.0)
+pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
+    if blob.len() == EMB_BLOB_BYTES {
+        // f16 path (current format)
+        blob.chunks_exact(EMB_ELEMENT_BYTES)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    } else if blob.len() % 4 == 0 {
+        // Legacy f32 path
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    } else {
+        eprintln!(
+            "kb: decode_emb_blob: unexpected blob length {} — corrupt embedding?",
+            blob.len()
+        );
+        Vec::new()
+    }
+}
+
+/// Decode a **canonical-format** (f16, `EMB_BLOB_BYTES` bytes) blob into an
+/// existing scratch buffer.
+///
+/// Clears `scratch`, then appends exactly `EMB_DIMS` decoded floats.
+/// Returns without writing if `blob.len() != EMB_BLOB_BYTES` (the caller then
+/// gets an empty slice → cosine_similarity returns 0.0, matching mismatch
+/// behaviour for corrupt blobs).
+///
+/// Intended for the semantic-scan hot loop — allocate the scratch buffer
+/// ONCE outside the loop and pass a mutable reference here to avoid
+/// per-row allocations.
+pub fn decode_f16_blob_into(blob: &[u8], scratch: &mut Vec<f32>) {
+    scratch.clear();
+    if blob.len() != EMB_BLOB_BYTES {
+        eprintln!(
+            "kb: decode_f16_blob_into: blob length {} != {} — skipping",
+            blob.len(),
+            EMB_BLOB_BYTES
+        );
+        return;
+    }
+    scratch.reserve(EMB_DIMS);
+    for c in blob.chunks_exact(EMB_ELEMENT_BYTES) {
+        scratch.push(f16::from_le_bytes([c[0], c[1]]).to_f32());
+    }
+}
+
+/// Convert f32 slice to little-endian f32 byte blob.
+/// Kept as backwards-compat helper for callers writing legacy or test blobs.
 pub fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Convert little-endian byte blob back to f32 vec.
+/// Convert little-endian f32 byte blob back to f32 vec.
+/// Kept as backwards-compat helper for test code and legacy read paths.
 pub fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
     debug_assert!(b.len().is_multiple_of(4), "blob length {} not divisible by 4 — corrupt embedding?", b.len());
     b.chunks_exact(4)
