@@ -507,6 +507,10 @@ pub struct SearchOptions {
     /// `find_repo_root()`. CLI invocations may leave this `None` because the
     /// user runs the binary from inside the repo tree.
     pub repo_root: Option<PathBuf>,
+    /// Pool size for the bounded verify thread pool (br-23b.13).
+    /// Currently unused; reserved for forward-compatibility with the
+    /// 23b.13 task that replaces the per-request `thread::scope` path.
+    pub verify_pool_size: Option<usize>,
 }
 
 impl Default for SearchOptions {
@@ -519,6 +523,7 @@ impl Default for SearchOptions {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: None,
+            verify_pool_size: None,
         }
     }
 }
@@ -564,8 +569,15 @@ pub struct SearchEntry {
 /// Fetch evidence rows for the given entry IDs, capped at
 /// `MAX_EVIDENCE_ROWS_PER_ENTRY` per entry (br-h9g, security I2).
 ///
-/// BENCH_BASELINE_LOOP: temporary loop-based implementation for measuring
-/// pre-batch baseline. Do not commit this version.
+/// Issues one `WHERE entry_id IN (…)` query per chunk of ≤999 IDs
+/// (SQLite's default SQLITE_MAX_VARIABLE_NUMBER limit).  Per-entry capping
+/// uses `ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id)`
+/// so the DB filters excess rows before they cross the Rust boundary.
+/// When an entry exceeds the cap a warning is emitted to stderr.
+///
+/// Result ordering: the returned Vec per entry follows `recorded_at, id`
+/// order, identical to the previous per-entry loop.  The HashMap key order
+/// is unspecified (HashMap), matching prior behaviour.
 fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
@@ -575,17 +587,54 @@ fn fetch_evidence_for_entries(
     if entry_ids.is_empty() {
         return Ok(map);
     }
+
+    // SQLite's default limit is 999 host parameters per statement.
+    // Use 998 so the row-number cap value occupies the last slot.
+    const CHUNK: usize = 998;
+    // Fetch one extra row per entry so we can detect truncation.
     let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
-    let mut stmt = conn.prepare(
-        "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
-         FROM evidence
-         WHERE entry_id = ?1
-         ORDER BY recorded_at, id
-         LIMIT ?2",
-    )?;
-    for entry_id in entry_ids {
-        let rows: Vec<Evidence> = stmt
-            .query_map(params![entry_id, probe_limit], |r| {
+
+    for chunk in entry_ids.chunks(CHUNK) {
+        // Build "?, ?, …" placeholder list for this chunk.
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // The row_number cap is the next parameter index after the chunk.
+        let rn_param_idx = chunk.len() + 1;
+
+        // Window function caps per-entry rows at probe_limit so we receive
+        // at most MAX_EVIDENCE_ROWS_PER_ENTRY+1 rows per entry, letting us
+        // detect (and warn about) truncation without a separate COUNT query.
+        let sql = format!(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                    citation_excerpt, derived_from, recorded_at
+             FROM (
+               SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                      citation_excerpt, derived_from, recorded_at,
+                      ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id) AS rn
+               FROM evidence
+               WHERE entry_id IN ({placeholders})
+             )
+             WHERE rn <= ?{rn_param_idx}
+             ORDER BY entry_id, recorded_at, id"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Bind entry_id strings first, then the probe_limit.
+        let rows_raw: Vec<Evidence> = {
+            use rusqlite::types::ToSql;
+            let mut params_vec: Vec<&dyn ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn ToSql)
+                .collect();
+            params_vec.push(&probe_limit);
+
+            stmt.query_map(params_vec.as_slice(), |r| {
                 Ok(Evidence {
                     id: r.get(0)?,
                     entry_id: r.get(1)?,
@@ -599,18 +648,44 @@ fn fetch_evidence_for_entries(
                 })
             })?
             .filter_map(|r| r.ok())
-            .collect();
-        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
-            eprintln!(
-                "kb: entry {entry_id} evidence rows truncated to MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
-                rows.len()
-            );
-            let capped: Vec<Evidence> = rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
-            map.insert(entry_id.clone(), capped);
-        } else if !rows.is_empty() {
-            map.insert(entry_id.clone(), rows);
+            .collect()
+        };
+
+        // Group rows by entry_id (already sorted by entry_id from ORDER BY).
+        // Emit truncation warning when an entry's row count hits probe_limit.
+        let mut current_id: Option<String> = None;
+        let mut current_rows: Vec<Evidence> = Vec::new();
+
+        let flush =
+            |entry_id: &str, rows: &mut Vec<Evidence>, map: &mut std::collections::HashMap<String, Vec<Evidence>>| {
+                if rows.is_empty() {
+                    return;
+                }
+                if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+                    eprintln!(
+                        "kb: entry {entry_id} evidence rows truncated to \
+                         MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                        rows.len()
+                    );
+                    rows.truncate(MAX_EVIDENCE_ROWS_PER_ENTRY);
+                }
+                map.insert(entry_id.to_string(), std::mem::take(rows));
+            };
+
+        for ev in rows_raw {
+            if current_id.as_deref() != Some(&ev.entry_id) {
+                if let Some(ref id) = current_id.take() {
+                    flush(id, &mut current_rows, &mut map);
+                }
+                current_id = Some(ev.entry_id.clone());
+            }
+            current_rows.push(ev);
+        }
+        if let Some(ref id) = current_id {
+            flush(id, &mut current_rows, &mut map);
         }
     }
+
     Ok(map)
 }
 
@@ -874,14 +949,30 @@ pub fn search_entries(
 
     let verify_count = opts.inline_verify_k.min(entries.len());
 
-    for (idx, entry) in entries.iter_mut().enumerate() {
+    // br-improvement-catalog-23b.13: bounded scoped pool.
+    // ADR-C: explicit std::thread, not rayon.
+    //
+    // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
+    // min(1) guards against systems returning 0 physical CPUs.
+    let pool_size = opts.verify_pool_size
+        .unwrap_or_else(num_cpus::get_physical)
+        .max(1);
+
+    // --- Phase 1: pre-collect per-entry evidence and byte-budget state ---
+    // We need to move ev_rows out of evidence_map before the thread::scope so
+    // the scope can borrow repo_root without fighting the mutable evidence_map.
+
+    struct EntryWork {
+        entry_idx: usize,
+        ev_rows: Vec<crate::models::Evidence>,
+        do_verify: bool,
+        budget_exceeded: bool,
+    }
+
+    let mut work_items: Vec<EntryWork> = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
         let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
         let do_verify = idx < verify_count;
-
-        if ev_rows.is_empty() {
-            entry.evidence = vec![];
-            continue;
-        }
 
         // br-und: compute total bytes for this entry's evidence rows (br-und security I3)
         let mut total_bytes: usize = 0;
@@ -912,45 +1003,109 @@ pub fn search_entries(
             );
         }
 
-        if do_verify && !budget_exceeded {
-            // Verify all evidence rows for this entry in parallel using thread::scope.
-            // ADR-C: explicit std::thread, not rayon.
-            let verified: Vec<bool> = std::thread::scope(|s| {
-                let handles: Vec<_> = ev_rows
-                    .iter()
-                    .map(|ev| {
-                        s.spawn(|| {
-                            if let Some(ref root) = repo_root {
-                                crate::components::verification::verify_evidence(ev, root)
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            }
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or(false))
-                    .collect()
-            });
+        work_items.push(EntryWork { entry_idx: idx, ev_rows, do_verify, budget_exceeded });
+    }
 
-            entry.evidence = ev_rows
+    // --- Phase 2: flatten all verification tasks across entries ---
+    // task_ranges[entry_idx] = Some(start..end) within verified_flat, or None.
+    let mut flat_tasks: Vec<crate::models::Evidence> = Vec::new();
+    let mut task_ranges: Vec<Option<std::ops::Range<usize>>> = vec![None; entries.len()];
+    for item in &work_items {
+        if item.do_verify && !item.budget_exceeded && !item.ev_rows.is_empty() {
+            let start = flat_tasks.len();
+            flat_tasks.extend(item.ev_rows.iter().cloned());
+            task_ranges[item.entry_idx] = Some(start..flat_tasks.len());
+        }
+    }
+
+    // --- Phase 3: run all verification tasks through the bounded pool ---
+    let total_tasks = flat_tasks.len();
+    let mut verified_flat: Vec<bool> = vec![false; total_tasks];
+
+    if total_tasks > 0 {
+        // Work channel: bounded at pool_size * 2 to bound in-flight tasks and
+        // provide backpressure to the sender. This is the queue from main → workers.
+        // Result channel: unbounded so workers never block emitting results.
+        // Main drains tx_result only AFTER dropping tx_work (sequential drain),
+        // so it cannot interleave sending and receiving. An unbounded result
+        // channel avoids the sender↔result-channel deadlock that arises when
+        // both channels are bounded and the main thread sends work while workers
+        // try to enqueue results.
+        //
+        // Total result count is bounded externally: at most
+        // MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY (br-h9g security I2).
+        let work_chan_cap = (pool_size * 2).max(1);
+        std::thread::scope(|scope| {
+            let (tx_work, rx_work) =
+                crossbeam_channel::bounded::<(usize, crate::models::Evidence)>(work_chan_cap);
+            let (tx_result, rx_result) =
+                crossbeam_channel::unbounded::<(usize, bool)>();
+
+            // Spawn pool_size worker threads. Each consumes (task_idx, Evidence)
+            // from rx_work and sends (task_idx, bool) to tx_result.
+            for _ in 0..pool_size {
+                let rx = rx_work.clone();
+                let tx = tx_result.clone();
+                let root_ref = repo_root.as_ref();
+                scope.spawn(move || {
+                    for (task_idx, ev) in rx {
+                        let verified = if let Some(root) = root_ref {
+                            crate::components::verification::verify_evidence(&ev, root)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        let _ = tx.send((task_idx, verified));
+                    }
+                });
+            }
+            // Drop the unused sender clone so rx_result closes after all
+            // worker sender clones are dropped. Drop rx_work so the channel
+            // closes once tx_work is dropped (workers drain then exit).
+            drop(tx_result);
+            drop(rx_work);
+
+            // Send all tasks; bounded work channel provides backpressure.
+            for (task_idx, ev) in flat_tasks.into_iter().enumerate() {
+                // send() only blocks if workers are slower than the sender;
+                // they cannot deadlock here because tx_result is unbounded.
+                let _ = tx_work.send((task_idx, ev));
+            }
+            // Drop tx_work → workers drain remaining work, then exit,
+            // dropping their tx_result clones → rx_result closes.
+            drop(tx_work);
+
+            // Sequential drain: workers have all exited by the time scope
+            // joins; rx_result is fully populated before we iterate.
+            for (task_idx, v) in rx_result {
+                verified_flat[task_idx] = v;
+            }
+        });
+    }
+
+    // --- Phase 4: assign results back to entries in original order ---
+    for item in work_items {
+        let entry = &mut entries[item.entry_idx];
+        if item.ev_rows.is_empty() {
+            entry.evidence = vec![];
+        } else if item.do_verify && !item.budget_exceeded {
+            let range = task_ranges[item.entry_idx].as_ref().unwrap();
+            entry.evidence = item.ev_rows
                 .into_iter()
-                .zip(verified.into_iter())
-                .map(|(ev, v)| SearchEvidence {
+                .zip(range.clone())
+                .map(|(ev, task_idx)| SearchEvidence {
                     id: ev.id,
                     kind: ev.kind,
                     citation_path: ev.citation_path,
                     citation_sha: ev.citation_sha,
                     citation_hash: ev.citation_hash,
                     citation_excerpt: ev.citation_excerpt,
-                    verified: Some(v),
+                    verified: Some(verified_flat[task_idx]),
                 })
                 .collect();
         } else {
-            // Beyond inline_verify_k or budget exceeded: return evidence metadata with verified=null.
-            entry.evidence = ev_rows
+            // Beyond inline_verify_k or budget exceeded: verified=null.
+            entry.evidence = item.ev_rows
                 .into_iter()
                 .map(|ev| SearchEvidence {
                     id: ev.id,
@@ -1538,6 +1693,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
+            verify_pool_size: None,
         };
         let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
 
@@ -1742,6 +1898,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
+            verify_pool_size: None,
         };
 
         let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
@@ -1808,6 +1965,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 0,
             repo_root: None,
+            verify_pool_size: None,
         };
         let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
         assert!(!results.is_empty(), "FTS must return the entry");
@@ -1824,6 +1982,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 0,
             repo_root: None,
+            verify_pool_size: None,
         };
         let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
         assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
@@ -1925,6 +2084,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 0,
             repo_root: None,
+            verify_pool_size: None,
         };
         let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
 
@@ -2134,6 +2294,105 @@ mod tests {
         );
         // Sanity: N/2 = 3 live entries
         assert_eq!(live_count, 3, "half the entries should be live");
+    }
+
+    // -----------------------------------------------------------------------
+    // br-improvement-catalog-23b.13: bounded verify pool — thread fan-out must
+    // not exceed pool size.
+    //
+    // Scenario: 10 entries × 50 evidence rows each. The old unbounded
+    // thread::scope spawned 50 OS threads per scope call; with the bounded
+    // pool concurrent thread count is limited to `verify_pool_size` (2 here).
+    //
+    // Samples /proc/self/task at 50µs intervals; asserts peak threads ≤
+    // baseline + pool_size + 2 (slack: sampler thread + spare).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_verify_pool_thread_fan_out_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // 10 entries × 50 evidence rows each.
+        let empty_hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for i in 0..10usize {
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": format!("pool-test-{i}"),
+                "path": format!("src/pool_test_{i}.rs"),
+                "summary": format!("bounded pool fan-out test entry {i}"),
+                "content": format!("content {i}"),
+                "tags": ["pool-test"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+            for j in 0..50usize {
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_path, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        format!("pool-ev-{i}-{j:03}"),
+                        format!("pool-test-{i}"),
+                        format!("src/nonexistent_{i}_{j}.rs:0-1"),
+                        empty_hash,
+                        format!("2024-01-01T00:00:{:02}Z", j % 60),
+                    ],
+                ).unwrap();
+            }
+        }
+
+        let pool_size: usize = 2;
+
+        #[cfg(target_os = "linux")]
+        let baseline = std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1);
+        #[cfg(not(target_os = "linux"))]
+        let baseline = 1usize;
+
+        let peak_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(baseline));
+        let stop_sampler = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_clone = std::sync::Arc::clone(&peak_threads);
+        let stop_clone = std::sync::Arc::clone(&stop_sampler);
+        let sampler = std::thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                #[cfg(target_os = "linux")]
+                if let Ok(d) = std::fs::read_dir("/proc/self/task") {
+                    let count = d.count();
+                    let prev = peak_clone.load(std::sync::atomic::Ordering::Relaxed);
+                    if count > prev {
+                        peak_clone.store(count, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(pool_size),
+        };
+        let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
+            .expect("search must succeed");
+
+        stop_sampler.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().unwrap();
+
+        let peak = peak_threads.load(std::sync::atomic::Ordering::Relaxed);
+        let allowed = baseline + pool_size + 2;
+        assert!(
+            peak <= allowed,
+            "thread fan-out bounded: peak={peak}, baseline={baseline}, \
+             pool_size={pool_size}, allowed={allowed}. \
+             Old unbounded code peaks at 50+ threads (one per evidence row)."
+        );
     }
 
     proptest::proptest! {
