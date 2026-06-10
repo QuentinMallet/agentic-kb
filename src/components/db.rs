@@ -561,10 +561,15 @@ pub struct SearchEntry {
 /// Fetch evidence rows for the given entry IDs, capped at
 /// `MAX_EVIDENCE_ROWS_PER_ENTRY` per entry (br-h9g, security I2).
 ///
-/// Issues one parameterised query per entry so the `LIMIT` clause caps
-/// per-entry rather than across the whole batch. When truncation occurs a
-/// warning is emitted to stderr so operators can see which entries have
-/// excess evidence in their KB.
+/// Issues one `WHERE entry_id IN (…)` query per chunk of ≤999 IDs
+/// (SQLite's default SQLITE_MAX_VARIABLE_NUMBER limit).  Per-entry capping
+/// uses `ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id)`
+/// so the DB filters excess rows before they cross the Rust boundary.
+/// When an entry exceeds the cap a warning is emitted to stderr.
+///
+/// Result ordering: the returned Vec per entry follows `recorded_at, id`
+/// order, identical to the previous per-entry loop.  The HashMap key order
+/// is unspecified (HashMap), matching prior behaviour.
 fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
@@ -574,18 +579,54 @@ fn fetch_evidence_for_entries(
     if entry_ids.is_empty() {
         return Ok(map);
     }
-    // Fetch one extra row so we can detect truncation without an extra COUNT(*).
+
+    // SQLite's default limit is 999 host parameters per statement.
+    // Use 998 so the row-number cap value occupies the last slot.
+    const CHUNK: usize = 998;
+    // Fetch one extra row per entry so we can detect truncation.
     let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
-    let mut stmt = conn.prepare(
-        "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
-         FROM evidence
-         WHERE entry_id = ?1
-         ORDER BY recorded_at, id
-         LIMIT ?2",
-    )?;
-    for entry_id in entry_ids {
-        let rows: Vec<Evidence> = stmt
-            .query_map(params![entry_id, probe_limit], |r| {
+
+    for chunk in entry_ids.chunks(CHUNK) {
+        // Build "?, ?, …" placeholder list for this chunk.
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // The row_number cap is the next parameter index after the chunk.
+        let rn_param_idx = chunk.len() + 1;
+
+        // Window function caps per-entry rows at probe_limit so we receive
+        // at most MAX_EVIDENCE_ROWS_PER_ENTRY+1 rows per entry, letting us
+        // detect (and warn about) truncation without a separate COUNT query.
+        let sql = format!(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                    citation_excerpt, derived_from, recorded_at
+             FROM (
+               SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                      citation_excerpt, derived_from, recorded_at,
+                      ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id) AS rn
+               FROM evidence
+               WHERE entry_id IN ({placeholders})
+             )
+             WHERE rn <= ?{rn_param_idx}
+             ORDER BY entry_id, recorded_at, id"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Bind entry_id strings first, then the probe_limit.
+        let rows_raw: Vec<Evidence> = {
+            use rusqlite::types::ToSql;
+            let mut params_vec: Vec<&dyn ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn ToSql)
+                .collect();
+            params_vec.push(&probe_limit);
+
+            stmt.query_map(params_vec.as_slice(), |r| {
                 Ok(Evidence {
                     id: r.get(0)?,
                     entry_id: r.get(1)?,
@@ -599,18 +640,44 @@ fn fetch_evidence_for_entries(
                 })
             })?
             .filter_map(|r| r.ok())
-            .collect();
-        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
-            eprintln!(
-                "kb: entry {entry_id} evidence rows truncated to MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
-                rows.len()
-            );
-            let capped: Vec<Evidence> = rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
-            map.insert(entry_id.clone(), capped);
-        } else if !rows.is_empty() {
-            map.insert(entry_id.clone(), rows);
+            .collect()
+        };
+
+        // Group rows by entry_id (already sorted by entry_id from ORDER BY).
+        // Emit truncation warning when an entry's row count hits probe_limit.
+        let mut current_id: Option<String> = None;
+        let mut current_rows: Vec<Evidence> = Vec::new();
+
+        let flush =
+            |entry_id: &str, rows: &mut Vec<Evidence>, map: &mut std::collections::HashMap<String, Vec<Evidence>>| {
+                if rows.is_empty() {
+                    return;
+                }
+                if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+                    eprintln!(
+                        "kb: entry {entry_id} evidence rows truncated to \
+                         MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                        rows.len()
+                    );
+                    rows.truncate(MAX_EVIDENCE_ROWS_PER_ENTRY);
+                }
+                map.insert(entry_id.to_string(), std::mem::take(rows));
+            };
+
+        for ev in rows_raw {
+            if current_id.as_deref() != Some(&ev.entry_id) {
+                if let Some(ref id) = current_id.take() {
+                    flush(id, &mut current_rows, &mut map);
+                }
+                current_id = Some(ev.entry_id.clone());
+            }
+            current_rows.push(ev);
+        }
+        if let Some(ref id) = current_id {
+            flush(id, &mut current_rows, &mut map);
         }
     }
+
     Ok(map)
 }
 
