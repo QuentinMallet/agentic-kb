@@ -513,10 +513,14 @@ pub struct SearchEntry {
     pub content: String,
     /// Raw JSON array string (e.g. `["rust","test"]`).
     pub tags: String,
-    /// Relevance score (cosine similarity for semantic, 1.0 for FTS).
+    /// Relevance score. For RRF hybrid: sum of 1/(k+rank) across sources.
+    /// For FTS-only: 1.0. For semantic-only: raw cosine similarity.
     pub score: f32,
-    /// `"fts"` or `"semantic"`.
+    /// `"fts"`, `"semantic"`, or `"rrf"` (hybrid Reciprocal Rank Fusion).
     pub source: &'static str,
+    /// Scoring kind: `"fts"` | `"semantic"` | `"rrf"`.
+    /// Equals `source` for single-lane results; `"rrf"` for hybrid-merged results.
+    pub score_kind: &'static str,
     /// Evidence rows with inline verification results.
     pub evidence: Vec<SearchEvidence>,
     /// Beta(1,1) posterior confidence: (s+1)/(s+f+2). Bootstrap value 0.5 when no audits.
@@ -643,6 +647,7 @@ pub fn search_entries(
                 tags,
                 score: 1.0,
                 source: "fts",
+                score_kind: "fts",
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
@@ -683,31 +688,95 @@ pub fn search_entries(
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
-            if seen_ids.contains(&id) {
-                continue;
-            }
-            entries.push(SearchEntry {
-                id,
-                path,
-                summary,
-                content,
-                tags,
-                score: sim,
-                source: "semantic",
-                evidence: vec![],
-                confidence: 0.5,
-                audit_n: 0,
-                origin_repo: None,
-            });
-        }
-
-        // Re-sort hybrid results by score descending and cap at limit
         if opts.do_fts {
+            // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
+            // FTS and semantic rankings. Each entry's RRF score is the sum of
+            // 1/(k+rank) across all sources it appears in, where rank is 1-based.
+            //
+            // This replaces the naive "FTS gets 1.0, semantic gets cosine" approach
+            // which caused FTS to dominate every tie. RRF is order-aware: an entry
+            // appearing in both sources earns two rank contributions and will
+            // outrank an entry appearing in only one, regardless of raw score.
+            const RRF_K: f32 = 60.0;
+
+            // Build a map of id → RRF score, seeding with FTS ranks.
+            let mut rrf_scores: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            for (fts_rank, entry) in entries.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (fts_rank + 1) as f32);
+                rrf_scores.insert(entry.id.clone(), contrib);
+            }
+
+            // Build a lookup for semantic candidates (id → (rank, metadata)).
+            let sem_total = candidates.len();
+            let mut sem_meta: std::collections::HashMap<String, (String, String, String, String, String)> =
+                std::collections::HashMap::with_capacity(sem_total);
+            for (sem_rank, (_, id, path, summary, content, tags)) in candidates.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
+                let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
+                *entry += contrib;
+                sem_meta.insert(id.clone(), (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone()));
+            }
+
+            // Re-build entries from rrf_scores, merging FTS entries and new semantic-only entries.
+            // Existing FTS entries already have their metadata; semantic-only ones need it added.
+            let mut fts_meta: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (i, entry) in entries.iter().enumerate() {
+                fts_meta.insert(entry.id.clone(), i);
+            }
+
+            // For semantic-only entries (not in FTS), create new SearchEntry values.
+            // We cap to opts.limit * 2 candidates to avoid iterating all of them.
+            for (_, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit * 2) {
+                if !fts_meta.contains_key(&id) {
+                    entries.push(SearchEntry {
+                        id: id.clone(),
+                        path,
+                        summary,
+                        content,
+                        tags,
+                        score: 0.0, // will be overwritten below
+                        source: "semantic",
+                        score_kind: "rrf",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                    });
+                }
+            }
+
+            // Apply RRF scores to all entries and mark score_kind as "rrf".
+            for entry in &mut entries {
+                let rrf = rrf_scores.get(&entry.id).copied().unwrap_or(0.0);
+                entry.score = rrf;
+                entry.score_kind = "rrf";
+            }
+
+            // Sort by RRF score descending and cap at limit.
             entries.sort_by(|a, b| {
                 b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
             });
             entries.truncate(opts.limit);
+        } else {
+            // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
+            for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
+                entries.push(SearchEntry {
+                    id,
+                    path,
+                    summary,
+                    content,
+                    tags,
+                    score: sim,
+                    source: "semantic",
+                    score_kind: "semantic",
+                    evidence: vec![],
+                    confidence: 0.5,
+                    audit_n: 0,
+                    origin_repo: None,
+                });
+            }
         }
     }
 
@@ -1496,6 +1565,190 @@ mod tests {
                 ev.verified, None,
                 "evidence must not be verified when entry bytes exceed MAX_PER_ENTRY_BYTES"
             );
+        }
+    }
+
+    /// RRF fusion correctness (br-improvement-catalog-23b.5):
+    ///
+    /// Scenario: two entries — entry A appears in BOTH FTS and semantic results,
+    /// entry B appears in ONLY the semantic result with a numerically higher raw
+    /// cosine score. RRF fused scoring must rank entry A above entry B because A
+    /// earns rank-contribution from two sources.
+    ///
+    /// With NoopEmbedder the semantic lane is skipped entirely, so we test RRF via
+    /// direct calls to `search_entries` with a hand-crafted in-memory DB where
+    /// embeddings are injected directly. However since NoopEmbedder prevents the
+    /// semantic path, we test the following invariants that *are* observable with
+    /// NoopEmbedder:
+    ///
+    /// 1. Hybrid mode with only FTS active assigns score_kind="fts" to results.
+    /// 2. FTS-only mode assigns score_kind="fts".
+    /// 3. Semantic-only mode with NoopEmbedder returns empty (noop skips it) — but
+    ///    if it weren't noop, score_kind="semantic" would be assigned.
+    /// 4. score_kind field exists on SearchEntry (compilation check).
+    ///
+    /// The RRF-beats-raw-score property is tested via unit logic in the rrf test
+    /// below that bypasses the embedder by inserting embeddings directly and using
+    /// a FakeEmbedder that returns a fixed vector.
+    #[test]
+    fn test_rrf_score_kind_fts_only_mode() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-fts-1",
+            "path": "src/rrf_test.rs",
+            "summary": "rrf fts score_kind test entry",
+            "content": "body",
+            "tags": ["rrf"],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // FTS-only mode
+        let opts_fts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+        };
+        let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
+        assert!(!results.is_empty(), "FTS must return the entry");
+        for r in &results {
+            assert_eq!(r.score_kind, "fts", "FTS-only mode must set score_kind=fts");
+        }
+
+        // Hybrid mode (semantic skipped because NoopEmbedder) — FTS results get score_kind=fts
+        let opts_hybrid = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+        };
+        let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
+        assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
+        for r in &hybrid_results {
+            assert_eq!(r.score_kind, "fts", "Hybrid FTS-only path must set score_kind=fts");
+        }
+    }
+
+    /// RRF ranking: when a real embedder is present, an entry appearing in both
+    /// FTS and semantic results must outscore an entry that appears in only one
+    /// source, even if the single-source entry has a higher raw semantic score.
+    ///
+    /// We simulate this with a FakeEmbedder that returns fixed vectors, injecting
+    /// embeddings directly via the entries_emb table so we control both lanes.
+    #[test]
+    fn test_rrf_fusion_dual_source_beats_high_raw_semantic_score() {
+        use crate::models::{blob_to_f32s, f32s_to_blob};
+
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Entry A: appears in FTS (summary contains query token) and we'll
+        // inject a moderate semantic embedding.
+        let upsert_a = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-dual-A",
+            "path": "src/dual_a.rs",
+            "summary": "rrf dual source alpha needle",
+            "content": "body a",
+            "tags": [],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert_a).unwrap();
+
+        // Entry B: does NOT appear in FTS (different summary), but we'll inject
+        // a very high-similarity semantic embedding so it would win raw-score sort.
+        let upsert_b = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-dual-B",
+            "path": "src/dual_b.rs",
+            "summary": "completely unrelated summary zzzz",
+            "content": "body b",
+            "tags": [],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert_b).unwrap();
+
+        // Get the rowids for A and B
+        let rowid_a: i64 = conn.query_row(
+            "SELECT rowid FROM entries WHERE id='rrf-dual-A'", [], |r| r.get(0)
+        ).unwrap();
+        let rowid_b: i64 = conn.query_row(
+            "SELECT rowid FROM entries WHERE id='rrf-dual-B'", [], |r| r.get(0)
+        ).unwrap();
+
+        // Query vector: [1.0, 0.0] (unit vector along dim-0)
+        let q_vec: Vec<f32> = vec![1.0, 0.0];
+
+        // Entry A embedding: moderate similarity = [0.8, 0.6] → sim ≈ 0.8
+        let emb_a: Vec<f32> = vec![0.8, 0.6];
+        // Entry B embedding: very high similarity = [1.0, 0.0] → sim = 1.0
+        let emb_b: Vec<f32> = vec![1.0, 0.0];
+
+        // Insert embeddings
+        conn.execute(
+            "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+            rusqlite::params![rowid_a, f32s_to_blob(&emb_a)],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+            rusqlite::params![rowid_b, f32s_to_blob(&emb_b)],
+        ).unwrap();
+
+        // Use a FakeEmbedder that returns q_vec = [1.0, 0.0]
+        struct FixedEmbedder(Vec<f32>);
+        impl crate::components::embedder::Embedder for FixedEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> { Ok(self.0.clone()) }
+            fn is_noop(&self) -> bool { false }
+        }
+        let fixed_emb = FixedEmbedder(q_vec);
+
+        // Hybrid search: FTS will match A (has "needle"), semantic matches both.
+        // Raw sort: B(sim=1.0) > A(sim=0.8) → B would win.
+        // RRF: A gets rank contribution from FTS(rank=1) + semantic(rank=2),
+        //      B gets contribution from semantic only(rank=1).
+        // RRF scores (k=60):
+        //   A: 1/(60+1) + 1/(60+2) = 0.016393 + 0.016129 = 0.032522
+        //   B: 1/(60+1)             = 0.016393
+        // A must outrank B.
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+        };
+        let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
+
+        assert!(results.len() >= 2, "both entries must be returned, got {}", results.len());
+
+        let pos_a = results.iter().position(|r| r.id == "rrf-dual-A").expect("A must be in results");
+        let pos_b = results.iter().position(|r| r.id == "rrf-dual-B").expect("B must be in results");
+        assert!(
+            pos_a < pos_b,
+            "RRF: dual-source A (rank={pos_a}) must beat single-source B (rank={pos_b}) even though B has higher raw semantic score"
+        );
+
+        // score_kind for hybrid results must be "rrf"
+        for r in &results {
+            assert_eq!(r.score_kind, "rrf", "hybrid RRF results must have score_kind=rrf, got {}", r.score_kind);
         }
     }
 
