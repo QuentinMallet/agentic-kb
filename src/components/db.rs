@@ -730,9 +730,9 @@ impl FtsReadPath {
     }
 }
 
-type FtsRow = (String, String, String, String, String);
+pub type FtsRow = (String, String, String, String, String);
 
-fn fts_query_contentless(
+pub fn fts_query_contentless(
     conn: &Connection,
     safe_query: &str,
     opts: &SearchOptions,
@@ -758,7 +758,7 @@ fn fts_query_contentless(
     Ok(rows)
 }
 
-fn fts_query_content_entries(
+pub fn fts_query_content_entries(
     conn: &Connection,
     safe_query: &str,
     opts: &SearchOptions,
