@@ -712,10 +712,83 @@ fn fetch_evidence_for_entries(
     Ok(map)
 }
 
+/// Which FTS table search queries hit. Controlled by `KB_FTS_READ_PATH`:
+///   "contentless"     — entries_fts (default)
+///   "content_entries" — entries_fts_v2 (content='entries' table, post-cutover)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsReadPath {
+    Contentless,
+    ContentEntries,
+}
+
+impl FtsReadPath {
+    pub fn from_env() -> Self {
+        match std::env::var("KB_FTS_READ_PATH").as_deref() {
+            Ok("content_entries") => FtsReadPath::ContentEntries,
+            _ => FtsReadPath::Contentless,
+        }
+    }
+}
+
+type FtsRow = (String, String, String, String, String);
+
+fn fts_query_contentless(
+    conn: &Connection,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.path, e.summary, e.content, e.tags
+         FROM entries_fts f
+         JOIN entries e ON e.id = f.id
+         WHERE f.entries_fts MATCH ?1
+           AND e.is_stale = 0
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
+         ORDER BY rank
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn fts_query_content_entries(
+    conn: &Connection,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.path, e.summary, e.content, e.tags
+         FROM entries_fts_v2 f
+         JOIN entries e ON e.rowid = f.rowid
+         WHERE f.entries_fts_v2 MATCH ?1
+           AND e.is_stale = 0
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
+         ORDER BY rank
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Shared hybrid search used by both the CLI and MCP handler.
 ///
 /// FTS queries are wrapped in double-quotes to enable phrase search and prevent
 /// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
+/// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "contentless").
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -728,39 +801,59 @@ pub fn search_entries(
     if opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
         // operator injection (AND/OR/NOT) while allowing multi-term recall.
-        // "auth security" matches entries with both words anywhere, not just
-        // as an exact phrase.
         let safe_query: String = query
             .split_whitespace()
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags
-             FROM entries_fts f
-             JOIN entries e ON e.id = f.id
-             WHERE f.entries_fts MATCH ?1
-               AND e.is_stale = 0
-               AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
-               AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-             ORDER BY rank
-             LIMIT ?4",
-        )?;
-        let rows: Vec<_> = stmt
-            .query_map(
-                params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                    ))
-                },
-            )?
-            .filter_map(|r| r.ok())
-            .collect();
+
+        let read_path = FtsReadPath::from_env();
+        let rows = match read_path {
+            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, opts)?,
+            FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
+        };
+
+        // Divergence detection: compare both read paths and emit a warning when
+        // they disagree. In debug builds, assert equality to catch regressions
+        // early. In release builds, log only so production is never disrupted.
+        #[cfg(debug_assertions)]
+        {
+            let alt_rows = match read_path {
+                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
+                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
+            };
+            if let Ok(alt) = alt_rows {
+                let primary_ids: Vec<&str> = rows.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
+                debug_assert_eq!(
+                    primary_ids, alt_ids,
+                    "fts5_dual_write_divergence: primary={:?} alt={:?}",
+                    primary_ids, alt_ids
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let alt_rows = match read_path {
+                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
+                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
+            };
+            if let Ok(alt) = alt_rows {
+                let primary_ids: std::collections::BTreeSet<&str> =
+                    rows.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: std::collections::BTreeSet<&str> =
+                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+                if primary_ids != alt_ids {
+                    tracing::warn!(
+                        fts5_dual_write_divergence = true,
+                        read_path = ?read_path,
+                        primary_count = primary_ids.len(),
+                        alt_count = alt_ids.len(),
+                        "FTS5 read-path result divergence detected"
+                    );
+                }
+            }
+        }
 
         for (id, path, summary, content, tags) in rows {
             seen_ids.insert(id.clone());
@@ -2505,5 +2598,48 @@ mod tests {
             let state2 = snapshot_db_state(&conn2).unwrap();
             proptest::prop_assert_eq!(state1, state2);
         }
+    }
+
+    // US-3: dual-write correctness — both FTS tables return the same IDs
+    // after applying a batch of upsert/expire events.
+    #[test]
+    fn test_dual_write_both_fts_tables_agree() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let events = [
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw1","path":"src/main.rs","summary":"dual write alpha","content":"alpha content","tags":["rust"],"ts":"2024-01-01T00:00:00Z"}),
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw2","path":"src/lib.rs","summary":"dual write beta","content":"beta content","tags":["rust"],"ts":"2024-01-01T00:00:01Z"}),
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw3","path":"docs/foo.md","summary":"dual write gamma","content":"gamma content","tags":["docs"],"ts":"2024-01-01T00:00:02Z"}),
+            // Expire one to verify both tables remove it
+            serde_json::json!({"action":"expire","table":"entries","id":"dw2","ts":"2024-01-01T01:00:00Z","session":"test"}),
+        ];
+
+        for ev in &events {
+            apply_event(&conn, &embedder, ev).unwrap();
+        }
+
+        let opts = SearchOptions { do_fts: true, do_semantic: false, limit: 20, ..Default::default() };
+        let safe_q = "\"dual\"";
+
+        let v1_ids: Vec<String> = fts_query_contentless(&conn, safe_q, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        let v2_ids: Vec<String> = fts_query_content_entries(&conn, safe_q, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+
+        assert_eq!(
+            v1_ids.iter().collect::<std::collections::BTreeSet<_>>(),
+            v2_ids.iter().collect::<std::collections::BTreeSet<_>>(),
+            "both FTS tables must return the same entry IDs"
+        );
+        assert!(!v1_ids.contains(&"dw2".to_string()), "expired entry dw2 must be absent");
+        assert!(v1_ids.contains(&"dw1".to_string()), "dw1 must be present");
+        assert!(v1_ids.contains(&"dw3".to_string()), "dw3 must be present");
     }
 }
