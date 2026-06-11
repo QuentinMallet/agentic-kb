@@ -291,6 +291,100 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // AC-P6 migrations: add cross-repo provenance columns to entries.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN origin_repo TEXT;");
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN cross_repo_epic TEXT;");
+    // T8 (br-fts5-content-migration-31t.8): deprecation gate counter table.
+    // Tracks the four event-gated signals required before dropping entries_fts.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS fts5_deprecation_gate (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO fts5_deprecation_gate(key, value) VALUES
+            ('post_cutover_writes', '0'),
+            ('rollback_invocations', '0'),
+            ('parity_rerun_divergence', '-1'),
+            ('rollback_drill_passed', '0');
+        "#,
+    )?;
+    maybe_drop_contentless_fts(conn)?;
+    Ok(())
+}
+
+/// Set a T8 deprecation gate signal (key → value as string).
+/// Used by parity rerun, rollback drill, and ops tooling.
+pub fn set_deprecation_gate(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fts5_deprecation_gate(key, value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [key, value],
+    )?;
+    Ok(())
+}
+
+/// T8: drop entries_fts (contentless) and its write triggers when all four
+/// deprecation gate signals are met:
+///   1. post_cutover_writes >= 1000
+///   2. rollback_invocations == 0
+///   3. parity_rerun_divergence == 0  (must have been set by a parity rerun)
+///   4. rollback_drill_passed == 1
+///
+/// Idempotent: if entries_fts no longer exists the function is a no-op.
+pub fn maybe_drop_contentless_fts(conn: &Connection) -> Result<()> {
+    // Fast path: table already dropped.
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return Ok(());
+    }
+
+    // Read gate signals.
+    let gate_val = |key: &str| -> i64 {
+        conn.query_row(
+            "SELECT value FROM fts5_deprecation_gate WHERE key=?1",
+            [key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1)
+    };
+
+    let post_cutover_writes = gate_val("post_cutover_writes");
+    let rollback_invocations = gate_val("rollback_invocations");
+    let parity_rerun_divergence = gate_val("parity_rerun_divergence");
+    let rollback_drill_passed = gate_val("rollback_drill_passed");
+
+    let gate_open = post_cutover_writes >= 1000
+        && rollback_invocations == 0
+        && parity_rerun_divergence == 0
+        && rollback_drill_passed == 1;
+
+    if !gate_open {
+        return Ok(());
+    }
+
+    // All gates satisfied — drop contentless FTS table and its write triggers.
+    // The FTS5 'delete' trigger (entries_ai_fts) was created by earlier schema
+    // versions; drop it too if it exists.
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS entries_fts;
+        DROP TRIGGER IF EXISTS entries_ai_fts;
+        DROP TRIGGER IF EXISTS entries_au_fts;
+        DROP TRIGGER IF EXISTS entries_ad_fts;
+        "#,
+    )?;
+    conn.execute_batch("VACUUM;")?;
+    eprintln!(
+        "kb: fts5_v1_table_dropped post_cutover_writes={post_cutover_writes} \
+         parity_rerun_divergence={parity_rerun_divergence} \
+         rollback_drill_passed={rollback_drill_passed}"
+    );
     Ok(())
 }
 
@@ -373,6 +467,11 @@ pub fn apply_event(
                     params![rowid, blob],
                 )?;
             }
+            // T8 deprecation gate: count post-cutover entry writes.
+            let _ = conn.execute(
+                "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
+                [],
+            );
         }
 
         ("expire", "entries") => {
@@ -404,6 +503,11 @@ pub fn apply_event(
                 return Err(e);
             }
             conn.execute_batch("COMMIT")?;
+            // T8 deprecation gate: count post-cutover entry writes.
+            let _ = conn.execute(
+                "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
+                [],
+            );
         }
 
         ("upsert", "test_cases") => {
@@ -2653,5 +2757,76 @@ mod tests {
         assert!(!v1_ids.contains(&"dw2".to_string()), "expired entry dw2 must be absent");
         assert!(v1_ids.contains(&"dw1".to_string()), "dw1 must be present");
         assert!(v1_ids.contains(&"dw3".to_string()), "dw3 must be present");
+    }
+
+    // US-8: deprecation gate — entries_fts dropped + VACUUM once all gate signals met.
+    #[test]
+    fn test_deprecation_gate_drops_contentless_fts_when_all_signals_met() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Apply 1000 upsert/expire cycles to satisfy post_cutover_writes >= 1000.
+        for i in 0..500 {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": format!("gate-{i}"), "path": "src/gate.rs",
+                "summary": format!("gate test {i}"),
+                "content": "gate content", "tags": ["gate"],
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+            let exp = serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": format!("gate-{i}"), "ts": "2024-01-02T00:00:00Z", "session": "test"
+            });
+            apply_event(&conn, &embedder, &exp).unwrap();
+        }
+
+        // Verify counter accumulated
+        let writes: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM fts5_deprecation_gate WHERE key='post_cutover_writes'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert!(writes >= 1000, "expected ≥1000 post_cutover_writes, got {writes}");
+
+        // entries_fts still present — gate not yet open (other signals unset)
+        let fts_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_exists, 1, "entries_fts must still exist before all gate signals are met");
+
+        // Satisfy remaining gate signals
+        set_deprecation_gate(&conn, "rollback_invocations", "0").unwrap();
+        set_deprecation_gate(&conn, "parity_rerun_divergence", "0").unwrap();
+        set_deprecation_gate(&conn, "rollback_drill_passed", "1").unwrap();
+
+        // Now trigger the check
+        maybe_drop_contentless_fts(&conn).unwrap();
+
+        // entries_fts must be gone
+        let fts_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_after, 0, "entries_fts must be dropped after all gate signals are met");
+
+        // Idempotency: calling again must not error
+        maybe_drop_contentless_fts(&conn).unwrap();
+
+        // entries_fts_v2 (content='entries') must still be intact
+        let v2_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts_v2'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_exists, 1, "entries_fts_v2 must remain after contentless drop");
     }
 }
