@@ -844,15 +844,25 @@ pub fn search_entries(
                 let alt_ids: std::collections::BTreeSet<&str> =
                     alt.iter().map(|(id, ..)| id.as_str()).collect();
                 if primary_ids != alt_ids {
-                    tracing::warn!(
-                        fts5_dual_write_divergence = true,
-                        read_path = ?read_path,
-                        primary_count = primary_ids.len(),
-                        alt_count = alt_ids.len(),
-                        "FTS5 read-path result divergence detected"
+                    eprintln!(
+                        "kb: fts5_dual_write_divergence read_path={:?} \
+                         primary_count={} alt_count={}",
+                        read_path,
+                        primary_ids.len(),
+                        alt_ids.len()
                     );
                 }
             }
+        }
+
+        // T5a opt-in counter: log each content_entries search so the cutover
+        // gate (T5b) can verify ≥50 searches and ≥7 distinct days before flipping.
+        if read_path == FtsReadPath::ContentEntries {
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            eprintln!(
+                "kb: fts5_content_entries_search date={date} result_count={}",
+                rows.len()
+            );
         }
 
         for (id, path, summary, content, tags) in rows {
