@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "bench": "bench_search_vs_size",
+    "date": "2026-06-10",
+    "branch": "epic-23b-improvement-catalog",
+    "commit": "d326563",
+    "note": "Baseline for br-improvement-catalog-23b.10. Units: nanoseconds (point_estimate). 1M bench not run — requires BENCH_LARGE_SIZE=1.",
+    "embedder": "BenchEmbedder (deterministic, seeded 42, 384-dim unit vectors from pool of 512)",
+    "seeding": "StdRng::seed_from_u64(42), structured entries (summary/content/tags/path per CATEGORIES+LOREM_WORDS cycle)"
+  },
+  "results": {
+    "search_vs_size/1000/fts_only": {
+      "point_estimate_ns": 1728609.189,
+      "mean_ns": 1500664.016,
+      "ci_lower_ns": 1482150.538,
+      "ci_upper_ns": 1991320.212,
+      "note": "~1.5-1.7 ms at 1k entries"
+    },
+    "search_vs_size/1000/semantic_only": {
+      "point_estimate_ns": 5504785.255,
+      "mean_ns": 5396586.634,
+      "ci_lower_ns": 5142293.392,
+      "ci_upper_ns": 5983528.971,
+      "note": "~5.4-5.5 ms at 1k entries — O(n) brute-force cosine scan"
+    },
+    "search_vs_size/1000/hybrid": {
+      "point_estimate_ns": 7252718.020,
+      "mean_ns": 7664481.738,
+      "ci_lower_ns": 6787099.060,
+      "ci_upper_ns": 7787894.759,
+      "note": "~7.3-7.7 ms at 1k entries — RRF merge overhead visible vs FTS-only"
+    }
+  },
+  "notes": [
+    "10k and 100k baselines not included — run 'cargo bench --bench bench_search_vs_size' to generate them.",
+    "1M bench requires BENCH_LARGE_SIZE=1 (see bench file header for memory estimate: ~1.8 GB).",
+    "These numbers are on an unoptimized dev machine under load; treat as order-of-magnitude, not absolute targets.",
+    "Lane D perf tasks (23b.11-23b.14) should re-run this bench to measure improvement."
+  ]
+}

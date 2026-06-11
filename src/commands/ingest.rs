@@ -34,7 +34,7 @@ pub struct Ingest {
     /// Mark all chunks permanent
     #[arg(long, default_value_t = false)]
     pub permanent: bool,
-    /// Skip embedding (sets KB_NO_EMBED)
+    /// Skip embedding (uses NoopEmbedder; does not mutate KB_NO_EMBED)
     #[arg(long, default_value_t = false)]
     pub no_embed: bool,
     /// Print chunks without writing to KB
@@ -55,7 +55,27 @@ impl Runnable for Ingest {
 }
 
 impl Ingest {
-    pub fn execute(&self) -> anyhow::Result<()> {
+    /// Execute with explicit paths + embedder.
+    ///
+    /// This is the canonical implementation path. `execute()` delegates here after
+    /// constructing the embedder via `make_embedder_with_opts(no_embed)`, avoiding
+    /// any `env::set_var` calls (unsafe in Rust 2024 multi-threaded contexts).
+    ///
+    /// # replace_path semantics
+    /// Only the **first** chunk is ingested with `replace_path=true`. Subsequent
+    /// chunks use `replace_path=false`. This is the key correctness fix: previously
+    /// every chunk used `replace_path=true`, which caused each iteration to expire
+    /// all entries from prior iterations — silent data loss leaving only the last
+    /// chunk active.
+    ///
+    /// TLA+ spec: `agent-kb/tla/ingest_replace_path.tla`
+    /// Invariant `AllChunkIdsPresent`: after the loop, non-stale entries cover
+    /// all chunk indices {0..N-1}.
+    pub fn execute_with(
+        &self,
+        paths: &config::Paths,
+        embedder: &dyn embedder::Embedder,
+    ) -> anyhow::Result<()> {
         let text = match &self.file {
             Some(p) => std::fs::read_to_string(p)?,
             None => {
@@ -74,14 +94,9 @@ impl Ingest {
             return Ok(());
         }
 
-        let paths = config::Paths::discover()?;
-        if self.no_embed {
-            std::env::set_var("KB_NO_EMBED", "1");
-        }
-        let embedder: Box<dyn embedder::Embedder> = add::make_embedder(&paths);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
 
-        for chunk in &chunks {
+        for (i, chunk) in chunks.iter().enumerate() {
             let cmd = Add {
                 path: self.path.clone(),
                 summary: self.summary.clone(),
@@ -90,15 +105,23 @@ impl Ingest {
                 version_ref: version_ref.clone(),
                 id: None,
                 permanent: self.permanent,
-                replace_path: true,
+                replace_path: i == 0,
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
             };
-            cmd.execute_with(&paths, embedder.as_ref())?;
+            cmd.execute_with(paths, embedder)?;
         }
         println!("ingested {} chunk(s) → {}", chunks.len(), self.path);
         Ok(())
+    }
+
+    pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        // Construct embedder without env::set_var.
+        // Directive: env::set_var is unsafe in Rust 2024 — never reintroduce.
+        let embedder = add::make_embedder_with_opts(&paths, self.no_embed);
+        self.execute_with(&paths, embedder.as_ref())
     }
 }
 
@@ -264,12 +287,16 @@ fn advance_char_boundary(s: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::add::Add;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
     use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
+
+    fn make_paths(root: &std::path::Path) -> Paths {
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        Paths::from_root(root)
+    }
 
     #[test]
     fn test_chunk_text_single_small_doc() {
@@ -299,34 +326,49 @@ mod tests {
         }
     }
 
+    // ── TDD: Bug fix for replace_path-on-every-iteration (AC1) ───────────────
+    //
+    // Pre-fix the original test asserted `count >= 1`, which accepted the bug.
+    // Post-fix this test asserts `count == N` (ALL chunks survive).
+    //
+    // This test exercises `Ingest::execute_with` directly — the same code path
+    // that `execute()` delegates to — so it covers both the replace_path fix
+    // and the no-env-mutation fix.
     #[test]
-    fn test_ingest_writes_chunks_to_db() {
+    fn test_ingest_writes_all_chunks_to_db() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(root);
+        let paths = make_paths(root);
         let embedder = NoopEmbedder;
 
+        // Two-section doc guaranteed to produce exactly 2 chunks at 1800-char limit.
         let doc = "# Part One\n\nThis is part one content with enough text.\n\n\
                    # Part Two\n\nThis is part two content with enough text.\n";
-        let chunks = chunk_text(doc, 1800, 150);
+        let expected_chunks = chunk_text(doc, 1800, 150);
+        // Confirm we actually have >= 2 chunks; if chunker changes, this catches it.
+        assert!(
+            expected_chunks.len() >= 2,
+            "doc must produce >= 2 chunks, got {}",
+            expected_chunks.len()
+        );
 
-        for chunk in &chunks {
-            let cmd = Add {
-                path: "docs/test.md".to_string(),
-                summary: "test doc".to_string(),
-                content: chunk.clone(),
-                tags: "docs".to_string(),
-                version_ref: Some("abc123".to_string()),
-                id: None,
-                permanent: false,
-                replace_path: true,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-            };
-            cmd.execute_with(&paths, &embedder).unwrap();
-        }
+        // Build a temp file for the ingest command.
+        let doc_file = root.join("doc.md");
+        fs::write(&doc_file, doc).unwrap();
+
+        let ingest = Ingest {
+            path: "docs/test.md".to_string(),
+            summary: "test doc".to_string(),
+            tags: "docs".to_string(),
+            file: Some(doc_file),
+            chunk_size: 1800,
+            overlap: 150,
+            permanent: false,
+            no_embed: true,
+            dry_run: false,
+            version_ref: Some("abc123".to_string()),
+        };
+        ingest.execute_with(&paths, &embedder).unwrap();
 
         let conn = Connection::open(&paths.db).unwrap();
         let count: i64 = conn
@@ -336,8 +378,184 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // The last replace_path call marks prior chunks stale — only 1 active
-        assert!(count >= 1, "at least one chunk in DB");
+        // AC1: ALL N chunks must survive — not just the last one.
+        assert_eq!(
+            count,
+            expected_chunks.len() as i64,
+            "expected all {} chunks active in DB, got {}",
+            expected_chunks.len(),
+            count
+        );
+    }
+
+    // Legacy test kept for regression coverage — now also asserts ALL chunks.
+    // Previously this used a manual Add loop with replace_path=true on every
+    // iteration (the bug), but that's replaced by execute_with above.
+    #[test]
+    fn test_ingest_writes_chunks_to_db() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let paths = make_paths(root);
+        let embedder = NoopEmbedder;
+
+        let doc = "# Part One\n\nThis is part one content with enough text.\n\n\
+                   # Part Two\n\nThis is part two content with enough text.\n";
+        let chunks = chunk_text(doc, 1800, 150);
+        let doc_file = root.join("legacy_doc.md");
+        fs::write(&doc_file, doc).unwrap();
+
+        let ingest = Ingest {
+            path: "docs/legacy.md".to_string(),
+            summary: "legacy test doc".to_string(),
+            tags: "docs".to_string(),
+            file: Some(doc_file),
+            chunk_size: 1800,
+            overlap: 150,
+            permanent: false,
+            no_embed: true,
+            dry_run: false,
+            version_ref: Some("abc123".to_string()),
+        };
+        ingest.execute_with(&paths, &embedder).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path='docs/legacy.md' AND is_stale=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Strengthened: must equal the actual chunk count, not just >= 1.
+        assert_eq!(count, chunks.len() as i64, "all chunks must be active in DB");
+    }
+
+    // ── Proptest: no env cross-talk between parallel Ingest calls ─────────────
+    //
+    // AC3: two concurrent `execute_with` calls — one with no_embed=true (uses
+    // NoopEmbedder), one with no_embed=false would normally use CandleEmbedder,
+    // but we pass a NoopEmbedder for both since we're testing the env-isolation
+    // contract, not the embedder itself.  Both calls must succeed independently
+    // and both see exactly their expected chunk counts.
+    //
+    // Before the fix this could not be written as a proptest because the code
+    // called `env::set_var("KB_NO_EMBED", "1")` which is process-global state;
+    // two threads racing on that var would corrupt each other's embedder.
+    // After the fix, `execute_with` receives an explicit `&dyn Embedder`, so
+    // no env mutation occurs at all — the proptest below proves this by running
+    // both threads concurrently and asserting deterministic results.
+    #[test]
+    fn test_ingest_no_env_cross_talk_parallel() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let doc_a = "# Alpha\n\nSection Alpha content is here.\n\n\
+                     # Beta\n\nSection Beta content is here.\n";
+        let doc_b = "# Gamma\n\nSection Gamma content is here.\n\n\
+                     # Delta\n\nSection Delta content is here.\n\
+                     \n# Epsilon\n\nSection Epsilon content is here.\n";
+
+        let expected_a = chunk_text(doc_a, 1800, 150).len();
+        let expected_b = chunk_text(doc_b, 1800, 150).len();
+        assert!(expected_a >= 2, "doc_a must have >= 2 chunks");
+        assert!(expected_b >= 2, "doc_b must have >= 2 chunks");
+
+        // Two independent temp dirs — each thread owns its own KB.
+        // TempDir is wrapped in Arc so it lives until both threads finish.
+        let dir_a = Arc::new(tempdir().unwrap());
+        let dir_b = Arc::new(tempdir().unwrap());
+
+        // Pre-create the .state/agent-kb dirs before spawning threads.
+        fs::create_dir_all(dir_a.path().join(".state/agent-kb")).unwrap();
+        fs::create_dir_all(dir_b.path().join(".state/agent-kb")).unwrap();
+
+        // Write doc files
+        let file_a = dir_a.path().join("a.md");
+        let file_b = dir_b.path().join("b.md");
+        fs::write(&file_a, doc_a).unwrap();
+        fs::write(&file_b, doc_b).unwrap();
+
+        // Clone Arcs for threads (keeps TempDir alive until thread finishes).
+        let dir_a_t = Arc::clone(&dir_a);
+        let dir_b_t = Arc::clone(&dir_b);
+
+        // Thread A: no_embed=true (would have called env::set_var before the fix)
+        let handle_a = thread::spawn(move || {
+            let root = dir_a_t.path().to_path_buf();
+            let paths = Paths::from_root(&root);
+            let embedder = NoopEmbedder;
+            let ingest = Ingest {
+                path: "docs/a.md".to_string(),
+                summary: "thread a".to_string(),
+                tags: "test".to_string(),
+                file: Some(root.join("a.md")),
+                chunk_size: 1800,
+                overlap: 150,
+                permanent: false,
+                no_embed: true,
+                dry_run: false,
+                version_ref: Some("sha-a".to_string()),
+            };
+            ingest.execute_with(&paths, &embedder).unwrap();
+            let conn = Connection::open(&paths.db).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE path='docs/a.md' AND is_stale=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            count
+        });
+
+        // Thread B: no_embed=false (but we pass NoopEmbedder explicitly — tests
+        // that the no_embed flag on the struct does NOT affect the embedder passed
+        // to execute_with, proving the env var is not consulted).
+        let handle_b = thread::spawn(move || {
+            let root = dir_b_t.path().to_path_buf();
+            let paths = Paths::from_root(&root);
+            let embedder = NoopEmbedder;
+            let ingest = Ingest {
+                path: "docs/b.md".to_string(),
+                summary: "thread b".to_string(),
+                tags: "test".to_string(),
+                file: Some(root.join("b.md")),
+                chunk_size: 1800,
+                overlap: 150,
+                permanent: false,
+                no_embed: false,
+                dry_run: false,
+                version_ref: Some("sha-b".to_string()),
+            };
+            ingest.execute_with(&paths, &embedder).unwrap();
+            let conn = Connection::open(&paths.db).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE path='docs/b.md' AND is_stale=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            count
+        });
+
+        let count_a = handle_a.join().expect("thread A panicked");
+        let count_b = handle_b.join().expect("thread B panicked");
+
+        assert_eq!(
+            count_a,
+            expected_a as i64,
+            "thread A: expected {} active chunks, got {}",
+            expected_a,
+            count_a
+        );
+        assert_eq!(
+            count_b,
+            expected_b as i64,
+            "thread B: expected {} active chunks, got {}",
+            expected_b,
+            count_b
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@ fn bench_search_confidence(c: &mut Criterion) {
         tag_filter: None,
         inline_verify_k: 0,
         repo_root: None,
+        verify_pool_size: None,
     };
 
     // Baseline: same query, no source_weights rows (would be identical structure)
