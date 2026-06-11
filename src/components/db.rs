@@ -128,6 +128,45 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             id UNINDEXED, path, summary, content, tags
         );
 
+        -- FTS5 content table (migration target). Triggers keep it in sync with entries.
+        -- Old contentless entries_fts remains active until deprecation (br-fts5-content-migration-31t.8).
+        -- Minimum SQLite version: 3.20 (FTS5 content= + trigger semantics).
+        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts_v2 USING fts5(
+            id UNINDEXED, path, summary, content, tags,
+            content='entries', content_rowid='rowid'
+        );
+
+        -- AFTER INSERT: populate FTS v2 for non-stale entries only.
+        -- SQLite >= 3.20 required for FTS5 content='entries' + trigger semantics.
+        CREATE TRIGGER IF NOT EXISTS entries_ai_fts_v2 AFTER INSERT ON entries
+        WHEN new.is_stale = 0
+        BEGIN
+            INSERT INTO entries_fts_v2(rowid, id, path, summary, content, tags)
+            VALUES (new.rowid, new.id, new.path, new.summary, new.content, new.tags);
+        END;
+
+        -- AFTER UPDATE: remove old FTS v2 entry only if it was indexed (is_stale=0);
+        -- re-insert only if new row is not stale.
+        -- Guard with SELECT...WHERE to avoid double-delete corruption (SQLITE_CORRUPT_VTAB)
+        -- when an expired (stale) entry is re-upserted.
+        CREATE TRIGGER IF NOT EXISTS entries_au_fts_v2 AFTER UPDATE ON entries
+        BEGIN
+            INSERT INTO entries_fts_v2(entries_fts_v2, rowid, id, path, summary, content, tags)
+            SELECT 'delete', old.rowid, old.id, old.path, old.summary, old.content, old.tags
+            WHERE old.is_stale = 0;
+            INSERT INTO entries_fts_v2(rowid, id, path, summary, content, tags)
+            SELECT new.rowid, new.id, new.path, new.summary, new.content, new.tags
+            WHERE new.is_stale = 0;
+        END;
+
+        -- AFTER DELETE: remove from FTS v2 only if the row was indexed.
+        CREATE TRIGGER IF NOT EXISTS entries_ad_fts_v2 AFTER DELETE ON entries
+        BEGIN
+            INSERT INTO entries_fts_v2(entries_fts_v2, rowid, id, path, summary, content, tags)
+            SELECT 'delete', old.rowid, old.id, old.path, old.summary, old.content, old.tags
+            WHERE old.is_stale = 0;
+        END;
+
         CREATE TABLE IF NOT EXISTS entries_emb (
             rowid    INTEGER PRIMARY KEY,
             embedding BLOB NOT NULL
@@ -252,7 +291,106 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // AC-P6 migrations: add cross-repo provenance columns to entries.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN origin_repo TEXT;");
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN cross_repo_epic TEXT;");
+    // Deprecation gate: tracks the four event-gated signals required before dropping entries_fts.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS fts5_deprecation_gate (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO fts5_deprecation_gate(key, value) VALUES
+            ('post_cutover_writes', '0'),
+            ('rollback_invocations', '0'),
+            ('parity_rerun_divergence', '-1'),
+            ('rollback_drill_passed', '0');
+        "#,
+    )?;
+    maybe_drop_contentless_fts(conn)?;
     Ok(())
+}
+
+/// Set a deprecation gate signal (key → value as string).
+pub fn set_deprecation_gate(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fts5_deprecation_gate(key, value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [key, value],
+    )?;
+    Ok(())
+}
+
+/// Drop entries_fts (contentless) and its write triggers when all four
+/// deprecation gate signals are met:
+///   1. post_cutover_writes >= 1000
+///   2. rollback_invocations == 0
+///   3. parity_rerun_divergence == 0  (must have been set by a parity rerun)
+///   4. rollback_drill_passed == 1
+///
+/// Idempotent: if entries_fts no longer exists the function is a no-op.
+pub fn maybe_drop_contentless_fts(conn: &Connection) -> Result<()> {
+    // Fast path: table already dropped.
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return Ok(());
+    }
+
+    // Read gate signals.
+    let gate_val = |key: &str| -> i64 {
+        conn.query_row(
+            "SELECT value FROM fts5_deprecation_gate WHERE key=?1",
+            [key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1)
+    };
+
+    let post_cutover_writes = gate_val("post_cutover_writes");
+    let rollback_invocations = gate_val("rollback_invocations");
+    let parity_rerun_divergence = gate_val("parity_rerun_divergence");
+    let rollback_drill_passed = gate_val("rollback_drill_passed");
+
+    let gate_open = post_cutover_writes >= 1000
+        && rollback_invocations == 0
+        && parity_rerun_divergence == 0
+        && rollback_drill_passed == 1;
+
+    if !gate_open {
+        return Ok(());
+    }
+
+    // All gates satisfied — drop contentless FTS table and its write triggers.
+    // The FTS5 'delete' trigger (entries_ai_fts) was created by earlier schema
+    // versions; drop it too if it exists.
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS entries_fts;
+        DROP TRIGGER IF EXISTS entries_ai_fts;
+        DROP TRIGGER IF EXISTS entries_au_fts;
+        DROP TRIGGER IF EXISTS entries_ad_fts;
+        "#,
+    )?;
+    conn.execute_batch("VACUUM;")?;
+    eprintln!(
+        "kb: fts5_v1_table_dropped post_cutover_writes={post_cutover_writes} \
+         parity_rerun_divergence={parity_rerun_divergence} \
+         rollback_drill_passed={rollback_drill_passed}"
+    );
+    Ok(())
+}
+
+fn increment_post_cutover_writes(conn: &Connection) {
+    let _ = conn.execute(
+        "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
+        [],
+    );
 }
 
 /// Apply a single event to the database.
@@ -301,7 +439,8 @@ pub fn apply_event(
             // DELETE entries_emb in the same transaction as the entries write so no
             // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
             if is_stale == 1 {
-                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                 conn.execute(
                     "DELETE FROM entries_emb WHERE rowid = \
                      (SELECT rowid FROM entries WHERE id=?1)",
@@ -316,13 +455,13 @@ pub fn apply_event(
                 |r| r.get(0),
             )?;
 
-            // Sync FTS5
-            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
-            conn.execute(
+            // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
+            let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+            let _ = conn.execute(
                 "INSERT INTO entries_fts(id, path, summary, content, tags)
                  VALUES(?1,?2,?3,?4,?5)",
                 params![id, path, summary, content, tags],
-            )?;
+            );
 
             // Sync embedding store (f16 wire format — 768 bytes per entry)
             if !embedder.is_noop() {
@@ -334,6 +473,7 @@ pub fn apply_event(
                     params![rowid, blob],
                 )?;
             }
+            increment_post_cutover_writes(conn);
         }
 
         ("expire", "entries") => {
@@ -351,7 +491,8 @@ pub fn apply_event(
                     params![id],
                 )?;
                 // Remove from FTS so expired entries don't appear in search.
-                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                 // GC: remove embedding row so entries_emb stays in sync with live entries.
                 conn.execute(
                     "DELETE FROM entries_emb WHERE rowid = \
@@ -365,6 +506,7 @@ pub fn apply_event(
                 return Err(e);
             }
             conn.execute_batch("COMMIT")?;
+            increment_post_cutover_writes(conn);
         }
 
         ("upsert", "test_cases") => {
@@ -673,10 +815,85 @@ fn fetch_evidence_for_entries(
     Ok(map)
 }
 
+/// Which FTS table search queries hit. Controlled by `KB_FTS_READ_PATH`:
+///   "contentless"     — entries_fts (explicit rollback override)
+///   "content_entries" — entries_fts_v2 (content='entries' table; default)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsReadPath {
+    Contentless,
+    ContentEntries,
+}
+
+impl FtsReadPath {
+    pub fn from_env() -> Self {
+        // Unset or "content_entries" → content_entries (default post-cutover).
+        // Explicit "contentless" preserves the rollback affordance.
+        match std::env::var("KB_FTS_READ_PATH").as_deref() {
+            Ok("contentless") => FtsReadPath::Contentless,
+            _ => FtsReadPath::ContentEntries,
+        }
+    }
+}
+
+pub type FtsRow = (String, String, String, String, String);
+
+pub fn fts_query_contentless(
+    conn: &Connection,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.path, e.summary, e.content, e.tags
+         FROM entries_fts f
+         JOIN entries e ON e.id = f.id
+         WHERE f.entries_fts MATCH ?1
+           AND e.is_stale = 0
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
+         ORDER BY rank
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn fts_query_content_entries(
+    conn: &Connection,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.path, e.summary, e.content, e.tags
+         FROM entries_fts_v2 f
+         JOIN entries e ON e.rowid = f.rowid
+         WHERE f.entries_fts_v2 MATCH ?1
+           AND e.is_stale = 0
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
+         ORDER BY rank
+         LIMIT ?4",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Shared hybrid search used by both the CLI and MCP handler.
 ///
 /// FTS queries are wrapped in double-quotes to enable phrase search and prevent
 /// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
+/// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "content_entries").
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -689,39 +906,71 @@ pub fn search_entries(
     if opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
         // operator injection (AND/OR/NOT) while allowing multi-term recall.
-        // "auth security" matches entries with both words anywhere, not just
-        // as an exact phrase.
         let safe_query: String = query
             .split_whitespace()
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" ");
-        let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags
-             FROM entries_fts f
-             JOIN entries e ON e.id = f.id
-             WHERE f.entries_fts MATCH ?1
-               AND e.is_stale = 0
-               AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
-               AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-             ORDER BY rank
-             LIMIT ?4",
-        )?;
-        let rows: Vec<_> = stmt
-            .query_map(
-                params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                    ))
-                },
-            )?
-            .filter_map(|r| r.ok())
-            .collect();
+
+        let read_path = FtsReadPath::from_env();
+        let rows = match read_path {
+            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, opts)?,
+            FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
+        };
+
+        // Divergence detection: compare both read paths and emit a warning when
+        // they disagree. In debug builds, assert equality to catch regressions
+        // early. In release builds, log only so production is never disrupted.
+        #[cfg(debug_assertions)]
+        {
+            let alt_rows = match read_path {
+                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
+                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
+            };
+            if let Ok(alt) = alt_rows {
+                let primary_ids: std::collections::BTreeSet<&str> =
+                    rows.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: std::collections::BTreeSet<&str> =
+                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+                debug_assert_eq!(
+                    primary_ids, alt_ids,
+                    "fts5_dual_write_divergence: primary={:?} alt={:?}",
+                    primary_ids, alt_ids
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let alt_rows = match read_path {
+                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
+                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
+            };
+            if let Ok(alt) = alt_rows {
+                let primary_ids: std::collections::BTreeSet<&str> =
+                    rows.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: std::collections::BTreeSet<&str> =
+                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+                if primary_ids != alt_ids {
+                    eprintln!(
+                        "kb: fts5_dual_write_divergence read_path={:?} \
+                         primary_count={} alt_count={}",
+                        read_path,
+                        primary_ids.len(),
+                        alt_ids.len()
+                    );
+                }
+            }
+        }
+
+        // T5a opt-in counter: log each content_entries search so the cutover
+        // gate (T5b) can verify ≥50 searches and ≥7 distinct days before flipping.
+        if read_path == FtsReadPath::ContentEntries {
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            eprintln!(
+                "kb: fts5_content_entries_search date={date} result_count={}",
+                rows.len()
+            );
+        }
 
         for (id, path, summary, content, tags) in rows {
             seen_ids.insert(id.clone());
@@ -2379,6 +2628,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_entries_fts_v2_trigger_idempotency() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "e1",
+            "path": "src/lib.rs",
+            "summary": "fts v2 idempotency test",
+            "content": "some content",
+            "tags": ["test"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+
+        // First upsert
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        // Second upsert with identical content (ON CONFLICT DO UPDATE path)
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Exactly one FTS v2 row — search by summary term (id is UNINDEXED).
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM entries_fts_v2 WHERE entries_fts_v2 MATCH 'idempotency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate upsert must not create two FTS v2 rows");
+
+        // Expire: trigger must remove the FTS v2 row
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "e1",
+            "ts": "2024-01-01T00:00:00Z",
+            "session": "test"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        let count_after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM entries_fts_v2 WHERE entries_fts_v2 MATCH 'idempotency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, 0, "expired entry must be absent from FTS v2");
+    }
+
     proptest::proptest! {
         /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
         /// events into an in-memory DB produces the same materialized state as
@@ -2415,5 +2715,134 @@ mod tests {
             let state2 = snapshot_db_state(&conn2).unwrap();
             proptest::prop_assert_eq!(state1, state2);
         }
+    }
+
+    // US-3: dual-write correctness — both FTS tables return the same IDs
+    // after applying a batch of upsert/expire events.
+    #[test]
+    fn test_dual_write_both_fts_tables_agree() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let events = [
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw1","path":"src/main.rs","summary":"dual write alpha","content":"alpha content","tags":["rust"],"ts":"2024-01-01T00:00:00Z"}),
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw2","path":"src/lib.rs","summary":"dual write beta","content":"beta content","tags":["rust"],"ts":"2024-01-01T00:00:01Z"}),
+            serde_json::json!({"action":"upsert","table":"entries","id":"dw3","path":"docs/foo.md","summary":"dual write gamma","content":"gamma content","tags":["docs"],"ts":"2024-01-01T00:00:02Z"}),
+            // Expire one to verify both tables remove it
+            serde_json::json!({"action":"expire","table":"entries","id":"dw2","ts":"2024-01-01T01:00:00Z","session":"test"}),
+        ];
+
+        for ev in &events {
+            apply_event(&conn, &embedder, ev).unwrap();
+        }
+
+        let opts = SearchOptions { do_fts: true, do_semantic: false, limit: 20, ..Default::default() };
+        let safe_q = "\"dual\"";
+
+        let v1_ids: Vec<String> = fts_query_contentless(&conn, safe_q, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        let v2_ids: Vec<String> = fts_query_content_entries(&conn, safe_q, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+
+        assert_eq!(
+            v1_ids.iter().collect::<std::collections::BTreeSet<_>>(),
+            v2_ids.iter().collect::<std::collections::BTreeSet<_>>(),
+            "both FTS tables must return the same entry IDs"
+        );
+        assert!(!v1_ids.contains(&"dw2".to_string()), "expired entry dw2 must be absent");
+        assert!(v1_ids.contains(&"dw1".to_string()), "dw1 must be present");
+        assert!(v1_ids.contains(&"dw3".to_string()), "dw3 must be present");
+    }
+
+    #[test]
+    fn test_deprecation_gate_drops_contentless_fts_when_all_signals_met() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Apply 1000 upsert/expire cycles to satisfy post_cutover_writes >= 1000.
+        for i in 0..500 {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": format!("gate-{i}"), "path": "src/gate.rs",
+                "summary": format!("gate test {i}"),
+                "content": "gate content", "tags": ["gate"],
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+            let exp = serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": format!("gate-{i}"), "ts": "2024-01-02T00:00:00Z", "session": "test"
+            });
+            apply_event(&conn, &embedder, &exp).unwrap();
+        }
+
+        // Verify counter accumulated
+        let writes: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM fts5_deprecation_gate WHERE key='post_cutover_writes'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert!(writes >= 1000, "expected ≥1000 post_cutover_writes, got {writes}");
+
+        // entries_fts still present — gate not yet open (other signals unset)
+        let fts_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_exists, 1, "entries_fts must still exist before all gate signals are met");
+
+        // Satisfy remaining gate signals
+        set_deprecation_gate(&conn, "rollback_invocations", "0").unwrap();
+        set_deprecation_gate(&conn, "parity_rerun_divergence", "0").unwrap();
+        set_deprecation_gate(&conn, "rollback_drill_passed", "1").unwrap();
+
+        // Now trigger the check
+        maybe_drop_contentless_fts(&conn).unwrap();
+
+        // entries_fts must be gone
+        let fts_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_after, 0, "entries_fts must be dropped after all gate signals are met");
+
+        // Idempotency: calling again must not error
+        maybe_drop_contentless_fts(&conn).unwrap();
+
+        // entries_fts_v2 (content='entries') must still be intact
+        let v2_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts_v2'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_exists, 1, "entries_fts_v2 must remain after contentless drop");
+
+        // Post-drop writes must succeed: apply_event must not fail because entries_fts is gone.
+        let post_drop_upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "post-drop-1", "path": "src/post_drop.rs",
+            "summary": "post-drop write", "content": "content after drop",
+            "tags": ["post-drop"], "ts": "2024-01-03T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &post_drop_upsert)
+            .expect("upsert after entries_fts drop must succeed");
+        let post_drop_expire = serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "post-drop-1", "ts": "2024-01-04T00:00:00Z", "session": "test"
+        });
+        apply_event(&conn, &embedder, &post_drop_expire)
+            .expect("expire after entries_fts drop must succeed");
     }
 }
