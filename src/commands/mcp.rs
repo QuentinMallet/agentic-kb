@@ -113,7 +113,14 @@ fn handle_request(
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
         "stale_check" => handle_stale_check(&id, &req, paths),
-        "compact" => handle_compact(&id, paths),
+        "compact" => {
+            let vacuum_cfg = crate::application::APP
+                .config()
+                .vacuum
+                .clone()
+                .unwrap_or_default();
+            handle_compact(&id, paths, &vacuum_cfg)
+        }
         "reembed" => handle_reembed(&id, &req, paths, emb),
         "run" => handle_run(&id, &req, paths, emb),
         "test_add" => handle_test_add(&id, &req, paths, emb),
@@ -615,14 +622,9 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
     json!({"id":id,"type":"ok","embedded":done,"failed":failed,"skipped":skipped})
 }
 
-fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
+fn handle_compact(id: &Value, paths: &config::Paths, vacuum_cfg: &config::VacuumConfig) -> Value {
     let compact_cmd = crate::commands::compact::Compact;
-    let vacuum_cfg = crate::application::APP
-        .config()
-        .vacuum
-        .clone()
-        .unwrap_or_default();
-    match compact_cmd.execute_with_paths_and_vacuum(paths, &vacuum_cfg) {
+    match compact_cmd.execute_with_paths_and_vacuum(paths, vacuum_cfg) {
         Ok((before, after)) => json!({"id": id, "type": "ok", "before": before, "after": after}),
         Err(e) => json!({"id":id,"type":"error","code":"compact_error","message":e.to_string()}),
     }
@@ -1944,7 +1946,7 @@ mod tests {
             db::apply_event(&conn, &emb, &ev).unwrap();
         }
 
-        let resp = handle_compact(&id, &paths);
+        let resp = handle_compact(&id, &paths, &Default::default());
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["before"], 3);
         assert_eq!(resp["after"], 1);
