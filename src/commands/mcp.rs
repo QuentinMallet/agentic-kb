@@ -352,6 +352,10 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
+    let omc_session_id = std::env::var("OMC_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
@@ -402,6 +406,7 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
             "version_ref": null,
             "ts": ts,
             "session": "mcp-import",
+            "session_id": omc_session_id,
         });
 
         if let Err(e) = events::append_event(&paths.events, &event) {
