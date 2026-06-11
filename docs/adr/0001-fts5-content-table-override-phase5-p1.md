@@ -169,3 +169,16 @@ The config flip back to the old FTS table works in test environments, but produc
 - After deprecation lands: propose a Phase-5 revision scoping P1's additive-only rule to non-FTS (canonical data) schema changes.
 - Audit other locations where the contentless FTS pattern is used. Current assessment: this is the only instance; confirm during T2.
 - At deprecation: update this ADR with the four gate signals captured at the time of the drop.
+
+## Deprecation record
+
+**Deprecated:** _pending production gate signals_
+
+Gate signals at drop time (update when `maybe_drop_contentless_fts` fires in production):
+
+| Signal | Required | Actual |
+|--------|----------|--------|
+| `post_cutover_writes` | ≥ 1000 | — |
+| `rollback_invocations` | == 0 | — |
+| `parity_rerun_divergence` | == 0 | — |
+| `rollback_drill_passed` | == 1 | — |
