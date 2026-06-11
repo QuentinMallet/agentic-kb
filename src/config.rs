@@ -71,6 +71,28 @@ impl KbConfig {
     pub fn dep_depth(&self) -> u8 {
         self.dep_depth.unwrap_or(1)
     }
+
+    /// Load KbConfig from `kb.toml` relative to the repo root derived from `paths`.
+    /// Falls back to `KbConfig::default()` when the file is absent or unparseable.
+    ///
+    /// The repo root is inferred as `paths.db.parent().parent().parent()` (i.e. the
+    /// directory above `.state/agent-kb/`).
+    pub fn from_paths(paths: &Paths) -> Self {
+        let root = paths
+            .db
+            .parent() // agent-kb/
+            .and_then(|p| p.parent()) // .state/
+            .and_then(|p| p.parent()); // repo root
+        let toml_path = match root {
+            Some(r) => r.join("kb.toml"),
+            None => return Self::default(),
+        };
+        let content = match std::fs::read_to_string(&toml_path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+        toml::from_str(&content).unwrap_or_default()
+    }
 }
 
 /// Embedding configuration

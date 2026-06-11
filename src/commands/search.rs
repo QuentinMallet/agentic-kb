@@ -77,6 +77,7 @@ impl Search {
         paths: &config::Paths,
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
+        let kb_config = config::KbConfig::from_paths(paths);
         // CLI: repo_root left None; search_entries falls back to find_repo_root()
         // walking from CWD, which is correct for the CLI invocation pattern (user
         // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
@@ -90,7 +91,7 @@ impl Search {
             tag_filter: self.tag.clone(),
             inline_verify_k: self.limit, // verify all results by default
             repo_root: None,
-            verify_pool_size: None,
+            verify_pool_size: kb_config.verify_pool_size,
         };
 
         let conn = db::open_db(&paths.db)?;
