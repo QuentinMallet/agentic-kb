@@ -612,7 +612,12 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
 
 fn handle_compact(id: &Value, paths: &config::Paths) -> Value {
     let compact_cmd = crate::commands::compact::Compact;
-    match compact_cmd.execute_with_paths(paths) {
+    let vacuum_cfg = crate::application::APP
+        .config()
+        .vacuum
+        .clone()
+        .unwrap_or_default();
+    match compact_cmd.execute_with_paths_and_vacuum(paths, &vacuum_cfg) {
         Ok((before, after)) => json!({"id": id, "type": "ok", "before": before, "after": after}),
         Err(e) => json!({"id":id,"type":"error","code":"compact_error","message":e.to_string()}),
     }
