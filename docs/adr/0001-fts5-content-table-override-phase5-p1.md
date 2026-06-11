@@ -176,9 +176,11 @@ The config flip back to the old FTS table works in test environments, but produc
 
 Gate signals at drop time (update when `maybe_drop_contentless_fts` fires in production):
 
-| Signal | Required | Actual |
-|--------|----------|--------|
-| `post_cutover_writes` | ≥ 1000 | — |
-| `rollback_invocations` | == 0 | — |
-| `parity_rerun_divergence` | == 0 | — |
-| `rollback_drill_passed` | == 1 | — |
+| Signal | Required | Auto/Manual | Actual |
+|--------|----------|-------------|--------|
+| `post_cutover_writes` | ≥ 1000 | auto (apply_event) | — |
+| `rollback_invocations` | == 0 | manual (operator must verify no rollbacks occurred; default stays 0) | — |
+| `parity_rerun_divergence` | == 0 | manual (`set_deprecation_gate(conn, "parity_rerun_divergence", "0")`) | — |
+| `rollback_drill_passed` | == 1 | manual (`set_deprecation_gate(conn, "rollback_drill_passed", "1")`) | — |
+
+Note: `rollback_invocations` is not auto-incremented. Before triggering deprecation, the operator must confirm no production rollback to `contentless` occurred and set the signal explicitly if needed.
