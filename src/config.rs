@@ -8,6 +8,42 @@ fn default_inline_verify_k() -> usize {
     10
 }
 
+fn default_vacuum_after_compacts() -> u64 {
+    8
+}
+
+fn default_vacuum_min_free_pages() -> u64 {
+    1024
+}
+
+/// VACUUM trigger configuration for the compact command.
+///
+/// VACUUM fires only when BOTH conditions hold:
+/// - `vacuum_after_compacts`: compaction counter has reached this value since the last VACUUM.
+/// - `vacuum_min_free_pages`: SQLite `freelist_count` is at least this value.
+///
+/// Both thresholds are config knobs; the AND-gating is hard-coded.
+/// Defaults: `vacuum_after_compacts = 8`, `vacuum_min_free_pages = 1024`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VacuumConfig {
+    /// Number of compact runs since last VACUUM before triggering. Default: 8.
+    #[serde(default = "default_vacuum_after_compacts")]
+    pub vacuum_after_compacts: u64,
+    /// Minimum SQLite freelist_count required to trigger VACUUM. Default: 1024.
+    #[serde(default = "default_vacuum_min_free_pages")]
+    pub vacuum_min_free_pages: u64,
+}
+
+impl Default for VacuumConfig {
+    fn default() -> Self {
+        Self {
+            vacuum_after_compacts: default_vacuum_after_compacts(),
+            vacuum_min_free_pages: default_vacuum_min_free_pages(),
+        }
+    }
+}
+
 /// kb configuration
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -21,12 +57,41 @@ pub struct KbConfig {
     pub inline_verify_k: usize,
     /// Default peer traversal depth for dep-type edges. Default: 1.
     pub dep_depth: Option<u8>,
+    /// Optional VACUUM configuration for the compact command.
+    /// When absent, defaults are used (vacuum_after_compacts=8, vacuum_min_free_pages=1024).
+    pub vacuum: Option<VacuumConfig>,
+    /// Number of worker threads in the bounded verification pool used by
+    /// `search_entries`. Defaults to `num_cpus::get_physical()` when absent.
+    /// Set lower to cap verification CPU usage (e.g. `verify_pool_size=2`).
+    pub verify_pool_size: Option<usize>,
 }
 
 impl KbConfig {
     /// Returns the effective dep traversal depth (defaults to 1 when unset).
     pub fn dep_depth(&self) -> u8 {
         self.dep_depth.unwrap_or(1)
+    }
+
+    /// Load KbConfig from `kb.toml` relative to the repo root derived from `paths`.
+    /// Falls back to `KbConfig::default()` when the file is absent or unparseable.
+    ///
+    /// The repo root is inferred as `paths.db.parent().parent().parent()` (i.e. the
+    /// directory above `.state/agent-kb/`).
+    pub fn from_paths(paths: &Paths) -> Self {
+        let root = paths
+            .db
+            .parent() // agent-kb/
+            .and_then(|p| p.parent()) // .state/
+            .and_then(|p| p.parent()); // repo root
+        let toml_path = match root {
+            Some(r) => r.join("kb.toml"),
+            None => return Self::default(),
+        };
+        let content = match std::fs::read_to_string(&toml_path) {
+            Ok(s) => s,
+            Err(_) => return Self::default(),
+        };
+        toml::from_str(&content).unwrap_or_default()
     }
 }
 
@@ -59,32 +124,33 @@ pub struct Paths {
     pub db: PathBuf,
     /// Model cache directory
     pub fastembed_cache: PathBuf,
+    /// Compact state file path (persists VACUUM counter across invocations).
+    pub compact_state: PathBuf,
 }
 
 impl Paths {
     /// Walk up from cwd to find the repo root (has a .state/ directory).
-    /// Prefers `agent-kb/agent-kb.db` (symlink convention) but falls back to
-    /// `.state/agent-kb/agent-kb.db` when the symlink is absent (e.g. worktrees).
+    /// Always returns the canonical `.state/agent-kb/agent-kb.db` form, consistent
+    /// with `from_root()`. The `agent-kb/` symlink convention at the repo root is
+    /// intentionally ignored here -- symlink-fallback removal is a separate follow-up
+    /// chore (see plan sec-paths-discover-canonical-form-regression, revision #11).
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut dir: &Path = &cwd;
         loop {
             if dir.join(".state").is_dir() {
-                let symlink_db = dir.join("agent-kb").join("agent-kb.db");
-                let state_db = dir.join(".state").join("agent-kb").join("agent-kb.db");
-                let db = if symlink_db.exists() {
-                    symlink_db
-                } else {
-                    state_db
-                };
                 return Ok(Paths {
                     lock: dir.join(".state").join(".lock"),
                     events: dir
                         .join(".state")
                         .join("agent-kb")
                         .join("agent-kb-events.jsonl"),
-                    db,
+                    db: dir.join(".state").join("agent-kb").join("agent-kb.db"),
                     fastembed_cache: model_cache_dir(),
+                    compact_state: dir
+                        .join(".state")
+                        .join("agent-kb")
+                        .join("compact-state.json"),
                 });
             }
             match dir.parent() {
@@ -111,6 +177,10 @@ impl Paths {
                 .join("agent-kb")
                 .join("agent-kb.db"),
             fastembed_cache: model_cache_dir(),
+            compact_state: root
+                .join(".state")
+                .join("agent-kb")
+                .join("compact-state.json"),
         }
     }
 }
@@ -148,6 +218,23 @@ fn model_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// RAII guard that restores cwd on drop (same pattern as add.rs tests).
+    struct CwdGuard(PathBuf);
+    impl CwdGuard {
+        fn set(dir: &Path) -> Self {
+            let orig = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard(orig)
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     #[test]
     fn test_kb_config_default_fields() {
@@ -169,6 +256,96 @@ mod tests {
         assert_eq!(
             paths.db,
             PathBuf::from("/tmp/test-repo/.state/agent-kb/agent-kb.db")
+        );
+        assert_eq!(
+            paths.compact_state,
+            PathBuf::from("/tmp/test-repo/.state/agent-kb/compact-state.json")
+        );
+    }
+
+    #[test]
+    fn test_vacuum_config_defaults() {
+        let vcfg = VacuumConfig::default();
+        assert_eq!(vcfg.vacuum_after_compacts, 8);
+        assert_eq!(vcfg.vacuum_min_free_pages, 1024);
+    }
+
+    /// Regression test (br-bhg): both `Paths::discover` and `Paths::from_root` must
+    /// return identical canonical `.state/agent-kb/...` form for the same root input.
+    #[test]
+    fn test_canonical_form_discover_matches_from_root_without_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let state_db_dir = root.join(".state").join("agent-kb");
+        fs::create_dir_all(&state_db_dir).unwrap();
+        fs::write(state_db_dir.join("agent-kb.db"), b"").unwrap();
+
+        let _guard = CwdGuard::set(root);
+        let discover_paths = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        let from_root_paths = Paths::from_root(root);
+
+        assert_eq!(
+            discover_paths.db, from_root_paths.db,
+            "discover() and from_root() must return the same canonical db path"
+        );
+
+        let db_str = discover_paths.db.to_string_lossy();
+        assert!(
+            db_str.contains("/.state/agent-kb/"),
+            "db path must contain '/.state/agent-kb/', got: {db_str}"
+        );
+        assert!(
+            !db_str.contains("/.agent-kb/"),
+            "db path must not contain '/.agent-kb/', got: {db_str}"
+        );
+        let agent_kb_pos = db_str.find("/agent-kb/");
+        let state_agent_kb_pos = db_str.find("/.state/agent-kb/");
+        assert_eq!(
+            agent_kb_pos,
+            state_agent_kb_pos.map(|p| p + "/.state".len()),
+            "'/agent-kb/' in db path must be preceded by '.state', got: {db_str}"
+        );
+    }
+
+    #[test]
+    fn test_canonical_form_discover_with_symlink_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let state_db_dir = root.join(".state").join("agent-kb");
+        fs::create_dir_all(&state_db_dir).unwrap();
+        let state_db = state_db_dir.join("agent-kb.db");
+        fs::write(&state_db, b"").unwrap();
+
+        let symlink_dir = root.join("agent-kb");
+        fs::create_dir_all(&symlink_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&state_db, symlink_dir.join("agent-kb.db")).unwrap();
+
+        let _guard = CwdGuard::set(root);
+        let discover_paths = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        let from_root_paths = Paths::from_root(root);
+
+        assert_eq!(
+            discover_paths.db, from_root_paths.db,
+            "discover() and from_root() must return the same canonical db path even when symlink exists"
+        );
+
+        let db_str = discover_paths.db.to_string_lossy();
+        assert!(
+            db_str.contains("/.state/agent-kb/"),
+            "db path must contain '/.state/agent-kb/' even with symlink, got: {db_str}"
+        );
+
+        let symlink_path = root.join("agent-kb").join("agent-kb.db").to_string_lossy().to_string();
+        assert_ne!(
+            discover_paths.db.to_string_lossy().as_ref(),
+            symlink_path.as_str(),
+            "discover() must not return the symlink-based path, got: {db_str}"
         );
     }
 }

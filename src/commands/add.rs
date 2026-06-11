@@ -1,14 +1,20 @@
 //! `add` subcommand
+//!
+//! This command constructs validated inputs and delegates all event-writing and
+//! DB-apply work to `kb_core::add`.  It does NOT contain any direct calls to
+//! `events::append_event` / `events::append_events_batch` / `db::apply_event`
+//! inside `execute_with` — those are the sole responsibility of `kb_core::add`.
+//!
+//! The `"session"` field written to events is `$OMC_SESSION_ID` when set, else `"cli"`.
+//! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
+//! The `expire_reason` is `"replaced by --replace-path"`.
 
 use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
-use crate::components::db;
 use crate::components::embedder;
-use crate::components::events;
+use crate::components::kb_core;
 use crate::config;
-use crate::models::Evidence;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use rusqlite::params;
 use serde_json::Value;
 
 /// Add or update a knowledge entry
@@ -105,99 +111,78 @@ impl Add {
         validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
 
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
-
-        let _lock = acquire_lock(&paths.lock)?;
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        // Read OMC_SESSION_ID once: used for both the audit "session" label and
+        // the per-entry session_id column (Phase-5 per-session confidence weighting).
+        let (session, omc_session_id) = read_omc_session();
 
-        // Open DB once; used for both the optional path-replace step and the upsert.
-        let conn = db::open_db(&paths.db)?;
+        // Delegate to kb_core::add — all event-writing and DB-apply logic lives there.
+        let outcome = kb_core::add(
+            paths,
+            embedder,
+            kb_core::AddArgs {
+                id: id.clone(),
+                path: self.path.clone(),
+                summary: self.summary.clone(),
+                content: self.content.clone(),
+                tags: tags_json,
+                version_ref,
+                permanent: self.permanent,
+                replace_path: self.replace_path,
+                kind: self.kind.clone(),
+                evidence_status: evidence_status.to_string(),
+                evidence_rows,
+                ts,
+                session,
+                session_id: omc_session_id,
+                expire_reason: "replaced by --replace-path".to_string(),
+            },
+        )?;
 
-        // --replace-path: expire all existing non-stale entries at this path before
-        // inserting. Bypasses the permanent guard in expire.rs (the user is explicitly
-        // replacing the entry via kb add --replace-path).
-        if self.replace_path {
-            let existing_ids: Vec<String> = {
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM entries WHERE path=?1 AND is_stale=0",
-                )?;
-                let ids: Vec<String> = stmt
-                    .query_map(params![self.path], |r| r.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                ids
-            };
-            for old_id in existing_ids {
-                let expire_ev = serde_json::json!({
-                    "action": "expire",
-                    "table": "entries",
-                    "id": old_id,
-                    "reason": "replaced by --replace-path",
-                    "ts": ts,
-                    "session": session,
-                });
-                events::append_event(&paths.events, &expire_ev)?;
-                db::apply_event(&conn, embedder, &expire_ev)?;
-            }
-        }
-
-        // Build Add event (carries kind + evidence_status).
-        let add_event = serde_json::json!({
-            "action": "upsert",
-            "table": "entries",
-            "id": id,
-            "path": self.path,
-            "summary": self.summary,
-            "content": self.content,
-            "tags": tags_json,
-            "version_ref": version_ref,
-            "permanent": self.permanent,
-            "kind": self.kind,
-            "evidence_status": evidence_status,
-            "ts": ts,
-            "session": session,
-        });
-
-        // Build EvidenceAdd events (one per evidence row).
-        let evidence_events: Vec<Value> = evidence_rows
-            .iter()
-            .map(|ev| {
-                let evidence = Evidence {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    entry_id: id.clone(),
-                    kind: ev.get("kind").and_then(|v| v.as_str()).unwrap_or("code").to_string(),
-                    citation_path: ev.get("citation_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    citation_sha: ev.get("citation_sha").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    citation_hash: ev.get("citation_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    citation_excerpt: ev.get("citation_excerpt").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    derived_from: ev.get("derived_from").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    recorded_at: Some(ts.clone()),
-                };
-                events::evidence_add_event(&id, &evidence, version_ref.as_deref())
-            })
-            .collect();
-
-        // Atomic batch: Add event + N EvidenceAdd events under the held lock (AC12).
-        let mut batch = vec![add_event.clone()];
-        batch.extend(evidence_events.iter().cloned());
-        events::append_events_batch(&paths.events, &batch)?;
-
-        // Apply each event to the DB (also under lock).
-        db::apply_event(&conn, embedder, &add_event)?;
-        for ev in &evidence_events {
-            db::apply_event(&conn, embedder, ev)?;
-        }
-
-        println!("added  {} ({})", self.path, id);
+        println!("added  {} ({})", self.path, outcome.entry_id);
         Ok(())
     }
 }
 
+/// Read `OMC_SESSION_ID` and derive the `(session, session_id)` pair used by
+/// every CLI subcommand that emits an event.
+///
+/// Returns `(session, session_id)` where:
+/// - `session_id` is `Some(value)` when the env var is set and non-empty, else `None`.
+/// - `session` mirrors `session_id` when present, else falls back to the literal `"cli"`.
+///
+/// Centralising the read avoids the divergent `unwrap_or_else` / `ok().filter()`
+/// patterns that previously appeared in `add.rs`, `expire.rs`, `run.rs`, and `test_add.rs`.
+pub fn read_omc_session() -> (String, Option<String>) {
+    let session_id = std::env::var("OMC_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let session = session_id.clone().unwrap_or_else(|| "cli".to_string());
+    (session, session_id)
+}
+
 /// Build the appropriate embedder based on KB_NO_EMBED env var.
+///
+/// Prefer `make_embedder_with_opts` at call sites that control `no_embed` explicitly
+/// (e.g. `ingest`, `import`). This wrapper exists for callers that rely on the env var
+/// (e.g. the top-level `add` command invoked via the shell).
 pub fn make_embedder(paths: &config::Paths) -> Box<dyn embedder::Embedder> {
-    if std::env::var("KB_NO_EMBED").is_ok() {
+    make_embedder_with_opts(paths, std::env::var("KB_NO_EMBED").is_ok())
+}
+
+/// Build an embedder with an explicit no-embed flag.
+///
+/// Pass `no_embed=true` to get a `NoopEmbedder` without touching `std::env`.
+/// This avoids `env::set_var` (unsafe in multi-threaded contexts, forbidden by
+/// Rust 2024 Edition) and eliminates cross-talk between parallel test threads.
+///
+/// Constraint: must not break the MCP `make_embedder` path — `make_embedder`
+///             remains as a backwards-compatible wrapper that reads the env var.
+/// Directive: never reintroduce `env::set_var("KB_NO_EMBED", …)` to flip embedder
+///            behaviour; pass `no_embed` explicitly via this function instead.
+pub fn make_embedder_with_opts(paths: &config::Paths, no_embed: bool) -> Box<dyn embedder::Embedder> {
+    if no_embed {
         Box::new(embedder::NoopEmbedder)
     } else {
         Box::new(embedder::CandleEmbedder::new(&paths.fastembed_cache))
@@ -230,7 +215,7 @@ pub struct Lock(#[allow(dead_code)] std::fs::File);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::embedder::NoopEmbedder;
+    use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
     use rusqlite::Connection;
     use std::fs;
@@ -633,8 +618,10 @@ mod tests {
             evidence_file: None,
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
-        assert!(err.to_string().contains("evidence required for kind='observation'"),
-            "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("evidence required for kind='observation'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -703,5 +690,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evidence_status, "present");
+    }
+
+    // ── TDD: session_id propagation (Lane A, A2) ────────────────────────────
+    //
+    // FAILING TEST (pre-implementation):
+    // With OMC_SESSION_ID set, `kb add` must write that value into
+    // entries.session_id.  Before the fix, add.rs passes `session_id: None`
+    // to kb_core::AddArgs, so the column stays NULL.
+    //
+    // Confirmed failing on HEAD: `session_id: None` is hard-coded in
+    // Add::execute_with.
+
+    #[test]
+    fn test_cli_add_propagates_session_id_to_db() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let embedder = NoopEmbedder;
+
+        // Set OMC_SESSION_ID in the environment for the duration of this test.
+        std::env::set_var("OMC_SESSION_ID", "test123");
+
+        let cmd = Add {
+            path: "src/session_test.rs".to_string(),
+            summary: "session propagation test".to_string(),
+            content: "content".to_string(),
+            tags: "test,session".to_string(),
+            version_ref: Some("abc123".to_string()),
+            id: Some("sess-prop-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+        };
+        cmd.execute_with(&paths, &embedder).unwrap();
+
+        // Clean up env var.
+        std::env::remove_var("OMC_SESSION_ID");
+
+        // AC2: entries.session_id must be "test123" (NOT NULL).
+        let conn = Connection::open(&paths.db).unwrap();
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM entries WHERE id='sess-prop-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            session_id,
+            Some("test123".to_string()),
+            "entries.session_id must be populated from OMC_SESSION_ID"
+        );
+
+        // AC1: the upsert event in the JSONL must also carry session_id.
+        let events_content = fs::read_to_string(&paths.events).unwrap();
+        let ev: Value = serde_json::from_str(events_content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            ev["session_id"],
+            serde_json::json!("test123"),
+            "upsert event must carry session_id field"
+        );
     }
 }

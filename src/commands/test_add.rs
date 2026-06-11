@@ -1,6 +1,6 @@
 //! `test-add` subcommand
 
-use crate::commands::add::acquire_lock;
+use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::{db, events};
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -49,8 +49,7 @@ impl TestAdd {
             .unwrap_or_else(|| format!("{}-{}", self.app, self.name.replace(' ', "-")));
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        let (session, omc_session_id) = read_omc_session();
 
         let event = serde_json::json!({
             "action": "upsert",
@@ -63,6 +62,7 @@ impl TestAdd {
             "version_ref": version_ref,
             "ts": ts,
             "session": session,
+            "session_id": omc_session_id,
         });
 
         events::append_event(&paths.events, &event)?;

@@ -1,7 +1,10 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
-use crate::models::{blob_to_f32s, cosine_similarity, f32s_to_blob, Evidence};
+use crate::models::{
+    blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
+    f32s_to_f16_blob, Evidence, EMB_DIMS,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::fs;
@@ -294,9 +297,16 @@ pub fn apply_event(
                 params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
             )?;
 
-            // Stale entries: clean up FTS/embeddings so they don't appear in search
+            // Stale entries: clean up FTS/embeddings so they don't appear in search.
+            // DELETE entries_emb in the same transaction as the entries write so no
+            // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
             if is_stale == 1 {
                 conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                conn.execute(
+                    "DELETE FROM entries_emb WHERE rowid = \
+                     (SELECT rowid FROM entries WHERE id=?1)",
+                    params![id],
+                )?;
                 return Ok(());
             }
 
@@ -314,11 +324,11 @@ pub fn apply_event(
                 params![id, path, summary, content, tags],
             )?;
 
-            // Sync embedding store
+            // Sync embedding store (f16 wire format — 768 bytes per entry)
             if !embedder.is_noop() {
                 let text = format!("{} {} {}", path, summary, content);
                 let emb = embedder.embed(&text)?;
-                let blob = f32s_to_blob(&emb);
+                let blob = f32s_to_f16_blob(&emb);
                 conn.execute(
                     "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
                     params![rowid, blob],
@@ -328,12 +338,33 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
-            conn.execute(
-                "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
-                params![id],
-            )?;
-            // Remove from FTS so expired entries don't appear in search
-            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+            // Single transaction: entries UPDATE + FTS DELETE + entries_emb DELETE.
+            // Prevents orphan embedding rows accumulating for stale entries
+            // (br-improvement-catalog-23b.6 GC).
+            //
+            // We can't use `Connection::transaction()` here because `apply_event`
+            // takes `&Connection`, not `&mut Connection`. Manual BEGIN/COMMIT it is.
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<()> {
+                conn.execute(
+                    "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
+                    params![id],
+                )?;
+                // Remove from FTS so expired entries don't appear in search.
+                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // GC: remove embedding row so entries_emb stays in sync with live entries.
+                conn.execute(
+                    "DELETE FROM entries_emb WHERE rowid = \
+                     (SELECT rowid FROM entries WHERE id=?1)",
+                    params![id],
+                )?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            conn.execute_batch("COMMIT")?;
         }
 
         ("upsert", "test_cases") => {
@@ -477,6 +508,10 @@ pub struct SearchOptions {
     /// `find_repo_root()`. CLI invocations may leave this `None` because the
     /// user runs the binary from inside the repo tree.
     pub repo_root: Option<PathBuf>,
+    /// Pool size for the bounded verify thread pool (br-23b.13).
+    /// Currently unused; reserved for forward-compatibility with the
+    /// 23b.13 task that replaces the per-request `thread::scope` path.
+    pub verify_pool_size: Option<usize>,
 }
 
 impl Default for SearchOptions {
@@ -489,6 +524,7 @@ impl Default for SearchOptions {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: None,
+            verify_pool_size: None,
         }
     }
 }
@@ -513,10 +549,14 @@ pub struct SearchEntry {
     pub content: String,
     /// Raw JSON array string (e.g. `["rust","test"]`).
     pub tags: String,
-    /// Relevance score (cosine similarity for semantic, 1.0 for FTS).
+    /// Relevance score. For RRF hybrid: sum of 1/(k+rank) across sources.
+    /// For FTS-only: 1.0. For semantic-only: raw cosine similarity.
     pub score: f32,
-    /// `"fts"` or `"semantic"`.
+    /// `"fts"`, `"semantic"`, or `"rrf"` (hybrid Reciprocal Rank Fusion).
     pub source: &'static str,
+    /// Scoring kind: `"fts"` | `"semantic"` | `"rrf"`.
+    /// Equals `source` for single-lane results; `"rrf"` for hybrid-merged results.
+    pub score_kind: &'static str,
     /// Evidence rows with inline verification results.
     pub evidence: Vec<SearchEvidence>,
     /// Beta(1,1) posterior confidence: (s+1)/(s+f+2). Bootstrap value 0.5 when no audits.
@@ -530,10 +570,15 @@ pub struct SearchEntry {
 /// Fetch evidence rows for the given entry IDs, capped at
 /// `MAX_EVIDENCE_ROWS_PER_ENTRY` per entry (br-h9g, security I2).
 ///
-/// Issues one parameterised query per entry so the `LIMIT` clause caps
-/// per-entry rather than across the whole batch. When truncation occurs a
-/// warning is emitted to stderr so operators can see which entries have
-/// excess evidence in their KB.
+/// Issues one `WHERE entry_id IN (…)` query per chunk of ≤999 IDs
+/// (SQLite's default SQLITE_MAX_VARIABLE_NUMBER limit).  Per-entry capping
+/// uses `ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id)`
+/// so the DB filters excess rows before they cross the Rust boundary.
+/// When an entry exceeds the cap a warning is emitted to stderr.
+///
+/// Result ordering: the returned Vec per entry follows `recorded_at, id`
+/// order, identical to the previous per-entry loop.  The HashMap key order
+/// is unspecified (HashMap), matching prior behaviour.
 fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
@@ -543,18 +588,54 @@ fn fetch_evidence_for_entries(
     if entry_ids.is_empty() {
         return Ok(map);
     }
-    // Fetch one extra row so we can detect truncation without an extra COUNT(*).
+
+    // SQLite's default limit is 999 host parameters per statement.
+    // Use 998 so the row-number cap value occupies the last slot.
+    const CHUNK: usize = 998;
+    // Fetch one extra row per entry so we can detect truncation.
     let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
-    let mut stmt = conn.prepare(
-        "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
-         FROM evidence
-         WHERE entry_id = ?1
-         ORDER BY recorded_at, id
-         LIMIT ?2",
-    )?;
-    for entry_id in entry_ids {
-        let rows: Vec<Evidence> = stmt
-            .query_map(params![entry_id, probe_limit], |r| {
+
+    for chunk in entry_ids.chunks(CHUNK) {
+        // Build "?, ?, …" placeholder list for this chunk.
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // The row_number cap is the next parameter index after the chunk.
+        let rn_param_idx = chunk.len() + 1;
+
+        // Window function caps per-entry rows at probe_limit so we receive
+        // at most MAX_EVIDENCE_ROWS_PER_ENTRY+1 rows per entry, letting us
+        // detect (and warn about) truncation without a separate COUNT query.
+        let sql = format!(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                    citation_excerpt, derived_from, recorded_at
+             FROM (
+               SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                      citation_excerpt, derived_from, recorded_at,
+                      ROW_NUMBER() OVER (PARTITION BY entry_id ORDER BY recorded_at, id) AS rn
+               FROM evidence
+               WHERE entry_id IN ({placeholders})
+             )
+             WHERE rn <= ?{rn_param_idx}
+             ORDER BY entry_id, recorded_at, id"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Bind entry_id strings first, then the probe_limit.
+        let rows_raw: Vec<Evidence> = {
+            use rusqlite::types::ToSql;
+            let mut params_vec: Vec<&dyn ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn ToSql)
+                .collect();
+            params_vec.push(&probe_limit);
+
+            stmt.query_map(params_vec.as_slice(), |r| {
                 Ok(Evidence {
                     id: r.get(0)?,
                     entry_id: r.get(1)?,
@@ -568,18 +649,27 @@ fn fetch_evidence_for_entries(
                 })
             })?
             .filter_map(|r| r.ok())
-            .collect();
-        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
-            eprintln!(
-                "kb: entry {entry_id} evidence rows truncated to MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
-                rows.len()
-            );
-            let capped: Vec<Evidence> = rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
-            map.insert(entry_id.clone(), capped);
-        } else if !rows.is_empty() {
-            map.insert(entry_id.clone(), rows);
+            .collect()
+        };
+
+        // Group rows by entry_id (rows are already sorted by entry_id via ORDER BY).
+        // Emit truncation warning when an entry hits the probe limit.
+        for ev in rows_raw {
+            map.entry(ev.entry_id.clone()).or_default().push(ev);
         }
     }
+
+    for (entry_id, rows) in map.iter_mut() {
+        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+            eprintln!(
+                "kb: entry {entry_id} evidence rows truncated to \
+                 MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                rows.len()
+            );
+            rows.truncate(MAX_EVIDENCE_ROWS_PER_ENTRY);
+        }
+    }
+
     Ok(map)
 }
 
@@ -643,6 +733,7 @@ pub fn search_entries(
                 tags,
                 score: 1.0,
                 source: "fts",
+                score_kind: "fts",
                 evidence: vec![],
                 confidence: 0.5,
                 audit_n: 0,
@@ -662,7 +753,12 @@ pub fn search_entries(
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         )?;
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
-        let mut candidates: Vec<(f32, String, String, String, String, String)> = stmt
+        //
+        // Scratch buffer allocated ONCE outside the loop — no per-row Vec allocation.
+        // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
+        // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
+        // decode_emb_blob fallback via length dispatch.
+        let rows: Vec<(String, String, String, String, String, Vec<u8>)> = stmt
             .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -674,40 +770,114 @@ pub fn search_entries(
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(id, path, summary, content, tags, blob)| {
-                let emb_vec = blob_to_f32s(&blob);
-                let sim = cosine_similarity(&q_emb, &emb_vec);
-                (sim, id, path, summary, content, tags)
-            })
             .collect();
+
+        let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
+        let mut candidates: Vec<(f32, String, String, String, String, String)> =
+            Vec::with_capacity(rows.len());
+        for (id, path, summary, content, tags, blob) in rows {
+            decode_f16_blob_into(&blob, &mut scratch);
+            let sim = if scratch.is_empty() {
+                // blob was not canonical f16 — fall back to graceful decode
+                let fallback = decode_emb_blob(&blob);
+                cosine_similarity(&q_emb, &fallback)
+            } else {
+                cosine_similarity(&q_emb, &scratch)
+            };
+            candidates.push((sim, id, path, summary, content, tags));
+        }
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
-            if seen_ids.contains(&id) {
-                continue;
-            }
-            entries.push(SearchEntry {
-                id,
-                path,
-                summary,
-                content,
-                tags,
-                score: sim,
-                source: "semantic",
-                evidence: vec![],
-                confidence: 0.5,
-                audit_n: 0,
-                origin_repo: None,
-            });
-        }
-
-        // Re-sort hybrid results by score descending and cap at limit
         if opts.do_fts {
+            // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
+            // FTS and semantic rankings. Each entry's RRF score is the sum of
+            // 1/(k+rank) across all sources it appears in, where rank is 1-based.
+            //
+            // This replaces the naive "FTS gets 1.0, semantic gets cosine" approach
+            // which caused FTS to dominate every tie. RRF is order-aware: an entry
+            // appearing in both sources earns two rank contributions and will
+            // outrank an entry appearing in only one, regardless of raw score.
+            const RRF_K: f32 = 60.0;
+
+            // Build a map of id → RRF score, seeding with FTS ranks.
+            let mut rrf_scores: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            for (fts_rank, entry) in entries.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (fts_rank + 1) as f32);
+                rrf_scores.insert(entry.id.clone(), contrib);
+            }
+
+            // Build a lookup for semantic candidates (id → (rank, metadata)).
+            let sem_total = candidates.len();
+            let mut sem_meta: std::collections::HashMap<String, (String, String, String, String, String)> =
+                std::collections::HashMap::with_capacity(sem_total);
+            for (sem_rank, (_, id, path, summary, content, tags)) in candidates.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
+                let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
+                *entry += contrib;
+                sem_meta.insert(id.clone(), (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone()));
+            }
+
+            // Re-build entries from rrf_scores, merging FTS entries and new semantic-only entries.
+            // Existing FTS entries already have their metadata; semantic-only ones need it added.
+            let mut fts_meta: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for (i, entry) in entries.iter().enumerate() {
+                fts_meta.insert(entry.id.clone(), i);
+            }
+
+            // For semantic-only entries (not in FTS), create new SearchEntry values.
+            // We cap to opts.limit * 2 candidates to avoid iterating all of them.
+            for (_, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit * 2) {
+                if !fts_meta.contains_key(&id) {
+                    entries.push(SearchEntry {
+                        id: id.clone(),
+                        path,
+                        summary,
+                        content,
+                        tags,
+                        score: 0.0, // will be overwritten below
+                        source: "semantic",
+                        score_kind: "rrf",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                    });
+                }
+            }
+
+            // Apply RRF scores to all entries and mark score_kind as "rrf".
+            for entry in &mut entries {
+                let rrf = rrf_scores.get(&entry.id).copied().unwrap_or(0.0);
+                entry.score = rrf;
+                entry.score_kind = "rrf";
+            }
+
+            // Sort by RRF score descending and cap at limit.
             entries.sort_by(|a, b| {
                 b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
             });
             entries.truncate(opts.limit);
+        } else {
+            // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
+            for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
+                entries.push(SearchEntry {
+                    id,
+                    path,
+                    summary,
+                    content,
+                    tags,
+                    score: sim,
+                    source: "semantic",
+                    score_kind: "semantic",
+                    evidence: vec![],
+                    confidence: 0.5,
+                    audit_n: 0,
+                    origin_repo: None,
+                });
+            }
         }
     }
 
@@ -763,14 +933,30 @@ pub fn search_entries(
 
     let verify_count = opts.inline_verify_k.min(entries.len());
 
-    for (idx, entry) in entries.iter_mut().enumerate() {
+    // br-improvement-catalog-23b.13: bounded scoped pool.
+    // ADR-C: explicit std::thread, not rayon.
+    //
+    // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
+    // min(1) guards against systems returning 0 physical CPUs.
+    let pool_size = opts.verify_pool_size
+        .unwrap_or_else(num_cpus::get_physical)
+        .max(1);
+
+    // --- Phase 1: pre-collect per-entry evidence and byte-budget state ---
+    // We need to move ev_rows out of evidence_map before the thread::scope so
+    // the scope can borrow repo_root without fighting the mutable evidence_map.
+
+    struct EntryWork {
+        entry_idx: usize,
+        ev_rows: Vec<crate::models::Evidence>,
+        do_verify: bool,
+        budget_exceeded: bool,
+    }
+
+    let mut work_items: Vec<EntryWork> = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
         let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
         let do_verify = idx < verify_count;
-
-        if ev_rows.is_empty() {
-            entry.evidence = vec![];
-            continue;
-        }
 
         // br-und: compute total bytes for this entry's evidence rows (br-und security I3)
         let mut total_bytes: usize = 0;
@@ -801,45 +987,109 @@ pub fn search_entries(
             );
         }
 
-        if do_verify && !budget_exceeded {
-            // Verify all evidence rows for this entry in parallel using thread::scope.
-            // ADR-C: explicit std::thread, not rayon.
-            let verified: Vec<bool> = std::thread::scope(|s| {
-                let handles: Vec<_> = ev_rows
-                    .iter()
-                    .map(|ev| {
-                        s.spawn(|| {
-                            if let Some(ref root) = repo_root {
-                                crate::components::verification::verify_evidence(ev, root)
-                                    .unwrap_or(false)
-                            } else {
-                                false
-                            }
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or(false))
-                    .collect()
-            });
+        work_items.push(EntryWork { entry_idx: idx, ev_rows, do_verify, budget_exceeded });
+    }
 
-            entry.evidence = ev_rows
+    // --- Phase 2: flatten all verification tasks across entries ---
+    // task_ranges[entry_idx] = Some(start..end) within verified_flat, or None.
+    let mut flat_tasks: Vec<crate::models::Evidence> = Vec::new();
+    let mut task_ranges: Vec<Option<std::ops::Range<usize>>> = vec![None; entries.len()];
+    for item in &work_items {
+        if item.do_verify && !item.budget_exceeded && !item.ev_rows.is_empty() {
+            let start = flat_tasks.len();
+            flat_tasks.extend(item.ev_rows.iter().cloned());
+            task_ranges[item.entry_idx] = Some(start..flat_tasks.len());
+        }
+    }
+
+    // --- Phase 3: run all verification tasks through the bounded pool ---
+    let total_tasks = flat_tasks.len();
+    let mut verified_flat: Vec<bool> = vec![false; total_tasks];
+
+    if total_tasks > 0 {
+        // Work channel: bounded at pool_size * 2 to bound in-flight tasks and
+        // provide backpressure to the sender. This is the queue from main → workers.
+        // Result channel: unbounded so workers never block emitting results.
+        // Main drains tx_result only AFTER dropping tx_work (sequential drain),
+        // so it cannot interleave sending and receiving. An unbounded result
+        // channel avoids the sender↔result-channel deadlock that arises when
+        // both channels are bounded and the main thread sends work while workers
+        // try to enqueue results.
+        //
+        // Total result count is bounded externally: at most
+        // MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY (br-h9g security I2).
+        let work_chan_cap = (pool_size * 2).max(1);
+        std::thread::scope(|scope| {
+            let (tx_work, rx_work) =
+                crossbeam_channel::bounded::<(usize, crate::models::Evidence)>(work_chan_cap);
+            let (tx_result, rx_result) =
+                crossbeam_channel::unbounded::<(usize, bool)>();
+
+            // Spawn pool_size worker threads. Each consumes (task_idx, Evidence)
+            // from rx_work and sends (task_idx, bool) to tx_result.
+            for _ in 0..pool_size {
+                let rx = rx_work.clone();
+                let tx = tx_result.clone();
+                let root_ref = repo_root.as_ref();
+                scope.spawn(move || {
+                    for (task_idx, ev) in rx {
+                        let verified = if let Some(root) = root_ref {
+                            crate::components::verification::verify_evidence(&ev, root)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        let _ = tx.send((task_idx, verified));
+                    }
+                });
+            }
+            // Drop the unused sender clone so rx_result closes after all
+            // worker sender clones are dropped. Drop rx_work so the channel
+            // closes once tx_work is dropped (workers drain then exit).
+            drop(tx_result);
+            drop(rx_work);
+
+            // Send all tasks; bounded work channel provides backpressure.
+            for (task_idx, ev) in flat_tasks.into_iter().enumerate() {
+                // send() only blocks if workers are slower than the sender;
+                // they cannot deadlock here because tx_result is unbounded.
+                let _ = tx_work.send((task_idx, ev));
+            }
+            // Drop tx_work → workers drain remaining work, then exit,
+            // dropping their tx_result clones → rx_result closes.
+            drop(tx_work);
+
+            // Sequential drain: workers have all exited by the time scope
+            // joins; rx_result is fully populated before we iterate.
+            for (task_idx, v) in rx_result {
+                verified_flat[task_idx] = v;
+            }
+        });
+    }
+
+    // --- Phase 4: assign results back to entries in original order ---
+    for item in work_items {
+        let entry = &mut entries[item.entry_idx];
+        if item.ev_rows.is_empty() {
+            entry.evidence = vec![];
+        } else if item.do_verify && !item.budget_exceeded {
+            let range = task_ranges[item.entry_idx].as_ref().unwrap();
+            entry.evidence = item.ev_rows
                 .into_iter()
-                .zip(verified.into_iter())
-                .map(|(ev, v)| SearchEvidence {
+                .zip(range.clone())
+                .map(|(ev, task_idx)| SearchEvidence {
                     id: ev.id,
                     kind: ev.kind,
                     citation_path: ev.citation_path,
                     citation_sha: ev.citation_sha,
                     citation_hash: ev.citation_hash,
                     citation_excerpt: ev.citation_excerpt,
-                    verified: Some(v),
+                    verified: Some(verified_flat[task_idx]),
                 })
                 .collect();
         } else {
-            // Beyond inline_verify_k or budget exceeded: return evidence metadata with verified=null.
-            entry.evidence = ev_rows
+            // Beyond inline_verify_k or budget exceeded: verified=null.
+            entry.evidence = item.ev_rows
                 .into_iter()
                 .map(|ev| SearchEvidence {
                     id: ev.id,
@@ -1197,6 +1447,155 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // br-23b.12: batch evidence fetch order-equivalence.
+    //
+    // Reference implementation kept here as a test helper only — matches the
+    // pre-batch per-id loop.  The production fn now issues one query per chunk.
+    // -----------------------------------------------------------------------
+
+    /// Reference loop-based implementation kept for order-equivalence testing.
+    /// Mirrors the pre-batch logic exactly so the test can compare maps.
+    fn fetch_evidence_loop_reference(
+        conn: &Connection,
+        entry_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<Evidence>>> {
+        let mut map: std::collections::HashMap<String, Vec<Evidence>> =
+            std::collections::HashMap::new();
+        if entry_ids.is_empty() {
+            return Ok(map);
+        }
+        let probe_limit = (MAX_EVIDENCE_ROWS_PER_ENTRY + 1) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at
+             FROM evidence
+             WHERE entry_id = ?1
+             ORDER BY recorded_at, id
+             LIMIT ?2",
+        )?;
+        for entry_id in entry_ids {
+            let rows: Vec<Evidence> = stmt
+                .query_map(params![entry_id, probe_limit], |r| {
+                    Ok(Evidence {
+                        id: r.get(0)?,
+                        entry_id: r.get(1)?,
+                        kind: r.get(2)?,
+                        citation_path: r.get(3)?,
+                        citation_sha: r.get(4)?,
+                        citation_hash: r.get(5).unwrap_or_default(),
+                        citation_excerpt: r.get(6)?,
+                        derived_from: r.get(7)?,
+                        recorded_at: r.get(8)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+                let capped: Vec<Evidence> =
+                    rows.into_iter().take(MAX_EVIDENCE_ROWS_PER_ENTRY).collect();
+                map.insert(entry_id.clone(), capped);
+            } else if !rows.is_empty() {
+                map.insert(entry_id.clone(), rows);
+            }
+        }
+        Ok(map)
+    }
+
+    /// br-23b.12: batched fetch must return a map identical to the reference
+    /// per-id loop for 100 entries × 200 evidence rows each.
+    ///
+    /// Verifies:
+    ///   - same key set
+    ///   - per-entry Vec identical (same order, same fields)
+    ///   - per-entry cap (MAX_EVIDENCE_ROWS_PER_ENTRY) still held
+    #[test]
+    fn test_batch_evidence_order_equivalence() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        const N_ENTRIES: usize = 100;
+        const ROWS_PER_ENTRY: usize = 200; // exactly at the cap
+
+        let entry_ids: Vec<String> = (0..N_ENTRIES)
+            .map(|i| format!("batch-eq-entry-{i:03}"))
+            .collect();
+
+        // Seed N_ENTRIES entries so foreign-key constraints are satisfied.
+        for id in &entry_ids {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": id, "path": format!("batch/{id}"), "summary": id,
+                "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        // Insert exactly ROWS_PER_ENTRY evidence rows per entry, with
+        // deterministic recorded_at so ORDER BY recorded_at, id is stable.
+        for (ei, entry_id) in entry_ids.iter().enumerate() {
+            for ri in 0..ROWS_PER_ENTRY {
+                // Pad seconds/minutes to keep recorded_at unique per row.
+                let mins = ri / 60;
+                let secs = ri % 60;
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', 'sha256:test', ?3)",
+                    params![
+                        format!("ev-{ei:03}-{ri:03}"),
+                        entry_id,
+                        format!("2024-01-01T00:{mins:02}:{secs:02}Z"),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let ref_map = fetch_evidence_loop_reference(&conn, &entry_ids).unwrap();
+        let batch_map = fetch_evidence_for_entries(&conn, &entry_ids).unwrap();
+
+        assert_eq!(
+            ref_map.len(),
+            batch_map.len(),
+            "key count must match: ref={} batch={}",
+            ref_map.len(),
+            batch_map.len()
+        );
+
+        for entry_id in &entry_ids {
+            let ref_rows = ref_map
+                .get(entry_id)
+                .expect("reference map must contain entry");
+            let batch_rows = batch_map
+                .get(entry_id)
+                .expect("batch map must contain entry");
+
+            assert_eq!(
+                ref_rows.len(),
+                batch_rows.len(),
+                "row count mismatch for {entry_id}: ref={} batch={}",
+                ref_rows.len(),
+                batch_rows.len()
+            );
+            assert_eq!(
+                ref_rows.len(),
+                MAX_EVIDENCE_ROWS_PER_ENTRY,
+                "per-entry cap must hold for {entry_id}"
+            );
+
+            for (i, (r, b)) in ref_rows.iter().zip(batch_rows.iter()).enumerate() {
+                assert_eq!(
+                    r.id, b.id,
+                    "row {i} id mismatch for {entry_id}: ref={:?} batch={:?}",
+                    r.id, b.id
+                );
+                assert_eq!(
+                    r.recorded_at, b.recorded_at,
+                    "row {i} recorded_at mismatch for {entry_id}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // br-bhg: explicit SearchOptions.repo_root threads through to verification.
     // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
     // returns None (or the wrong root), causing verified=false on every row.
@@ -1278,6 +1677,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
+            verify_pool_size: None,
         };
         let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
 
@@ -1482,6 +1882,7 @@ mod tests {
             tag_filter: None,
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
+            verify_pool_size: None,
         };
 
         let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
@@ -1497,6 +1898,485 @@ mod tests {
                 "evidence must not be verified when entry bytes exceed MAX_PER_ENTRY_BYTES"
             );
         }
+    }
+
+    /// RRF fusion correctness (br-improvement-catalog-23b.5):
+    ///
+    /// Scenario: two entries — entry A appears in BOTH FTS and semantic results,
+    /// entry B appears in ONLY the semantic result with a numerically higher raw
+    /// cosine score. RRF fused scoring must rank entry A above entry B because A
+    /// earns rank-contribution from two sources.
+    ///
+    /// With NoopEmbedder the semantic lane is skipped entirely, so we test RRF via
+    /// direct calls to `search_entries` with a hand-crafted in-memory DB where
+    /// embeddings are injected directly. However since NoopEmbedder prevents the
+    /// semantic path, we test the following invariants that *are* observable with
+    /// NoopEmbedder:
+    ///
+    /// 1. Hybrid mode with only FTS active assigns score_kind="fts" to results.
+    /// 2. FTS-only mode assigns score_kind="fts".
+    /// 3. Semantic-only mode with NoopEmbedder returns empty (noop skips it) — but
+    ///    if it weren't noop, score_kind="semantic" would be assigned.
+    /// 4. score_kind field exists on SearchEntry (compilation check).
+    ///
+    /// The RRF-beats-raw-score property is tested via unit logic in the rrf test
+    /// below that bypasses the embedder by inserting embeddings directly and using
+    /// a FakeEmbedder that returns a fixed vector.
+    #[test]
+    fn test_rrf_score_kind_fts_only_mode() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-fts-1",
+            "path": "src/rrf_test.rs",
+            "summary": "rrf fts score_kind test entry",
+            "content": "body",
+            "tags": ["rrf"],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // FTS-only mode
+        let opts_fts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+        };
+        let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
+        assert!(!results.is_empty(), "FTS must return the entry");
+        for r in &results {
+            assert_eq!(r.score_kind, "fts", "FTS-only mode must set score_kind=fts");
+        }
+
+        // Hybrid mode (semantic skipped because NoopEmbedder) — FTS results get score_kind=fts
+        let opts_hybrid = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+        };
+        let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
+        assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
+        for r in &hybrid_results {
+            assert_eq!(r.score_kind, "fts", "Hybrid FTS-only path must set score_kind=fts");
+        }
+    }
+
+    /// RRF ranking: when a real embedder is present, an entry appearing in both
+    /// FTS and semantic results must outscore an entry that appears in only one
+    /// source, even if the single-source entry has a higher raw semantic score.
+    ///
+    /// We simulate this with a FakeEmbedder that returns fixed vectors, injecting
+    /// embeddings directly via the entries_emb table so we control both lanes.
+    #[test]
+    fn test_rrf_fusion_dual_source_beats_high_raw_semantic_score() {
+        use crate::models::{blob_to_f32s, f32s_to_blob};
+
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // Entry A: appears in FTS (summary contains query token) and we'll
+        // inject a moderate semantic embedding.
+        let upsert_a = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-dual-A",
+            "path": "src/dual_a.rs",
+            "summary": "rrf dual source alpha needle",
+            "content": "body a",
+            "tags": [],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert_a).unwrap();
+
+        // Entry B: does NOT appear in FTS (different summary), but we'll inject
+        // a very high-similarity semantic embedding so it would win raw-score sort.
+        let upsert_b = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "rrf-dual-B",
+            "path": "src/dual_b.rs",
+            "summary": "completely unrelated summary zzzz",
+            "content": "body b",
+            "tags": [],
+            "kind": "convention",
+            "evidence_status": "n/a",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert_b).unwrap();
+
+        // Get the rowids for A and B
+        let rowid_a: i64 = conn.query_row(
+            "SELECT rowid FROM entries WHERE id='rrf-dual-A'", [], |r| r.get(0)
+        ).unwrap();
+        let rowid_b: i64 = conn.query_row(
+            "SELECT rowid FROM entries WHERE id='rrf-dual-B'", [], |r| r.get(0)
+        ).unwrap();
+
+        // Query vector: [1.0, 0.0] (unit vector along dim-0)
+        let q_vec: Vec<f32> = vec![1.0, 0.0];
+
+        // Entry A embedding: moderate similarity = [0.8, 0.6] → sim ≈ 0.8
+        let emb_a: Vec<f32> = vec![0.8, 0.6];
+        // Entry B embedding: very high similarity = [1.0, 0.0] → sim = 1.0
+        let emb_b: Vec<f32> = vec![1.0, 0.0];
+
+        // Insert embeddings
+        conn.execute(
+            "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+            rusqlite::params![rowid_a, f32s_to_blob(&emb_a)],
+        ).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+            rusqlite::params![rowid_b, f32s_to_blob(&emb_b)],
+        ).unwrap();
+
+        // Use a FakeEmbedder that returns q_vec = [1.0, 0.0]
+        struct FixedEmbedder(Vec<f32>);
+        impl crate::components::embedder::Embedder for FixedEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> { Ok(self.0.clone()) }
+            fn is_noop(&self) -> bool { false }
+        }
+        let fixed_emb = FixedEmbedder(q_vec);
+
+        // Hybrid search: FTS will match A (has "needle"), semantic matches both.
+        // Raw sort: B(sim=1.0) > A(sim=0.8) → B would win.
+        // RRF: A gets rank contribution from FTS(rank=1) + semantic(rank=2),
+        //      B gets contribution from semantic only(rank=1).
+        // RRF scores (k=60):
+        //   A: 1/(60+1) + 1/(60+2) = 0.016393 + 0.016129 = 0.032522
+        //   B: 1/(60+1)             = 0.016393
+        // A must outrank B.
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+        };
+        let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
+
+        assert!(results.len() >= 2, "both entries must be returned, got {}", results.len());
+
+        let pos_a = results.iter().position(|r| r.id == "rrf-dual-A").expect("A must be in results");
+        let pos_b = results.iter().position(|r| r.id == "rrf-dual-B").expect("B must be in results");
+        assert!(
+            pos_a < pos_b,
+            "RRF: dual-source A (rank={pos_a}) must beat single-source B (rank={pos_b}) even though B has higher raw semantic score"
+        );
+
+        // score_kind for hybrid results must be "rrf"
+        for r in &results {
+            assert_eq!(r.score_kind, "rrf", "hybrid RRF results must have score_kind=rrf, got {}", r.score_kind);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // br-improvement-catalog-23b.6: entries_emb GC on expire and is_stale
+    // -----------------------------------------------------------------------
+
+    /// Regression: insert an entry with a real embedder, expire it, confirm the
+    /// corresponding entries_emb row is deleted in the same transaction.
+    ///
+    /// Uses a FakeEmbedder (returns a fixed non-empty vector) to produce an
+    /// actual entries_emb row on upsert. After expire the row must be gone.
+    #[test]
+    fn test_expire_deletes_entries_emb_row() {
+        use crate::models::f32s_to_blob;
+
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.1_f32, 0.2_f32, 0.3_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Upsert — should write entries_emb row
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-e1",
+            "path": "src/gc_test.rs",
+            "summary": "gc test entry",
+            "content": "some content",
+            "tags": [],
+            "kind": "observation",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // entries_emb row must exist before expire
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(before, 1, "entries_emb row must exist after upsert");
+
+        // Expire
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "emb-gc-e1"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        // entries_emb row must be gone after expire
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(after, 0, "expire must delete the entries_emb row (GC regression)");
+    }
+
+    /// Regression: upsert with is_stale=true must delete any existing entries_emb row.
+    ///
+    /// Simulates the compact path: an entry exists with an embedding, then compact
+    /// replays a stale upsert — the embedding orphan must be cleaned up.
+    #[test]
+    fn test_stale_upsert_deletes_entries_emb_row() {
+        use crate::models::f32s_to_blob;
+
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.4_f32, 0.5_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Upsert live entry — writes entries_emb row
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-stale1",
+            "path": "src/stale_gc.rs",
+            "summary": "stale gc test",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(before, 1, "entries_emb row must exist after live upsert");
+
+        // Stale upsert (as produced by compact for an expired entry)
+        let stale_upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "emb-gc-stale1",
+            "path": "src/stale_gc.rs",
+            "summary": "stale gc test",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "is_stale": true,
+            "ts": "2024-01-02T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &stale_upsert).unwrap();
+
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+             (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(after, 0, "is_stale=true upsert must delete entries_emb row (GC regression)");
+    }
+
+    /// Steady-state invariant: after any sequence of upserts and expires,
+    /// COUNT(entries_emb) == COUNT(entries WHERE is_stale=0).
+    ///
+    /// Uses a FakeEmbedder so all live entries get embedding rows written.
+    #[test]
+    fn test_entries_emb_count_equals_live_entries_invariant() {
+        struct FakeEmbedder;
+        impl crate::components::embedder::Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0_f32, 0.0_f32])
+            }
+            fn is_noop(&self) -> bool { false }
+        }
+
+        let conn = open_db_memory().unwrap();
+        let embedder = FakeEmbedder;
+
+        // Insert N=6 entries
+        for i in 0..6_u32 {
+            let ev = serde_json::json!({
+                "action": "upsert",
+                "table": "entries",
+                "id": format!("inv-{i}"),
+                "path": format!("src/inv_{i}.rs"),
+                "summary": format!("invariant entry {i}"),
+                "content": "c",
+                "tags": [],
+                "kind": "belief",
+                "evidence_status": "missing",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        // Expire half (entries 0, 2, 4)
+        for i in (0..6_u32).step_by(2) {
+            let ev = serde_json::json!({
+                "action": "expire",
+                "table": "entries",
+                "id": format!("inv-{i}")
+            });
+            apply_event(&conn, &embedder, &ev).unwrap();
+        }
+
+        let emb_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_emb", [], |r| r.get(0))
+            .unwrap();
+        let live_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(
+            emb_count, live_count,
+            "steady-state invariant: COUNT(entries_emb)={emb_count} must equal \
+             COUNT(entries WHERE is_stale=0)={live_count}"
+        );
+        // Sanity: N/2 = 3 live entries
+        assert_eq!(live_count, 3, "half the entries should be live");
+    }
+
+    // -----------------------------------------------------------------------
+    // br-improvement-catalog-23b.13: bounded verify pool — thread fan-out must
+    // not exceed pool size.
+    //
+    // Scenario: 10 entries × 50 evidence rows each. The old unbounded
+    // thread::scope spawned 50 OS threads per scope call; with the bounded
+    // pool concurrent thread count is limited to `verify_pool_size` (2 here).
+    //
+    // Samples /proc/self/task at 50µs intervals; asserts peak threads ≤
+    // baseline + pool_size + 2 (slack: sampler thread + spare).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_verify_pool_thread_fan_out_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        // 10 entries × 50 evidence rows each.
+        let empty_hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for i in 0..10usize {
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": format!("pool-test-{i}"),
+                "path": format!("src/pool_test_{i}.rs"),
+                "summary": format!("bounded pool fan-out test entry {i}"),
+                "content": format!("content {i}"),
+                "tags": ["pool-test"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+            for j in 0..50usize {
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_path, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        format!("pool-ev-{i}-{j:03}"),
+                        format!("pool-test-{i}"),
+                        format!("src/nonexistent_{i}_{j}.rs:0-1"),
+                        empty_hash,
+                        format!("2024-01-01T00:00:{:02}Z", j % 60),
+                    ],
+                ).unwrap();
+            }
+        }
+
+        let pool_size: usize = 2;
+
+        #[cfg(target_os = "linux")]
+        let baseline = std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1);
+        #[cfg(not(target_os = "linux"))]
+        let baseline = 1usize;
+
+        let peak_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(baseline));
+        let stop_sampler = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_clone = std::sync::Arc::clone(&peak_threads);
+        let stop_clone = std::sync::Arc::clone(&stop_sampler);
+        let sampler = std::thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                #[cfg(target_os = "linux")]
+                if let Ok(d) = std::fs::read_dir("/proc/self/task") {
+                    let count = d.count();
+                    let prev = peak_clone.load(std::sync::atomic::Ordering::Relaxed);
+                    if count > prev {
+                        peak_clone.store(count, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(pool_size),
+        };
+        let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
+            .expect("search must succeed");
+
+        stop_sampler.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().unwrap();
+
+        let peak = peak_threads.load(std::sync::atomic::Ordering::Relaxed);
+        let allowed = baseline + pool_size + 2;
+        assert!(
+            peak <= allowed,
+            "thread fan-out bounded: peak={peak}, baseline={baseline}, \
+             pool_size={pool_size}, allowed={allowed}. \
+             Old unbounded code peaks at 50+ threads (one per evidence row)."
+        );
     }
 
     proptest::proptest! {

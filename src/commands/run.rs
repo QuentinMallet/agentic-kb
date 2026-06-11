@@ -1,6 +1,6 @@
 //! `run` subcommand
 
-use crate::commands::add::acquire_lock;
+use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::{db, events};
 use crate::config;
 use anyhow::bail;
@@ -41,8 +41,7 @@ impl Run {
         let paths = config::Paths::discover()?;
         let _lock = acquire_lock(&paths.lock)?;
         let ts = chrono::Utc::now().to_rfc3339();
-        let session =
-            std::env::var("OMC_SESSION_ID").unwrap_or_else(|_| "cli".to_string());
+        let (session, omc_session_id) = read_omc_session();
         let run_id = uuid::Uuid::new_v4().to_string();
 
         let event = serde_json::json!({
@@ -55,6 +54,7 @@ impl Run {
             "ts": ts,
             "run_id": run_id,
             "session": session,
+            "session_id": omc_session_id,
         });
 
         events::append_event(&paths.events, &event)?;
