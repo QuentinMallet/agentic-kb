@@ -924,37 +924,10 @@ fn handle_audit_record(
         }
     }
 
-    // JSONL-first: collect ALL expire events for false verdicts, append in ONE batch,
-    // then apply to DB.  This eliminates the per-verdict append/apply gap (AC2, AC4).
-    let expire_events: Vec<Value> = verdicts
-        .iter()
-        .filter_map(|v| {
-            let eid = v.get("entry_id").and_then(|x| x.as_str())?;
-            let verdict = v.get("verdict").and_then(|x| x.as_bool()).unwrap_or(false);
-            if verdict {
-                return None;
-            }
-            Some(json!({
-                "action": "expire", "table": "entries",
-                "id": eid, "reason": "audit verdict=false",
-                "ts": ts, "session": "mcp",
-            }))
-        })
-        .collect();
-
-    if !expire_events.is_empty() {
-        if let Err(e) = events::append_events_batch(&paths.events, &expire_events) {
-            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-        }
-        for ev in &expire_events {
-            if let Err(e) = db::apply_event(&conn, emb, ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            expired += 1;
-        }
-    }
-
-    // Now process audit_runs inserts and source_weights updates.
+    // Process each verdict individually: for false verdicts, append+apply the expire
+    // event before recording the audit_run row, keeping the two operations paired.
+    // This eliminates the split-brain failure mode where a batch expire could succeed
+    // while the subsequent audit_runs inserts fail.
     for verdict_obj in &verdicts {
         let entry_id = match verdict_obj.get("entry_id").and_then(|v| v.as_str()) {
             Some(e) => e.to_string(),
@@ -962,6 +935,21 @@ fn handle_audit_record(
         };
         let verdict = verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
         let note = verdict_obj.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        if !verdict {
+            let expire_event = json!({
+                "action": "expire", "table": "entries",
+                "id": entry_id, "reason": "audit verdict=false",
+                "ts": ts, "session": "mcp",
+            });
+            if let Err(e) = events::append_event(&paths.events, &expire_event) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            if let Err(e) = db::apply_event(&conn, emb, &expire_event) {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+            }
+            expired += 1;
+        }
 
         // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
         let inserted = match conn.execute(
