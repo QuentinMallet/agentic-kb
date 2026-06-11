@@ -723,9 +723,11 @@ pub enum FtsReadPath {
 
 impl FtsReadPath {
     pub fn from_env() -> Self {
+        // T5b default-flip: unset or "content_entries" → content_entries.
+        // Explicit "contentless" preserves the rollback affordance.
         match std::env::var("KB_FTS_READ_PATH").as_deref() {
-            Ok("content_entries") => FtsReadPath::ContentEntries,
-            _ => FtsReadPath::Contentless,
+            Ok("contentless") => FtsReadPath::Contentless,
+            _ => FtsReadPath::ContentEntries,
         }
     }
 }
