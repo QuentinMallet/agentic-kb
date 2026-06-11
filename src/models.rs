@@ -88,11 +88,7 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
 pub fn decode_f16_blob_into(blob: &[u8], scratch: &mut Vec<f32>) {
     scratch.clear();
     if blob.len() != EMB_BLOB_BYTES {
-        eprintln!(
-            "kb: decode_f16_blob_into: blob length {} != {} — skipping",
-            blob.len(),
-            EMB_BLOB_BYTES
-        );
+        // legacy f32 blob — caller detects via scratch.is_empty() and falls back to decode_emb_blob
         return;
     }
     scratch.reserve(EMB_DIMS);
