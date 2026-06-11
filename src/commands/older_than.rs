@@ -48,7 +48,7 @@ impl OlderThan {
              FROM entries
              WHERE is_stale = 0
              GROUP BY path
-             HAVING latest_upsert < datetime('now', '-' || ?1 || ' days')
+             HAVING latest_upsert < strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-' || ?1 || ' days'))
              ORDER BY path",
         )?;
 
@@ -99,7 +99,7 @@ mod tests {
                  FROM entries
                  WHERE is_stale = 0
                  GROUP BY path
-                 HAVING latest_upsert < datetime('now', '-' || ?1 || ' days')
+                 HAVING latest_upsert < strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-' || ?1 || ' days'))
                  ORDER BY path",
             )
             .unwrap();
