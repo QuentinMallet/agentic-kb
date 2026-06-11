@@ -128,6 +128,45 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             id UNINDEXED, path, summary, content, tags
         );
 
+        -- FTS5 content table (migration target). Triggers keep it in sync with entries.
+        -- Old contentless entries_fts remains active until deprecation (br-fts5-content-migration-31t.8).
+        -- Minimum SQLite version: 3.20 (FTS5 content= + trigger semantics).
+        CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts_v2 USING fts5(
+            id UNINDEXED, path, summary, content, tags,
+            content='entries', content_rowid='rowid'
+        );
+
+        -- AFTER INSERT: populate FTS v2 for non-stale entries only.
+        -- SQLite >= 3.20 required for FTS5 content='entries' + trigger semantics.
+        CREATE TRIGGER IF NOT EXISTS entries_ai_fts_v2 AFTER INSERT ON entries
+        WHEN new.is_stale = 0
+        BEGIN
+            INSERT INTO entries_fts_v2(rowid, id, path, summary, content, tags)
+            VALUES (new.rowid, new.id, new.path, new.summary, new.content, new.tags);
+        END;
+
+        -- AFTER UPDATE: remove old FTS v2 entry only if it was indexed (is_stale=0);
+        -- re-insert only if new row is not stale.
+        -- Guard with SELECT...WHERE to avoid double-delete corruption (SQLITE_CORRUPT_VTAB)
+        -- when an expired (stale) entry is re-upserted.
+        CREATE TRIGGER IF NOT EXISTS entries_au_fts_v2 AFTER UPDATE ON entries
+        BEGIN
+            INSERT INTO entries_fts_v2(entries_fts_v2, rowid, id, path, summary, content, tags)
+            SELECT 'delete', old.rowid, old.id, old.path, old.summary, old.content, old.tags
+            WHERE old.is_stale = 0;
+            INSERT INTO entries_fts_v2(rowid, id, path, summary, content, tags)
+            SELECT new.rowid, new.id, new.path, new.summary, new.content, new.tags
+            WHERE new.is_stale = 0;
+        END;
+
+        -- AFTER DELETE: remove from FTS v2 only if the row was indexed.
+        CREATE TRIGGER IF NOT EXISTS entries_ad_fts_v2 AFTER DELETE ON entries
+        BEGIN
+            INSERT INTO entries_fts_v2(entries_fts_v2, rowid, id, path, summary, content, tags)
+            SELECT 'delete', old.rowid, old.id, old.path, old.summary, old.content, old.tags
+            WHERE old.is_stale = 0;
+        END;
+
         CREATE TABLE IF NOT EXISTS entries_emb (
             rowid    INTEGER PRIMARY KEY,
             embedding BLOB NOT NULL
@@ -2377,6 +2416,57 @@ mod tests {
              pool_size={pool_size}, allowed={allowed}. \
              Old unbounded code peaks at 50+ threads (one per evidence row)."
         );
+    }
+
+    #[test]
+    fn test_entries_fts_v2_trigger_idempotency() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "e1",
+            "path": "src/lib.rs",
+            "summary": "fts v2 idempotency test",
+            "content": "some content",
+            "tags": ["test"],
+            "ts": "2024-01-01T00:00:00Z"
+        });
+
+        // First upsert
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        // Second upsert with identical content (ON CONFLICT DO UPDATE path)
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        // Exactly one FTS v2 row — search by summary term (id is UNINDEXED).
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM entries_fts_v2 WHERE entries_fts_v2 MATCH 'idempotency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate upsert must not create two FTS v2 rows");
+
+        // Expire: trigger must remove the FTS v2 row
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "e1",
+            "ts": "2024-01-01T00:00:00Z",
+            "session": "test"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        let count_after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM entries_fts_v2 WHERE entries_fts_v2 MATCH 'idempotency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, 0, "expired entry must be absent from FTS v2");
     }
 
     proptest::proptest! {
