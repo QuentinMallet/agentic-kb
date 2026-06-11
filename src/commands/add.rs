@@ -115,12 +115,7 @@ impl Add {
         let ts = chrono::Utc::now().to_rfc3339();
         // Read OMC_SESSION_ID once: used for both the audit "session" label and
         // the per-entry session_id column (Phase-5 per-session confidence weighting).
-        let omc_session_id = std::env::var("OMC_SESSION_ID")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let session = omc_session_id
-            .clone()
-            .unwrap_or_else(|| "cli".to_string());
+        let (session, omc_session_id) = read_omc_session();
 
         // Delegate to kb_core::add — all event-writing and DB-apply logic lives there.
         let outcome = kb_core::add(
@@ -148,6 +143,23 @@ impl Add {
         println!("added  {} ({})", self.path, outcome.entry_id);
         Ok(())
     }
+}
+
+/// Read `OMC_SESSION_ID` and derive the `(session, session_id)` pair used by
+/// every CLI subcommand that emits an event.
+///
+/// Returns `(session, session_id)` where:
+/// - `session_id` is `Some(value)` when the env var is set and non-empty, else `None`.
+/// - `session` mirrors `session_id` when present, else falls back to the literal `"cli"`.
+///
+/// Centralising the read avoids the divergent `unwrap_or_else` / `ok().filter()`
+/// patterns that previously appeared in `add.rs`, `expire.rs`, `run.rs`, and `test_add.rs`.
+pub fn read_omc_session() -> (String, Option<String>) {
+    let session_id = std::env::var("OMC_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let session = session_id.clone().unwrap_or_else(|| "cli".to_string());
+    (session, session_id)
 }
 
 /// Build the appropriate embedder based on KB_NO_EMBED env var.

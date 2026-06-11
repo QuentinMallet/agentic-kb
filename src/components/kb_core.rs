@@ -187,17 +187,14 @@ pub fn add(
 
     // ATOMIC BATCH: all expire events + upsert + evidence-add events in ONE write.
     // JSONL-first invariant: this append precedes all DB writes.
-    let mut batch: Vec<Value> = expire_events.clone();
-    batch.push(add_event.clone());
-    batch.extend(evidence_events.iter().cloned());
+    // Order: expires, upsert, evidence-adds. The same Vec is then applied to the
+    // DB in-order under the held flock, so no per-event clone is needed.
+    let mut batch: Vec<Value> = expire_events;
+    batch.push(add_event);
+    batch.extend(evidence_events);
     events::append_events_batch(&paths.events, &batch)?;
 
-    // Apply each event to the DB in order, under the held flock.
-    for ev in &expire_events {
-        db::apply_event(&conn, embedder, ev)?;
-    }
-    db::apply_event(&conn, embedder, &add_event)?;
-    for ev in &evidence_events {
+    for ev in &batch {
         db::apply_event(&conn, embedder, ev)?;
     }
 

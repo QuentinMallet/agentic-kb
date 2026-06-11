@@ -341,15 +341,18 @@ pub fn apply_event(
             // Single transaction: entries UPDATE + FTS DELETE + entries_emb DELETE.
             // Prevents orphan embedding rows accumulating for stale entries
             // (br-improvement-catalog-23b.6 GC).
+            //
+            // We can't use `Connection::transaction()` here because `apply_event`
+            // takes `&Connection`, not `&mut Connection`. Manual BEGIN/COMMIT it is.
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
                 conn.execute(
                     "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
                     params![id],
                 )?;
-                // Remove from FTS so expired entries don't appear in search
+                // Remove from FTS so expired entries don't appear in search.
                 conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
-                // GC: remove embedding row so entries_emb stays in sync with live entries
+                // GC: remove embedding row so entries_emb stays in sync with live entries.
                 conn.execute(
                     "DELETE FROM entries_emb WHERE rowid = \
                      (SELECT rowid FROM entries WHERE id=?1)",
@@ -357,13 +360,11 @@ pub fn apply_event(
                 )?;
                 Ok(())
             })();
-            match result {
-                Ok(()) => conn.execute_batch("COMMIT")?,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
+            if let Err(e) = result {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
+            conn.execute_batch("COMMIT")?;
         }
 
         ("upsert", "test_cases") => {
@@ -651,38 +652,21 @@ fn fetch_evidence_for_entries(
             .collect()
         };
 
-        // Group rows by entry_id (already sorted by entry_id from ORDER BY).
-        // Emit truncation warning when an entry's row count hits probe_limit.
-        let mut current_id: Option<String> = None;
-        let mut current_rows: Vec<Evidence> = Vec::new();
-
-        let flush =
-            |entry_id: &str, rows: &mut Vec<Evidence>, map: &mut std::collections::HashMap<String, Vec<Evidence>>| {
-                if rows.is_empty() {
-                    return;
-                }
-                if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
-                    eprintln!(
-                        "kb: entry {entry_id} evidence rows truncated to \
-                         MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
-                        rows.len()
-                    );
-                    rows.truncate(MAX_EVIDENCE_ROWS_PER_ENTRY);
-                }
-                map.insert(entry_id.to_string(), std::mem::take(rows));
-            };
-
+        // Group rows by entry_id (rows are already sorted by entry_id via ORDER BY).
+        // Emit truncation warning when an entry hits the probe limit.
         for ev in rows_raw {
-            if current_id.as_deref() != Some(&ev.entry_id) {
-                if let Some(ref id) = current_id.take() {
-                    flush(id, &mut current_rows, &mut map);
-                }
-                current_id = Some(ev.entry_id.clone());
-            }
-            current_rows.push(ev);
+            map.entry(ev.entry_id.clone()).or_default().push(ev);
         }
-        if let Some(ref id) = current_id {
-            flush(id, &mut current_rows, &mut map);
+    }
+
+    for (entry_id, rows) in map.iter_mut() {
+        if rows.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+            eprintln!(
+                "kb: entry {entry_id} evidence rows truncated to \
+                 MAX_EVIDENCE_ROWS_PER_ENTRY={MAX_EVIDENCE_ROWS_PER_ENTRY} (had >= {})",
+                rows.len()
+            );
+            rows.truncate(MAX_EVIDENCE_ROWS_PER_ENTRY);
         }
     }
 

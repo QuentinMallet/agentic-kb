@@ -161,38 +161,31 @@ impl Search {
             }
         }
 
-        if is_rrf {
-            println!("=== Hybrid (RRF) results ===");
-            if results.is_empty() {
-                println!("  (no results)");
-            } else {
-                for r in &results {
-                    print_entry(r, self.content);
-                }
+        fn print_section<'a, I>(header: &str, rows: I, show_content: bool)
+        where
+            I: IntoIterator<Item = &'a db::SearchEntry>,
+        {
+            println!("{header}");
+            let mut empty = true;
+            for r in rows {
+                print_entry(r, show_content);
+                empty = false;
             }
+            if empty {
+                println!("  (no results)");
+            }
+        }
+
+        if is_rrf {
+            print_section("=== Hybrid (RRF) results ===", &results, self.content);
         } else {
             if opts.do_fts {
-                println!("=== FTS results ===");
-                let fts_results: Vec<_> = results.iter().filter(|r| r.score_kind == "fts").collect();
-                if fts_results.is_empty() {
-                    println!("  (no results)");
-                } else {
-                    for r in fts_results {
-                        print_entry(r, self.content);
-                    }
-                }
+                let fts = results.iter().filter(|r| r.score_kind == "fts");
+                print_section("=== FTS results ===", fts, self.content);
             }
-
             if opts.do_semantic && !embedder.is_noop() {
-                println!("=== Semantic results ===");
-                let sem_results: Vec<_> = results.iter().filter(|r| r.score_kind == "semantic").collect();
-                if sem_results.is_empty() {
-                    println!("  (no results)");
-                } else {
-                    for r in sem_results {
-                        print_entry(r, self.content);
-                    }
-                }
+                let sem = results.iter().filter(|r| r.score_kind == "semantic");
+                print_section("=== Semantic results ===", sem, self.content);
             }
         }
 
@@ -210,12 +203,29 @@ fn collect_peer_paths(
     max_hops: u8,
     slug_filter: Option<&str>,
 ) -> Vec<String> {
-    if let Some(start) = reachable_from {
-        bfs_peers(conn, start, max_hops, slug_filter)
-    } else {
+    match reachable_from {
+        Some(start) => bfs_peers(conn, start, max_hops, slug_filter),
         // Direct peers only (1 hop).
-        query_direct_peers(conn, slug_filter)
+        None => query_direct_peers(conn, slug_filter),
     }
+}
+
+/// Run a `SELECT DISTINCT target_repo FROM peers` variant and collect the rows.
+///
+/// Returns an empty Vec on any prepare/query error — peer federation is best-effort
+/// and must not abort the local search. `params` are bound positionally in order.
+fn query_target_repos(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return vec![];
+    };
+    stmt.query_map(params, |r| r.get::<_, String>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Query direct target_repo values from the peers table.
@@ -223,27 +233,14 @@ fn query_direct_peers(
     conn: &rusqlite::Connection,
     slug_filter: Option<&str>,
 ) -> Vec<String> {
-    let sql = if slug_filter.is_some() {
-        "SELECT DISTINCT target_repo FROM peers WHERE epic_slug = ?1"
-    } else {
-        "SELECT DISTINCT target_repo FROM peers"
-    };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let rows: Vec<String> = if let Some(slug) = slug_filter {
-        stmt.query_map(rusqlite::params![slug], |r| r.get(0))
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    } else {
-        stmt.query_map([], |r| r.get(0))
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    };
-    rows
+    match slug_filter {
+        Some(slug) => query_target_repos(
+            conn,
+            "SELECT DISTINCT target_repo FROM peers WHERE epic_slug = ?1",
+            &[&slug],
+        ),
+        None => query_target_repos(conn, "SELECT DISTINCT target_repo FROM peers", &[]),
+    }
 }
 
 /// BFS traversal of peer graph starting from `start_repo` up to `max_hops`.
@@ -264,10 +261,8 @@ fn bfs_peers(
         }
         let mut next_frontier: Vec<String> = Vec::new();
         for repo in &frontier {
-            let neighbors = query_neighbors(conn, repo, slug_filter);
-            for neighbor in neighbors {
-                if !visited.contains(&neighbor) {
-                    visited.insert(neighbor.clone());
+            for neighbor in query_neighbors(conn, repo, slug_filter) {
+                if visited.insert(neighbor.clone()) {
                     result.push(neighbor.clone());
                     next_frontier.push(neighbor);
                 }
@@ -284,25 +279,17 @@ fn query_neighbors(
     source_repo: &str,
     slug_filter: Option<&str>,
 ) -> Vec<String> {
-    let sql = if slug_filter.is_some() {
-        "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1 AND epic_slug = ?2"
-    } else {
-        "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1"
-    };
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    if let Some(slug) = slug_filter {
-        stmt.query_map(rusqlite::params![source_repo, slug], |r| r.get(0))
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    } else {
-        stmt.query_map(rusqlite::params![source_repo], |r| r.get(0))
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+    match slug_filter {
+        Some(slug) => query_target_repos(
+            conn,
+            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1 AND epic_slug = ?2",
+            &[&source_repo, &slug],
+        ),
+        None => query_target_repos(
+            conn,
+            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1",
+            &[&source_repo],
+        ),
     }
 }
 

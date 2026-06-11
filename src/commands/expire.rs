@@ -1,6 +1,6 @@
 //! `expire` subcommand
 
-use crate::commands::add::acquire_lock;
+use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::{Embedder, NoopEmbedder};
 use crate::components::{db, events};
 use crate::config;
@@ -65,12 +65,7 @@ impl Expire {
         }
 
         let ts = chrono::Utc::now().to_rfc3339();
-        let omc_session_id = std::env::var("OMC_SESSION_ID")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let session = omc_session_id
-            .clone()
-            .unwrap_or_else(|| "cli".to_string());
+        let (session, omc_session_id) = read_omc_session();
 
         let event = serde_json::json!({
             "action": "expire",

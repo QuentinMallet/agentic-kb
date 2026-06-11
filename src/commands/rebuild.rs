@@ -87,13 +87,12 @@ impl Rebuild {
             // Stop at snapshot_len so we never encounter a partial tail line
             // that a concurrent writer may be mid-writing after Phase 1 released the lock.
             let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
-            let to_replay = evts.len();
             let conn = db::open_db(&tmp_db)?;
             // DELETE journal avoids WAL files on the tmp path, simplifying the
             // rename step (no companion files to move or orphan).
             conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-            eprintln!("replaying {} events...", to_replay);
-            for event in &evts[..to_replay] {
+            eprintln!("replaying {} events...", evts.len());
+            for event in &evts {
                 db::apply_event(&conn, embedder, event)
                     .with_context(|| format!("apply event: {}", event))?;
             }
