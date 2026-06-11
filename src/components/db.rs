@@ -291,8 +291,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // AC-P6 migrations: add cross-repo provenance columns to entries.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN origin_repo TEXT;");
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN cross_repo_epic TEXT;");
-    // T8 (br-fts5-content-migration-31t.8): deprecation gate counter table.
-    // Tracks the four event-gated signals required before dropping entries_fts.
+    // Deprecation gate: tracks the four event-gated signals required before dropping entries_fts.
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS fts5_deprecation_gate (
@@ -310,8 +309,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Set a T8 deprecation gate signal (key → value as string).
-/// Used by parity rerun, rollback drill, and ops tooling.
+/// Set a deprecation gate signal (key → value as string).
 pub fn set_deprecation_gate(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO fts5_deprecation_gate(key, value) VALUES(?1,?2)
@@ -321,7 +319,7 @@ pub fn set_deprecation_gate(conn: &Connection, key: &str, value: &str) -> Result
     Ok(())
 }
 
-/// T8: drop entries_fts (contentless) and its write triggers when all four
+/// Drop entries_fts (contentless) and its write triggers when all four
 /// deprecation gate signals are met:
 ///   1. post_cutover_writes >= 1000
 ///   2. rollback_invocations == 0
@@ -386,6 +384,13 @@ pub fn maybe_drop_contentless_fts(conn: &Connection) -> Result<()> {
          rollback_drill_passed={rollback_drill_passed}"
     );
     Ok(())
+}
+
+fn increment_post_cutover_writes(conn: &Connection) {
+    let _ = conn.execute(
+        "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
+        [],
+    );
 }
 
 /// Apply a single event to the database.
@@ -467,11 +472,7 @@ pub fn apply_event(
                     params![rowid, blob],
                 )?;
             }
-            // T8 deprecation gate: count post-cutover entry writes.
-            let _ = conn.execute(
-                "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
-                [],
-            );
+            increment_post_cutover_writes(conn);
         }
 
         ("expire", "entries") => {
@@ -503,11 +504,7 @@ pub fn apply_event(
                 return Err(e);
             }
             conn.execute_batch("COMMIT")?;
-            // T8 deprecation gate: count post-cutover entry writes.
-            let _ = conn.execute(
-                "UPDATE fts5_deprecation_gate SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='post_cutover_writes'",
-                [],
-            );
+            increment_post_cutover_writes(conn);
         }
 
         ("upsert", "test_cases") => {
@@ -817,8 +814,8 @@ fn fetch_evidence_for_entries(
 }
 
 /// Which FTS table search queries hit. Controlled by `KB_FTS_READ_PATH`:
-///   "contentless"     — entries_fts (default)
-///   "content_entries" — entries_fts_v2 (content='entries' table, post-cutover)
+///   "contentless"     — entries_fts (explicit rollback override)
+///   "content_entries" — entries_fts_v2 (content='entries' table; default)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FtsReadPath {
     Contentless,
@@ -827,7 +824,7 @@ pub enum FtsReadPath {
 
 impl FtsReadPath {
     pub fn from_env() -> Self {
-        // T5b default-flip: unset or "content_entries" → content_entries.
+        // Unset or "content_entries" → content_entries (default post-cutover).
         // Explicit "contentless" preserves the rollback affordance.
         match std::env::var("KB_FTS_READ_PATH").as_deref() {
             Ok("contentless") => FtsReadPath::Contentless,
@@ -2759,7 +2756,6 @@ mod tests {
         assert!(v1_ids.contains(&"dw3".to_string()), "dw3 must be present");
     }
 
-    // US-8: deprecation gate — entries_fts dropped + VACUUM once all gate signals met.
     #[test]
     fn test_deprecation_gate_drops_contentless_fts_when_all_signals_met() {
         let conn = open_db_memory().unwrap();
