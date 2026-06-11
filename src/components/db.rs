@@ -439,7 +439,8 @@ pub fn apply_event(
             // DELETE entries_emb in the same transaction as the entries write so no
             // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
             if is_stale == 1 {
-                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                 conn.execute(
                     "DELETE FROM entries_emb WHERE rowid = \
                      (SELECT rowid FROM entries WHERE id=?1)",
@@ -454,13 +455,13 @@ pub fn apply_event(
                 |r| r.get(0),
             )?;
 
-            // Sync FTS5
-            conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
-            conn.execute(
+            // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
+            let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+            let _ = conn.execute(
                 "INSERT INTO entries_fts(id, path, summary, content, tags)
                  VALUES(?1,?2,?3,?4,?5)",
                 params![id, path, summary, content, tags],
-            )?;
+            );
 
             // Sync embedding store (f16 wire format — 768 bytes per entry)
             if !embedder.is_noop() {
@@ -490,7 +491,8 @@ pub fn apply_event(
                     params![id],
                 )?;
                 // Remove from FTS so expired entries don't appear in search.
-                conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id])?;
+                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                 // GC: remove embedding row so entries_emb stays in sync with live entries.
                 conn.execute(
                     "DELETE FROM entries_emb WHERE rowid = \
@@ -891,7 +893,7 @@ pub fn fts_query_content_entries(
 ///
 /// FTS queries are wrapped in double-quotes to enable phrase search and prevent
 /// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
-/// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "contentless").
+/// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "content_entries").
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -926,8 +928,10 @@ pub fn search_entries(
                 FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
             };
             if let Ok(alt) = alt_rows {
-                let primary_ids: Vec<&str> = rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
+                let primary_ids: std::collections::BTreeSet<&str> =
+                    rows.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: std::collections::BTreeSet<&str> =
+                    alt.iter().map(|(id, ..)| id.as_str()).collect();
                 debug_assert_eq!(
                     primary_ids, alt_ids,
                     "fts5_dual_write_divergence: primary={:?} alt={:?}",
@@ -2824,5 +2828,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v2_exists, 1, "entries_fts_v2 must remain after contentless drop");
+
+        // Post-drop writes must succeed: apply_event must not fail because entries_fts is gone.
+        let post_drop_upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "post-drop-1", "path": "src/post_drop.rs",
+            "summary": "post-drop write", "content": "content after drop",
+            "tags": ["post-drop"], "ts": "2024-01-03T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &post_drop_upsert)
+            .expect("upsert after entries_fts drop must succeed");
+        let post_drop_expire = serde_json::json!({
+            "action": "expire", "table": "entries",
+            "id": "post-drop-1", "ts": "2024-01-04T00:00:00Z", "session": "test"
+        });
+        apply_event(&conn, &embedder, &post_drop_expire)
+            .expect("expire after entries_fts drop must succeed");
     }
 }
