@@ -1,6 +1,7 @@
 //! `compress` subcommand — semantic paragraph deduplication for bloated KB entries
 
 use crate::commands::add::make_embedder;
+use crate::commands::add_validation::compute_evidence_status_write;
 use crate::components::{kb_core, redactor, text_chunker};
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -161,7 +162,8 @@ pub fn run(
     // Drop the conn before acquiring the flock inside kb_core::add.
     drop(conn);
 
-    // Fetch tags for the existing entry so we preserve them.
+    // Fetch tags + evidence for the existing entry so the compressed version
+    // preserves the original's evidential standing (required for mandated kinds).
     let conn2 = db::open_db(&paths.db)?;
     let tags_json: serde_json::Value = {
         let mut stmt = conn2.prepare(
@@ -170,10 +172,30 @@ pub fn run(
         let tags_str: String = stmt.query_row(params![entry_id], |r| r.get(0))?;
         serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]))
     };
+    let evidence_rows: Vec<serde_json::Value> = {
+        let mut stmt = conn2.prepare(
+            "SELECT kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from
+             FROM evidence WHERE entry_id = ?1 ORDER BY rowid",
+        )?;
+        let rows: Vec<serde_json::Value> = stmt.query_map(params![entry_id], |r| {
+            Ok(serde_json::json!({
+                "kind":             r.get::<_, String>(0)?,
+                "citation_path":    r.get::<_, Option<String>>(1)?,
+                "citation_sha":     r.get::<_, Option<String>>(2)?,
+                "citation_hash":    r.get::<_, String>(3)?,
+                "citation_excerpt": r.get::<_, Option<String>>(4)?,
+                "derived_from":     r.get::<_, Option<String>>(5)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        rows
+    };
     drop(conn2);
 
     let ts = chrono::Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
+    let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
     let add_args = kb_core::AddArgs {
         id: new_id,
@@ -185,8 +207,8 @@ pub fn run(
         permanent: false,
         replace_path: true,
         kind,
-        evidence_status: "n/a".to_string(),
-        evidence_rows: vec![],
+        evidence_status: evidence_status.to_string(),
+        evidence_rows,
         ts,
         session: "cli".to_string(),
         session_id: None,
@@ -244,7 +266,7 @@ mod tests {
             id: None,
             permanent: false,
             replace_path: false,
-            kind: "belief".to_string(),
+            kind: "memory".to_string(),
             evidence: vec![],
             evidence_file: None,
         };
