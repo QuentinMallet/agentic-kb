@@ -35,7 +35,7 @@
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
 use crate::commands::add::acquire_lock;
-use crate::components::{db, embedder, events};
+use crate::components::{db, embedder, events, redactor};
 use crate::config;
 use crate::models::Evidence;
 use anyhow::Result;
@@ -94,8 +94,18 @@ pub struct AddOutcome {
 pub fn add(
     paths: &config::Paths,
     embedder: &dyn embedder::Embedder,
-    args: AddArgs,
+    mut args: AddArgs,
 ) -> Result<AddOutcome> {
+    // Redact credentials from user-supplied text fields before persisting.
+    args.content = redactor::redact_str(&args.content).into_owned();
+    args.summary = redactor::redact_str(&args.summary).into_owned();
+    redactor::redact_in_place(&mut args.tags);
+    for ev in args.evidence_rows.iter_mut() {
+        if let Some(excerpt) = ev.get_mut("citation_excerpt") {
+            redactor::redact_in_place(excerpt);
+        }
+    }
+
     let _lock = acquire_lock(&paths.lock)?;
     let conn = db::open_db(&paths.db)?;
 

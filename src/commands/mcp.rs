@@ -349,16 +349,6 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         Err(e) => return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()}),
     };
 
-    let _lock = match acquire_lock(&paths.lock) {
-        Ok(l) => l,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
     let omc_session_id = std::env::var("OMC_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty());
@@ -369,7 +359,13 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     for seed in &seeds {
         let path = seed.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+        // Upsert=false: skip entries already present. Open a short-lived read
+        // connection for the check; kb_core::add acquires the write lock below.
         if !upsert {
+            let conn = match db::open_db(&paths.db) {
+                Ok(c) => c,
+                Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+            };
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path = ?1 AND is_stale = 0",
@@ -387,7 +383,7 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         let entry_id = uuid::Uuid::new_v4().to_string();
         let ts = chrono::Utc::now().to_rfc3339();
         let summary = seed.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let content = seed.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let seed_content = seed.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tags = seed.get("tags").cloned().unwrap_or(Value::Array(vec![]));
         let kind = seed.get("kind").and_then(|v| v.as_str()).unwrap_or("convention").to_string();
         let evidence_rows: Vec<Value> = seed.get("evidence")
@@ -400,26 +396,29 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
         }
         let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
-        let event = json!({
-            "action": "upsert",
-            "table": "entries",
-            "id": entry_id,
-            "path": path,
-            "summary": summary,
-            "content": content,
-            "tags": tags,
-            "kind": kind,
-            "evidence_status": evidence_status,
-            "version_ref": null,
-            "ts": ts,
-            "session": "mcp-import",
-            "session_id": omc_session_id,
-        });
-
-        if let Err(e) = events::append_event(&paths.events, &event) {
-            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-        }
-        if let Err(e) = db::apply_event(&conn, emb, &event) {
+        // Route through kb_core::add so redaction and JSONL-first atomicity are
+        // applied consistently (same path as handle_add).
+        if let Err(e) = kb_core::add(
+            paths,
+            emb,
+            kb_core::AddArgs {
+                id: entry_id,
+                path,
+                summary,
+                content: seed_content,
+                tags,
+                version_ref: None,
+                permanent: false,
+                replace_path: false,
+                kind,
+                evidence_status: evidence_status.to_string(),
+                evidence_rows,
+                ts,
+                session: "mcp-import".to_string(),
+                session_id: omc_session_id.clone(),
+                expire_reason: String::new(),
+            },
+        ) {
             return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
         }
 
@@ -442,6 +441,11 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     }
 }
 
+// Redaction exemption: handle_run writes an "insert" event to the `run_history`
+// table (test_id, result, adapter, detail).  None of those fields are
+// user-authored KB content; they carry structured test outcome data.  Routing
+// through kb_core::add is not applicable here because the event targets a
+// different table and schema.  No credential redaction is needed.
 fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
     let test_id = match req.get("test_id").and_then(|v| v.as_str()) {
         Some(t) => t.to_string(),
@@ -482,6 +486,12 @@ fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     json!({"id": id, "type": "ok", "run_id": run_id, "test_id": test_id, "result": result})
 }
 
+// Redaction exemption: handle_test_add writes an "upsert" event to the
+// `test_cases` table (app, name, protocol, config).  The `config` field is a
+// structured JSON blob describing browser/test automation parameters, not
+// free-form KB content authored by the user.  Routing through kb_core::add is
+// not applicable here because the event targets a different table and schema.
+// No credential redaction is needed.
 fn handle_test_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
     let app = match req.get("app").and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),
