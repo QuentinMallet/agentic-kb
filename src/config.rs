@@ -8,6 +8,14 @@ fn default_inline_verify_k() -> usize {
     10
 }
 
+fn default_compress_threshold() -> usize {
+    4000
+}
+
+fn default_compress_cosine_cutoff() -> f32 {
+    0.85
+}
+
 fn default_vacuum_after_compacts() -> u64 {
     8
 }
@@ -69,6 +77,12 @@ pub struct KbConfig {
     /// A value around 0.01 gives half-life of ~70 days.
     #[serde(default)]
     pub recency_lambda: f32,
+    /// Minimum body size (chars) before kb compress considers an entry bloated.
+    #[serde(default = "default_compress_threshold")]
+    pub compress_threshold: usize,
+    /// Cosine similarity cutoff for paragraph deduplication in kb compress.
+    #[serde(default = "default_compress_cosine_cutoff")]
+    pub compress_cosine_cutoff: f32,
 }
 
 impl KbConfig {

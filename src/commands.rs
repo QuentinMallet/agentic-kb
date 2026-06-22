@@ -2,8 +2,10 @@
 
 pub mod add;
 pub mod digest;
+pub mod hook;
 pub mod add_validation;
 pub mod compact;
+pub mod compress;
 pub mod expire;
 pub mod import_cmd;
 pub mod ingest;
@@ -37,6 +39,8 @@ pub enum KbCmd {
     Rebuild(rebuild::Rebuild),
     /// Compact the event log (squash superseded events)
     Compact(compact::Compact),
+    /// Compress a KB entry via semantic paragraph deduplication
+    Compress(compress::Compress),
     /// Mark an entry stale
     Expire(expire::Expire),
     /// Re-embed entries that are missing embeddings
@@ -56,6 +60,8 @@ pub enum KbCmd {
     /// Manage peer repo graph edges
     #[command(subcommand)]
     Peers(peers::Peers),
+    /// Run a lifecycle hook (e.g. SessionEnd digest)
+    Hook(hook::Hook),
 }
 
 /// Entry point for the application.
