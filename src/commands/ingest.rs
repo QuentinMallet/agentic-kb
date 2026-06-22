@@ -2,6 +2,7 @@
 
 use crate::commands::add::{self, Add};
 use crate::components::embedder;
+use crate::components::text_chunker;
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -180,11 +181,8 @@ fn split_piece(text: &str, max_size: usize, overlap: usize, chunks: &mut Vec<Str
         return;
     }
     // Try paragraph split (blank lines)
-    let paras: Vec<&str> = text
-        .split("\n\n")
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .collect();
+    let para_strings = text_chunker::split_paragraphs(text, 0);
+    let paras: Vec<&str> = para_strings.iter().map(|s| s.as_str()).collect();
     if paras.len() > 1 {
         merge_pieces(&paras, max_size, overlap, chunks);
         return;
