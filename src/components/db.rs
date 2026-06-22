@@ -654,6 +654,10 @@ pub struct SearchOptions {
     /// Currently unused; reserved for forward-compatibility with the
     /// 23b.13 task that replaces the per-request `thread::scope` path.
     pub verify_pool_size: Option<usize>,
+    /// Recency-bias decay factor (λ in exp(-λ·days)) applied after RRF scoring.
+    /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
+    /// in hybrid mode. Forced to 0.0 for peer federation queries (clock skew).
+    pub recency_lambda: f32,
 }
 
 impl Default for SearchOptions {
@@ -667,6 +671,7 @@ impl Default for SearchOptions {
             inline_verify_k: 10,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         }
     }
 }
@@ -1109,6 +1114,56 @@ pub fn search_entries(
                 b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
             });
             entries.truncate(opts.limit);
+
+            // Recency-bias post-RRF pass: multiply each entry's score by
+            // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
+            // preserve byte-identical behavior with pre-recency-bias code.
+            if opts.recency_lambda != 0.0 {
+                let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+                let placeholders: String = (1..=ids.len())
+                    .map(|i| format!("?{}", i))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, updated_at FROM entries WHERE id IN ({})",
+                    placeholders
+                );
+                let now = chrono::Utc::now().naive_utc();
+                let decay_map: std::collections::HashMap<String, f32> =
+                    match conn.prepare(&sql) {
+                        Ok(mut stmt) => stmt
+                            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })
+                            .map(|rows| {
+                                rows.filter_map(|r| r.ok())
+                                    .map(|(id, updated_at)| {
+                                        let days = chrono::NaiveDateTime::parse_from_str(
+                                            &updated_at,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        )
+                                        .map(|dt| {
+                                            let secs = (now - dt).num_seconds() as f32;
+                                            (secs / 86400.0).max(0.0)
+                                        })
+                                        .unwrap_or(0.0);
+                                        let decay = (-opts.recency_lambda * days).exp();
+                                        (id, decay)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        Err(_) => std::collections::HashMap::new(),
+                    };
+                for entry in &mut entries {
+                    let decay = decay_map.get(&entry.id).copied().unwrap_or(1.0);
+                    entry.score *= decay;
+                }
+                // Re-sort: multiplication may change relative order.
+                entries.sort_by(|a, b| {
+                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
             for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
@@ -1927,6 +1982,7 @@ mod tests {
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
 
@@ -2132,6 +2188,7 @@ mod tests {
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
 
         let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
@@ -2199,6 +2256,7 @@ mod tests {
             inline_verify_k: 0,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
         assert!(!results.is_empty(), "FTS must return the entry");
@@ -2216,6 +2274,7 @@ mod tests {
             inline_verify_k: 0,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
         assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
@@ -2318,6 +2377,7 @@ mod tests {
             inline_verify_k: 0,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
 
@@ -2611,6 +2671,7 @@ mod tests {
             inline_verify_k: 10,
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: Some(pool_size),
+            recency_lambda: 0.0,
         };
         let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
             .expect("search must succeed");

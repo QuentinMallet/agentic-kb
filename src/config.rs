@@ -64,6 +64,11 @@ pub struct KbConfig {
     /// `search_entries`. Defaults to `num_cpus::get_physical()` when absent.
     /// Set lower to cap verification CPU usage (e.g. `verify_pool_size=2`).
     pub verify_pool_size: Option<usize>,
+    /// Recency-bias decay factor for hybrid search (λ in exp(-λ·days)).
+    /// Set to 0.0 to disable (byte-identical to pre-recency-bias behavior).
+    /// A value around 0.01 gives half-life of ~70 days.
+    #[serde(default)]
+    pub recency_lambda: f32,
 }
 
 impl KbConfig {
