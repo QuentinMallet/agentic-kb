@@ -1118,7 +1118,7 @@ pub fn search_entries(
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
             // preserve byte-identical behavior with pre-recency-bias code.
-            if opts.recency_lambda != 0.0 {
+            if opts.recency_lambda != 0.0 && !entries.is_empty() {
                 let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
                 let placeholders: String = (1..=ids.len())
                     .map(|i| format!("?{}", i))

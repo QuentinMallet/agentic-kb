@@ -96,6 +96,11 @@ impl TranscriptState {
                 self.state_path.display()
             )
         })?;
+        // Fsync the directory so the rename is durable on non-auto-commit
+        // filesystems (XFS, btrfs) before we release the lock.
+        fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .context("fsync state dir")?;
         drop(lock);
         Ok(())
     }
@@ -129,7 +134,12 @@ impl TranscriptState {
         let map: TranscriptOffsets = if content.is_empty() {
             TranscriptOffsets::default()
         } else {
-            serde_json::from_slice(&content).unwrap_or_default()
+            serde_json::from_slice(&content).unwrap_or_else(|e| {
+                eprintln!(
+                    "warn: transcript state file corrupt ({e}); resetting offsets — full re-digest on next run"
+                );
+                TranscriptOffsets::default()
+            })
         };
         Ok((f, map))
     }

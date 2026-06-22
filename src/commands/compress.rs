@@ -93,8 +93,13 @@ pub fn run(
         anyhow::bail!("kb compress requires embeddings; KB_NO_EMBED=1 is set");
     }
 
-    // Step 2: split into paragraphs.
-    let paragraphs = text_chunker::split_paragraphs(&content, 100);
+    // Step 2: split into paragraphs. Cap at 512 to keep O(n²) cosine dedup
+    // bounded even if content is unusually dense with short paragraphs.
+    const MAX_PARAGRAPHS: usize = 512;
+    let paragraphs: Vec<String> = text_chunker::split_paragraphs(&content, 100)
+        .into_iter()
+        .take(MAX_PARAGRAPHS)
+        .collect();
     let original_count = paragraphs.len();
 
     // Step 4: embed each paragraph.

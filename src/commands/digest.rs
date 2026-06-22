@@ -51,8 +51,16 @@ pub fn digest_session(
         });
     }
 
-    // Parse unread bytes as UTF-8 (lossy so we never bail on binary garbage).
-    let text = String::from_utf8_lossy(unread).into_owned();
+    // Cap raw bytes before materialising as UTF-8 to bound memory on pathological
+    // transcripts. 512 KiB is well above any realistic session.
+    const MAX_DIGEST_BYTES: usize = 512 * 1024;
+    let unread_capped = if unread.len() > MAX_DIGEST_BYTES {
+        &unread[..MAX_DIGEST_BYTES]
+    } else {
+        unread
+    };
+    // Lossy so we never bail on binary garbage in tool output.
+    let text = String::from_utf8_lossy(unread_capped).into_owned();
 
     // Split into turns by blank lines or literal `---` separator, cap at 500.
     let turns: Vec<String> = split_turns(&text, 500);
