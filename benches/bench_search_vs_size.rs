@@ -205,6 +205,7 @@ fn opts_fts() -> db::SearchOptions {
         inline_verify_k: 0,
         repo_root: None,
         verify_pool_size: None,
+        recency_lambda: 0.0,
     }
 }
 
@@ -218,6 +219,7 @@ fn opts_semantic() -> db::SearchOptions {
         inline_verify_k: 0,
         repo_root: None,
         verify_pool_size: None,
+        recency_lambda: 0.0,
     }
 }
 
@@ -231,6 +233,7 @@ fn opts_hybrid() -> db::SearchOptions {
         inline_verify_k: 0,
         repo_root: None,
         verify_pool_size: None,
+        recency_lambda: 0.0,
     }
 }
 
@@ -260,6 +263,7 @@ fn opts_hybrid_verify() -> db::SearchOptions {
         inline_verify_k: 0,
         repo_root: None,
         verify_pool_size: None,
+        recency_lambda: 0.0,
     }
 }
 

@@ -113,6 +113,7 @@ fn bench_kb_search_with_verification(c: &mut Criterion) {
         inline_verify_k: 10,
         repo_root: None,
         verify_pool_size: None,
+        recency_lambda: 0.0,
     };
 
     c.bench_function("bench_kb_search_with_verification", |b| {

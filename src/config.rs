@@ -8,6 +8,14 @@ fn default_inline_verify_k() -> usize {
     10
 }
 
+fn default_compress_threshold() -> usize {
+    4000
+}
+
+fn default_compress_cosine_cutoff() -> f32 {
+    0.85
+}
+
 fn default_vacuum_after_compacts() -> u64 {
     8
 }
@@ -64,6 +72,17 @@ pub struct KbConfig {
     /// `search_entries`. Defaults to `num_cpus::get_physical()` when absent.
     /// Set lower to cap verification CPU usage (e.g. `verify_pool_size=2`).
     pub verify_pool_size: Option<usize>,
+    /// Recency-bias decay factor for hybrid search (λ in exp(-λ·days)).
+    /// Set to 0.0 to disable (byte-identical to pre-recency-bias behavior).
+    /// A value around 0.01 gives half-life of ~70 days.
+    #[serde(default)]
+    pub recency_lambda: f32,
+    /// Minimum body size (chars) before kb compress considers an entry bloated.
+    #[serde(default = "default_compress_threshold")]
+    pub compress_threshold: usize,
+    /// Cosine similarity cutoff for paragraph deduplication in kb compress.
+    #[serde(default = "default_compress_cosine_cutoff")]
+    pub compress_cosine_cutoff: f32,
 }
 
 impl KbConfig {

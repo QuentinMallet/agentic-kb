@@ -92,6 +92,7 @@ impl Search {
             inline_verify_k: self.limit, // verify all results by default
             repo_root: None,
             verify_pool_size: kb_config.verify_pool_size,
+            recency_lambda: kb_config.recency_lambda,
         };
 
         let conn = db::open_db(&paths.db)?;
@@ -114,8 +115,18 @@ impl Search {
                         continue;
                     }
                 };
+                // Federation asymmetry guard: recency_lambda is forced to 0.0
+                // for peer queries. Peer clocks may differ from local clock,
+                // making decay scores incomparable across repos.
+                if opts.recency_lambda != 0.0 {
+                    eprintln!(
+                        "warn: recency_lambda={} forced to 0.0 for peer {} (clock skew guard)",
+                        opts.recency_lambda, peer_path
+                    );
+                }
                 let peer_opts = db::SearchOptions {
                     repo_root: Some(std::path::PathBuf::from(&peer_path)),
+                    recency_lambda: 0.0,
                     ..opts.clone()
                 };
                 match db::search_entries(&peer_conn, embedder, &self.query, &peer_opts) {
@@ -582,6 +593,7 @@ mod tests {
             inline_verify_k: 10,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
@@ -657,6 +669,7 @@ mod tests {
             inline_verify_k: 1,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
@@ -744,6 +757,7 @@ mod tests {
                     inline_verify_k: 0,
                     repo_root: None,
                     verify_pool_size: None,
+                    recency_lambda: 0.0,
                 };
 
                 // Should not panic; FTS keywords inside quotes are treated as literals
@@ -820,6 +834,7 @@ mod tests {
             inline_verify_k: 0,
             repo_root: None,
             verify_pool_size: None,
+            recency_lambda: 0.0,
         };
 
         let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;
