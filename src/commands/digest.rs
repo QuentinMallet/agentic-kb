@@ -68,7 +68,7 @@ pub fn digest_session(
 
     // head: first 3 turns; tail: last 3 turns (non-overlapping with head).
     let head_end = turns.len().min(3);
-    let tail_start = if turns.len() > 3 { turns.len() - 3 } else { head_end };
+    let tail_start = turns.len().saturating_sub(3).max(head_end);
     let head_text = turns[..head_end].join("\n\n---\n\n");
     let tail_text = turns[tail_start..].join("\n\n---\n\n");
 
@@ -121,7 +121,8 @@ pub fn digest_session(
     let id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
     let (session, omc_session_id) = read_omc_session();
-    let tags = serde_json::json!({"digest_hash": digest_hash});
+    // Encode hash as a prefixed tag string so tags stays a JSON Array (schema requirement).
+    let tags = serde_json::json!([format!("digest_hash:{}", digest_hash)]);
     let kind = "memory";
     let evidence_rows: Vec<serde_json::Value> = vec![];
     let evidence_status = compute_evidence_status_write(kind, &evidence_rows);
@@ -223,9 +224,11 @@ fn read_digest_hash(paths: &config::Paths, kb_path: &str) -> Result<String> {
     let tags_json = row.ok_or_else(|| anyhow::anyhow!("no existing digest entry"))?;
     let tags: serde_json::Value =
         serde_json::from_str(&tags_json).context("parse tags JSON")?;
-    tags.get("digest_hash")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    tags.as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|v| v.as_str()?.strip_prefix("digest_hash:").map(str::to_string))
+        })
         .ok_or_else(|| anyhow::anyhow!("no digest_hash tag"))
 }
 

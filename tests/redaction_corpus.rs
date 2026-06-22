@@ -170,10 +170,9 @@ fn aws_access_key_positive() {
 
 #[test]
 fn aws_access_key_negative() {
-    // AKIA + only 15 uppercase alphanum (needs 16)
-    assert_clean("AKIAIOSFODNN7EXA"); // 16 chars but includes lowercase via mixed — actually let's just use a short one
-    // "AKIA" + 15 chars is too short
-    assert_clean("AKIA123456789AB"); // 4 + 11 = 15 — below threshold
+    // AKIA + exactly 15 chars is below the 16-char threshold.
+    assert_clean(&format!("AKIA{}", "A".repeat(15)));
+    assert_clean("AKIA123456789AB"); // 4 + 11 = 15 total — below threshold
 }
 
 #[test]
