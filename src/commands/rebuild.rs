@@ -67,14 +67,30 @@ pub fn rebuild_if_schema_obsolete(
         if db::schema_is_current(&conn) {
             return Ok(false);
         }
-        // Obsolete stamp but nothing to replay (no/empty event log): the DB
-        // cannot contain derived rows the log would produce — stamp and move on.
+        // Missing/empty event log: only a DB with ZERO entries is genuinely
+        // fresh (stamp and move on). A populated DB without its log means the
+        // events path did not resolve (layout mismatch) — stamping would
+        // permanently disarm the upgrade while derived state (e.g. the empty
+        // entries_fts_v2 table) stays broken. Warn loudly, leave unstamped so
+        // every interaction retries until the path issue is fixed.
         let has_events = fs::metadata(&paths.events).map(|m| m.len() > 0).unwrap_or(false);
         if !has_events {
-            conn.execute(
-                "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
-                rusqlite::params![db::SCHEMA_VERSION.to_string()],
-            )?;
+            let entries: i64 =
+                conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))?;
+            if entries == 0 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
+                    rusqlite::params![db::SCHEMA_VERSION.to_string()],
+                )?;
+            } else {
+                eprintln!(
+                    "kb: WARNING DB schema predates v{} and holds {entries} entries, but the \
+                     event log was not found at {} — cannot upgrade-rebuild. Check the KB \
+                     path layout; searches may be degraded until the log is reachable.",
+                    db::SCHEMA_VERSION,
+                    paths.events.display()
+                );
+            }
             return Ok(false);
         }
     }

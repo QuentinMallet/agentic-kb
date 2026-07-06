@@ -183,6 +183,47 @@ fn test_obsolete_schema_forces_one_rebuild() {
     assert!(!rebuilt_again, "current schema must not rebuild again");
 }
 
+/// Missing event log must NEVER silently stamp a populated DB (scenario-B
+/// finding): a legacy DB whose log path failed to resolve stays unstamped
+/// (warn + retry next interaction). Only a genuinely empty DB may stamp.
+#[test]
+fn test_missing_log_does_not_disarm_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+
+    add(&paths, &NoopEmbedder, base_args("orphaned")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+    // Simulate a layout mismatch: the log is unreachable at paths.events.
+    fs::remove_file(&paths.events).unwrap();
+
+    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    assert!(!rebuilt, "no log -> no rebuild");
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert!(
+            !schema_is_current(&conn),
+            "populated DB without its log must NOT be stamped — the upgrade must retry"
+        );
+    }
+
+    // Genuinely fresh DB (zero entries, no log): stamping is correct.
+    let dir2 = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir2.path().join(".state/agent-kb")).unwrap();
+    let paths2 = Paths::from_root(dir2.path());
+    {
+        let conn = open_db(&paths2.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+    let rebuilt2 = rebuild_if_schema_obsolete(&paths2, &FixedEmbedder).unwrap();
+    assert!(!rebuilt2);
+    let conn = open_db(&paths2.db).unwrap();
+    assert!(schema_is_current(&conn), "empty DB with no log may stamp without rebuild");
+}
+
 /// Single-flight (codex review finding): concurrent first interactions with
 /// an obsolete KB serialize on the upgrade lock — exactly one performs the
 /// rebuild, the loser re-checks the stamp and returns without rebuilding.
