@@ -2,6 +2,7 @@
 
 pub mod add;
 pub mod digest;
+pub mod eval;
 pub mod hook;
 pub mod add_validation;
 pub mod compact;
@@ -41,6 +42,8 @@ pub enum KbCmd {
     Compact(compact::Compact),
     /// Compress a KB entry via semantic paragraph deduplication
     Compress(compress::Compress),
+    /// Evaluate retrieval quality against a golden set (recall@k, MRR)
+    Eval(eval::Eval),
     /// Mark an entry stale
     Expire(expire::Expire),
     /// Re-embed entries that are missing embeddings
