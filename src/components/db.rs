@@ -714,6 +714,10 @@ pub struct SearchOptions {
     /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
     /// in hybrid mode. Forced to 0.0 for peer federation queries (clock skew).
     pub recency_lambda: f32,
+    /// MMR diversification strength for hybrid search. 0.0 disables (default,
+    /// byte-identical to pre-MMR behavior). In (0,1]: greedy re-rank over a
+    /// 2×limit pool maximizing λ·relevance − (1−λ)·max_cosine_to_selected.
+    pub mmr_lambda: f32,
 }
 
 impl Default for SearchOptions {
@@ -728,6 +732,7 @@ impl Default for SearchOptions {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         }
     }
 }
@@ -955,6 +960,246 @@ pub fn fts_query_content_entries(
 /// FTS queries are wrapped in double-quotes to enable phrase search and prevent
 /// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
 /// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "content_entries").
+/// Frontier expand primitive (Memora pickup .7): live entries adjacent to the
+/// seed ids. Adjacency facets, one point each:
+///   * same path directory (all components up to the last `/`)
+///   * at least one shared tag
+///   * at least one shared cue text
+///   * at least one shared evidence citation file
+///
+/// The calling agent is the retrieval policy loop (Memora's EXPAND / RE_QUERY /
+/// STOP); this function only materializes the frontier. Seeds are excluded,
+/// stale entries are excluded, results sorted by facet count descending.
+/// `score` = facet count, `score_kind` = "expand".
+pub fn expand_entries(
+    conn: &Connection,
+    ids: &[String],
+    limit: usize,
+) -> Result<Vec<SearchEntry>> {
+    use std::collections::{HashMap, HashSet};
+
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let limit = limit.min(MAX_LIMIT);
+    let seed_set: HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+    fn dirname(path: &str) -> Option<&str> {
+        path.rfind('/').map(|i| &path[..i])
+    }
+    fn parse_tags(tags: &str) -> HashSet<String> {
+        serde_json::from_str::<Vec<String>>(tags)
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
+    }
+    fn citation_file(citation_path: &str) -> &str {
+        citation_path.rsplit_once(':').map_or(citation_path, |(f, _)| f)
+    }
+
+    // Seed facets.
+    let mut seed_dirs: HashSet<String> = HashSet::new();
+    let mut seed_tags: HashSet<String> = HashSet::new();
+    {
+        let placeholders: String =
+            (1..=ids.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, tags FROM entries WHERE is_stale = 0 AND id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.is_empty() {
+            return Ok(vec![]); // unknown or stale seeds
+        }
+        for (path, tags) in rows {
+            if let Some(d) = dirname(&path) {
+                seed_dirs.insert(d.to_string());
+            }
+            seed_tags.extend(parse_tags(&tags));
+        }
+    }
+
+    // Cue texts and evidence citation files, keyed by entry — one query each
+    // over live entries; overlap computed in Rust (KB scale is small; same
+    // O(n) tradeoff as the semantic brute-force scan).
+    let mut cues_by_entry: HashMap<String, HashSet<String>> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT c.entry_id, c.cue FROM cues c
+         JOIN entries e ON e.id = c.entry_id WHERE e.is_stale = 0",
+    ) {
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        for (entry_id, cue) in rows {
+            cues_by_entry.entry(entry_id).or_default().insert(cue);
+        }
+    }
+    let mut files_by_entry: HashMap<String, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT ev.entry_id, ev.citation_path FROM evidence ev
+             JOIN entries e ON e.id = ev.entry_id
+             WHERE e.is_stale = 0 AND ev.citation_path IS NOT NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (entry_id, cp) in rows {
+            files_by_entry
+                .entry(entry_id)
+                .or_default()
+                .insert(citation_file(&cp).to_string());
+        }
+    }
+    let empty: HashSet<String> = HashSet::new();
+    let seed_cues: HashSet<&String> = ids
+        .iter()
+        .flat_map(|id| cues_by_entry.get(id).unwrap_or(&empty))
+        .collect();
+    let seed_files: HashSet<&String> = ids
+        .iter()
+        .flat_map(|id| files_by_entry.get(id).unwrap_or(&empty))
+        .collect();
+
+    // Score all live candidates by facet overlap.
+    let mut stmt = conn.prepare(
+        "SELECT id, path, summary, content, tags FROM entries WHERE is_stale = 0",
+    )?;
+    let candidates: Vec<(String, String, String, String, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut scored: Vec<SearchEntry> = Vec::new();
+    for (id, path, summary, content, tags) in candidates {
+        if seed_set.contains(id.as_str()) {
+            continue;
+        }
+        let mut facets = 0u8;
+        if dirname(&path).is_some_and(|d| seed_dirs.contains(d)) {
+            facets += 1;
+        }
+        if !seed_tags.is_empty() && !parse_tags(&tags).is_disjoint(&seed_tags) {
+            facets += 1;
+        }
+        if cues_by_entry
+            .get(&id)
+            .is_some_and(|cs| cs.iter().any(|c| seed_cues.contains(c)))
+        {
+            facets += 1;
+        }
+        if files_by_entry
+            .get(&id)
+            .is_some_and(|fs| fs.iter().any(|f| seed_files.contains(f)))
+        {
+            facets += 1;
+        }
+        if facets > 0 {
+            scored.push(SearchEntry {
+                id,
+                path,
+                summary,
+                content,
+                tags,
+                score: facets as f32,
+                source: "expand",
+                score_kind: "expand",
+                evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
+                origin_repo: None,
+            });
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Greedy MMR re-rank of `entries` in place (Memora pickup .6).
+///
+/// Selection: seed with the top-scored entry (top-1 is never displaced), then
+/// repeatedly pick argmax of `λ·rel_norm − (1−λ)·max_cosine_to_selected`.
+/// `rel_norm` is the entry score divided by the pool max, mapping RRF scores
+/// onto [0,1] so both terms share a scale.
+///
+/// Entries without an embedding row (NoopEmbedder vintage) get similarity 0 —
+/// they look maximally diverse, which errs toward inclusion, never exclusion.
+fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
+    // Fetch embeddings for the pool in one query.
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let placeholders: String = (1..=ids.len())
+        .map(|i| format!("?{}", i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT e.id, emb.embedding FROM entries e
+         JOIN entries_emb emb ON emb.rowid = e.rowid
+         WHERE e.id IN ({})",
+        placeholders
+    );
+    let emb_map: std::collections::HashMap<String, Vec<f32>> = match conn.prepare(&sql) {
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .map(|(id, blob)| (id, decode_emb_blob(&blob)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return, // best-effort: no embeddings, keep RRF order
+    };
+
+    let max_score = entries.iter().map(|e| e.score).fold(f32::MIN, f32::max);
+    if max_score <= 0.0 {
+        return;
+    }
+
+    let mut remaining: Vec<SearchEntry> = std::mem::take(entries);
+    // Seed: highest-scored entry (list is sorted descending).
+    let mut selected: Vec<SearchEntry> = vec![remaining.remove(0)];
+
+    while !remaining.is_empty() {
+        let (best_idx, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(i, cand)| {
+                let rel = cand.score / max_score;
+                let max_sim = emb_map
+                    .get(&cand.id)
+                    .map(|cv| {
+                        selected
+                            .iter()
+                            .filter_map(|s| emb_map.get(&s.id))
+                            .map(|sv| cosine_similarity(cv, sv).max(0.0))
+                            .fold(0.0f32, f32::max)
+                    })
+                    .unwrap_or(0.0);
+                (i, lambda * rel - (1.0 - lambda) * max_sim)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, 0.0));
+        selected.push(remaining.remove(best_idx));
+    }
+
+    *entries = selected;
+}
+
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -1166,10 +1411,17 @@ pub fn search_entries(
             }
 
             // Sort by RRF score descending and cap at limit.
+            // With MMR enabled, keep a 2×limit pool so diversification has
+            // candidates to swap in; the final truncate happens after MMR.
             entries.sort_by(|a, b| {
                 b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
             });
-            entries.truncate(opts.limit);
+            let pool = if opts.mmr_lambda > 0.0 {
+                opts.limit.saturating_mul(2)
+            } else {
+                opts.limit
+            };
+            entries.truncate(pool);
 
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
@@ -1219,6 +1471,15 @@ pub fn search_entries(
                 entries.sort_by(|a, b| {
                     b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
                 });
+            }
+
+            // MMR diversification pass (Memora pickup .6): greedy re-rank of
+            // the pool penalizing similarity to already-selected results, then
+            // cut to limit. Scores and score_kind are left untouched — MMR
+            // changes ORDER and MEMBERSHIP, not the relevance signal.
+            if opts.mmr_lambda > 0.0 && entries.len() > 1 {
+                mmr_rerank(conn, &mut entries, opts.mmr_lambda);
+                entries.truncate(opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
@@ -2039,6 +2300,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
 
@@ -2245,6 +2507,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
 
         let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
@@ -2313,6 +2576,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
         assert!(!results.is_empty(), "FTS must return the entry");
@@ -2331,6 +2595,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
         assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
@@ -2434,6 +2699,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
 
@@ -2728,6 +2994,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: Some(pool_size),
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
             .expect("search must succeed");

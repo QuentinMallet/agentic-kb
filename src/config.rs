@@ -83,6 +83,14 @@ pub struct KbConfig {
     /// Cosine similarity cutoff for paragraph deduplication in kb compress.
     #[serde(default = "default_compress_cosine_cutoff")]
     pub compress_cosine_cutoff: f32,
+    /// Cosine cutoff for the near-duplicate probe on kb_add / MCP kb_add.
+    /// Unset → 0.85. Values > 1.0 disable the probe (cosine never exceeds 1).
+    #[serde(default)]
+    pub dedup_cosine_cutoff: Option<f32>,
+    /// MMR diversification strength for hybrid search (λ in
+    /// λ·relevance − (1−λ)·max_cosine_to_selected). 0.0 disables (default).
+    #[serde(default)]
+    pub mmr_lambda: f32,
 }
 
 impl KbConfig {

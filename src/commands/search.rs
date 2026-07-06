@@ -93,6 +93,7 @@ impl Search {
             repo_root: None,
             verify_pool_size: kb_config.verify_pool_size,
             recency_lambda: kb_config.recency_lambda,
+            mmr_lambda: kb_config.mmr_lambda,
         };
 
         let conn = db::open_db(&paths.db)?;
@@ -127,6 +128,7 @@ impl Search {
                 let peer_opts = db::SearchOptions {
                     repo_root: Some(std::path::PathBuf::from(&peer_path)),
                     recency_lambda: 0.0,
+                    mmr_lambda: 0.0,
                     ..opts.clone()
                 };
                 match db::search_entries(&peer_conn, embedder, &self.query, &peer_opts) {
@@ -594,6 +596,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
@@ -670,6 +673,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
@@ -758,6 +762,7 @@ mod tests {
                     repo_root: None,
                     verify_pool_size: None,
                     recency_lambda: 0.0,
+                    mmr_lambda: 0.0,
                 };
 
                 // Should not panic; FTS keywords inside quotes are treated as literals
@@ -835,6 +840,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
 
         let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;

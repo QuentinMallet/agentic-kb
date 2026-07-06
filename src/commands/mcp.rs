@@ -65,6 +65,7 @@ impl Mcp {
         // SearchOptions so the config knob is honoured in MCP search requests.
         let verify_pool_size_default = crate::application::APP.config().verify_pool_size;
         let recency_lambda_default = crate::application::APP.config().recency_lambda;
+        let mmr_lambda_default = crate::application::APP.config().mmr_lambda;
 
         // Build embedder once; reused for all requests in this session.
         let emb = make_embedder(&paths);
@@ -83,7 +84,7 @@ impl Mcp {
             if line.trim().is_empty() {
                 continue;
             }
-            let response = handle_request(&line, &paths, emb.as_ref(), inline_verify_k_default, verify_pool_size_default, recency_lambda_default);
+            let response = handle_request(&line, &paths, emb.as_ref(), inline_verify_k_default, verify_pool_size_default, recency_lambda_default, mmr_lambda_default);
             println!("{response}");
             io::stdout().flush()?;
         }
@@ -98,6 +99,7 @@ fn handle_request(
     inline_verify_k_default: usize,
     verify_pool_size_default: Option<usize>,
     recency_lambda_default: f32,
+    mmr_lambda_default: f32,
 ) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -110,7 +112,7 @@ fn handle_request(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "search" => handle_search(&id, &req, paths, emb, inline_verify_k_default, verify_pool_size_default, recency_lambda_default),
+        "search" => handle_search(&id, &req, paths, emb, inline_verify_k_default, verify_pool_size_default, recency_lambda_default, mmr_lambda_default),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
@@ -152,7 +154,33 @@ fn handle_search(
     inline_verify_k_default: usize,
     verify_pool_size_default: Option<usize>,
     recency_lambda_default: f32,
+    mmr_lambda_default: f32,
 ) -> Value {
+    // Frontier expand mode (Memora pickup .7): expand_ids present → return
+    // facet-overlap neighbors of the given entry ids; no query needed. The
+    // calling agent drives the EXPAND / RE_QUERY / STOP loop.
+    if let Some(expand_ids) = req.get("expand_ids").and_then(|v| v.as_array()) {
+        let ids: Vec<String> = expand_ids
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if ids.is_empty() {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"expand_ids must be a non-empty array of entry ids"});
+        }
+        let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+        let conn = match db::open_db(&paths.db) {
+            Ok(c) => c,
+            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        };
+        return match db::expand_entries(&conn, &ids, limit) {
+            Ok(results) => {
+                let entries = entries_to_json(results);
+                json!({"id": id, "type": "result", "entries": entries})
+            }
+            Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+        };
+    }
+
     let query = match req.get("query").and_then(|q| q.as_str()) {
         Some(q) => q.to_string(),
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"}),
@@ -193,6 +221,7 @@ fn handle_search(
         repo_root,
         verify_pool_size: verify_pool_size_default,
         recency_lambda: recency_lambda_default,
+        mmr_lambda: mmr_lambda_default,
     };
 
     let conn = match db::open_db(&paths.db) {
@@ -200,13 +229,20 @@ fn handle_search(
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    // Cap content per entry to prevent port line buffer overflow (10MB limit).
-    // 8000 chars per entry * 50 entries = 400KB typical, well under the limit.
-    const MAX_CONTENT_CHARS: usize = 8000;
-
     match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
-            let entries: Vec<Value> = results
+            let entries = entries_to_json(results);
+            json!({"id": id, "type": "result", "entries": entries})
+        }
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    }
+}
+
+/// Serialize SearchEntry rows to the MCP wire shape (shared by search and
+/// expand modes). Content capped to prevent port line buffer overflow.
+fn entries_to_json(results: Vec<db::SearchEntry>) -> Vec<Value> {
+    const MAX_CONTENT_CHARS: usize = 8000;
+    results
                 .into_iter()
                 .map(|e| {
                     let tags: Value =
@@ -254,11 +290,7 @@ fn handle_search(
                         "origin_repo": e.origin_repo,
                     })
                 })
-                .collect();
-            json!({"id": id, "type": "result", "entries": entries})
-        }
-        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    }
+                .collect()
 }
 
 /// MCP kb_add handler.
@@ -1737,7 +1769,7 @@ mod tests {
 
         // Search with path_prefix filter
         let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
@@ -1770,7 +1802,7 @@ mod tests {
             "method":"search","id":"clamp-limit-search",
             "query":"clamp-limit-needle","mode":"fts","limit":10_000
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(
@@ -1835,7 +1867,7 @@ mod tests {
             "limit": n,
             "inline_verify_k": 10_000
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert_eq!(entries.len(), n, "all entries must be returned");
@@ -1902,7 +1934,7 @@ mod tests {
             "method":"search","id":"env-search",
             "query":"envelope-needle","mode":"fts","limit":5
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -2163,7 +2195,7 @@ mod tests {
             line in proptest::string::string_regex("\\PC*").unwrap(),
         ) {
             let (_dir, paths, emb) = setup();
-            let resp = handle_request(&line, &paths, &emb, 10, None, 0.0);
+            let resp = handle_request(&line, &paths, &emb, 10, None, 0.0, 0.0);
             // Response is always a structured JSON value with a "type" field.
             let ty = resp.get("type")
                 .and_then(|v| v.as_str())
@@ -2546,7 +2578,7 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/conf0", None);
         let id = json!(null);
         let req = json!({"query": "conf0", "mode": "fts"});
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         let entries = resp["entries"].as_array().unwrap();
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
@@ -2565,7 +2597,7 @@ mod tests {
         handle_audit_record(&id, &req, &paths, &emb);
 
         let req2 = json!({"query": "conf1", "mode": "fts"});
-        let resp = handle_search(&id, &req2, &paths, &emb, 10, None, 0.0);
+        let resp = handle_search(&id, &req2, &paths, &emb, 10, None, 0.0, 0.0);
         let entries = resp["entries"].as_array().unwrap();
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
@@ -2743,7 +2775,7 @@ mod tests {
         let rec_resp = handle_audit_record(&id, &rec_req, &paths, &emb);
         assert_eq!(rec_resp["expired"], 1);
 
-        let search = handle_search(&id, &json!({"query":"e2e entry","mode":"fts"}), &paths, &emb, 10, None, 0.0);
+        let search = handle_search(&id, &json!({"query":"e2e entry","mode":"fts"}), &paths, &emb, 10, None, 0.0, 0.0);
         let hits = search["entries"].as_array().unwrap();
         assert!(!hits.iter().any(|e| e["id"] == eid), "expired entry must not appear in search");
 
@@ -2775,7 +2807,7 @@ mod tests {
         seed_audit_candidate(&paths, "run-conf-e2e", &e2);
         let req_true = json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
         handle_audit_record(&id, &req_true, &paths, &emb);
-        let search2 = handle_search(&id, &json!({"query":"e2e conf","mode":"fts"}), &paths, &emb, 10, None, 0.0);
+        let search2 = handle_search(&id, &json!({"query":"e2e conf","mode":"fts"}), &paths, &emb, 10, None, 0.0, 0.0);
         let entries2 = search2["entries"].as_array().unwrap();
         if let Some(e) = entries2.iter().find(|e| e["id"] == e2) {
             let conf = e["confidence"].as_f64().unwrap();
