@@ -28,9 +28,11 @@
 
   Scope notes (analyst audit, 2026-07-06):
     * append_events_batch writes line-by-line; a crash mid-batch persists a
-      valid PREFIX of the batch.  The DB stays consistent with the shorter
-      log, so S1-S3 hold; torn-final-line durability is out of scope here
-      (handled by read_events parsing + rebuild snapshot bound).
+      valid PREFIX of the batch.  This is MODELLED: CrashMidAppend appends
+      every strict prefix of the pending batch and crashes, and TLC verifies
+      S1-S3 still hold after Rebuild.  Torn-final-line durability (a partial
+      LINE, not a partial batch) remains out of scope (handled by
+      read_events parsing + rebuild snapshot bound).
     * The impl's is_stale=1 upsert variant (strips FTS/emb/cues) is never
       emitted with a cues field by kb_core::add and is out of scope.
     * replace_path CAN emit expire(X) + upsert(X) for the SAME id when the
@@ -149,6 +151,17 @@ Crash ==
   /\ phase' = "crashed"
   /\ UNCHANGED << jsonl, db_entries, db_cues, batch_events, apply_idx >>
 
+\* Crash DURING the append: append_events_batch writes one line per event, so
+\* a crash mid-write persists a strict PREFIX of the batch (0..n-1 events).
+\* The DB is untouched (no apply started). Rebuild must still converge.
+CrashMidAppend ==
+  /\ phase = "appended"
+  /\ \E k \in 0..(Len(batch_events) - 1) :
+       jsonl' = jsonl \o SubSeq(batch_events, 1, k)
+  /\ crash' = TRUE
+  /\ phase' = "crashed"
+  /\ UNCHANGED << db_entries, db_cues, batch_events, apply_idx >>
+
 \* Recovery: rebuild replays the full JSONL (entries and cue rows together).
 Rebuild ==
   /\ phase = "crashed"
@@ -172,6 +185,7 @@ Next_CueBatch ==
        StartReplace(eid, nid, cs)
   \/ \E nid \in EntryIds, cs \in SUBSET CueIds : StartAdd(nid, cs)
   \/ AppendBatch
+  \/ CrashMidAppend
   \/ ApplyNext
   \/ Crash
   \/ Rebuild

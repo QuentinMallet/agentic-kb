@@ -1089,6 +1089,10 @@ pub fn expand_entries(
     if ids.is_empty() {
         return Ok(vec![]);
     }
+    // Request-amplification cap: seeds come from untrusted MCP input and feed
+    // SQL placeholder construction + facet scans. Excess seeds are dropped.
+    const MAX_EXPAND_SEEDS: usize = 32;
+    let ids = &ids[..ids.len().min(MAX_EXPAND_SEEDS)];
     let limit = limit.min(MAX_LIMIT);
     let seed_set: HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
 
@@ -1669,7 +1673,9 @@ pub fn search_entries(
             // cut to limit. Scores and score_kind are left untouched — MMR
             // changes ORDER and MEMBERSHIP, not the relevance signal.
             if opts.mmr_lambda > 0.0 && entries.len() > 1 {
-                mmr_rerank(conn, &mut entries, opts.mmr_lambda);
+                // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
+                // similarity REWARD, actively clustering duplicates.
+                mmr_rerank(conn, &mut entries, opts.mmr_lambda.clamp(0.0, 1.0));
                 entries.truncate(opts.limit);
             }
         } else {

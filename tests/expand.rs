@@ -132,6 +132,26 @@ fn test_expand_unknown_id_empty() {
     assert!(results.is_empty());
 }
 
+/// Request-amplification cap: seeds beyond MAX_EXPAND_SEEDS (32) are dropped
+/// silently — the call succeeds using the first 32.
+#[test]
+fn test_expand_seed_count_capped() {
+    let conn = setup();
+    let mut ids: Vec<String> = (0..40).map(|i| format!("junk-{i}")).collect();
+    ids.push("seed".to_string()); // position 41 — beyond the cap, must be ignored
+    let results = expand_entries(&conn, &ids, 10).unwrap();
+    assert!(
+        results.is_empty(),
+        "seed beyond the 32-seed cap must not contribute facets: {:?}",
+        results.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+
+    let mut ids2: Vec<String> = vec!["seed".to_string()]; // inside the cap
+    ids2.extend((0..40).map(|i| format!("junk-{i}")));
+    let results2 = expand_entries(&conn, &ids2, 10).unwrap();
+    assert!(!results2.is_empty(), "seed inside the cap must still expand");
+}
+
 #[test]
 fn test_expand_respects_limit() {
     let conn = setup();

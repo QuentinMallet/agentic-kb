@@ -39,10 +39,16 @@ defmodule AgenticKbMcp.McpServer do
           "expand_ids" => %{
             "type" => "array",
             "items" => %{"type" => "string"},
-            "description" => "Frontier expand mode: instead of a query, return entries ADJACENT to these entry ids (same path directory, shared tag, shared cue, or shared evidence file), ranked by facet overlap. Use after a normal search when results feel incomplete: expand the best hits, then decide to expand further, re-query with refined terms, or stop. `query` is ignored in this mode."
+            "minItems" => 1,
+            "maxItems" => 32,
+            "description" => "Frontier expand mode: instead of a query, return entries ADJACENT to these entry ids (same path directory, shared tag, shared cue, or shared evidence file), ranked by facet overlap. Use after a normal search when results feel incomplete: expand the best hits, then decide to expand further, re-query with refined terms, or stop. `query` is ignored in this mode. Max 32 seed ids."
           }
         },
-        "required" => []
+        "required" => [],
+        "anyOf" => [
+          %{"required" => ["query"]},
+          %{"required" => ["expand_ids"]}
+        ]
       }
     },
     %{
