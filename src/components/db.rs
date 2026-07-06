@@ -34,6 +34,25 @@ use std::path::{Path, PathBuf};
 // while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
 // = 4k verification threads, which the test host tolerates.
 pub const MAX_LIMIT: usize = 100;
+
+/// Entry field caps — MUST match the schema CHECK constraints on `entries`
+/// (SQLite LENGTH counts characters on TEXT, hence char-based clamping).
+pub const MAX_SUMMARY_CHARS: usize = 200;
+pub const MAX_ENTRY_CONTENT_CHARS: usize = 10_000;
+
+/// Clamp a field to `max` chars, warning loudly when data is dropped.
+/// Deterministic — replaying the same event always yields the same row.
+fn clamp_chars<'a>(s: &'a str, max: usize, field: &str, id: &str) -> std::borrow::Cow<'a, str> {
+    if s.chars().count() <= max {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        eprintln!(
+            "kb: WARNING entry {id}: legacy {field} exceeds {max} chars — clamped on replay \
+             (pre-cap event; the JSONL retains the full value)"
+        );
+        std::borrow::Cow::Owned(s.chars().take(max).collect())
+    }
+}
 pub const MAX_INLINE_VERIFY_K: usize = 20;
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
@@ -86,6 +105,39 @@ pub fn sweep_expired_peers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Schema generation of THIS binary. Bump when derived-state shape changes
+/// in a way that requires replaying the event log (new tables/lanes whose
+/// rows only materialize through apply_event, changed embedding semantics).
+///
+/// v1: implicit — every DB created before the stamp existed.
+/// v2: cues + kb_meta tables, cue rows materialized from upsert events.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// True when the DB carries the current schema_version stamp.
+///
+/// Only fresh DBs (created by `open_db`/`open_db_memory` from nothing) and
+/// rebuild outputs are stamped — a pre-existing DB opened by a newer binary
+/// gets missing TABLES from `ensure_schema` but keeps reading as obsolete
+/// until a rebuild replays the log into them.
+pub fn schema_is_current(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM kb_meta WHERE key='schema_version'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<i64>().ok())
+    .is_some_and(|v| v >= SCHEMA_VERSION)
+}
+
+fn stamp_schema_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
+        params![SCHEMA_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+
 /// Open (or create) the SQLite database at the given path.
 pub fn open_db(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
@@ -94,9 +146,25 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open DB {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // Fresh-DB detection BEFORE ensure_schema: a DB with no entries table was
+    // just created and gets stamped current; a pre-existing DB keeps whatever
+    // stamp it has (none = legacy = obsolete) so callers can force a rebuild.
+    let is_fresh: bool = !table_exists(&conn, "entries");
     ensure_schema(&conn)?;
+    if is_fresh {
+        stamp_schema_version(&conn)?;
+    }
     sweep_expired_peers(&conn)?;
     Ok(conn)
+}
+
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .is_ok()
 }
 
 /// Open an in-memory database with the full schema.
@@ -104,6 +172,7 @@ pub fn open_db_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     ensure_schema(&conn)?;
+    stamp_schema_version(&conn)?;
     Ok(conn)
 }
 
@@ -523,6 +592,15 @@ pub fn apply_event(
             let path = event["path"].as_str().context("missing path")?;
             let summary = event["summary"].as_str().context("missing summary")?;
             let content = event["content"].as_str().context("missing content")?;
+            // Legacy-log tolerance (br-23b-handoff-tomorrow-y0a): events
+            // written before the length caps existed can exceed the schema
+            // CHECKs. Clamp deterministically instead of aborting — replay
+            // (rebuild is the RECOVERY path) must never fail on data the log
+            // actually contains. New writes are rejected with a clear error
+            // in kb_core::add before any event is appended.
+            let summary = clamp_chars(summary, MAX_SUMMARY_CHARS, "summary", id);
+            let content = clamp_chars(content, MAX_ENTRY_CONTENT_CHARS, "content", id);
+            let (summary, content) = (summary.as_ref(), content.as_ref());
             let tags = event["tags"].to_string();
             let version_ref = event["version_ref"].as_str();
             let ts = event["ts"].as_str().unwrap_or("");

@@ -70,6 +70,14 @@ impl Mcp {
         // Build embedder once; reused for all requests in this session.
         let emb = make_embedder(&paths);
 
+        // Schema-generation gate (br-23b-handoff-tomorrow-uob): first
+        // interaction with a pre-v2 DB replays the log once so new derived
+        // state (cue rows, vintage stamp) materializes. Steady state: one
+        // stamp read. Best-effort — a failed upgrade must not kill the port.
+        if let Err(e) = crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref()) {
+            eprintln!("warn: schema upgrade rebuild failed (serving current DB): {e}");
+        }
+
         let ready = json!({
             "type": "ready",
             "version": "1.0",

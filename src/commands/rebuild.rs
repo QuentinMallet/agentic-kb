@@ -33,6 +33,58 @@ fn take_phase2_barrier() -> Option<std::sync::Arc<std::sync::Barrier>> {
         .take()
 }
 
+/// Force a one-time rebuild when the DB predates the current schema
+/// generation (br-23b-handoff-tomorrow-uob).
+///
+/// Legacy DBs (created before the `schema_version` stamp existed) have their
+/// missing tables created empty by `ensure_schema`, but rows that only
+/// materialize through `apply_event` (cue rows, embedding vintages) stay
+/// absent until the log is replayed. Entry points (MCP startup, CLI
+/// search/add/eval) call this once per interaction; it is a cheap stamp read
+/// in the steady state.
+///
+/// Returns `Ok(true)` when a rebuild was performed.
+pub fn rebuild_if_schema_obsolete(
+    paths: &config::Paths,
+    embedder: &dyn Embedder,
+) -> anyhow::Result<bool> {
+    {
+        let conn = db::open_db(&paths.db)?;
+        if db::schema_is_current(&conn) {
+            return Ok(false);
+        }
+        // Obsolete stamp but nothing to replay (no/empty event log): the DB
+        // cannot contain derived rows the log would produce — stamp and move on.
+        let has_events = fs::metadata(&paths.events).map(|m| m.len() > 0).unwrap_or(false);
+        if !has_events {
+            conn.execute(
+                "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
+                rusqlite::params![db::SCHEMA_VERSION.to_string()],
+            )?;
+            return Ok(false);
+        }
+    }
+    // A Noop embedder would replay the log WITHOUT embeddings — wiping
+    // entries_emb on a legacy KB. Defer the upgrade (and the stamp) until an
+    // interaction with a real embedder comes along.
+    if embedder.is_noop() {
+        eprintln!(
+            "kb: DB schema predates v{} but KB_NO_EMBED is set — deferring the \
+             upgrade rebuild to avoid dropping embeddings",
+            db::SCHEMA_VERSION
+        );
+        return Ok(false);
+    }
+    eprintln!(
+        "kb: DB schema predates v{} — replaying the event log once to \
+         materialize new derived state (cue rows, embedding vintage stamp)...",
+        db::SCHEMA_VERSION
+    );
+    (Rebuild).execute_with(paths, embedder)?;
+    eprintln!("kb: schema upgrade rebuild complete.");
+    Ok(true)
+}
+
 /// Replay all events and rebuild agent-kb.db from scratch
 #[derive(Command, Debug, Parser)]
 pub struct Rebuild;

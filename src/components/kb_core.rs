@@ -140,6 +140,25 @@ pub fn add(
         }
     }
 
+    // Entry field caps — validated on the REDACTED values (redaction markers
+    // can change length) so the schema CHECK can never fire mid-batch.
+    // Rejecting here gives a clear error; apply_event's clamp is for legacy
+    // pre-cap events only, never for new writes.
+    if args.summary.chars().count() > db::MAX_SUMMARY_CHARS {
+        anyhow::bail!(
+            "summary exceeds {} chars ({})",
+            db::MAX_SUMMARY_CHARS,
+            args.summary.chars().count()
+        );
+    }
+    if args.content.chars().count() > db::MAX_ENTRY_CONTENT_CHARS {
+        anyhow::bail!(
+            "content exceeds {} chars ({}) — split the entry or use kb ingest",
+            db::MAX_ENTRY_CONTENT_CHARS,
+            args.content.chars().count()
+        );
+    }
+
     let _lock = acquire_lock(&paths.lock)?;
     let conn = db::open_db(&paths.db)?;
 

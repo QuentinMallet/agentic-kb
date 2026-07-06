@@ -68,6 +68,7 @@ impl Search {
             config::Paths::discover()?
         };
         let emb = crate::commands::add::make_embedder(&paths);
+        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
         self.execute_with(&paths, emb.as_ref())
     }
 
