@@ -100,23 +100,69 @@ pub fn rebuild_if_schema_obsolete(
     // unreachable (layout mismatch) — replaying it would silently DROP every
     // uncovered row. Manual `kb rebuild` remains available to operators.
     {
-        let log_upsert_ids: std::collections::HashSet<String> =
-            match events::read_events(&paths.events) {
-                Ok(evts) => evts
-                    .iter()
-                    .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
-                    .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
-                    .collect(),
-                Err(e) => {
-                    eprintln!(
-                        "kb: WARNING cannot parse event log at {} ({e}) — deferring the \
-                         schema upgrade rebuild",
-                        paths.events.display()
-                    );
-                    return Ok(false);
-                }
-            };
+        let evts = match events::read_events(&paths.events) {
+            Ok(evts) => evts,
+            Err(e) => {
+                eprintln!(
+                    "kb: WARNING cannot parse event log at {} ({e}) — deferring the \
+                     schema upgrade rebuild",
+                    paths.events.display()
+                );
+                return Ok(false);
+            }
+        };
+        let log_upsert_ids: std::collections::HashSet<String> = evts
+            .iter()
+            .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
+            .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+            .collect();
+        // Freshness guard (codex round 5): a RESTORED/stale log can cover
+        // every live id yet carry older payloads — replaying it would roll
+        // the DB back. Under the JSONL-first write protocol the log is never
+        // older than the DB, so a DB whose newest row post-dates the log's
+        // newest event by more than a generous skew margin means the log is
+        // not this DB's history. Refuse; log-vs-DB reconciliation is an
+        // operator decision (`kb rebuild` if the log should win).
+        const FRESHNESS_SKEW_SECS: i64 = 24 * 3600;
+        let log_max_ts: Option<chrono::NaiveDateTime> = evts
+            .iter()
+            .filter_map(|e| e["ts"].as_str())
+            .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.naive_utc())
+            .max();
+        // updated_at carries MIXED formats: RFC3339 (apply_event upserts use
+        // the event ts) and sqlite's "%Y-%m-%d %H:%M:%S" (expire updates,
+        // column DEFAULT). Parse both per row and max AFTER parsing — a
+        // string-level MAX across formats is not chronologically sound.
+        fn parse_updated_at(s: &str) -> Option<chrono::NaiveDateTime> {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| t.naive_utc())
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                })
+        }
         let conn = db::open_db(&paths.db)?;
+        let db_max_updated: Option<chrono::NaiveDateTime> = conn
+            .prepare("SELECT updated_at FROM entries WHERE is_stale=0")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter_map(|s| parse_updated_at(&s))
+            .max();
+        if let (Some(log_ts), Some(db_ts)) = (log_max_ts, db_max_updated) {
+            if (db_ts - log_ts).num_seconds() > FRESHNESS_SKEW_SECS {
+                eprintln!(
+                    "kb: WARNING DB schema predates v{} but the event log's newest event \
+                     ({log_ts}) is more than {}h older than the DB's newest entry \
+                     ({db_ts}) — the log looks restored/stale and auto-rebuild could roll \
+                     entries back. Refusing; reconcile the log, or run `kb rebuild` \
+                     deliberately if the log should win.",
+                    db::SCHEMA_VERSION,
+                    FRESHNESS_SKEW_SECS / 3600
+                );
+                return Ok(false);
+            }
+        }
         let mut stmt = conn.prepare("SELECT id FROM entries WHERE is_stale=0")?;
         let live_ids: Vec<String> = stmt
             .query_map([], |r| r.get(0))?

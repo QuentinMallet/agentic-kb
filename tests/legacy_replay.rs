@@ -72,7 +72,7 @@ fn base_args(id: &str) -> AddArgs {
         kind: "memory".into(),
         evidence_status: "n/a".into(),
         evidence_rows: vec![],
-        ts: "2024-01-01T00:00:00Z".into(),
+        ts: chrono::Utc::now().to_rfc3339(),
         session: "test".into(),
         session_id: None,
         expire_reason: String::new(),
@@ -254,6 +254,45 @@ fn test_partial_log_refuses_auto_rebuild() {
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 3, "no entry may be dropped by the refused upgrade");
+}
+
+/// Freshness guard (codex round-5 finding): a restored/stale log that covers
+/// every live id but whose newest event is far older than the DB's newest row
+/// must refuse auto-rebuild — replaying it would roll entries back.
+#[test]
+fn test_stale_covering_log_refuses_auto_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+
+    add(&paths, &NoopEmbedder, base_args("rolled")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+    // Replace the log with a STALE one: same id (full coverage) but an old
+    // payload and an event ts years behind the DB row's updated_at.
+    fs::write(
+        &paths.events,
+        serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "rolled",
+            "path": "t/rolled", "summary": "OLD payload", "content": "OLD content",
+            "tags": [], "ts": "2020-01-01T00:00:00Z",
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    assert!(!rebuilt, "stale covering log must refuse auto-rebuild");
+
+    let conn = open_db(&paths.db).unwrap();
+    assert!(!schema_is_current(&conn), "refusal must not stamp");
+    let content: String = conn
+        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "ok", "the newer DB payload must survive (base_args content)");
 }
 
 /// Single-flight (codex review finding): concurrent first interactions with
