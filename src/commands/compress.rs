@@ -213,6 +213,8 @@ pub fn run(
         session: "cli".to_string(),
         session_id: None,
         expire_reason: "compressed by kb compress".to_string(),
+        dedup_cutoff: None,
+        cues: vec![],
     };
 
     kb_core::add(paths, embedder, add_args)?;
@@ -269,6 +271,7 @@ mod tests {
             kind: "memory".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd.execute_with(paths, &emb).unwrap();
     }

@@ -172,6 +172,25 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             embedding BLOB NOT NULL
         );
 
+        -- Cue anchors (Memora pickup .4): agent-supplied semantic entry points,
+        -- embedded per row. Rows are replaced wholesale on entry upsert and
+        -- removed on expire (agent-kb/tla/CueBatch.tla S2/S3).
+        CREATE TABLE IF NOT EXISTS cues (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id  TEXT NOT NULL,
+            cue       TEXT NOT NULL,
+            embedding BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_cues_entry ON cues(entry_id);
+
+        -- Derived-state metadata (NOT event-sourced; rebuilt DBs start empty).
+        -- embed_text_mode: which KB_EMBED_TEXT vintage entries_emb was built
+        -- with — used to warn on mixed-vintage writes.
+        CREATE TABLE IF NOT EXISTS kb_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS test_cases (
             id          TEXT PRIMARY KEY,
             app         TEXT NOT NULL,
@@ -393,6 +412,102 @@ fn increment_post_cutover_writes(conn: &Connection) {
     );
 }
 
+/// Which text is embedded per entry. Controlled by `KB_EMBED_TEXT`:
+/// - unset / `"full"`: path + summary + content (legacy default)
+/// - `"abstraction"`: path + summary + flattened tags — the Memora principle
+///   of indexing abstractions, not content. Content stays FTS-indexed.
+///
+/// Switching modes requires a full `kb reembed --all` (or rebuild) — mixed
+/// vintages in entries_emb make cosine scores incomparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTextMode {
+    Full,
+    Abstraction,
+}
+
+impl EmbedTextMode {
+    /// Parse a mode string; anything unrecognized falls back to Full so a
+    /// typo can never silently drop content from every new embedding.
+    pub fn parse(v: Option<&str>) -> Self {
+        match v {
+            Some("abstraction") => EmbedTextMode::Abstraction,
+            _ => EmbedTextMode::Full,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("KB_EMBED_TEXT").ok().as_deref())
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmbedTextMode::Full => "full",
+            EmbedTextMode::Abstraction => "abstraction",
+        }
+    }
+}
+
+/// Stamp/verify the embed-text mode vintage of `entries_emb`.
+///
+/// The first embed write stamps the active mode into `kb_meta`; later writes
+/// under a DIFFERENT mode warn loudly — mixed-vintage embeddings make cosine
+/// scores incomparable and degrade ranking with no error (review finding).
+/// The stamp resets only when derived state is rebuilt from scratch (rebuild
+/// replays into a fresh DB), which is exactly when a mode switch is safe.
+pub fn check_embed_mode_vintage(conn: &Connection, mode: EmbedTextMode) {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='embed_text_mode'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    match stored {
+        None => {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO kb_meta(key, value) VALUES('embed_text_mode', ?1)",
+                params![mode.as_str()],
+            );
+        }
+        Some(v) if v != mode.as_str() => {
+            eprintln!(
+                "kb: WARNING embed_text_mode mismatch — entries_emb built with '{v}', \
+                 KB_EMBED_TEXT now '{}'; cosine scores are incomparable across vintages. \
+                 Run `kb rebuild` (or clear entries_emb + `kb reembed`) to converge.",
+                mode.as_str()
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Flatten a JSON-array tags string (`["a","b"]`) to plain words for
+/// embedding. Non-JSON tag strings pass through unchanged.
+fn tags_for_embedding(tags: &str) -> String {
+    match serde_json::from_str::<Vec<String>>(tags) {
+        Ok(v) => v.join(" "),
+        Err(_) => tags.to_string(),
+    }
+}
+
+/// Build the text embedded for an entry. Single source of truth shared by
+/// apply_event, `kb reembed`, and the MCP reembed handler — the three sites
+/// must never diverge or cosine scores become vintage-dependent.
+pub fn entry_embed_text(
+    mode: EmbedTextMode,
+    path: &str,
+    summary: &str,
+    content: &str,
+    tags: &str,
+) -> String {
+    match mode {
+        EmbedTextMode::Full => format!("{} {} {}", path, summary, content),
+        EmbedTextMode::Abstraction => {
+            format!("{} {} {}", path, summary, tags_for_embedding(tags))
+        }
+    }
+}
+
 /// Apply a single event to the database.
 pub fn apply_event(
     conn: &Connection,
@@ -419,61 +534,104 @@ pub fn apply_event(
             let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
             let session_id = event["session_id"].as_str();
 
-            conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-                 ON CONFLICT(id) DO UPDATE SET
-                   path=excluded.path, summary=excluded.summary,
-                   content=excluded.content, tags=excluded.tags,
-                   version_ref=excluded.version_ref,
-                   permanent=excluded.permanent,
-                   is_stale=excluded.is_stale,
-                   kind=excluded.kind,
-                   evidence_status=excluded.evidence_status,
-                   session_id=excluded.session_id,
-                   updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
-            )?;
-
-            // Stale entries: clean up FTS/embeddings so they don't appear in search.
-            // DELETE entries_emb in the same transaction as the entries write so no
-            // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
-            if is_stale == 1 {
-                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
-                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+            // Single transaction: entry INSERT + FTS sync + embedding + cue
+            // replace. One upsert event applies atomically, matching
+            // CueBatch.tla's ApplyNext — a reader can never observe the entry
+            // with a stale cue set or missing embedding mid-apply.
+            //
+            // Manual BEGIN/COMMIT because `apply_event` takes `&Connection`,
+            // not `&mut Connection` (same pattern as the expire branch).
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<bool> {
                 conn.execute(
-                    "DELETE FROM entries_emb WHERE rowid = \
-                     (SELECT rowid FROM entries WHERE id=?1)",
+                    "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                     ON CONFLICT(id) DO UPDATE SET
+                       path=excluded.path, summary=excluded.summary,
+                       content=excluded.content, tags=excluded.tags,
+                       version_ref=excluded.version_ref,
+                       permanent=excluded.permanent,
+                       is_stale=excluded.is_stale,
+                       kind=excluded.kind,
+                       evidence_status=excluded.evidence_status,
+                       session_id=excluded.session_id,
+                       updated_at=excluded.updated_at",
+                    params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
+                )?;
+
+                // Stale entries: clean up FTS/embeddings/cues so they don't
+                // appear in search (br-improvement-catalog-23b.6 GC,
+                // CueBatch.tla S2). Returns false: stale upserts don't count
+                // toward the FTS deprecation gate.
+                if is_stale == 1 {
+                    // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                    let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+                    conn.execute(
+                        "DELETE FROM entries_emb WHERE rowid = \
+                         (SELECT rowid FROM entries WHERE id=?1)",
+                        params![id],
+                    )?;
+                    conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                    return Ok(false);
+                }
+
+                let rowid: i64 = conn.query_row(
+                    "SELECT rowid FROM entries WHERE id=?1",
                     params![id],
+                    |r| r.get(0),
                 )?;
-                return Ok(());
+
+                // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+                let _ = conn.execute(
+                    "INSERT INTO entries_fts(id, path, summary, content, tags)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![id, path, summary, content, tags],
+                );
+
+                // Sync embedding store (f16 wire format — 768 bytes per entry)
+                if !embedder.is_noop() {
+                    let mode = EmbedTextMode::from_env();
+                    check_embed_mode_vintage(conn, mode);
+                    let text = entry_embed_text(mode, path, summary, content, &tags);
+                    let emb = embedder.embed(&text)?;
+                    let blob = f32s_to_f16_blob(&emb);
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
+                        params![rowid, blob],
+                    )?;
+                }
+
+                // Replace cue rows wholesale (CueBatch.tla S3). Legacy events
+                // without a "cues" field still clear rows from any prior
+                // upsert that had cues.
+                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                if let Some(cues) = event["cues"].as_array() {
+                    for cue in cues.iter().filter_map(|c| c.as_str()) {
+                        let blob: Option<Vec<u8>> = if embedder.is_noop() {
+                            None
+                        } else {
+                            Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                        };
+                        conn.execute(
+                            "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
+                            params![id, cue, blob],
+                        )?;
+                    }
+                }
+                Ok(true)
+            })();
+            let counts_toward_gate = match result {
+                Ok(counts) => counts,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            };
+            conn.execute_batch("COMMIT")?;
+            if counts_toward_gate {
+                increment_post_cutover_writes(conn);
             }
-
-            let rowid: i64 = conn.query_row(
-                "SELECT rowid FROM entries WHERE id=?1",
-                params![id],
-                |r| r.get(0),
-            )?;
-
-            // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
-            let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
-            let _ = conn.execute(
-                "INSERT INTO entries_fts(id, path, summary, content, tags)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![id, path, summary, content, tags],
-            );
-
-            // Sync embedding store (f16 wire format — 768 bytes per entry)
-            if !embedder.is_noop() {
-                let text = format!("{} {} {}", path, summary, content);
-                let emb = embedder.embed(&text)?;
-                let blob = f32s_to_f16_blob(&emb);
-                conn.execute(
-                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
-                    params![rowid, blob],
-                )?;
-            }
-            increment_post_cutover_writes(conn);
         }
 
         ("expire", "entries") => {
@@ -499,6 +657,8 @@ pub fn apply_event(
                      (SELECT rowid FROM entries WHERE id=?1)",
                     params![id],
                 )?;
+                // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
+                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -658,6 +818,14 @@ pub struct SearchOptions {
     /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
     /// in hybrid mode. Forced to 0.0 for peer federation queries (clock skew).
     pub recency_lambda: f32,
+    /// MMR diversification strength for hybrid search. 0.0 disables (default,
+    /// byte-identical to pre-MMR behavior). In (0,1]: greedy re-rank over a
+    /// 2×limit pool maximizing λ·relevance − (1−λ)·max_cosine_to_selected.
+    ///
+    /// Note: the cue-anchor lane (and MMR) run only in HYBRID mode
+    /// (do_fts && do_semantic). Semantic-only mode is a raw
+    /// entry-embedding debugging lane and intentionally skips both.
+    pub mmr_lambda: f32,
 }
 
 impl Default for SearchOptions {
@@ -672,6 +840,7 @@ impl Default for SearchOptions {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         }
     }
 }
@@ -899,6 +1068,250 @@ pub fn fts_query_content_entries(
 /// FTS queries are wrapped in double-quotes to enable phrase search and prevent
 /// FTS5 operator injection (e.g. unexpected `AND`/`OR` parsing).
 /// Active FTS table is selected by `KB_FTS_READ_PATH` (default: "content_entries").
+/// Frontier expand primitive (Memora pickup .7): live entries adjacent to the
+/// seed ids. Adjacency facets, one point each:
+///   * same path directory (all components up to the last `/`)
+///   * at least one shared tag
+///   * at least one shared cue text
+///   * at least one shared evidence citation file
+///
+/// The calling agent is the retrieval policy loop (Memora's EXPAND / RE_QUERY /
+/// STOP); this function only materializes the frontier. Seeds are excluded,
+/// stale entries are excluded, results sorted by facet count descending.
+/// `score` = facet count, `score_kind` = "expand".
+pub fn expand_entries(
+    conn: &Connection,
+    ids: &[String],
+    limit: usize,
+) -> Result<Vec<SearchEntry>> {
+    use std::collections::{HashMap, HashSet};
+
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    // Request-amplification cap: seeds come from untrusted MCP input and feed
+    // SQL placeholder construction + facet scans. Excess seeds are dropped.
+    const MAX_EXPAND_SEEDS: usize = 32;
+    let ids = &ids[..ids.len().min(MAX_EXPAND_SEEDS)];
+    let limit = limit.min(MAX_LIMIT);
+    let seed_set: HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+
+    fn dirname(path: &str) -> Option<&str> {
+        path.rfind('/').map(|i| &path[..i])
+    }
+    fn parse_tags(tags: &str) -> HashSet<String> {
+        serde_json::from_str::<Vec<String>>(tags)
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
+    }
+    fn citation_file(citation_path: &str) -> &str {
+        citation_path.rsplit_once(':').map_or(citation_path, |(f, _)| f)
+    }
+
+    // Seed facets.
+    let mut seed_dirs: HashSet<String> = HashSet::new();
+    let mut seed_tags: HashSet<String> = HashSet::new();
+    {
+        let placeholders: String =
+            (1..=ids.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, tags FROM entries WHERE is_stale = 0 AND id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.is_empty() {
+            return Ok(vec![]); // unknown or stale seeds
+        }
+        for (path, tags) in rows {
+            if let Some(d) = dirname(&path) {
+                seed_dirs.insert(d.to_string());
+            }
+            seed_tags.extend(parse_tags(&tags));
+        }
+    }
+
+    // Cue texts and evidence citation files, keyed by entry — one query each
+    // over live entries; overlap computed in Rust (KB scale is small; same
+    // O(n) tradeoff as the semantic brute-force scan).
+    let mut cues_by_entry: HashMap<String, HashSet<String>> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT c.entry_id, c.cue FROM cues c
+         JOIN entries e ON e.id = c.entry_id WHERE e.is_stale = 0",
+    ) {
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        for (entry_id, cue) in rows {
+            cues_by_entry.entry(entry_id).or_default().insert(cue);
+        }
+    }
+    let mut files_by_entry: HashMap<String, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT ev.entry_id, ev.citation_path FROM evidence ev
+             JOIN entries e ON e.id = ev.entry_id
+             WHERE e.is_stale = 0 AND ev.citation_path IS NOT NULL",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (entry_id, cp) in rows {
+            files_by_entry
+                .entry(entry_id)
+                .or_default()
+                .insert(citation_file(&cp).to_string());
+        }
+    }
+    let empty: HashSet<String> = HashSet::new();
+    let seed_cues: HashSet<&String> = ids
+        .iter()
+        .flat_map(|id| cues_by_entry.get(id).unwrap_or(&empty))
+        .collect();
+    let seed_files: HashSet<&String> = ids
+        .iter()
+        .flat_map(|id| files_by_entry.get(id).unwrap_or(&empty))
+        .collect();
+
+    // Score all live candidates by facet overlap.
+    let mut stmt = conn.prepare(
+        "SELECT id, path, summary, content, tags FROM entries WHERE is_stale = 0",
+    )?;
+    let candidates: Vec<(String, String, String, String, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut scored: Vec<SearchEntry> = Vec::new();
+    for (id, path, summary, content, tags) in candidates {
+        if seed_set.contains(id.as_str()) {
+            continue;
+        }
+        let mut facets = 0u8;
+        if dirname(&path).is_some_and(|d| seed_dirs.contains(d)) {
+            facets += 1;
+        }
+        if !seed_tags.is_empty() && !parse_tags(&tags).is_disjoint(&seed_tags) {
+            facets += 1;
+        }
+        if cues_by_entry
+            .get(&id)
+            .is_some_and(|cs| cs.iter().any(|c| seed_cues.contains(c)))
+        {
+            facets += 1;
+        }
+        if files_by_entry
+            .get(&id)
+            .is_some_and(|fs| fs.iter().any(|f| seed_files.contains(f)))
+        {
+            facets += 1;
+        }
+        if facets > 0 {
+            scored.push(SearchEntry {
+                id,
+                path,
+                summary,
+                content,
+                tags,
+                score: facets as f32,
+                source: "expand",
+                score_kind: "expand",
+                evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
+                origin_repo: None,
+            });
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    scored.truncate(limit);
+    Ok(scored)
+}
+
+/// Greedy MMR re-rank of `entries` in place (Memora pickup .6).
+///
+/// Selection: seed with the top-scored entry (top-1 is never displaced), then
+/// repeatedly pick argmax of `λ·rel_norm − (1−λ)·max_cosine_to_selected`.
+/// `rel_norm` is the entry score divided by the pool max, mapping RRF scores
+/// onto [0,1] so both terms share a scale.
+///
+/// Entries without an embedding row (NoopEmbedder vintage) get similarity 0 —
+/// they look maximally diverse, which errs toward inclusion, never exclusion.
+fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
+    // Fetch embeddings for the pool in one query.
+    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    let placeholders: String = (1..=ids.len())
+        .map(|i| format!("?{}", i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT e.id, emb.embedding FROM entries e
+         JOIN entries_emb emb ON emb.rowid = e.rowid
+         WHERE e.id IN ({})",
+        placeholders
+    );
+    let emb_map: std::collections::HashMap<String, Vec<f32>> = match conn.prepare(&sql) {
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .map(|(id, blob)| (id, decode_emb_blob(&blob)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => return, // best-effort: no embeddings, keep RRF order
+    };
+
+    let max_score = entries.iter().map(|e| e.score).fold(f32::MIN, f32::max);
+    if max_score <= 0.0 {
+        return;
+    }
+
+    let mut remaining: Vec<SearchEntry> = std::mem::take(entries);
+    // Seed: highest-scored entry (list is sorted descending).
+    let mut selected: Vec<SearchEntry> = vec![remaining.remove(0)];
+
+    while !remaining.is_empty() {
+        let (best_idx, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(i, cand)| {
+                let rel = cand.score / max_score;
+                let max_sim = emb_map
+                    .get(&cand.id)
+                    .map(|cv| {
+                        selected
+                            .iter()
+                            .filter_map(|s| emb_map.get(&s.id))
+                            .map(|sv| cosine_similarity(cv, sv).max(0.0))
+                            .fold(0.0f32, f32::max)
+                    })
+                    .unwrap_or(0.0);
+                (i, lambda * rel - (1.0 - lambda) * max_sim)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((0, 0.0));
+        selected.push(remaining.remove(best_idx));
+    }
+
+    *entries = selected;
+}
+
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -1043,6 +1456,63 @@ pub fn search_entries(
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Cue lane (Memora pickup .4): score each live entry by its best-cosine
+        // cue anchor. Ranked separately so RRF fuses it as a third source.
+        // Best-effort: absence of the cues table (pre-migration DB) is not an
+        // error, just an empty lane.
+        let mut cue_ranked: Vec<(f32, String, String, String, String, String)> = Vec::new();
+        if opts.do_fts {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags
+             FROM cues c
+             JOIN entries e ON e.id = c.entry_id
+             WHERE e.is_stale = 0
+               AND c.embedding IS NOT NULL
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
+        ) {
+            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String)> = stmt
+                .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+
+            // Best cue score per entry.
+            let mut best: std::collections::HashMap<String, (f32, String, String, String, String)> =
+                std::collections::HashMap::new();
+            for (entry_id, blob, path, summary, content, tags) in cue_rows {
+                decode_f16_blob_into(&blob, &mut scratch);
+                let sim = if scratch.is_empty() {
+                    let fallback = decode_emb_blob(&blob);
+                    cosine_similarity(&q_emb, &fallback)
+                } else {
+                    cosine_similarity(&q_emb, &scratch)
+                };
+                match best.get(&entry_id) {
+                    Some((prev, ..)) if *prev >= sim => {}
+                    _ => {
+                        best.insert(entry_id, (sim, path, summary, content, tags));
+                    }
+                }
+            }
+            cue_ranked = best
+                .into_iter()
+                .map(|(id, (sim, path, summary, content, tags))| (sim, id, path, summary, content, tags))
+                .collect();
+            cue_ranked
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            cue_ranked.truncate(opts.limit.saturating_mul(2));
+        }
+        }
+
         if opts.do_fts {
             // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
             // FTS and semantic rankings. Each entry's RRF score is the sum of
@@ -1062,15 +1532,18 @@ pub fn search_entries(
                 rrf_scores.insert(entry.id.clone(), contrib);
             }
 
-            // Build a lookup for semantic candidates (id → (rank, metadata)).
-            let sem_total = candidates.len();
-            let mut sem_meta: std::collections::HashMap<String, (String, String, String, String, String)> =
-                std::collections::HashMap::with_capacity(sem_total);
-            for (sem_rank, (_, id, path, summary, content, tags)) in candidates.iter().enumerate() {
+            // Second RRF source: semantic candidate ranks.
+            for (sem_rank, (_, id, ..)) in candidates.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
-                sem_meta.insert(id.clone(), (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone()));
+            }
+
+            // Third RRF source: cue-anchor lane (best cue cosine per entry).
+            for (cue_rank, (_, id, ..)) in cue_ranked.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
+                let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
+                *entry += contrib;
             }
 
             // Re-build entries from rrf_scores, merging FTS entries and new semantic-only entries.
@@ -1085,6 +1558,7 @@ pub fn search_entries(
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
             for (_, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit * 2) {
                 if !fts_meta.contains_key(&id) {
+                    fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
                         path,
@@ -1102,6 +1576,28 @@ pub fn search_entries(
                 }
             }
 
+            // Cue-only entries (reached via a cue anchor, absent from both the
+            // FTS and entry-embedding lanes) still need materializing.
+            for (_, id, path, summary, content, tags) in cue_ranked.into_iter() {
+                if !fts_meta.contains_key(&id) {
+                    fts_meta.insert(id.clone(), entries.len());
+                    entries.push(SearchEntry {
+                        id: id.clone(),
+                        path,
+                        summary,
+                        content,
+                        tags,
+                        score: 0.0, // will be overwritten below
+                        source: "cue",
+                        score_kind: "rrf",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                    });
+                }
+            }
+
             // Apply RRF scores to all entries and mark score_kind as "rrf".
             for entry in &mut entries {
                 let rrf = rrf_scores.get(&entry.id).copied().unwrap_or(0.0);
@@ -1110,10 +1606,17 @@ pub fn search_entries(
             }
 
             // Sort by RRF score descending and cap at limit.
+            // With MMR enabled, keep a 2×limit pool so diversification has
+            // candidates to swap in; the final truncate happens after MMR.
             entries.sort_by(|a, b| {
                 b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
             });
-            entries.truncate(opts.limit);
+            let pool = if opts.mmr_lambda > 0.0 {
+                opts.limit.saturating_mul(2)
+            } else {
+                opts.limit
+            };
+            entries.truncate(pool);
 
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
@@ -1163,6 +1666,17 @@ pub fn search_entries(
                 entries.sort_by(|a, b| {
                     b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
                 });
+            }
+
+            // MMR diversification pass (Memora pickup .6): greedy re-rank of
+            // the pool penalizing similarity to already-selected results, then
+            // cut to limit. Scores and score_kind are left untouched — MMR
+            // changes ORDER and MEMBERSHIP, not the relevance signal.
+            if opts.mmr_lambda > 0.0 && entries.len() > 1 {
+                // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
+                // similarity REWARD, actively clustering duplicates.
+                mmr_rerank(conn, &mut entries, opts.mmr_lambda.clamp(0.0, 1.0));
+                entries.truncate(opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
@@ -1983,6 +2497,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "br-bhg regression", &opts).unwrap();
 
@@ -2189,6 +2704,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
 
         let results = search_entries(&conn, &embedder, "byte cap test", &opts).unwrap();
@@ -2257,6 +2773,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
         assert!(!results.is_empty(), "FTS must return the entry");
@@ -2275,6 +2792,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
         assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
@@ -2378,6 +2896,7 @@ mod tests {
             repo_root: None,
             verify_pool_size: None,
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
 
@@ -2672,6 +3191,7 @@ mod tests {
             repo_root: Some(root.to_path_buf()),
             verify_pool_size: Some(pool_size),
             recency_lambda: 0.0,
+            mmr_lambda: 0.0,
         };
         let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
             .expect("search must succeed");

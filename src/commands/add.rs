@@ -54,6 +54,10 @@ pub struct Add {
     /// Path to a JSON file containing an array of evidence objects (mutually exclusive with --evidence)
     #[arg(long, conflicts_with = "evidence")]
     pub evidence_file: Option<String>,
+    /// Cue anchor "[Main Entity] + [Key Aspect]" (repeatable, max 8).
+    /// Semantic entry points embedded separately from the entry.
+    #[arg(long = "cue")]
+    pub cues: Vec<String>,
 }
 
 impl Runnable for Add {
@@ -137,10 +141,18 @@ impl Add {
                 session,
                 session_id: omc_session_id,
                 expire_reason: "replaced by --replace-path".to_string(),
+                dedup_cutoff: config::KbConfig::from_paths(paths).dedup_cutoff(),
+                cues: self.cues.clone(),
             },
         )?;
 
         println!("added  {} ({})", self.path, outcome.entry_id);
+        for s in &outcome.similar_existing {
+            eprintln!(
+                "warn: similar existing entry (cosine {:.2}): [{}] {} (id={})",
+                s.score, s.path, s.summary, s.id
+            );
+        }
         Ok(())
     }
 }
@@ -286,6 +298,7 @@ mod tests {
             kind: "belief".to_string(),
             evidence: vec![r#"{"kind":"code","citation_hash":"sha256:abc123"}"#.to_string()],
             evidence_file: None,
+            cues: vec![],
         }
     }
 
@@ -338,6 +351,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -364,6 +378,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
@@ -438,6 +453,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd1.execute_with(&paths, &embedder).unwrap();
 
@@ -454,6 +470,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
@@ -507,6 +524,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -565,6 +583,7 @@ mod tests {
             kind: "fact".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
         assert!(err.to_string().contains("invalid kind 'fact'"));
@@ -590,6 +609,7 @@ mod tests {
             kind: "observation".to_string(),
             evidence: vec![r#"{"kind":"test","citation_hash":"sha256:abc"}"#.to_string()],
             evidence_file: None,
+            cues: vec![],
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
         assert!(err.to_string().contains("Phase 1 ships evidence.kind=code|derived only"));
@@ -616,6 +636,7 @@ mod tests {
             kind: "observation".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
         assert!(
@@ -647,6 +668,7 @@ mod tests {
                 r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_sha":"abc","citation_hash":"sha256:bbb","citation_excerpt":"fn bar() {}"}"#.to_string(),
             ],
             evidence_file: None,
+            cues: vec![],
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -725,6 +747,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 

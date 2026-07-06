@@ -99,6 +99,7 @@ fn hybrid_opts(recency_lambda: f32) -> SearchOptions {
         repo_root: None,
         verify_pool_size: None,
         recency_lambda,
+        mmr_lambda: 0.0,
     }
 }
 

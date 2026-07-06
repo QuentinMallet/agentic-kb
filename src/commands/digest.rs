@@ -147,6 +147,8 @@ pub fn digest_session(
             session,
             session_id: omc_session_id,
             expire_reason: format!("replaced by session digest for {session_id}"),
+            dedup_cutoff: None,
+            cues: vec![],
         },
     )?;
 
@@ -240,7 +242,13 @@ mod tests {
     use crate::components::db;
     use crate::config::Paths;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// KB_STATE_DIR is process-global; tests that set it must not interleave
+    /// or one test resolves another's (already-dropped) tempdir. Poisoning is
+    /// recovered because a panicked holder leaves no shared state behind.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     fn setup() -> (tempfile::TempDir, Paths) {
         let dir = tempdir().unwrap();
@@ -268,6 +276,7 @@ mod tests {
     fn test_digest_session_basic() {
         let (dir, paths) = setup();
         let state_dir = paths.db.parent().unwrap().to_path_buf();
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("KB_STATE_DIR", &state_dir);
 
         let content = make_transcript_content(5);
@@ -295,6 +304,7 @@ mod tests {
     fn test_digest_session_no_change() {
         let (dir, paths) = setup();
         let state_dir = paths.db.parent().unwrap().to_path_buf();
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("KB_STATE_DIR", &state_dir);
 
         let content = make_transcript_content(5);
@@ -321,6 +331,7 @@ mod tests {
     fn test_digest_session_hash_idempotence() {
         let (dir, paths) = setup();
         let state_dir = paths.db.parent().unwrap().to_path_buf();
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("KB_STATE_DIR", &state_dir);
 
         let content = make_transcript_content(3);
@@ -349,6 +360,7 @@ mod tests {
     fn test_digest_session_empty_transcript() {
         let (dir, paths) = setup();
         let state_dir = paths.db.parent().unwrap().to_path_buf();
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("KB_STATE_DIR", &state_dir);
 
         let tp = write_transcript(&dir, "empty.jsonl", "");

@@ -83,3 +83,51 @@ echo 'recency_lambda = 0.0' >> kb.toml
 
 - [Hybrid Search](./architecture/hybrid-search.md) — RRF scoring before recency decay
 - [Stale Entries](./concepts/staleness.md) — how entries age and are filtered
+
+## MMR Diversification
+
+With `mmr_lambda > 0`, hybrid search re-ranks a 2×limit candidate pool after
+RRF + recency, greedily selecting results that maximize:
+
+```
+λ × relevance − (1−λ) × max_cosine_to_already_selected
+```
+
+Relevance is the RRF score normalized to the pool maximum. The top-1 result is
+never displaced; subsequent picks trade rank for diversity, so two
+near-duplicate entries stop occupying two of the top-k slots.
+
+```toml
+mmr_lambda = 0.5    # Default: 0.0 (disabled, byte-identical ordering)
+```
+
+Entries without embeddings look maximally diverse to MMR (similarity 0) — the
+pass errs toward inclusion. Validate any non-zero λ with `kb eval` before
+adopting it.
+
+## Near-Duplicate Probe on Add
+
+`kb add` / MCP `kb_add` run a semantic-only search for live entries whose
+embedding cosine is at or above the dedup cutoff and report them — the add is
+never blocked. CLI prints `warn: similar existing entry ...`; MCP returns
+`similar_existing: [{id, path, summary, score}]` so the calling agent can
+merge or expire instead of accumulating near-duplicates.
+
+```toml
+dedup_cosine_cutoff = 0.85   # Default when unset: 0.85. Values > 1.0 disable.
+```
+
+Internal re-add paths (rebuild, digest, compress, import) skip the probe.
+
+## Embedding Text Mode (`KB_EMBED_TEXT`)
+
+What gets embedded per entry:
+
+| Mode | Text | Notes |
+|------|------|-------|
+| `full` (default) | `path summary content` | Legacy behavior |
+| `abstraction` | `path summary tags` | Memora principle: index abstractions, not content. Content stays FTS-indexed. |
+
+Switching modes requires re-embedding the whole store (`kb reembed` after
+deleting `entries_emb` rows, or `kb rebuild`) — mixed-vintage embeddings make
+cosine scores incomparable. Measure with `kb eval` before and after.

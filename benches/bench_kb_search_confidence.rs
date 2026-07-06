@@ -64,6 +64,7 @@ fn bench_search_confidence(c: &mut Criterion) {
         repo_root: None,
         verify_pool_size: None,
         recency_lambda: 0.0,
+        mmr_lambda: 0.0,
     };
 
     // Baseline: same query, no source_weights rows (would be identical structure)

@@ -44,13 +44,13 @@ impl Reembed {
 
         // Find non-stale entries with no embedding row
         let mut stmt = conn.prepare(
-            "SELECT e.rowid, e.id, e.path, e.summary, e.content
+            "SELECT e.rowid, e.id, e.path, e.summary, e.content, e.tags
              FROM entries e
              WHERE e.is_stale = 0
                AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
         )?;
 
-        let candidates: Vec<(i64, String, String, String, String)> = stmt
+        let candidates: Vec<(i64, String, String, String, String, String)> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -58,15 +58,20 @@ impl Reembed {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?
             .filter_map(|r| r.ok())
             .collect();
 
+        // Size filter runs on the ACTUAL embed text for the active mode —
+        // in Abstraction mode content is excluded and tags included, so a
+        // path+summary+content heuristic would mis-skip (review finding).
+        let mode = db::EmbedTextMode::from_env();
         let to_embed: Vec<_> = candidates
             .iter()
-            .filter(|(_, _, path, summary, content)| {
-                path.len() + summary.len() + content.len() + 2 <= self.max_chars
+            .filter(|(_, _, path, summary, content, tags)| {
+                db::entry_embed_text(mode, path, summary, content, tags).len() <= self.max_chars
             })
             .collect();
 
@@ -79,7 +84,7 @@ impl Reembed {
                 skipped_size,
                 self.max_chars
             );
-            for (_, id, path, _, _) in &to_embed {
+            for (_, id, path, _, _, _) in &to_embed {
                 println!("  would embed: [{path}] id={id}");
             }
             return Ok(());
@@ -93,8 +98,9 @@ impl Reembed {
         let mut done = 0usize;
         let mut failed = 0usize;
 
-        for (rowid, id, path, summary, content) in &to_embed {
-            let text = format!("{} {} {}", path, summary, content);
+        db::check_embed_mode_vintage(&conn, mode);
+        for (rowid, id, path, summary, content, tags) in &to_embed {
+            let text = db::entry_embed_text(mode, path, summary, content, tags);
             match embedder.embed(&text) {
                 Ok(emb_vec) => {
                     let blob = f32s_to_f16_blob(&emb_vec);
@@ -148,6 +154,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -178,6 +185,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
