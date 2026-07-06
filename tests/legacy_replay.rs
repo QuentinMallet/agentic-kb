@@ -224,6 +224,38 @@ fn test_missing_log_does_not_disarm_upgrade() {
     assert!(schema_is_current(&conn), "empty DB with no log may stamp without rebuild");
 }
 
+/// Coverage guard (codex round-4 finding): an obsolete DB whose log does NOT
+/// cover its live entries (partial/foreign log created after the original
+/// went unreachable) must never auto-rebuild — that would drop the uncovered
+/// rows. The gate refuses, warns, and leaves the DB unstamped and intact.
+#[test]
+fn test_partial_log_refuses_auto_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+
+    add(&paths, &NoopEmbedder, base_args("legacy-a")).unwrap();
+    add(&paths, &NoopEmbedder, base_args("legacy-b")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+    // Simulate the partial-log hazard: the original log is gone; one later
+    // write created a fresh log containing only a NEW entry.
+    fs::remove_file(&paths.events).unwrap();
+    add(&paths, &NoopEmbedder, base_args("only-in-new-log")).unwrap();
+
+    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    assert!(!rebuilt, "partial log must refuse auto-rebuild");
+
+    let conn = open_db(&paths.db).unwrap();
+    assert!(!schema_is_current(&conn), "refusal must not stamp");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3, "no entry may be dropped by the refused upgrade");
+}
+
 /// Single-flight (codex review finding): concurrent first interactions with
 /// an obsolete KB serialize on the upgrade lock — exactly one performs the
 /// rebuild, the loser re-checks the stamp and returns without rebuilding.

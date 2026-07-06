@@ -94,6 +94,50 @@ pub fn rebuild_if_schema_obsolete(
             return Ok(false);
         }
     }
+    // Coverage guard (codex review finding): the AUTO-rebuild must never run
+    // from a log that does not cover the DB's live entries. Such a partial /
+    // foreign log exists when writes landed after the original log went
+    // unreachable (layout mismatch) — replaying it would silently DROP every
+    // uncovered row. Manual `kb rebuild` remains available to operators.
+    {
+        let log_upsert_ids: std::collections::HashSet<String> =
+            match events::read_events(&paths.events) {
+                Ok(evts) => evts
+                    .iter()
+                    .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
+                    .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+                    .collect(),
+                Err(e) => {
+                    eprintln!(
+                        "kb: WARNING cannot parse event log at {} ({e}) — deferring the \
+                         schema upgrade rebuild",
+                        paths.events.display()
+                    );
+                    return Ok(false);
+                }
+            };
+        let conn = db::open_db(&paths.db)?;
+        let mut stmt = conn.prepare("SELECT id FROM entries WHERE is_stale=0")?;
+        let live_ids: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let uncovered = live_ids
+            .iter()
+            .filter(|id| !log_upsert_ids.contains(*id))
+            .count();
+        if uncovered > 0 {
+            eprintln!(
+                "kb: WARNING DB schema predates v{} but the event log at {} does NOT cover \
+                 {uncovered} of {} live entries — auto-rebuild would drop them. Refusing; \
+                 restore the full event log (or run `kb rebuild` deliberately).",
+                db::SCHEMA_VERSION,
+                paths.events.display(),
+                live_ids.len()
+            );
+            return Ok(false);
+        }
+    }
     // A Noop embedder would replay the log WITHOUT embeddings — wiping
     // entries_emb on a legacy KB. Defer the upgrade (and the stamp) until an
     // interaction with a real embedder comes along.
