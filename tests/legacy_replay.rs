@@ -183,6 +183,42 @@ fn test_obsolete_schema_forces_one_rebuild() {
     assert!(!rebuilt_again, "current schema must not rebuild again");
 }
 
+/// Single-flight (codex review finding): concurrent first interactions with
+/// an obsolete KB serialize on the upgrade lock — exactly one performs the
+/// rebuild, the loser re-checks the stamp and returns without rebuilding.
+#[test]
+fn test_concurrent_upgrade_single_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+
+    add(&paths, &NoopEmbedder, base_args("cc-1")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+
+    let results: Vec<bool> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let paths = &paths;
+                s.spawn(move || rebuild_if_schema_obsolete(paths, &FixedEmbedder).unwrap())
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let rebuilds = results.iter().filter(|r| **r).count();
+    assert_eq!(rebuilds, 1, "exactly one of the racers must rebuild, got {results:?}");
+
+    let conn = open_db(&paths.db).unwrap();
+    assert!(schema_is_current(&conn));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "entries must survive the racing upgrade");
+}
+
 /// Invariant 8: end-to-end rebuild over a legacy log with an oversized event.
 #[test]
 fn test_rebuild_survives_oversized_legacy_event() {

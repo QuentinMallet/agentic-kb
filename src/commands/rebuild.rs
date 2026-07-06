@@ -48,6 +48,20 @@ pub fn rebuild_if_schema_obsolete(
     paths: &config::Paths,
     embedder: &dyn Embedder,
 ) -> anyhow::Result<bool> {
+    // Fast path: no lock for the steady-state stamp read.
+    {
+        let conn = db::open_db(&paths.db)?;
+        if db::schema_is_current(&conn) {
+            return Ok(false);
+        }
+    }
+    // Single-flight (codex review finding): concurrent first interactions
+    // serialize on a dedicated upgrade lock — distinct from the write flock,
+    // which Rebuild's phases acquire and release internally (holding THAT
+    // across execute_with would self-deadlock). After acquiring, re-check the
+    // stamp: the loser of the race finds the winner's stamp and returns.
+    let upgrade_lock = paths.lock.with_extension("schema-upgrade.lock");
+    let _flight = acquire_lock(&upgrade_lock)?;
     {
         let conn = db::open_db(&paths.db)?;
         if db::schema_is_current(&conn) {
@@ -133,7 +147,27 @@ impl Rebuild {
             barrier.wait(); // synchronise with concurrent writers in tests
         }
 
-        let tmp_db = paths.db.with_extension("db.tmp");
+        // Per-process tmp path: concurrent rebuilds (manual + auto-upgrade,
+        // or two sessions) must never share/delete each other's tmp DB
+        // (codex review finding). Orphans from CRASHED rebuilds are swept —
+        // a file is an orphan only when its embedded pid is no longer alive
+        // (/proc/<pid> absent); a live pid means a rebuild in flight, leave it.
+        let tmp_db = paths.db.with_extension(format!("db.tmp.{}", std::process::id()));
+        if let (Some(dir), Some(stem)) = (paths.db.parent(), paths.db.file_name()) {
+            let prefix = format!("{}.tmp.", stem.to_string_lossy());
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let Some(pid_str) = name.strip_prefix(&prefix) else { continue };
+                    let alive = pid_str
+                        .parse::<u32>()
+                        .is_ok_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+                    if e.path() != tmp_db && !alive {
+                        let _ = fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
         let _ = fs::remove_file(&tmp_db);
         {
             // Stop at snapshot_len so we never encounter a partial tail line
