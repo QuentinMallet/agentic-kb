@@ -163,6 +163,91 @@ fn test_legacy_event_without_cues() {
     assert_eq!(count_cues(&conn, "c6"), 0);
 }
 
+/// Spec Rebuild action (CueBatch.tla): replaying the full JSONL into a fresh
+/// DB rematerializes cue rows exactly — after upsert, cue-set replace, and
+/// expire, the rebuilt cues table equals the live one.
+#[test]
+fn test_rebuild_replays_cue_rows() {
+    use kb::commands::rebuild::Rebuild;
+    use kb::components::kb_core::{add, AddArgs};
+    use kb::config::Paths;
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+    let emb = KeywordEmbedder;
+
+    let mk = |id: &str, cues: Vec<String>| AddArgs {
+        id: id.into(),
+        path: format!("notes/{id}"),
+        summary: "summary".into(),
+        content: "content".into(),
+        tags: serde_json::json!([]),
+        version_ref: None,
+        permanent: false,
+        replace_path: false,
+        kind: "belief".into(),
+        evidence_status: "missing".into(),
+        evidence_rows: vec![],
+        ts: "2024-01-01T00:00:00Z".into(),
+        session: "test".into(),
+        session_id: None,
+        expire_reason: String::new(),
+        dedup_cutoff: None,
+        cues,
+    };
+
+    // History: r1 gets cues then a replacing cue set; r2 gets cues then expires.
+    add(&paths, &emb, mk("r1", vec!["old anchor".into()])).unwrap();
+    add(&paths, &emb, mk("r1", vec!["cuetok kept".into(), "second kept".into()])).unwrap();
+    add(&paths, &emb, mk("r2", vec!["doomed anchor".into()])).unwrap();
+    {
+        let conn = kb::components::db::open_db(&paths.db).unwrap();
+        apply_event(
+            &conn,
+            &emb,
+            &json!({"action": "expire", "table": "entries", "id": "r2",
+                    "reason": "test", "ts": "2024-01-02T00:00:00Z"}),
+        )
+        .unwrap();
+        // The expire above bypassed the event log (DB-only) — append it so the
+        // log is the source of truth the rebuild will replay.
+        kb::components::events::append_event(
+            &paths.events,
+            &json!({"action": "expire", "table": "entries", "id": "r2",
+                    "reason": "test", "ts": "2024-01-02T00:00:00Z"}),
+        )
+        .unwrap();
+    }
+
+    let live_cues = |paths: &Paths| -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT entry_id, cue FROM cues ORDER BY entry_id, cue")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    let before = live_cues(&paths);
+    assert_eq!(
+        before,
+        vec![
+            ("r1".to_string(), "cuetok kept".to_string()),
+            ("r1".to_string(), "second kept".to_string()),
+        ],
+        "pre-rebuild state must be the replaced cue set only"
+    );
+
+    // Rebuild from the event log into a fresh DB (spec Rebuild action).
+    (Rebuild).execute_with(&paths, &emb).unwrap();
+
+    let after = live_cues(&paths);
+    assert_eq!(after, before, "rebuild must rematerialize cue rows exactly");
+}
+
 /// Invariant 6: kb_core::add carries cues end-to-end (event + DB).
 #[test]
 fn test_kb_core_add_propagates_cues() {
