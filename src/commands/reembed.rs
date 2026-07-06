@@ -44,13 +44,13 @@ impl Reembed {
 
         // Find non-stale entries with no embedding row
         let mut stmt = conn.prepare(
-            "SELECT e.rowid, e.id, e.path, e.summary, e.content
+            "SELECT e.rowid, e.id, e.path, e.summary, e.content, e.tags
              FROM entries e
              WHERE e.is_stale = 0
                AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
         )?;
 
-        let candidates: Vec<(i64, String, String, String, String)> = stmt
+        let candidates: Vec<(i64, String, String, String, String, String)> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -58,6 +58,7 @@ impl Reembed {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -65,7 +66,7 @@ impl Reembed {
 
         let to_embed: Vec<_> = candidates
             .iter()
-            .filter(|(_, _, path, summary, content)| {
+            .filter(|(_, _, path, summary, content, _)| {
                 path.len() + summary.len() + content.len() + 2 <= self.max_chars
             })
             .collect();
@@ -79,7 +80,7 @@ impl Reembed {
                 skipped_size,
                 self.max_chars
             );
-            for (_, id, path, _, _) in &to_embed {
+            for (_, id, path, _, _, _) in &to_embed {
                 println!("  would embed: [{path}] id={id}");
             }
             return Ok(());
@@ -93,8 +94,14 @@ impl Reembed {
         let mut done = 0usize;
         let mut failed = 0usize;
 
-        for (rowid, id, path, summary, content) in &to_embed {
-            let text = format!("{} {} {}", path, summary, content);
+        for (rowid, id, path, summary, content, tags) in &to_embed {
+            let text = db::entry_embed_text(
+                db::EmbedTextMode::from_env(),
+                path,
+                summary,
+                content,
+                tags,
+            );
             match embedder.embed(&text) {
                 Ok(emb_vec) => {
                     let blob = f32s_to_f16_blob(&emb_vec);

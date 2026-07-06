@@ -588,7 +588,7 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT e.rowid, e.id, e.path, e.summary, e.content
+        "SELECT e.rowid, e.id, e.path, e.summary, e.content, e.tags
          FROM entries e
          WHERE e.is_stale = 0
            AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
@@ -597,9 +597,9 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let candidates: Vec<(i64, String, String, String, String)> = match stmt
+    let candidates: Vec<(i64, String, String, String, String, String)> = match stmt
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -607,7 +607,7 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
 
     let total_missing = candidates.len();
     let to_embed: Vec<_> = candidates.iter()
-        .filter(|(_, _, path, summary, content)| path.len() + summary.len() + content.len() + 2 <= max_chars)
+        .filter(|(_, _, path, summary, content, _)| path.len() + summary.len() + content.len() + 2 <= max_chars)
         .collect();
     let skipped = total_missing - to_embed.len();
 
@@ -618,11 +618,20 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
 
     let mut done = 0u32;
     let mut failed = 0u32;
-    for (rowid, _id, path, summary, content) in &to_embed {
-        let text = format!("{} {} {}", path, summary, content);
+    for (rowid, _id, path, summary, content, tags) in &to_embed {
+        let text = crate::components::db::entry_embed_text(
+            crate::components::db::EmbedTextMode::from_env(),
+            path,
+            summary,
+            content,
+            tags,
+        );
         match emb.embed(&text) {
             Ok(emb_vec) => {
-                let blob = crate::models::f32s_to_blob(&emb_vec);
+                // f16 is the canonical wire format (models.rs); the CLI reembed
+                // path writes f16 — this handler previously wrote legacy f32
+                // blobs, creating mixed-vintage rows.
+                let blob = crate::models::f32s_to_f16_blob(&emb_vec);
                 let _ = conn.execute(
                     "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
                     params![rowid, blob],

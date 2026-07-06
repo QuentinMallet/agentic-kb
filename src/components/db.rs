@@ -393,6 +393,61 @@ fn increment_post_cutover_writes(conn: &Connection) {
     );
 }
 
+/// Which text is embedded per entry. Controlled by `KB_EMBED_TEXT`:
+/// - unset / `"full"`: path + summary + content (legacy default)
+/// - `"abstraction"`: path + summary + flattened tags — the Memora principle
+///   of indexing abstractions, not content. Content stays FTS-indexed.
+///
+/// Switching modes requires a full `kb reembed --all` (or rebuild) — mixed
+/// vintages in entries_emb make cosine scores incomparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedTextMode {
+    Full,
+    Abstraction,
+}
+
+impl EmbedTextMode {
+    /// Parse a mode string; anything unrecognized falls back to Full so a
+    /// typo can never silently drop content from every new embedding.
+    pub fn parse(v: Option<&str>) -> Self {
+        match v {
+            Some("abstraction") => EmbedTextMode::Abstraction,
+            _ => EmbedTextMode::Full,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("KB_EMBED_TEXT").ok().as_deref())
+    }
+}
+
+/// Flatten a JSON-array tags string (`["a","b"]`) to plain words for
+/// embedding. Non-JSON tag strings pass through unchanged.
+fn tags_for_embedding(tags: &str) -> String {
+    match serde_json::from_str::<Vec<String>>(tags) {
+        Ok(v) => v.join(" "),
+        Err(_) => tags.to_string(),
+    }
+}
+
+/// Build the text embedded for an entry. Single source of truth shared by
+/// apply_event, `kb reembed`, and the MCP reembed handler — the three sites
+/// must never diverge or cosine scores become vintage-dependent.
+pub fn entry_embed_text(
+    mode: EmbedTextMode,
+    path: &str,
+    summary: &str,
+    content: &str,
+    tags: &str,
+) -> String {
+    match mode {
+        EmbedTextMode::Full => format!("{} {} {}", path, summary, content),
+        EmbedTextMode::Abstraction => {
+            format!("{} {} {}", path, summary, tags_for_embedding(tags))
+        }
+    }
+}
+
 /// Apply a single event to the database.
 pub fn apply_event(
     conn: &Connection,
@@ -465,7 +520,8 @@ pub fn apply_event(
 
             // Sync embedding store (f16 wire format — 768 bytes per entry)
             if !embedder.is_noop() {
-                let text = format!("{} {} {}", path, summary, content);
+                let text =
+                    entry_embed_text(EmbedTextMode::from_env(), path, summary, content, &tags);
                 let emb = embedder.embed(&text)?;
                 let blob = f32s_to_f16_blob(&emb);
                 conn.execute(
