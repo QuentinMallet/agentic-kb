@@ -51,10 +51,22 @@ impl Mcp {
         let paths = config::Paths::from_root(&root);
         // Override db path with the explicitly passed one (handles cases where
         // the symlink .state/agent-kb/agent-kb.db differs from the canonical path).
-        let paths = config::Paths {
+        let mut paths = config::Paths {
             db: self.db.clone(),
             ..paths
         };
+        // Layout-proof fallback: events/lock always live NEXT TO the db file
+        // in every supported layout (<root>/agent-kb/ and <root>/.state/agent-kb/).
+        // root_from_db assumes the former; when handed the latter the derived
+        // sibling paths point nowhere and the schema-upgrade gate (and event
+        // appends!) would target the wrong location.
+        if let Some(dir) = self.db.parent() {
+            if !paths.events.exists() && dir.join("agent-kb-events.jsonl").exists() {
+                paths.events = dir.join("agent-kb-events.jsonl");
+                paths.lock = dir.join("agent-kb.lock");
+            }
+        }
+        let paths = paths;
 
         // br-3gp: read KbConfig::inline_verify_k once at startup so MCP search
         // requests without an explicit override fall back to the configured cap
@@ -69,6 +81,14 @@ impl Mcp {
 
         // Build embedder once; reused for all requests in this session.
         let emb = make_embedder(&paths);
+
+        // Schema-generation gate (br-23b-handoff-tomorrow-uob): first
+        // interaction with a pre-v2 DB replays the log once so new derived
+        // state (cue rows, vintage stamp) materializes. Steady state: one
+        // stamp read. Best-effort — a failed upgrade must not kill the port.
+        if let Err(e) = crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref()) {
+            eprintln!("warn: schema upgrade rebuild failed (serving current DB): {e}");
+        }
 
         let ready = json!({
             "type": "ready",

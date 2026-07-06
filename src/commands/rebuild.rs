@@ -33,6 +33,162 @@ fn take_phase2_barrier() -> Option<std::sync::Arc<std::sync::Barrier>> {
         .take()
 }
 
+/// Force a one-time rebuild when the DB predates the current schema
+/// generation (br-23b-handoff-tomorrow-uob).
+///
+/// Legacy DBs (created before the `schema_version` stamp existed) have their
+/// missing tables created empty by `ensure_schema`, but rows that only
+/// materialize through `apply_event` (cue rows, embedding vintages) stay
+/// absent until the log is replayed. Entry points (MCP startup, CLI
+/// search/add/eval) call this once per interaction; it is a cheap stamp read
+/// in the steady state.
+///
+/// Returns `Ok(true)` when a rebuild was performed.
+pub fn rebuild_if_schema_obsolete(
+    paths: &config::Paths,
+    embedder: &dyn Embedder,
+) -> anyhow::Result<bool> {
+    // Fast path: no lock for the steady-state stamp read.
+    {
+        let conn = db::open_db(&paths.db)?;
+        if db::schema_is_current(&conn) {
+            return Ok(false);
+        }
+    }
+    // Single-flight (codex review finding): concurrent first interactions
+    // serialize on a dedicated upgrade lock — distinct from the write flock,
+    // which Rebuild's phases acquire and release internally (holding THAT
+    // across execute_with would self-deadlock). After acquiring, re-check the
+    // stamp: the loser of the race finds the winner's stamp and returns.
+    let upgrade_lock = paths.lock.with_extension("schema-upgrade.lock");
+    let _flight = acquire_lock(&upgrade_lock)?;
+    {
+        let conn = db::open_db(&paths.db)?;
+        if db::schema_is_current(&conn) {
+            return Ok(false);
+        }
+        // Missing/empty event log: only a DB with ZERO entries is genuinely
+        // fresh (stamp and move on). A populated DB without its log means the
+        // events path did not resolve (layout mismatch) — stamping would
+        // permanently disarm the upgrade while derived state (e.g. the empty
+        // entries_fts_v2 table) stays broken. Warn loudly, leave unstamped so
+        // every interaction retries until the path issue is fixed.
+        let has_events = fs::metadata(&paths.events).map(|m| m.len() > 0).unwrap_or(false);
+        if !has_events {
+            let entries: i64 =
+                conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))?;
+            if entries == 0 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
+                    rusqlite::params![db::SCHEMA_VERSION.to_string()],
+                )?;
+            } else {
+                eprintln!(
+                    "kb: WARNING DB schema predates v{} and holds {entries} entries, but the \
+                     event log was not found at {} — cannot upgrade-rebuild. Check the KB \
+                     path layout; searches may be degraded until the log is reachable.",
+                    db::SCHEMA_VERSION,
+                    paths.events.display()
+                );
+            }
+            return Ok(false);
+        }
+    }
+    // Coverage guard (codex review finding): the AUTO-rebuild must never run
+    // from a log that does not cover the DB's live entries. Such a partial /
+    // foreign log exists when writes landed after the original log went
+    // unreachable (layout mismatch) — replaying it would silently DROP every
+    // uncovered row. Manual `kb rebuild` remains available to operators.
+    {
+        let evts = match events::read_events(&paths.events) {
+            Ok(evts) => evts,
+            Err(e) => {
+                eprintln!(
+                    "kb: WARNING cannot parse event log at {} ({e}) — deferring the \
+                     schema upgrade rebuild",
+                    paths.events.display()
+                );
+                return Ok(false);
+            }
+        };
+        let log_upsert_ids: std::collections::HashSet<String> = evts
+            .iter()
+            .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
+            .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
+            .collect();
+        // Coverage guard: if the log does not even mention every live entry id,
+        // it is obviously not this DB's history (truncated / foreign / wrong
+        // path). Replaying it would drop those entries outright — refuse loudly
+        // and let the operator reconcile rather than silently mangle the KB.
+        let conn = db::open_db(&paths.db)?;
+        let live_ids: Vec<String> = conn
+            .prepare("SELECT id FROM entries WHERE is_stale=0")?
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let uncovered = live_ids
+            .iter()
+            .filter(|id| !log_upsert_ids.contains(*id))
+            .count();
+        if uncovered > 0 {
+            eprintln!(
+                "kb: WARNING DB schema predates v{} but the event log at {} does NOT cover \
+                 {uncovered} of {} live entries — the log is not this DB's history. Refusing \
+                 the automatic upgrade; restore the full event log (or run `kb rebuild` \
+                 deliberately if the log should win).",
+                db::SCHEMA_VERSION,
+                paths.events.display(),
+                live_ids.len()
+            );
+            return Ok(false);
+        }
+    }
+    // A Noop embedder would replay the log WITHOUT embeddings — wiping
+    // entries_emb on a legacy KB. Defer the upgrade (and the stamp) until an
+    // interaction with a real embedder comes along.
+    if embedder.is_noop() {
+        eprintln!(
+            "kb: DB schema predates v{} but KB_NO_EMBED is set — deferring the \
+             upgrade rebuild to avoid dropping embeddings",
+            db::SCHEMA_VERSION
+        );
+        return Ok(false);
+    }
+    eprintln!(
+        "kb: DB schema predates v{} — replaying the event log once to \
+         materialize new derived state (cue rows, embedding vintage stamp)...",
+        db::SCHEMA_VERSION
+    );
+    // Non-destructive by construction: snapshot the pre-upgrade DB before the
+    // rebuild swap. Even if the log is subtly stale in a way coverage cannot
+    // catch (a same-id older payload), the operator recovers the exact prior
+    // state from the backup — the auto-upgrade can never irreversibly lose
+    // data. The backup is therefore MANDATORY: a failure aborts the upgrade
+    // (leaving the DB obsolete-but-intact, retried next interaction) rather
+    // than proceed and break the safety guarantee.
+    let backup = paths.db.with_extension(format!("db.pre-v{}.bak", db::SCHEMA_VERSION));
+    {
+        // Under the write flock so no concurrent writer mutates the DB mid-
+        // snapshot. VACUUM INTO takes a read transaction and emits a single
+        // transactionally-consistent file with no WAL sidecar — unlike a raw
+        // fs::copy of a live WAL database, which can capture a torn state.
+        let _wlock = acquire_lock(&paths.lock)?;
+        let conn = db::open_db(&paths.db)?;
+        let _ = fs::remove_file(&backup);
+        // Escape single quotes in the path for the SQL string literal (the
+        // path is ours, but repo paths can legitimately contain quotes).
+        let target = backup.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{target}'"))
+            .with_context(|| {
+                format!("back up pre-upgrade DB to {} (upgrade aborted)", backup.display())
+            })?;
+    } // release the write flock — Rebuild re-acquires it per phase
+    eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
+    (Rebuild).execute_with(paths, embedder)?;
+    eprintln!("kb: schema upgrade rebuild complete.");
+    Ok(true)
+}
+
 /// Replay all events and rebuild agent-kb.db from scratch
 #[derive(Command, Debug, Parser)]
 pub struct Rebuild;
@@ -81,7 +237,27 @@ impl Rebuild {
             barrier.wait(); // synchronise with concurrent writers in tests
         }
 
-        let tmp_db = paths.db.with_extension("db.tmp");
+        // Per-process tmp path: concurrent rebuilds (manual + auto-upgrade,
+        // or two sessions) must never share/delete each other's tmp DB
+        // (codex review finding). Orphans from CRASHED rebuilds are swept —
+        // a file is an orphan only when its embedded pid is no longer alive
+        // (/proc/<pid> absent); a live pid means a rebuild in flight, leave it.
+        let tmp_db = paths.db.with_extension(format!("db.tmp.{}", std::process::id()));
+        if let (Some(dir), Some(stem)) = (paths.db.parent(), paths.db.file_name()) {
+            let prefix = format!("{}.tmp.", stem.to_string_lossy());
+            if let Ok(rd) = fs::read_dir(dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let Some(pid_str) = name.strip_prefix(&prefix) else { continue };
+                    let alive = pid_str
+                        .parse::<u32>()
+                        .is_ok_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+                    if e.path() != tmp_db && !alive {
+                        let _ = fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
         let _ = fs::remove_file(&tmp_db);
         {
             // Stop at snapshot_len so we never encounter a partial tail line
