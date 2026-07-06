@@ -660,8 +660,12 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
     };
 
     let total_missing = candidates.len();
+    // Filter on the actual embed text for the active mode (review finding).
+    let mode = crate::components::db::EmbedTextMode::from_env();
     let to_embed: Vec<_> = candidates.iter()
-        .filter(|(_, _, path, summary, content, _)| path.len() + summary.len() + content.len() + 2 <= max_chars)
+        .filter(|(_, _, path, summary, content, tags)| {
+            crate::components::db::entry_embed_text(mode, path, summary, content, tags).len() <= max_chars
+        })
         .collect();
     let skipped = total_missing - to_embed.len();
 
@@ -672,14 +676,9 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
 
     let mut done = 0u32;
     let mut failed = 0u32;
+    crate::components::db::check_embed_mode_vintage(&conn, mode);
     for (rowid, _id, path, summary, content, tags) in &to_embed {
-        let text = crate::components::db::entry_embed_text(
-            crate::components::db::EmbedTextMode::from_env(),
-            path,
-            summary,
-            content,
-            tags,
-        );
+        let text = crate::components::db::entry_embed_text(mode, path, summary, content, tags);
         match emb.embed(&text) {
             Ok(emb_vec) => {
                 // f16 is the canonical wire format (models.rs); the CLI reembed

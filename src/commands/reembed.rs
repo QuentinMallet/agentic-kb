@@ -64,10 +64,14 @@ impl Reembed {
             .filter_map(|r| r.ok())
             .collect();
 
+        // Size filter runs on the ACTUAL embed text for the active mode —
+        // in Abstraction mode content is excluded and tags included, so a
+        // path+summary+content heuristic would mis-skip (review finding).
+        let mode = db::EmbedTextMode::from_env();
         let to_embed: Vec<_> = candidates
             .iter()
-            .filter(|(_, _, path, summary, content, _)| {
-                path.len() + summary.len() + content.len() + 2 <= self.max_chars
+            .filter(|(_, _, path, summary, content, tags)| {
+                db::entry_embed_text(mode, path, summary, content, tags).len() <= self.max_chars
             })
             .collect();
 
@@ -94,14 +98,9 @@ impl Reembed {
         let mut done = 0usize;
         let mut failed = 0usize;
 
+        db::check_embed_mode_vintage(&conn, mode);
         for (rowid, id, path, summary, content, tags) in &to_embed {
-            let text = db::entry_embed_text(
-                db::EmbedTextMode::from_env(),
-                path,
-                summary,
-                content,
-                tags,
-            );
+            let text = db::entry_embed_text(mode, path, summary, content, tags);
             match embedder.embed(&text) {
                 Ok(emb_vec) => {
                     let blob = f32s_to_f16_blob(&emb_vec);

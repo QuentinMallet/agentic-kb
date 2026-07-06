@@ -99,13 +99,14 @@ impl KbConfig {
         self.dep_depth.unwrap_or(1)
     }
 
-    /// Effective near-duplicate probe cutoff: unset → 0.85; > 1.0 → disabled.
+    /// Effective near-duplicate probe cutoff: unset → 0.85; outside (0.0, 1.0]
+    /// → disabled (≤ 0 would flag everything as similar, > 1 can never match).
     /// Defined as an accessor (not a serde default fn) so the value is correct
     /// under BOTH construction paths — `toml::from_str` and `KbConfig::default()`
     /// (derive(Default) ignores serde default fns).
     pub fn dedup_cutoff(&self) -> Option<f32> {
         let c = self.dedup_cosine_cutoff.unwrap_or(0.85);
-        (c <= 1.0).then_some(c)
+        (c > 0.0 && c <= 1.0).then_some(c)
     }
 
     /// Load KbConfig from `kb.toml` relative to the repo root derived from `paths`.

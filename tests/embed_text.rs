@@ -74,6 +74,28 @@ impl Embedder for CapturingEmbedder {
     }
 }
 
+/// Vintage stamp: the first embed write records the active mode in kb_meta;
+/// a later write under a different mode leaves the stamp unchanged (warns on
+/// stderr — mixed vintages are visible, never silently re-stamped).
+#[test]
+fn test_embed_mode_vintage_stamp() {
+    use kb::components::db::{check_embed_mode_vintage, EmbedTextMode};
+    let conn = open_db_memory().unwrap();
+
+    check_embed_mode_vintage(&conn, EmbedTextMode::Full);
+    let stored: String = conn
+        .query_row("SELECT value FROM kb_meta WHERE key='embed_text_mode'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, "full", "first write must stamp the active mode");
+
+    // Different mode: stamp must NOT be overwritten (warning path).
+    check_embed_mode_vintage(&conn, EmbedTextMode::Abstraction);
+    let stored: String = conn
+        .query_row("SELECT value FROM kb_meta WHERE key='embed_text_mode'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, "full", "mismatched mode must not re-stamp");
+}
+
 /// apply_event embeds the legacy full text by default (KB_EMBED_TEXT unset in
 /// the test environment).
 #[test]

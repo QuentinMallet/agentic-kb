@@ -123,6 +123,23 @@ fn test_replace_path_same_path_not_reported() {
     );
 }
 
+/// Config accessor: cutoff outside (0.0, 1.0] disables the probe; unset
+/// defaults to 0.85 (review finding: <=0 would flag everything as similar).
+#[test]
+fn test_dedup_cutoff_accessor_bounds() {
+    use kb::config::KbConfig;
+    let mut cfg = KbConfig::default();
+    assert_eq!(cfg.dedup_cutoff(), Some(0.85), "unset -> default 0.85");
+    cfg.dedup_cosine_cutoff = Some(0.9);
+    assert_eq!(cfg.dedup_cutoff(), Some(0.9));
+    cfg.dedup_cosine_cutoff = Some(0.0);
+    assert_eq!(cfg.dedup_cutoff(), None, "0.0 must disable");
+    cfg.dedup_cosine_cutoff = Some(-0.5);
+    assert_eq!(cfg.dedup_cutoff(), None, "negative must disable");
+    cfg.dedup_cosine_cutoff = Some(1.5);
+    assert_eq!(cfg.dedup_cutoff(), None, ">1.0 must disable");
+}
+
 /// Invariant 6: NoopEmbedder disables the probe without error.
 #[test]
 fn test_noop_embedder_probe_disabled() {

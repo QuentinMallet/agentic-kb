@@ -183,6 +183,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_cues_entry ON cues(entry_id);
 
+        -- Derived-state metadata (NOT event-sourced; rebuilt DBs start empty).
+        -- embed_text_mode: which KB_EMBED_TEXT vintage entries_emb was built
+        -- with — used to warn on mixed-vintage writes.
+        CREATE TABLE IF NOT EXISTS kb_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS test_cases (
             id          TEXT PRIMARY KEY,
             app         TEXT NOT NULL,
@@ -430,6 +438,47 @@ impl EmbedTextMode {
     pub fn from_env() -> Self {
         Self::parse(std::env::var("KB_EMBED_TEXT").ok().as_deref())
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmbedTextMode::Full => "full",
+            EmbedTextMode::Abstraction => "abstraction",
+        }
+    }
+}
+
+/// Stamp/verify the embed-text mode vintage of `entries_emb`.
+///
+/// The first embed write stamps the active mode into `kb_meta`; later writes
+/// under a DIFFERENT mode warn loudly — mixed-vintage embeddings make cosine
+/// scores incomparable and degrade ranking with no error (review finding).
+/// The stamp resets only when derived state is rebuilt from scratch (rebuild
+/// replays into a fresh DB), which is exactly when a mode switch is safe.
+pub fn check_embed_mode_vintage(conn: &Connection, mode: EmbedTextMode) {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='embed_text_mode'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    match stored {
+        None => {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO kb_meta(key, value) VALUES('embed_text_mode', ?1)",
+                params![mode.as_str()],
+            );
+        }
+        Some(v) if v != mode.as_str() => {
+            eprintln!(
+                "kb: WARNING embed_text_mode mismatch — entries_emb built with '{v}', \
+                 KB_EMBED_TEXT now '{}'; cosine scores are incomparable across vintages. \
+                 Run `kb rebuild` (or clear entries_emb + `kb reembed`) to converge.",
+                mode.as_str()
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Flatten a JSON-array tags string (`["a","b"]`) to plain words for
@@ -485,93 +534,104 @@ pub fn apply_event(
             let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
             let session_id = event["session_id"].as_str();
 
-            conn.execute(
-                "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-                 ON CONFLICT(id) DO UPDATE SET
-                   path=excluded.path, summary=excluded.summary,
-                   content=excluded.content, tags=excluded.tags,
-                   version_ref=excluded.version_ref,
-                   permanent=excluded.permanent,
-                   is_stale=excluded.is_stale,
-                   kind=excluded.kind,
-                   evidence_status=excluded.evidence_status,
-                   session_id=excluded.session_id,
-                   updated_at=excluded.updated_at",
-                params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
-            )?;
-
-            // Stale entries: clean up FTS/embeddings so they don't appear in search.
-            // DELETE entries_emb in the same transaction as the entries write so no
-            // orphan embedding rows accumulate (br-improvement-catalog-23b.6 GC).
-            if is_stale == 1 {
-                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
-                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+            // Single transaction: entry INSERT + FTS sync + embedding + cue
+            // replace. One upsert event applies atomically, matching
+            // CueBatch.tla's ApplyNext — a reader can never observe the entry
+            // with a stale cue set or missing embedding mid-apply.
+            //
+            // Manual BEGIN/COMMIT because `apply_event` takes `&Connection`,
+            // not `&mut Connection` (same pattern as the expire branch).
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<bool> {
                 conn.execute(
-                    "DELETE FROM entries_emb WHERE rowid = \
-                     (SELECT rowid FROM entries WHERE id=?1)",
-                    params![id],
+                    "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                     ON CONFLICT(id) DO UPDATE SET
+                       path=excluded.path, summary=excluded.summary,
+                       content=excluded.content, tags=excluded.tags,
+                       version_ref=excluded.version_ref,
+                       permanent=excluded.permanent,
+                       is_stale=excluded.is_stale,
+                       kind=excluded.kind,
+                       evidence_status=excluded.evidence_status,
+                       session_id=excluded.session_id,
+                       updated_at=excluded.updated_at",
+                    params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
                 )?;
-                // Stale entries keep no cue rows (CueBatch.tla S2).
-                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
-                return Ok(());
-            }
 
-            let rowid: i64 = conn.query_row(
-                "SELECT rowid FROM entries WHERE id=?1",
-                params![id],
-                |r| r.get(0),
-            )?;
-
-            // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
-            let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
-            let _ = conn.execute(
-                "INSERT INTO entries_fts(id, path, summary, content, tags)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![id, path, summary, content, tags],
-            );
-
-            // Sync embedding store (f16 wire format — 768 bytes per entry)
-            if !embedder.is_noop() {
-                let text =
-                    entry_embed_text(EmbedTextMode::from_env(), path, summary, content, &tags);
-                let emb = embedder.embed(&text)?;
-                let blob = f32s_to_f16_blob(&emb);
-                conn.execute(
-                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
-                    params![rowid, blob],
-                )?;
-            }
-            // Replace cue rows wholesale (CueBatch.tla S3). SAVEPOINT makes the
-            // delete+insert set atomic — a partial cue set is never observable.
-            // Legacy events without a "cues" field still clear stale rows from
-            // any prior upsert that had cues.
-            {
-                conn.execute_batch("SAVEPOINT cues_replace")?;
-                let result = (|| -> Result<()> {
+                // Stale entries: clean up FTS/embeddings/cues so they don't
+                // appear in search (br-improvement-catalog-23b.6 GC,
+                // CueBatch.tla S2). Returns false: stale upserts don't count
+                // toward the FTS deprecation gate.
+                if is_stale == 1 {
+                    // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+                    let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+                    conn.execute(
+                        "DELETE FROM entries_emb WHERE rowid = \
+                         (SELECT rowid FROM entries WHERE id=?1)",
+                        params![id],
+                    )?;
                     conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
-                    if let Some(cues) = event["cues"].as_array() {
-                        for cue in cues.iter().filter_map(|c| c.as_str()) {
-                            let blob: Option<Vec<u8>> = if embedder.is_noop() {
-                                None
-                            } else {
-                                Some(f32s_to_f16_blob(&embedder.embed(cue)?))
-                            };
-                            conn.execute(
-                                "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
-                                params![id, cue, blob],
-                            )?;
-                        }
+                    return Ok(false);
+                }
+
+                let rowid: i64 = conn.query_row(
+                    "SELECT rowid FROM entries WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+
+                // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
+                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+                let _ = conn.execute(
+                    "INSERT INTO entries_fts(id, path, summary, content, tags)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![id, path, summary, content, tags],
+                );
+
+                // Sync embedding store (f16 wire format — 768 bytes per entry)
+                if !embedder.is_noop() {
+                    let mode = EmbedTextMode::from_env();
+                    check_embed_mode_vintage(conn, mode);
+                    let text = entry_embed_text(mode, path, summary, content, &tags);
+                    let emb = embedder.embed(&text)?;
+                    let blob = f32s_to_f16_blob(&emb);
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
+                        params![rowid, blob],
+                    )?;
+                }
+
+                // Replace cue rows wholesale (CueBatch.tla S3). Legacy events
+                // without a "cues" field still clear rows from any prior
+                // upsert that had cues.
+                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                if let Some(cues) = event["cues"].as_array() {
+                    for cue in cues.iter().filter_map(|c| c.as_str()) {
+                        let blob: Option<Vec<u8>> = if embedder.is_noop() {
+                            None
+                        } else {
+                            Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                        };
+                        conn.execute(
+                            "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
+                            params![id, cue, blob],
+                        )?;
                     }
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    let _ = conn.execute_batch("ROLLBACK TO cues_replace; RELEASE cues_replace");
+                }
+                Ok(true)
+            })();
+            let counts_toward_gate = match result {
+                Ok(counts) => counts,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
                     return Err(e);
                 }
-                conn.execute_batch("RELEASE cues_replace")?;
+            };
+            conn.execute_batch("COMMIT")?;
+            if counts_toward_gate {
+                increment_post_cutover_writes(conn);
             }
-            increment_post_cutover_writes(conn);
         }
 
         ("expire", "entries") => {
@@ -761,6 +821,10 @@ pub struct SearchOptions {
     /// MMR diversification strength for hybrid search. 0.0 disables (default,
     /// byte-identical to pre-MMR behavior). In (0,1]: greedy re-rank over a
     /// 2×limit pool maximizing λ·relevance − (1−λ)·max_cosine_to_selected.
+    ///
+    /// Note: the cue-anchor lane (and MMR) run only in HYBRID mode
+    /// (do_fts && do_semantic). Semantic-only mode is a raw
+    /// entry-embedding debugging lane and intentionally skips both.
     pub mmr_lambda: f32,
 }
 
@@ -1464,25 +1528,18 @@ pub fn search_entries(
                 rrf_scores.insert(entry.id.clone(), contrib);
             }
 
-            // Build a lookup for semantic candidates (id → (rank, metadata)).
-            let sem_total = candidates.len();
-            let mut sem_meta: std::collections::HashMap<String, (String, String, String, String, String)> =
-                std::collections::HashMap::with_capacity(sem_total);
-            for (sem_rank, (_, id, path, summary, content, tags)) in candidates.iter().enumerate() {
+            // Second RRF source: semantic candidate ranks.
+            for (sem_rank, (_, id, ..)) in candidates.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
-                sem_meta.insert(id.clone(), (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone()));
             }
 
             // Third RRF source: cue-anchor lane (best cue cosine per entry).
-            for (cue_rank, (_, id, path, summary, content, tags)) in cue_ranked.iter().enumerate() {
+            for (cue_rank, (_, id, ..)) in cue_ranked.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
-                sem_meta.entry(id.clone()).or_insert_with(|| {
-                    (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone())
-                });
             }
 
             // Re-build entries from rrf_scores, merging FTS entries and new semantic-only entries.

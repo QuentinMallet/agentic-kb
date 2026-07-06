@@ -10,9 +10,10 @@
     * Cues are a FIELD of the upsert event — there are NO separate cue
       events in the JSONL.  One entry upsert = one event carrying its
       full cue set (possibly empty).
-    * apply_event writes the entry row AND replaces its cue rows in the
-      SAME SQLite transaction — a cue row can never be observed without
-      its entry nor survive it.
+    * apply_event applies the whole upsert (entry row + FTS + embedding
+      + cue-row replace) inside ONE BEGIN/COMMIT transaction, matching
+      ApplyNext below — a cue row can never be observed without its
+      entry nor survive it, even by concurrent readers mid-apply.
     * expire removes the entry AND its cue rows in the same transaction.
 
   Hazards modelled:
@@ -24,6 +25,21 @@
     S1  db_entries = Materialize(jsonl)          — steady-state equality
     S2  DOMAIN of cue rows ⊆ live entries        — no orphans (H2)
     S3  cue rows = cue set of LAST upsert        — no staleness (H3)
+
+  Scope notes (analyst audit, 2026-07-06):
+    * append_events_batch writes line-by-line; a crash mid-batch persists a
+      valid PREFIX of the batch.  The DB stays consistent with the shorter
+      log, so S1-S3 hold; torn-final-line durability is out of scope here
+      (handled by read_events parsing + rebuild snapshot bound).
+    * The impl's is_stale=1 upsert variant (strips FTS/emb/cues) is never
+      emitted with a cues field by kb_core::add and is out of scope.
+    * replace_path CAN emit expire(X) + upsert(X) for the SAME id when the
+      new id already lives at the path.  StartReplace excludes that pairing
+      (expire_id # new_id) because its whole-log fold is identical to the
+      StartAdd re-upsert case, which IS modelled (H3).
+    * TLC is run with -deadlock (deadlock checking disabled): the bounded
+      MaxLog termination device makes the max-log idle state terminal by
+      construction, not by defect.
 *)
 
 EXTENDS Naturals, Sequences, FiniteSets
