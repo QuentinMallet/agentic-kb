@@ -498,6 +498,8 @@ mod tests {
                         session: "mcp".to_string(),
                         session_id: None,
                         expire_reason: String::new(),
+                        dedup_cutoff: None,
+                        cues: vec![],
                     },
                 )
                 .expect("writer A kb_core::add must succeed");
@@ -530,6 +532,8 @@ mod tests {
                         session: "mcp".to_string(),
                         session_id: None,
                         expire_reason: String::new(),
+                        dedup_cutoff: None,
+                        cues: vec![],
                     },
                 )
                 .expect("writer B kb_core::add must succeed");

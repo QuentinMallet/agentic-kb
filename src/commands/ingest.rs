@@ -110,6 +110,7 @@ impl Ingest {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
             };
             cmd.execute_with(paths, embedder)?;
         }

@@ -147,6 +147,8 @@ pub fn digest_session(
             session,
             session_id: omc_session_id,
             expire_reason: format!("replaced by session digest for {session_id}"),
+            dedup_cutoff: None,
+            cues: vec![],
         },
     )?;
 

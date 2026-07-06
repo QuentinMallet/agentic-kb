@@ -329,6 +329,13 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
         .cloned()
         .unwrap_or_default();
     let session_id = req.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Cue anchors (Memora pickup .4): "[Main Entity] + [Key Aspect]" strings,
+    // e.g. "recency bias decay". Optional; validated/capped in kb_core::add.
+    let cues: Vec<String> = req
+        .get("cues")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     let entry_id = uuid::Uuid::new_v4().to_string();
 
@@ -361,9 +368,20 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
             session: "mcp".to_string(),
             session_id,
             expire_reason: "replaced by MCP kb_add replace_path".to_string(),
+            dedup_cutoff: config::KbConfig::from_paths(paths).dedup_cutoff(),
+            cues,
         },
     ) {
-        Ok(_) => json!({"id": id, "type": "ok", "entry_id": entry_id}),
+        Ok(outcome) => {
+            let mut resp = json!({"id": id, "type": "ok", "entry_id": entry_id});
+            // Near-duplicate probe hits: surfaced so the calling agent can
+            // decide merge / expire / keep-both. Omitted when empty.
+            if !outcome.similar_existing.is_empty() {
+                resp["similar_existing"] =
+                    serde_json::to_value(&outcome.similar_existing).unwrap_or_default();
+            }
+            resp
+        }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
 }
@@ -453,6 +471,10 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
                 session: "mcp-import".to_string(),
                 session_id: omc_session_id.clone(),
                 expire_reason: String::new(),
+                // Bulk import re-adds curated seeds — the probe would flag
+                // every re-imported entry against itself-by-content.
+                dedup_cutoff: None,
+                cues: vec![],
             },
         ) {
             return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});

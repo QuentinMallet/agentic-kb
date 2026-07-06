@@ -113,6 +113,7 @@ impl Import {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
             };
             cmd.execute_with(&paths, embedder.as_ref())?;
             imported += 1;
@@ -227,6 +228,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
             };
             add.execute_with(&paths, &embedder).unwrap();
         }

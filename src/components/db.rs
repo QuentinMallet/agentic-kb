@@ -172,6 +172,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             embedding BLOB NOT NULL
         );
 
+        -- Cue anchors (Memora pickup .4): agent-supplied semantic entry points,
+        -- embedded per row. Rows are replaced wholesale on entry upsert and
+        -- removed on expire (agent-kb/tla/CueBatch.tla S2/S3).
+        CREATE TABLE IF NOT EXISTS cues (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id  TEXT NOT NULL,
+            cue       TEXT NOT NULL,
+            embedding BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_cues_entry ON cues(entry_id);
+
         CREATE TABLE IF NOT EXISTS test_cases (
             id          TEXT PRIMARY KEY,
             app         TEXT NOT NULL,
@@ -501,6 +512,8 @@ pub fn apply_event(
                      (SELECT rowid FROM entries WHERE id=?1)",
                     params![id],
                 )?;
+                // Stale entries keep no cue rows (CueBatch.tla S2).
+                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
                 return Ok(());
             }
 
@@ -529,6 +542,35 @@ pub fn apply_event(
                     params![rowid, blob],
                 )?;
             }
+            // Replace cue rows wholesale (CueBatch.tla S3). SAVEPOINT makes the
+            // delete+insert set atomic — a partial cue set is never observable.
+            // Legacy events without a "cues" field still clear stale rows from
+            // any prior upsert that had cues.
+            {
+                conn.execute_batch("SAVEPOINT cues_replace")?;
+                let result = (|| -> Result<()> {
+                    conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                    if let Some(cues) = event["cues"].as_array() {
+                        for cue in cues.iter().filter_map(|c| c.as_str()) {
+                            let blob: Option<Vec<u8>> = if embedder.is_noop() {
+                                None
+                            } else {
+                                Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                            };
+                            conn.execute(
+                                "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
+                                params![id, cue, blob],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    let _ = conn.execute_batch("ROLLBACK TO cues_replace; RELEASE cues_replace");
+                    return Err(e);
+                }
+                conn.execute_batch("RELEASE cues_replace")?;
+            }
             increment_post_cutover_writes(conn);
         }
 
@@ -555,6 +597,8 @@ pub fn apply_event(
                      (SELECT rowid FROM entries WHERE id=?1)",
                     params![id],
                 )?;
+                // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
+                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -1344,6 +1388,63 @@ pub fn search_entries(
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Cue lane (Memora pickup .4): score each live entry by its best-cosine
+        // cue anchor. Ranked separately so RRF fuses it as a third source.
+        // Best-effort: absence of the cues table (pre-migration DB) is not an
+        // error, just an empty lane.
+        let mut cue_ranked: Vec<(f32, String, String, String, String, String)> = Vec::new();
+        if opts.do_fts {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags
+             FROM cues c
+             JOIN entries e ON e.id = c.entry_id
+             WHERE e.is_stale = 0
+               AND c.embedding IS NOT NULL
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
+        ) {
+            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String)> = stmt
+                .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+
+            // Best cue score per entry.
+            let mut best: std::collections::HashMap<String, (f32, String, String, String, String)> =
+                std::collections::HashMap::new();
+            for (entry_id, blob, path, summary, content, tags) in cue_rows {
+                decode_f16_blob_into(&blob, &mut scratch);
+                let sim = if scratch.is_empty() {
+                    let fallback = decode_emb_blob(&blob);
+                    cosine_similarity(&q_emb, &fallback)
+                } else {
+                    cosine_similarity(&q_emb, &scratch)
+                };
+                match best.get(&entry_id) {
+                    Some((prev, ..)) if *prev >= sim => {}
+                    _ => {
+                        best.insert(entry_id, (sim, path, summary, content, tags));
+                    }
+                }
+            }
+            cue_ranked = best
+                .into_iter()
+                .map(|(id, (sim, path, summary, content, tags))| (sim, id, path, summary, content, tags))
+                .collect();
+            cue_ranked
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            cue_ranked.truncate(opts.limit.saturating_mul(2));
+        }
+        }
+
         if opts.do_fts {
             // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
             // FTS and semantic rankings. Each entry's RRF score is the sum of
@@ -1374,6 +1475,16 @@ pub fn search_entries(
                 sem_meta.insert(id.clone(), (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone()));
             }
 
+            // Third RRF source: cue-anchor lane (best cue cosine per entry).
+            for (cue_rank, (_, id, path, summary, content, tags)) in cue_ranked.iter().enumerate() {
+                let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
+                let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
+                *entry += contrib;
+                sem_meta.entry(id.clone()).or_insert_with(|| {
+                    (path.clone(), summary.clone(), content.clone(), tags.clone(), id.clone())
+                });
+            }
+
             // Re-build entries from rrf_scores, merging FTS entries and new semantic-only entries.
             // Existing FTS entries already have their metadata; semantic-only ones need it added.
             let mut fts_meta: std::collections::HashMap<String, usize> =
@@ -1386,6 +1497,7 @@ pub fn search_entries(
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
             for (_, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit * 2) {
                 if !fts_meta.contains_key(&id) {
+                    fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
                         path,
@@ -1394,6 +1506,28 @@ pub fn search_entries(
                         tags,
                         score: 0.0, // will be overwritten below
                         source: "semantic",
+                        score_kind: "rrf",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                    });
+                }
+            }
+
+            // Cue-only entries (reached via a cue anchor, absent from both the
+            // FTS and entry-embedding lanes) still need materializing.
+            for (_, id, path, summary, content, tags) in cue_ranked.into_iter() {
+                if !fts_meta.contains_key(&id) {
+                    fts_meta.insert(id.clone(), entries.len());
+                    entries.push(SearchEntry {
+                        id: id.clone(),
+                        path,
+                        summary,
+                        content,
+                        tags,
+                        score: 0.0, // will be overwritten below
+                        source: "cue",
                         score_kind: "rrf",
                         evidence: vec![],
                         confidence: 0.5,

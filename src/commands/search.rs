@@ -336,6 +336,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -379,6 +380,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
         };
         add_cmd.execute_with(&remote_paths, &embedder).unwrap();
 
@@ -423,6 +425,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -467,6 +470,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -517,6 +521,7 @@ mod tests {
                 kind: "convention".to_string(),
                 evidence: vec![],
                 evidence_file: None,
+                cues: vec![],
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -582,6 +587,7 @@ mod tests {
             kind: "observation".to_string(),
             evidence: vec![evidence_json],
             evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -658,6 +664,7 @@ mod tests {
                 kind: "observation".to_string(),
                 evidence: vec![evidence_json],
                 evidence_file: None,
+                cues: vec![],
             };
             add_cmd.execute_with(&paths, &embedder).unwrap();
         }
@@ -747,6 +754,7 @@ mod tests {
                     kind: "convention".to_string(),
                     evidence: vec![],
                     evidence_file: None,
+                    cues: vec![],
                 };
                 add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -807,6 +815,7 @@ mod tests {
             kind: "convention".to_string(),
             evidence: vec![],
             evidence_file: None,
+            cues: vec![],
         };
         add_peer.execute_with(&peer_paths, &embedder).unwrap();
 

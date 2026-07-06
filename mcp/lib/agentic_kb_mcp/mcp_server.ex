@@ -35,14 +35,19 @@ defmodule AgenticKbMcp.McpServer do
           "inline_verify_k" => %{
             "type" => "integer",
             "description" => "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`), clamped to 20. Results beyond this budget have `verified=null`."
+          },
+          "expand_ids" => %{
+            "type" => "array",
+            "items" => %{"type" => "string"},
+            "description" => "Frontier expand mode: instead of a query, return entries ADJACENT to these entry ids (same path directory, shared tag, shared cue, or shared evidence file), ranked by facet overlap. Use after a normal search when results feel incomplete: expand the best hits, then decide to expand further, re-query with refined terms, or stop. `query` is ignored in this mode."
           }
         },
-        "required" => ["query"]
+        "required" => []
       }
     },
     %{
       "name" => "kb_add",
-      "description" => "Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are tagged `evidence_status=\"missing\"` and a warning is emitted to stderr.",
+      "description" => "Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are tagged `evidence_status=\"missing\"` and a warning is emitted to stderr. Supply 2-3 `cues` per entry so vague future queries can still reach it. The response may include `similar_existing` (entries with embedding cosine above the dedup cutoff) — when present, consider updating/expiring the listed entry instead of keeping both.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -85,6 +90,11 @@ defmodule AgenticKbMcp.McpServer do
               },
               "required" => ["kind", "citation_path", "citation_sha", "citation_hash"]
             }
+          },
+          "cues" => %{
+            "type" => "array",
+            "items" => %{"type" => "string"},
+            "description" => "Cue anchors (max 8, each <=120 chars): semantic entry points embedded separately from the entry, searched as a third retrieval lane. Pattern: \"[Main Entity] + [Key Aspect]\", e.g. \"recency bias decay\", \"kb rebuild three-phase\", \"FTS5 injection quoting\". Always anchor to a concrete entity from the content — never generic single words like \"performance\" or \"config\". Give each cue a DIFFERENT facet of the entry."
           }
         },
         "required" => ["path", "summary", "content"]
@@ -335,6 +345,7 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("path_prefix", args["path_prefix"])
       |> put_if_present("tag", args["tag"])
       |> put_if_present("inline_verify_k", args["inline_verify_k"])
+      |> put_if_present("expand_ids", args["expand_ids"])
 
     port_call_to_content(req)
   end
@@ -350,6 +361,7 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("replace_path", args["replace_path"])
       |> put_if_present("kind", args["kind"])
       |> put_if_present("evidence", args["evidence"])
+      |> put_if_present("cues", args["cues"])
 
     port_call_to_content(req)
   end
