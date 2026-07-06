@@ -159,21 +159,31 @@ pub fn rebuild_if_schema_obsolete(
          materialize new derived state (cue rows, embedding vintage stamp)...",
         db::SCHEMA_VERSION
     );
-    // Non-destructive by construction: keep a copy of the pre-upgrade DB. Even
-    // if the log is subtly stale in a way coverage cannot catch (e.g. a
-    // same-id older payload), the operator can recover the exact prior state
-    // from the backup — the auto-upgrade can never irreversibly lose data.
-    // Best-effort: a backup failure downgrades to a warning rather than
-    // blocking the upgrade (the log remains the source of truth).
+    // Non-destructive by construction: snapshot the pre-upgrade DB before the
+    // rebuild swap. Even if the log is subtly stale in a way coverage cannot
+    // catch (a same-id older payload), the operator recovers the exact prior
+    // state from the backup — the auto-upgrade can never irreversibly lose
+    // data. The backup is therefore MANDATORY: a failure aborts the upgrade
+    // (leaving the DB obsolete-but-intact, retried next interaction) rather
+    // than proceed and break the safety guarantee.
     let backup = paths.db.with_extension(format!("db.pre-v{}.bak", db::SCHEMA_VERSION));
-    match fs::copy(&paths.db, &backup) {
-        Ok(_) => eprintln!("kb: pre-upgrade DB backed up to {}", backup.display()),
-        Err(e) => eprintln!(
-            "kb: WARNING could not back up the pre-upgrade DB ({e}); the event log at {} \
-             remains the source of truth",
-            paths.events.display()
-        ),
-    }
+    {
+        // Under the write flock so no concurrent writer mutates the DB mid-
+        // snapshot. VACUUM INTO takes a read transaction and emits a single
+        // transactionally-consistent file with no WAL sidecar — unlike a raw
+        // fs::copy of a live WAL database, which can capture a torn state.
+        let _wlock = acquire_lock(&paths.lock)?;
+        let conn = db::open_db(&paths.db)?;
+        let _ = fs::remove_file(&backup);
+        // Escape single quotes in the path for the SQL string literal (the
+        // path is ours, but repo paths can legitimately contain quotes).
+        let target = backup.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{target}'"))
+            .with_context(|| {
+                format!("back up pre-upgrade DB to {} (upgrade aborted)", backup.display())
+            })?;
+    } // release the write flock — Rebuild re-acquires it per phase
+    eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
     (Rebuild).execute_with(paths, embedder)?;
     eprintln!("kb: schema upgrade rebuild complete.");
     Ok(true)

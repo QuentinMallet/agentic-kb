@@ -291,11 +291,47 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
     // The pre-upgrade DB (with 'NEW db payload') is preserved and recoverable.
     let backup = paths.db.with_extension("db.pre-v2.bak");
     assert!(backup.exists(), "pre-upgrade backup must exist: {}", backup.display());
+    // VACUUM INTO snapshot must be a clean single file (no WAL sidecar).
+    assert!(
+        !backup.with_extension("bak-wal").exists(),
+        "backup must have no WAL sidecar (consistent snapshot)"
+    );
     let bak = rusqlite::Connection::open(&backup).unwrap();
     let bak_content: String = bak
         .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(bak_content, "NEW db payload", "backup preserves the pre-upgrade state");
+}
+
+/// Backup is MANDATORY: if the snapshot cannot be written, the upgrade aborts
+/// (DB stays obsolete-but-intact) rather than rebuild without a safety net.
+#[test]
+fn test_upgrade_aborts_when_backup_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+
+    add(&paths, &NoopEmbedder, base_args("keep")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+    }
+    // Make the backup target unwritable: pre-create it as a directory so
+    // VACUUM INTO / remove_file cannot produce the snapshot file.
+    let backup = paths.db.with_extension("db.pre-v2.bak");
+    fs::create_dir(&backup).unwrap();
+    fs::create_dir(backup.join("blocker")).unwrap(); // non-empty → remove_file & rmdir fail
+
+    let res = rebuild_if_schema_obsolete(&paths, &FixedEmbedder);
+    assert!(res.is_err(), "backup failure must abort the upgrade");
+
+    // DB is untouched: obsolete, entry intact.
+    let conn = open_db(&paths.db).unwrap();
+    assert!(!schema_is_current(&conn), "aborted upgrade must not stamp");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1, "entry must survive the aborted upgrade");
 }
 
 /// Single-flight (codex review finding): concurrent first interactions with
