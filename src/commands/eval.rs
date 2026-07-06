@@ -114,3 +114,72 @@ impl Eval {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::add::Add;
+    use crate::components::embedder::NoopEmbedder;
+    use crate::config::Paths;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn setup_kb_with_entry(root: &std::path::Path) -> Paths {
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let add_cmd = Add {
+            path: "src/auth.rs".to_string(),
+            summary: "authentication jwt tokens".to_string(),
+            content: "verifies bearer jwt".to_string(),
+            tags: "auth".to_string(),
+            version_ref: Some("abc".to_string()),
+            id: Some("eval-cli-1".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
+        };
+        add_cmd.execute_with(&paths, &NoopEmbedder).unwrap();
+        paths
+    }
+
+    fn eval_cmd(golden: std::path::PathBuf, min_recall: Option<f64>) -> Eval {
+        Eval {
+            golden,
+            fts: true,
+            semantic: false,
+            k: 10,
+            json: false,
+            min_recall,
+            min_mrr: None,
+        }
+    }
+
+    /// End-to-end CLI path: golden file → report, gate passes at recall 1.0.
+    #[test]
+    fn test_cmd_eval_runs_and_gate_passes() {
+        let dir = tempdir().unwrap();
+        let paths = setup_kb_with_entry(dir.path());
+
+        let golden = dir.path().join("golden.jsonl");
+        fs::write(&golden, "{\"query\": \"authentication jwt\", \"expected_ids\": [\"eval-cli-1\"]}\n").unwrap();
+
+        eval_cmd(golden, Some(0.9)).execute_with(&paths, &NoopEmbedder).unwrap();
+    }
+
+    /// --min-recall above the achievable score must fail the gate (non-Ok).
+    #[test]
+    fn test_cmd_eval_gate_fails_below_threshold() {
+        let dir = tempdir().unwrap();
+        let paths = setup_kb_with_entry(dir.path());
+
+        let golden = dir.path().join("golden.jsonl");
+        fs::write(&golden, "{\"query\": \"zzz unfindable\", \"expected_ids\": [\"eval-cli-1\"]}\n").unwrap();
+
+        let err = eval_cmd(golden, Some(0.5)).execute_with(&paths, &NoopEmbedder);
+        assert!(err.is_err(), "gate must fail when recall < min_recall");
+        assert!(err.unwrap_err().to_string().contains("eval gate failed"));
+    }
+}
