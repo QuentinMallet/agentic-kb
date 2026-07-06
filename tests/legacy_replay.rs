@@ -256,11 +256,12 @@ fn test_partial_log_refuses_auto_rebuild() {
     assert_eq!(n, 3, "no entry may be dropped by the refused upgrade");
 }
 
-/// Freshness guard (codex round-5 finding): a restored/stale log that covers
-/// every live id but whose newest event is far older than the DB's newest row
-/// must refuse auto-rebuild — replaying it would roll entries back.
+/// Non-destructive upgrade (codex round-6 resolution): a covering-but-stale
+/// log (same id, older payload) DOES rebuild — the log is the source of truth
+/// under JSONL-first — but the pre-upgrade DB is preserved as a .bak so the
+/// prior state is always recoverable. No timestamp heuristic; provably safe.
 #[test]
-fn test_stale_covering_log_refuses_auto_rebuild() {
+fn test_upgrade_backs_up_pre_rebuild_db() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
     let paths = Paths::from_root(dir.path());
@@ -268,31 +269,33 @@ fn test_stale_covering_log_refuses_auto_rebuild() {
     add(&paths, &NoopEmbedder, base_args("rolled")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
+        conn.execute(
+            "UPDATE entries SET content='NEW db payload' WHERE id='rolled'",
+            [],
+        )
+        .unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
     }
-    // Replace the log with a STALE one: same id (full coverage) but an old
-    // payload and an event ts years behind the DB row's updated_at.
-    fs::write(
-        &paths.events,
-        serde_json::json!({
-            "action": "upsert", "table": "entries", "id": "rolled",
-            "path": "t/rolled", "summary": "OLD payload", "content": "OLD content",
-            "tags": [], "ts": "2020-01-01T00:00:00Z",
-        })
-        .to_string()
-            + "\n",
-    )
-    .unwrap();
-
+    // Log covers the id but with the ORIGINAL payload (base_args content 'ok').
     let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
-    assert!(!rebuilt, "stale covering log must refuse auto-rebuild");
+    assert!(rebuilt, "covering log rebuilds — log is the source of truth");
 
+    // Live DB now reflects the log (rolled back to 'ok') and is stamped.
     let conn = open_db(&paths.db).unwrap();
-    assert!(!schema_is_current(&conn), "refusal must not stamp");
+    assert!(schema_is_current(&conn));
     let content: String = conn
         .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(content, "ok", "the newer DB payload must survive (base_args content)");
+    assert_eq!(content, "ok", "rebuild materializes the log");
+
+    // The pre-upgrade DB (with 'NEW db payload') is preserved and recoverable.
+    let backup = paths.db.with_extension("db.pre-v2.bak");
+    assert!(backup.exists(), "pre-upgrade backup must exist: {}", backup.display());
+    let bak = rusqlite::Connection::open(&backup).unwrap();
+    let bak_content: String = bak
+        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bak_content, "NEW db payload", "backup preserves the pre-upgrade state");
 }
 
 /// Single-flight (codex review finding): concurrent first interactions with

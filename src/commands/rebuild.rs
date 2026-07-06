@@ -116,55 +116,13 @@ pub fn rebuild_if_schema_obsolete(
             .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
             .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
             .collect();
-        // Freshness guard (codex round 5): a RESTORED/stale log can cover
-        // every live id yet carry older payloads — replaying it would roll
-        // the DB back. Under the JSONL-first write protocol the log is never
-        // older than the DB, so a DB whose newest row post-dates the log's
-        // newest event by more than a generous skew margin means the log is
-        // not this DB's history. Refuse; log-vs-DB reconciliation is an
-        // operator decision (`kb rebuild` if the log should win).
-        const FRESHNESS_SKEW_SECS: i64 = 24 * 3600;
-        let log_max_ts: Option<chrono::NaiveDateTime> = evts
-            .iter()
-            .filter_map(|e| e["ts"].as_str())
-            .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| t.naive_utc())
-            .max();
-        // updated_at carries MIXED formats: RFC3339 (apply_event upserts use
-        // the event ts) and sqlite's "%Y-%m-%d %H:%M:%S" (expire updates,
-        // column DEFAULT). Parse both per row and max AFTER parsing — a
-        // string-level MAX across formats is not chronologically sound.
-        fn parse_updated_at(s: &str) -> Option<chrono::NaiveDateTime> {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|t| t.naive_utc())
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
-                })
-        }
+        // Coverage guard: if the log does not even mention every live entry id,
+        // it is obviously not this DB's history (truncated / foreign / wrong
+        // path). Replaying it would drop those entries outright — refuse loudly
+        // and let the operator reconcile rather than silently mangle the KB.
         let conn = db::open_db(&paths.db)?;
-        let db_max_updated: Option<chrono::NaiveDateTime> = conn
-            .prepare("SELECT updated_at FROM entries WHERE is_stale=0")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .filter_map(|s| parse_updated_at(&s))
-            .max();
-        if let (Some(log_ts), Some(db_ts)) = (log_max_ts, db_max_updated) {
-            if (db_ts - log_ts).num_seconds() > FRESHNESS_SKEW_SECS {
-                eprintln!(
-                    "kb: WARNING DB schema predates v{} but the event log's newest event \
-                     ({log_ts}) is more than {}h older than the DB's newest entry \
-                     ({db_ts}) — the log looks restored/stale and auto-rebuild could roll \
-                     entries back. Refusing; reconcile the log, or run `kb rebuild` \
-                     deliberately if the log should win.",
-                    db::SCHEMA_VERSION,
-                    FRESHNESS_SKEW_SECS / 3600
-                );
-                return Ok(false);
-            }
-        }
-        let mut stmt = conn.prepare("SELECT id FROM entries WHERE is_stale=0")?;
-        let live_ids: Vec<String> = stmt
+        let live_ids: Vec<String> = conn
+            .prepare("SELECT id FROM entries WHERE is_stale=0")?
             .query_map([], |r| r.get(0))?
             .filter_map(|r| r.ok())
             .collect();
@@ -175,8 +133,9 @@ pub fn rebuild_if_schema_obsolete(
         if uncovered > 0 {
             eprintln!(
                 "kb: WARNING DB schema predates v{} but the event log at {} does NOT cover \
-                 {uncovered} of {} live entries — auto-rebuild would drop them. Refusing; \
-                 restore the full event log (or run `kb rebuild` deliberately).",
+                 {uncovered} of {} live entries — the log is not this DB's history. Refusing \
+                 the automatic upgrade; restore the full event log (or run `kb rebuild` \
+                 deliberately if the log should win).",
                 db::SCHEMA_VERSION,
                 paths.events.display(),
                 live_ids.len()
@@ -200,6 +159,21 @@ pub fn rebuild_if_schema_obsolete(
          materialize new derived state (cue rows, embedding vintage stamp)...",
         db::SCHEMA_VERSION
     );
+    // Non-destructive by construction: keep a copy of the pre-upgrade DB. Even
+    // if the log is subtly stale in a way coverage cannot catch (e.g. a
+    // same-id older payload), the operator can recover the exact prior state
+    // from the backup — the auto-upgrade can never irreversibly lose data.
+    // Best-effort: a backup failure downgrades to a warning rather than
+    // blocking the upgrade (the log remains the source of truth).
+    let backup = paths.db.with_extension(format!("db.pre-v{}.bak", db::SCHEMA_VERSION));
+    match fs::copy(&paths.db, &backup) {
+        Ok(_) => eprintln!("kb: pre-upgrade DB backed up to {}", backup.display()),
+        Err(e) => eprintln!(
+            "kb: WARNING could not back up the pre-upgrade DB ({e}); the event log at {} \
+             remains the source of truth",
+            paths.events.display()
+        ),
+    }
     (Rebuild).execute_with(paths, embedder)?;
     eprintln!("kb: schema upgrade rebuild complete.");
     Ok(true)
