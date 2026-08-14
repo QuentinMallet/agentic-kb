@@ -29,3 +29,5 @@
 .claude/worktrees/
 .claude/skills/
 .claude/backups/
+# br doctor per-run artifacts
+.doctor/
