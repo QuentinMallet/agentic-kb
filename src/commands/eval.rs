@@ -2,7 +2,7 @@
 
 use crate::components::db;
 use crate::components::embedder;
-use crate::components::retrieval_eval::{evaluate, parse_golden_jsonl};
+use crate::components::retrieval_eval::{compare_reports, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, EvalReport, Split, SplitManifest};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -11,7 +11,14 @@ use clap::Parser;
 #[derive(Command, Debug, Parser)]
 pub struct Eval {
     /// Path to golden set JSONL ({"query": ..., "expected_ids": [...]})
-    pub golden: std::path::PathBuf,
+    #[arg(required_unless_present = "compare")]
+    pub golden: Option<std::path::PathBuf>,
+    /// Run the frozen sealed partition (manifest must be beside the golden file)
+    #[arg(long)]
+    pub sealed: bool,
+    /// Compare two JSON EvalReport files from paired same-corpus, same-time arms
+    #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
+    pub compare: Option<Vec<std::path::PathBuf>>,
     /// FTS5 keyword search only
     #[arg(long)]
     pub fts: bool,
@@ -43,6 +50,7 @@ impl Runnable for Eval {
 
 impl Eval {
     pub fn execute(&self) -> anyhow::Result<()> {
+        if let Some(files) = &self.compare { return self.execute_compare(files); }
         let paths = config::Paths::discover()?;
         let emb = crate::commands::add::make_embedder(&paths);
         crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
@@ -56,8 +64,17 @@ impl Eval {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        let text = std::fs::read_to_string(&self.golden)?;
-        let cases = parse_golden_jsonl(&text)?;
+        let golden = self.golden.as_ref().ok_or_else(|| anyhow::anyhow!("golden set is required outside --compare mode"))?;
+        let text = std::fs::read_to_string(golden)?;
+        let all_cases = parse_golden_jsonl(&text)?;
+        let requested = if self.sealed { Split::Sealed } else { Split::Dev };
+        let cases: Vec<_> = all_cases.iter().filter(|c| c.split == requested).cloned().collect();
+
+        if self.sealed {
+            let manifest_path = golden.parent().unwrap_or_else(|| std::path::Path::new(".")).join("split-manifest.json");
+            let manifest: SplitManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+            validate_sealed_manifest(&all_cases, &paths.events, &manifest)?;
+        }
 
         let opts = db::SearchOptions {
             limit: self.k,
@@ -73,7 +90,7 @@ impl Eval {
         };
 
         let conn = db::open_db(&paths.db)?;
-        let report = evaluate(&conn, embedder, &cases, &opts)?;
+        let report = evaluate_split(&conn, embedder, &cases, &opts, requested)?;
         let recall = report.recall_at_k();
         let mrr = report.mrr();
 
@@ -114,6 +131,18 @@ impl Eval {
         }
         Ok(())
     }
+
+    fn execute_compare(&self, files: &[std::path::PathBuf]) -> anyhow::Result<()> {
+        let before: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[0])?)?;
+        let after: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[1])?)?;
+        let comparison = compare_reports(&before, &after)?;
+        if comparison.verdict == crate::components::retrieval_eval::Verdict::Inconclusive {
+            println!("INCONCLUSIVE: no information — NOT evidence of no regression (discordant_pairs={})", comparison.discordant_pairs);
+        } else {
+            println!("{}: discordant_pairs={}", comparison.verdict.name(), comparison.discordant_pairs);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +177,9 @@ mod tests {
 
     fn eval_cmd(golden: std::path::PathBuf, min_recall: Option<f64>) -> Eval {
         Eval {
-            golden,
+            golden: Some(golden),
+            sealed: false,
+            compare: None,
             fts: true,
             semantic: false,
             k: 10,
@@ -165,7 +196,7 @@ mod tests {
         let paths = setup_kb_with_entry(dir.path());
 
         let golden = dir.path().join("golden.jsonl");
-        fs::write(&golden, "{\"query\": \"authentication jwt\", \"expected_ids\": [\"eval-cli-1\"]}\n").unwrap();
+        fs::write(&golden, "{\"query\": \"authentication jwt\", \"expected_ids\": [\"eval-cli-1\"], \"split\": \"dev\"}\n").unwrap();
 
         eval_cmd(golden, Some(0.9)).execute_with(&paths, &NoopEmbedder).unwrap();
     }
@@ -177,7 +208,7 @@ mod tests {
         let paths = setup_kb_with_entry(dir.path());
 
         let golden = dir.path().join("golden.jsonl");
-        fs::write(&golden, "{\"query\": \"zzz unfindable\", \"expected_ids\": [\"eval-cli-1\"]}\n").unwrap();
+        fs::write(&golden, "{\"query\": \"zzz unfindable\", \"expected_ids\": [\"eval-cli-1\"], \"split\": \"dev\"}\n").unwrap();
 
         let err = eval_cmd(golden, Some(0.5)).execute_with(&paths, &NoopEmbedder);
         assert!(err.is_err(), "gate must fail when recall < min_recall");
