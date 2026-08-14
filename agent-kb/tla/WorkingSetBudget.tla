@@ -101,6 +101,33 @@ GreedySelect(order, idx, spent, cs, budget, floor) ==
 SelectFn(cs, budget, floor) ==
   GreedySelect(OrderedIds(EntryIds, cs), 1, 0, cs, budget, floor)
 
+(* Tokens already committed by the greedy walk when it reaches position k.
+   Mirrors GreedySelect's accumulator exactly; the budget and floor are the
+   current B and F, so the caller only supplies the prefix bound. *)
+RECURSIVE SpentBefore(_, _, _, _, _)
+SpentBefore(order, idx, spent, cs, k) ==
+  IF idx >= k \/ idx > Len(order)
+  THEN spent
+  ELSE LET eid == order[idx]
+           entry == cs[eid]
+       IN IF entry.relevance < F
+             THEN SpentBefore(order, idx + 1, spent, cs, k)
+             ELSE IF spent + entry.tokens <= B
+                     THEN SpentBefore(order, idx + 1, spent + entry.tokens, cs, k)
+                     ELSE SpentBefore(order, idx + 1, spent, cs, k)
+
+InOutput(eid) == \E i \in 1..Len(output) : output[i] = eid
+
+(* Every sequence over EntryIds that visits each id exactly once. *)
+Orders ==
+  {order \in [1..MaxEntries -> EntryIds] :
+     \A i, j \in 1..MaxEntries : i # j => order[i] # order[j]}
+
+(* The selection rule, stated independently of OrderedIds' construction:
+   descending relevance, ascending entry id on ties. *)
+RuleAdmits(order, cs) ==
+  \A i, j \in 1..Len(order) : i < j => Better(order[i], order[j], cs)
+
 RECURSIVE SumTokens(_, _)
 SumTokens(ids, cs) ==
   IF ids = << >>
@@ -131,8 +158,32 @@ FloorSilence ==
   /\ \A i \in 1..Len(output) : candidates[output[i]].relevance >= F
   /\ (AllBelowFloor(candidates, F) => output = << >>)
 
+(* Greedy is maximal: a skipped entry that clears the floor was skipped only
+   because its full token count did not fit in the budget still unspent when
+   the walk reached it.  A selector that stopped early (truncation) or dropped
+   an affordable entry violates this. *)
+GreedyMaximal ==
+  phase = "done" =>
+    LET ord == OrderedIds(EntryIds, candidates)
+    IN \A k \in 1..Len(ord) :
+         LET eid == ord[k]
+         IN (candidates[eid].relevance >= F /\ ~InOutput(eid))
+              => SpentBefore(ord, 1, 0, candidates, k)
+                   + candidates[eid].tokens > B
+
+(* No entry is emitted twice; the budget accounting depends on it. *)
+NoDuplicates ==
+  \A i, j \in 1..Len(output) : i # j => output[i] # output[j]
+
+(* Determinism stated against the ranking RULE rather than against SelectFn's
+   own construction: every order the rule admits must yield this same output.
+   Reversing the tie-break inside GreedySelect's input order therefore breaks
+   the invariant instead of silently redefining it. *)
 Deterministic ==
-  phase = "idle" \/ output = SelectFn(candidates, B, F)
+  phase = "done" =>
+    \A ord \in Orders :
+      RuleAdmits(ord, candidates) =>
+        output = GreedySelect(ord, 1, 0, candidates, B, F)
 
 Spec ==
   /\ Init
