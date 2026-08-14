@@ -91,6 +91,13 @@ pub struct KbConfig {
     /// λ·relevance − (1−λ)·max_cosine_to_selected). 0.0 disables (default).
     #[serde(default)]
     pub mmr_lambda: f32,
+    /// Whether a successful relocation may rewrite `evidence.citation_path`.
+    /// Default `false`: relocation computes and reports, and mutates evidence
+    /// only under this explicit opt-in (plan P4 "no autonomous mutation of
+    /// evidence"). A heal writes the path only, never the stored hash, and
+    /// emits a `citation_healed` event so it stays auditable and revertible.
+    #[serde(default)]
+    pub relocation_autoheal: bool,
 }
 
 impl KbConfig {
@@ -298,6 +305,17 @@ mod tests {
             paths.compact_state,
             PathBuf::from("/tmp/test-repo/.state/agent-kb/compact-state.json")
         );
+    }
+
+    /// P4: relocation never mutates evidence unless the operator opts in, and
+    /// the opt-in must survive both construction paths (`Default` and TOML).
+    #[test]
+    fn test_relocation_autoheal_defaults_off() {
+        assert!(!KbConfig::default().relocation_autoheal);
+        let parsed: KbConfig = toml::from_str("inline_verify_k = 3\n").unwrap();
+        assert!(!parsed.relocation_autoheal);
+        let opted_in: KbConfig = toml::from_str("relocation_autoheal = true\n").unwrap();
+        assert!(opted_in.relocation_autoheal);
     }
 
     #[test]

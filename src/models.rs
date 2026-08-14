@@ -149,6 +149,46 @@ pub struct Entry {
     pub session_id: Option<String>,
 }
 
+/// Status lattice for a citation, mirroring `Statuses` in
+/// `agent-kb/tla/CitationRelocation.tla`.
+///
+/// `Relocated` is deliberately NOT a weak form of `Verified`: an excerpt match
+/// says where the code went, never that the recorded hash still describes it.
+/// Only a later pass that re-hashes the content at the healed path against the
+/// unchanged stored hash may reach `Verified` (spec `NoSilentPromotion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationStatus {
+    /// The stored hash matches the bytes currently under the citation.
+    Verified,
+    /// The excerpt was found at exactly one new location; the citation can be
+    /// repointed there. Says nothing about the hash.
+    Relocated,
+    /// Neither verified nor safely relocatable.
+    Unverified,
+}
+
+impl VerificationStatus {
+    /// Wire/CLI spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerificationStatus::Verified => "verified",
+            VerificationStatus::Relocated => "relocated",
+            VerificationStatus::Unverified => "unverified",
+        }
+    }
+
+    /// Mirrors `Rank` in `CitationRelocation.tla`: status never regresses
+    /// inside one verification pass.
+    pub fn rank(&self) -> u8 {
+        match self {
+            VerificationStatus::Unverified => 0,
+            VerificationStatus::Relocated => 1,
+            VerificationStatus::Verified => 2,
+        }
+    }
+}
+
 /// A piece of evidence attached to a KB entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Evidence {

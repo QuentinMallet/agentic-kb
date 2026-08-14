@@ -752,7 +752,16 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
     let repo_root = config::git_repo_root();
-    let report = match run_stale_check(&conn, &files, &explicit_commits, blame, repo_root.as_deref()) {
+    // MCP `kb_stale_check` is an agent-interactive call: no filesystem walk on
+    // this lane (plan §6 S2). Relocation surfaces via the CLI's `--relocate`.
+    let report = match run_stale_check(
+        &conn,
+        &files,
+        &explicit_commits,
+        blame,
+        repo_root.as_deref(),
+        crate::components::verification::RelocationPolicy::Never,
+    ) {
         Ok(r) => r,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };

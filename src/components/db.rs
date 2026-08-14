@@ -1,6 +1,7 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
+use crate::components::verification::RelocationPolicy;
 use crate::models::{
     blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
     f32s_to_f16_blob, Evidence, EMB_DIMS,
@@ -34,6 +35,20 @@ use std::path::{Path, PathBuf};
 // while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
 // = 4k verification threads, which the test host tolerates.
 pub const MAX_LIMIT: usize = 100;
+
+/// Relocation policy on the interactive search path — pinned to
+/// [`RelocationPolicy::Never`].
+///
+/// Pre-mortem S2 (`.omc/plans/kb-delivery.md` §6): the verification pool is
+/// bounded and `tx_work.send` blocks the producer once `pool_size * 2` tasks are
+/// in flight. A relocation walking a tree occupies one worker for its whole
+/// duration, so with `pool_size` such units the entire drain stalls behind the
+/// slowest one — mean and p95 stay flat while the tail explodes. Relocation
+/// belongs on the stale-check/audit lane, never here.
+///
+/// Asserted by `tests/citation_relocation.rs` and
+/// `tests/relocation_tail_latency.rs`.
+pub const SEARCH_PATH_RELOCATION_POLICY: RelocationPolicy = RelocationPolicy::Never;
 
 /// Entry field caps — MUST match the schema CHECK constraints on `entries`
 /// (SQLite LENGTH counts characters on TEXT, hence char-based clamping).
@@ -828,6 +843,29 @@ pub fn apply_event(
             )?;
         }
 
+        ("citation_healed", "evidence") => {
+            let ev_id = event["evidence_id"]
+                .as_str()
+                .context("citation_healed: missing evidence_id")?;
+            let entry_id = event["entry_id"]
+                .as_str()
+                .context("citation_healed: missing entry_id")?;
+            let new_path = event["new_path"]
+                .as_str()
+                .context("citation_healed: missing new_path")?;
+
+            // Heal writes citation_path and NOTHING else. citation_hash stays
+            // as recorded (spec CitationRelocation.tla StoredHashImmutable):
+            // an excerpt match locates the code, it does not re-attest it.
+            // A healed row therefore reads back as `relocated`, and only a
+            // later re-verification pass that re-hashes the content at the new
+            // path can promote it to `verified`.
+            conn.execute(
+                "UPDATE evidence SET citation_path=?1 WHERE id=?2 AND entry_id=?3",
+                params![new_path, ev_id, entry_id],
+            )?;
+        }
+
         ("evidence_expire", "evidence") => {
             let ev_id = event["evidence_id"].as_str().context("evidence_expire: missing evidence_id")?;
             let entry_id = event["entry_id"].as_str().context("evidence_expire: missing entry_id")?;
@@ -973,7 +1011,7 @@ pub struct SearchEntry {
 /// Result ordering: the returned Vec per entry follows `recorded_at, id`
 /// order, identical to the previous per-entry loop.  The HashMap key order
 /// is unspecified (HashMap), matching prior behaviour.
-fn fetch_evidence_for_entries(
+pub fn fetch_evidence_for_entries(
     conn: &Connection,
     entry_ids: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<Evidence>>> {
@@ -1930,8 +1968,13 @@ pub fn search_entries(
                 scope.spawn(move || {
                     for (task_idx, ev) in rx {
                         let verified = if let Some(root) = root_ref {
-                            crate::components::verification::verify_evidence(&ev, root)
-                                .unwrap_or(false)
+                            crate::components::verification::verify_evidence(
+                                &ev,
+                                root,
+                                SEARCH_PATH_RELOCATION_POLICY,
+                            )
+                            .map(|o| o.is_verified())
+                            .unwrap_or(false)
                         } else {
                             false
                         };
