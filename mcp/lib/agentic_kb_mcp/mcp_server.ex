@@ -9,6 +9,8 @@ defmodule AgenticKbMcp.McpServer do
 
   @protocol_version "2024-11-05"
   @server_info %{"name" => "agentic-kb-mcp", "version" => "0.1.0"}
+  @format_entries_max_bytes 32_000
+  @evidence_preview_limit 3
 
   @tools [
     %{
@@ -589,20 +591,107 @@ defmodule AgenticKbMcp.McpServer do
     end
   end
 
-  defp format_entries([]), do: "(no results)"
+  def format_entries([]), do: "(no results)"
 
-  defp format_entries(entries) do
-    entries
-    |> Enum.map(fn e ->
-      path = e["path"] || ""
-      summary = e["summary"] || ""
-      content = e["content"] || ""
-      score = e["score"]
-      score_str = if score, do: " (score: #{Float.round(score * 1.0, 3)})", else: ""
-      "## #{path}#{score_str}\n#{summary}\n\n#{content}"
-    end)
-    |> Enum.join("\n\n---\n\n")
+  def format_entries(entries) do
+    {rendered_entries, _bytes_used} =
+      Enum.reduce(entries, {[], 0}, fn entry, {acc, bytes_used} ->
+        rendered_entry = format_entry(entry)
+        separator = if acc == [], do: "", else: "\n\n---\n\n"
+        candidate = separator <> rendered_entry
+        candidate_bytes = byte_size(candidate)
+
+        if bytes_used + candidate_bytes <= @format_entries_max_bytes do
+          {[candidate | acc], bytes_used + candidate_bytes}
+        else
+          {acc, bytes_used}
+        end
+      end)
+      |> then(fn {acc, bytes_used} -> {Enum.reverse(acc), bytes_used} end)
+
+    finalize_rendered_entries(rendered_entries, length(entries))
   end
+
+  defp finalize_rendered_entries(rendered_entries, total_entries) do
+    omitted_count = max(total_entries - length(rendered_entries), 0)
+    text = Enum.join(rendered_entries, "")
+
+    cond do
+      omitted_count == 0 ->
+        text
+
+      text == "" ->
+        "…(#{omitted_count} more entries omitted)"
+
+      byte_size(text <> omission_suffix(omitted_count)) <= @format_entries_max_bytes ->
+        text <> omission_suffix(omitted_count)
+
+      true ->
+        rendered_entries
+        |> Enum.drop(-1)
+        |> finalize_rendered_entries(total_entries)
+    end
+  end
+
+  defp omission_suffix(omitted_count), do: "\n\n…(#{omitted_count} more entries omitted)"
+
+  defp format_entry(entry) do
+    path = entry["path"] || ""
+    summary = entry["summary"] || ""
+    content = entry["content"] || ""
+    score_str = format_score(entry["score"])
+    id = entry["id"] || ""
+    confidence = render_scalar(entry["confidence"])
+    audit_n = render_scalar(entry["audit_n"])
+
+    sections = [
+      "## #{path}#{score_str}",
+      "id: #{id}",
+      "confidence: #{confidence}  audit_n: #{audit_n}",
+      summary,
+      content
+    ]
+
+    case format_evidence(entry["evidence"]) do
+      nil -> Enum.join(sections, "\n\n")
+      evidence -> Enum.join(sections ++ [evidence], "\n\n")
+    end
+  end
+
+  defp format_score(score) when is_number(score), do: " (score: #{Float.round(score * 1.0, 3)})"
+  defp format_score(_score), do: ""
+
+  defp format_evidence(evidence) when evidence in [nil, []], do: nil
+
+  defp format_evidence(evidence) when is_list(evidence) do
+    evidence_lines =
+      evidence
+      |> Enum.with_index()
+      |> Enum.filter(fn {row, index} ->
+        not is_nil(Map.get(row, "verified")) or index < @evidence_preview_limit
+      end)
+      |> Enum.map(fn {row, _index} ->
+        kind = row["kind"] || ""
+        citation_path = row["citation_path"] || ""
+        verified = render_verified(row["verified"])
+        "- kind=#{kind}  citation_path=#{citation_path}  verified=#{verified}"
+      end)
+
+    if evidence_lines == [] do
+      nil
+    else
+      Enum.join(["evidence:" | evidence_lines], "\n")
+    end
+  end
+
+  defp format_evidence(_evidence), do: nil
+
+  defp render_verified(true), do: "verified"
+  defp render_verified(false), do: "BROKEN"
+  defp render_verified(nil), do: "deferred"
+
+  defp render_scalar(nil), do: ""
+  defp render_scalar(value), do: to_string(value)
 
   defp text_error(msg) do
     %{"content" => [%{"type" => "text", "text" => msg}], "isError" => true}
