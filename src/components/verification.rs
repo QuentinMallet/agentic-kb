@@ -165,7 +165,7 @@ impl VerificationOutcome {
 /// Rejects: absolute paths, any `..` / root / prefix components.
 /// Canonicalizes both sides and verifies containment.
 /// Returns `None` on any rejection or I/O error during canonicalization.
-fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return None;
@@ -430,7 +430,7 @@ fn search_for_excerpt(
 
     // -- the cited file first: an in-file move is the cheap, common case --
     if let Some(abs) = safe_join(repo_root, cited_rel) {
-        match scan_file(&abs, needle, &mut budget) {
+        match scan_file(&abs, repo_root, needle, &mut budget) {
             FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
             FileScan::Hits { count, first, size } if count > 0 => {
                 if count > 1 {
@@ -493,7 +493,7 @@ fn search_for_excerpt(
                 continue;
             }
 
-            match scan_file(&path, needle, &mut budget) {
+            match scan_file(&path, &canon_root, needle, &mut budget) {
                 FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
                 FileScan::Hits { count, first, size } if count > 0 => {
                     total += count;
@@ -534,11 +534,31 @@ enum FileScan {
 
 /// Read `path` and count non-overlapping occurrences of `needle`, charging the
 /// bytes read against `budget`.
-fn scan_file(path: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
-    let meta = match std::fs::metadata(path) {
+fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
+    // Reject links immediately before opening, then validate the opened object.
+    // All subsequent metadata and bytes come from this descriptor: the path is
+    // never reopened after the containment check.
+    let path_meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return FileScan::Skipped,
     };
+    if path_meta.file_type().is_symlink() || !path_meta.is_file() {
+        return FileScan::Skipped;
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return FileScan::Skipped,
+    };
+    let meta = match file.metadata() {
+        Ok(m) if m.is_file() => m,
+        _ => return FileScan::Skipped,
+    };
+    let (Ok(canonical_path), Ok(canonical_root)) = (path.canonicalize(), repo_root.canonicalize()) else {
+        return FileScan::Skipped;
+    };
+    if !canonical_path.starts_with(&canonical_root) {
+        return FileScan::Skipped;
+    }
     let size = meta.len();
     if size > MAX_FILE_BYTES || (size as usize) < needle.len() {
         return FileScan::Skipped;
@@ -548,10 +568,10 @@ fn scan_file(path: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
     }
     *budget -= size;
 
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return FileScan::Skipped,
-    };
+    let mut bytes = Vec::with_capacity(size as usize);
+    if file.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
+        return FileScan::Skipped;
+    }
     let (count, first) = count_occurrences(&bytes, needle);
     FileScan::Hits {
         count,
@@ -882,10 +902,37 @@ mod tests {
 
         let mut budget = MAX_RELOCATION_SCAN_BYTES;
         assert!(matches!(
-            scan_file(&big, b"needle", &mut budget),
+            scan_file(&big, dir.path(), b"needle", &mut budget),
             FileScan::CapExceeded
         ));
         assert_eq!(budget, MAX_RELOCATION_SCAN_BYTES, "budget must not be spent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_file_rejects_symlink_to_outside_target() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside secret needle").unwrap();
+        let candidate = repo.path().join("candidate.txt");
+        std::fs::write(&candidate, b"inside needle").unwrap();
+
+        let mut budget = 1024;
+        assert!(matches!(
+            scan_file(&candidate, repo.path(), b"needle", &mut budget),
+            FileScan::Hits { count: 1, .. }
+        ));
+
+        std::fs::remove_file(&candidate).unwrap();
+        symlink(outside.path(), &candidate).unwrap();
+        let mut budget = 1024;
+        assert!(matches!(
+            scan_file(&candidate, repo.path(), b"outside secret", &mut budget),
+            FileScan::Skipped
+        ));
+        assert_eq!(budget, 1024, "the outside target must not be charged or read");
     }
 
     #[test]

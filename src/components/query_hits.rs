@@ -14,6 +14,17 @@ use std::path::Path;
 const RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
 const MAX_ROWS: i64 = 200_000;
 
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_millis(2_000))?;
     conn.execute_batch(
@@ -65,6 +76,8 @@ pub fn record_injection(
         },
     };
     let now = chrono::Utc::now().timestamp();
+    let session_id = truncate_utf8(session_id, 64);
+    let surface = truncate_utf8(surface, 32);
     let result = (|| -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
         {
@@ -73,6 +86,8 @@ pub fn record_injection(
                  VALUES(?1,?2,?3,?4,?5)",
             )?;
             for (entry_id, cited_file) in entries {
+                let entry_id = truncate_utf8(entry_id, 512);
+                let cited_file = cited_file.as_deref().map(|v| truncate_utf8(v, 512));
                 insert.execute(params![session_id, entry_id, cited_file, surface, now])?;
             }
         }
@@ -108,6 +123,7 @@ fn is_tool_call(line: &str) -> bool {
 /// Mark this session's injections according to references in newly-read tool-call turns.
 /// Failures are swallowed; a prior match can never be changed back to unmatched.
 pub fn record_acted_on(path: &Path, session_id: &str, transcript_bytes: &[u8]) {
+    let session_id = truncate_utf8(session_id, 64);
     let mut conn = match open(path, false) {
         Ok(conn) => conn,
         Err(_) => {
@@ -242,6 +258,7 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
         },
     };
     let now = chrono::Utc::now().timestamp();
+    let surface = truncate_utf8(surface, 32);
     let result = (|| -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
         {
@@ -249,7 +266,7 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
                 "INSERT INTO hits(entry_id,queried_at,surface) VALUES(?1,?2,?3)",
             )?;
             for entry_id in entry_ids {
-                insert.execute(params![entry_id, now, surface])?;
+                insert.execute(params![truncate_utf8(entry_id, 512), now, surface])?;
             }
         }
         tx.execute(
@@ -404,5 +421,36 @@ mod tests {
         fs::write(&path, b"not sqlite").unwrap();
         record_injection(&path, "s1", &[("recovered".into(), None)], "test");
         assert_eq!(injection_telemetry(&path).unwrap().total_injections, 1);
+    }
+
+    #[test]
+    fn oversized_fields_are_truncated_on_utf8_boundaries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hits.db");
+        let surface = "é".repeat(40);
+        let session = "é".repeat(50);
+        let entry = "é".repeat(300);
+        let cited = "é".repeat(300);
+        record_injection(&path, &session, &[(entry.clone(), Some(cited))], &surface);
+        record_hits(&path, &[entry], &surface);
+
+        let conn = Connection::open(&path).unwrap();
+        let injection_lengths: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT length(CAST(session_id AS BLOB)), length(CAST(entry_id AS BLOB)), \
+                 length(CAST(cited_file AS BLOB)), length(CAST(surface AS BLOB)) FROM injections",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(injection_lengths, (64, 512, 512, 32));
+        let hit_lengths: (i64, i64) = conn
+            .query_row(
+                "SELECT length(CAST(entry_id AS BLOB)), length(CAST(surface AS BLOB)) FROM hits",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hit_lengths, (512, 32));
     }
 }

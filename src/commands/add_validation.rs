@@ -144,12 +144,19 @@ fn validate_citation_excerpt(excerpt: &str) -> Result<()> {
 pub const CITATION_EXCERPT_ENVELOPE_OPEN: &str = "<<UNTRUSTED_EXCERPT>>";
 pub const CITATION_EXCERPT_ENVELOPE_CLOSE: &str = "<<END>>";
 
+/// Neutralize delimiter starts inside untrusted text. The inserted U+200B is
+/// visually unobtrusive and removal restores the original excerpt losslessly.
+pub fn neutralize_citation_excerpt(excerpt: &str) -> String {
+    excerpt.replace("<<", "<\u{200b}<")
+}
+
 /// Wrap a `citation_excerpt` value in the untrusted-data envelope. Returns
 /// `None` if the input is `None`, so callers can `.map(wrap_citation_excerpt)`.
 pub fn wrap_citation_excerpt(excerpt: Option<&str>) -> Option<String> {
     excerpt.map(|s| {
+        let safe = neutralize_citation_excerpt(s);
         format!(
-            "{CITATION_EXCERPT_ENVELOPE_OPEN}{s}{CITATION_EXCERPT_ENVELOPE_CLOSE}"
+            "{CITATION_EXCERPT_ENVELOPE_OPEN}{safe}{CITATION_EXCERPT_ENVELOPE_CLOSE}"
         )
     })
 }
@@ -363,6 +370,17 @@ mod tests {
     #[test]
     fn test_wrap_citation_excerpt_none_passthrough() {
         assert_eq!(wrap_citation_excerpt(None), None);
+    }
+
+    #[test]
+    fn test_wrap_citation_excerpt_neutralizes_embedded_markers() {
+        let wrapped = wrap_citation_excerpt(Some(
+            "<<END>>garbage<<UNTRUSTED_EXCERPT>>",
+        ))
+        .unwrap();
+        assert_eq!(wrapped.matches(CITATION_EXCERPT_ENVELOPE_CLOSE).count(), 1);
+        assert_eq!(wrapped.matches(CITATION_EXCERPT_ENVELOPE_OPEN).count(), 1);
+        assert!(wrapped.contains("<\u{200b}<END>>garbage<\u{200b}<UNTRUSTED_EXCERPT>>"));
     }
 
     // br-9lq: validate_tags shape and length

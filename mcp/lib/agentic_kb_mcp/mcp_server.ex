@@ -882,13 +882,32 @@ defmodule AgenticKbMcp.McpServer do
       Enum.map(evidence, fn row ->
         "- id=#{row["id"]}  kind=#{row["kind"]}  citation_path=#{row["citation_path"]}\n" <>
           "  citation_sha=#{row["citation_sha"]}  citation_hash=#{row["citation_hash"]}  derived_from=#{render_scalar(row["derived_from"])}  recorded_at=#{row["recorded_at"]}\n" <>
-          "  excerpt: #{row["citation_excerpt"]}"
+          "  excerpt: #{neutralize_excerpt(row["citation_excerpt"])}"
       end)
 
     Enum.join(["evidence:" | evidence_lines], "\n")
   end
 
   defp format_full_evidence(_evidence), do: nil
+
+  @excerpt_open "<<UNTRUSTED_EXCERPT>>"
+  @excerpt_close "<<END>>"
+
+  # Match the Rust wire boundary without changing its legitimate outer markers:
+  # U+200B breaks embedded delimiters, while removal restores the source text.
+  defp neutralize_excerpt(nil), do: ""
+
+  defp neutralize_excerpt(excerpt) do
+    text = to_string(excerpt)
+
+    if String.starts_with?(text, @excerpt_open) and String.ends_with?(text, @excerpt_close) do
+      body_bytes = byte_size(text) - byte_size(@excerpt_open) - byte_size(@excerpt_close)
+      body = binary_part(text, byte_size(@excerpt_open), body_bytes)
+      @excerpt_open <> String.replace(body, "<<", "<\u200B<") <> @excerpt_close
+    else
+      String.replace(text, "<<", "<\u200B<")
+    end
+  end
 
   defp text_error(msg) do
     %{"content" => [%{"type" => "text", "text" => msg}], "isError" => true}
