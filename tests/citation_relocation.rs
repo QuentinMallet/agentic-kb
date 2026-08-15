@@ -18,7 +18,8 @@ use std::fs;
 use std::path::Path;
 
 /// A 66-byte, 3-line excerpt: clears both floors (≥64 bytes, ≥2 lines).
-const STRONG_EXCERPT: &str = "fn relocate_me(input: &str) -> usize {\n    input.as_bytes().len()\n}";
+const STRONG_EXCERPT: &str =
+    "fn relocate_me(input: &str) -> usize {\n    input.as_bytes().len()\n}";
 
 fn sha256_hex(b: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -64,8 +65,16 @@ fn moved_repo(moved_to: &str, decoys: &[&str]) -> MovedRepo {
     // The cited file survives, and stays long enough for the recorded range to
     // remain in bounds, but the excerpt is gone: the hash check reaches a
     // genuine mismatch rather than an out-of-range read.
-    write_file(root, "src/old.rs", &"// the cited code moved away\n".repeat(4));
-    write_file(root, moved_to, &format!("// preamble\n{STRONG_EXCERPT}\n// trailer\n"));
+    write_file(
+        root,
+        "src/old.rs",
+        &"// the cited code moved away\n".repeat(4),
+    );
+    write_file(
+        root,
+        moved_to,
+        &format!("// preamble\n{STRONG_EXCERPT}\n// trailer\n"),
+    );
     for (i, d) in decoys.iter().enumerate() {
         write_file(root, d, &format!("// decoy {i}\n{STRONG_EXCERPT}\n"));
     }
@@ -329,7 +338,11 @@ fn hash_match_verifies_without_searching() {
         RelocationPolicy::FileThenRepo,
     ] {
         let out = verify_evidence(&ev, root, policy).unwrap();
-        assert_eq!(out.status, VerificationStatus::Verified, "policy {policy:?}");
+        assert_eq!(
+            out.status,
+            VerificationStatus::Verified,
+            "policy {policy:?}"
+        );
         assert!(out.relocated_to.is_none(), "policy {policy:?}");
     }
 }
@@ -455,7 +468,10 @@ fn citation_healed_event_round_trips_through_replay() {
 
     let (healed_path, live_hash) = read_citation(&live);
     assert_eq!(healed_path, "src/new.rs:11-77");
-    assert_eq!(live_hash, original_hash, "heal must not write citation_hash");
+    assert_eq!(
+        live_hash, original_hash,
+        "heal must not write citation_hash"
+    );
 
     // Replay the whole log into a fresh DB — this is what `kb rebuild` does.
     let replayed = open_db_memory().unwrap();

@@ -101,9 +101,8 @@ impl Add {
         };
 
         // Build tags JSON before validation so validate_kb_add_inputs can check shape.
-        let tags_json: Value = serde_json::json!(
-            self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>()
-        );
+        let tags_json: Value =
+            serde_json::json!(self.tags.split(',').map(|t| t.trim()).collect::<Vec<_>>());
 
         // Compute id early so the self-loop provenance check in validate_kb_add_inputs
         // can compare evidence.derived_from against the entry's own id.
@@ -194,7 +193,10 @@ pub fn make_embedder(paths: &config::Paths) -> Box<dyn embedder::Embedder> {
 ///             remains as a backwards-compatible wrapper that reads the env var.
 /// Directive: never reintroduce `env::set_var("KB_NO_EMBED", …)` to flip embedder
 ///            behaviour; pass `no_embed` explicitly via this function instead.
-pub fn make_embedder_with_opts(paths: &config::Paths, no_embed: bool) -> Box<dyn embedder::Embedder> {
+pub fn make_embedder_with_opts(
+    paths: &config::Paths,
+    no_embed: bool,
+) -> Box<dyn embedder::Embedder> {
     if no_embed {
         Box::new(embedder::NoopEmbedder)
     } else {
@@ -430,7 +432,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(permanent, 0, "old events without permanent field must default to 0");
+        assert_eq!(
+            permanent, 0,
+            "old events without permanent field must default to 0"
+        );
     }
 
     #[test]
@@ -477,19 +482,15 @@ mod tests {
 
         let conn = Connection::open(&paths.db).unwrap();
         let old_stale: i64 = conn
-            .query_row(
-                "SELECT is_stale FROM entries WHERE id='rp-old'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT is_stale FROM entries WHERE id='rp-old'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(old_stale, 1, "old entry must be stale after --replace-path");
         let new_stale: i64 = conn
-            .query_row(
-                "SELECT is_stale FROM entries WHERE id='rp-new'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT is_stale FROM entries WHERE id='rp-new'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(new_stale, 0, "new entry must be active");
     }
@@ -613,7 +614,9 @@ mod tests {
             cues: vec![],
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
-        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code|derived only"));
+        assert!(err
+            .to_string()
+            .contains("Phase 1 ships evidence.kind=code|derived only"));
     }
 
     #[test]
@@ -641,7 +644,8 @@ mod tests {
         };
         let err = cmd.execute_with(&paths, &embedder).unwrap_err();
         assert!(
-            err.to_string().contains("evidence required for kind='observation'"),
+            err.to_string()
+                .contains("evidence required for kind='observation'"),
             "unexpected error: {err}"
         );
     }
@@ -677,7 +681,11 @@ mod tests {
         let events_content = fs::read_to_string(&paths.events).unwrap();
         let lines: Vec<&str> = events_content.lines().collect();
         // Should have 3 lines: 1 upsert + 2 evidence_add
-        assert_eq!(lines.len(), 3, "expected 3 event lines (1 add + 2 evidence_add)");
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected 3 event lines (1 add + 2 evidence_add)"
+        );
 
         let ev0: Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(ev0["action"], "upsert");

@@ -427,7 +427,11 @@ mod tests {
             )
             .unwrap();
         // Strengthened: must equal the actual chunk count, not just >= 1.
-        assert_eq!(count, chunks.len() as i64, "all chunks must be active in DB");
+        assert_eq!(
+            count,
+            chunks.len() as i64,
+            "all chunks must be active in DB"
+        );
     }
 
     // ── Proptest: no env cross-talk between parallel Ingest calls ─────────────
@@ -543,18 +547,14 @@ mod tests {
         let count_b = handle_b.join().expect("thread B panicked");
 
         assert_eq!(
-            count_a,
-            expected_a as i64,
+            count_a, expected_a as i64,
             "thread A: expected {} active chunks, got {}",
-            expected_a,
-            count_a
+            expected_a, count_a
         );
         assert_eq!(
-            count_b,
-            expected_b as i64,
+            count_b, expected_b as i64,
             "thread B: expected {} active chunks, got {}",
-            expected_b,
-            count_b
+            expected_b, count_b
         );
     }
 

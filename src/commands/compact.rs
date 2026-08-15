@@ -128,10 +128,8 @@ impl Compact {
         // implicitly dropped — they never appear in entry_pairs, so they are never
         // emitted. This is safe: absent == stale, so rebuild from the compacted log
         // produces identical search-visible state.
-        let mut entry_pairs: Vec<(usize, &str)> = entry_last
-            .iter()
-            .map(|(id, &i)| (i, id.as_str()))
-            .collect();
+        let mut entry_pairs: Vec<(usize, &str)> =
+            entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
             if expire_last.get(id).is_some_and(|&e| e > i) {
@@ -286,7 +284,11 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 0, "force-expired entry must be purged from the log");
+        assert_eq!(
+            after.len(),
+            0,
+            "force-expired entry must be purged from the log"
+        );
     }
 
     #[test]
@@ -328,9 +330,16 @@ mod tests {
         cmd.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1, "compact must produce exactly one entry event");
+        assert_eq!(
+            after.len(),
+            1,
+            "compact must produce exactly one entry event"
+        );
         // The compact must emit the LATEST upsert (v2) and must NOT mark stale.
-        assert_eq!(after[0]["summary"], "v2", "compact must keep the last upsert content");
+        assert_eq!(
+            after[0]["summary"], "v2",
+            "compact must keep the last upsert content"
+        );
         assert!(
             after[0]["is_stale"].is_null() || after[0]["is_stale"] == false,
             "re-upsert after expire must NOT be marked stale (br-joj)"
@@ -380,10 +389,14 @@ mod tests {
             });
             append_event(&paths.events, &ev).unwrap();
         }
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "dead", "ts": "2024-01-01T01:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "dead", "ts": "2024-01-01T01:00:00Z"
+            }),
+        )
+        .unwrap();
 
         Compact.execute_with_paths(&paths).unwrap();
 
@@ -449,9 +462,16 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), RUN_HISTORY_CAP, "exactly RUN_HISTORY_CAP events must not be trimmed");
+        assert_eq!(
+            after.len(),
+            RUN_HISTORY_CAP,
+            "exactly RUN_HISTORY_CAP events must not be trimmed"
+        );
         assert_eq!(after[0]["test_id"], "0");
-        assert_eq!(after[RUN_HISTORY_CAP - 1]["test_id"], format!("{}", RUN_HISTORY_CAP - 1));
+        assert_eq!(
+            after[RUN_HISTORY_CAP - 1]["test_id"],
+            format!("{}", RUN_HISTORY_CAP - 1)
+        );
     }
 
     #[test]
@@ -468,22 +488,34 @@ mod tests {
         let paths = Paths::from_root(root);
 
         // Case (a): pure orphan expire.
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "ghost", "ts": "2024-01-01T00:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "ghost", "ts": "2024-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(after.len(), 0, "pure orphan expire must be dropped");
 
         // Case (b): post-compact orphan — another expire after log is empty.
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "ghost", "ts": "2024-01-01T01:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "ghost", "ts": "2024-01-01T01:00:00Z"
+            }),
+        )
+        .unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         let after2 = events::read_events(&paths.events).unwrap();
-        assert_eq!(after2.len(), 0, "post-compact orphan expire must also be dropped");
+        assert_eq!(
+            after2.len(),
+            0,
+            "post-compact orphan expire must also be dropped"
+        );
     }
 
     // br-h7c: proptest target #4 — expire/compact state machine.
@@ -564,8 +596,7 @@ mod tests {
     /// Raw op generator — unrestricted alphabet across 4 ids.
     fn arb_raw_op() -> impl proptest::strategy::Strategy<Value = CompactOp> {
         use proptest::prelude::*;
-        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"])
-            .prop_map(|s| s.to_string());
+        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
         prop_oneof![
             arb_id.clone().prop_map(CompactOp::Upsert),
             arb_id.prop_map(CompactOp::Expire),
@@ -679,7 +710,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
             assert_eq!(
                 read_counter(&paths),
                 n,
@@ -695,7 +728,9 @@ mod tests {
             "ts": "2024-01-01T00:00:00Z"
         });
         append_event(&paths.events, &ev).unwrap();
-        Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+        Compact
+            .execute_with_paths_and_vacuum(&paths, &vcfg)
+            .unwrap();
 
         assert_eq!(
             read_counter(&paths),
@@ -722,7 +757,10 @@ mod tests {
             vacuum_min_free_pages: 1024,
         };
 
-        assert!(freelist_count(&paths) >= 1024, "AC2 precondition: >=1024 free pages");
+        assert!(
+            freelist_count(&paths) >= 1024,
+            "AC2 precondition: >=1024 free pages"
+        );
 
         for n in 1..=7_u64 {
             let ev = serde_json::json!({
@@ -732,7 +770,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
         }
 
         assert_eq!(
@@ -774,7 +814,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
         }
 
         assert_eq!(
@@ -793,8 +835,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_sigkill_during_vacuum_leaves_db_readable() {
-        use std::process::{Command, Stdio};
         use libc;
+        use std::process::{Command, Stdio};
 
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();

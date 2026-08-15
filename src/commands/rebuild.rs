@@ -4,8 +4,8 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
 use crate::components::{db, events};
 use crate::config;
-use anyhow::Context;
 use abscissa_core::{Command, Runnable};
+use anyhow::Context;
 use clap::Parser;
 use std::fs;
 
@@ -19,18 +19,13 @@ static PHASE2_BARRIER: std::sync::OnceLock<
 
 #[cfg(test)]
 pub(crate) fn set_phase2_barrier(b: std::sync::Arc<std::sync::Barrier>) {
-    let m = PHASE2_BARRIER
-        .get_or_init(|| std::sync::Mutex::new(None));
+    let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
     *m.lock().unwrap() = Some(b);
 }
 
 #[cfg(test)]
 fn take_phase2_barrier() -> Option<std::sync::Arc<std::sync::Barrier>> {
-    PHASE2_BARRIER
-        .get()?
-        .lock()
-        .ok()?
-        .take()
+    PHASE2_BARRIER.get()?.lock().ok()?.take()
 }
 
 /// Force a one-time rebuild when the DB predates the current schema
@@ -73,10 +68,11 @@ pub fn rebuild_if_schema_obsolete(
         // permanently disarm the upgrade while derived state (e.g. the empty
         // entries_fts_v2 table) stays broken. Warn loudly, leave unstamped so
         // every interaction retries until the path issue is fixed.
-        let has_events = fs::metadata(&paths.events).map(|m| m.len() > 0).unwrap_or(false);
+        let has_events = fs::metadata(&paths.events)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
         if !has_events {
-            let entries: i64 =
-                conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))?;
+            let entries: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))?;
             if entries == 0 {
                 conn.execute(
                     "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
@@ -166,7 +162,9 @@ pub fn rebuild_if_schema_obsolete(
     // data. The backup is therefore MANDATORY: a failure aborts the upgrade
     // (leaving the DB obsolete-but-intact, retried next interaction) rather
     // than proceed and break the safety guarantee.
-    let backup = paths.db.with_extension(format!("db.pre-v{}.bak", db::SCHEMA_VERSION));
+    let backup = paths
+        .db
+        .with_extension(format!("db.pre-v{}.bak", db::SCHEMA_VERSION));
     {
         // Under the write flock so no concurrent writer mutates the DB mid-
         // snapshot. VACUUM INTO takes a read transaction and emits a single
@@ -180,7 +178,10 @@ pub fn rebuild_if_schema_obsolete(
         let target = backup.to_string_lossy().replace('\'', "''");
         conn.execute_batch(&format!("VACUUM INTO '{target}'"))
             .with_context(|| {
-                format!("back up pre-upgrade DB to {} (upgrade aborted)", backup.display())
+                format!(
+                    "back up pre-upgrade DB to {} (upgrade aborted)",
+                    backup.display()
+                )
             })?;
     } // release the write flock — Rebuild re-acquires it per phase
     eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
@@ -242,13 +243,17 @@ impl Rebuild {
         // (codex review finding). Orphans from CRASHED rebuilds are swept —
         // a file is an orphan only when its embedded pid is no longer alive
         // (/proc/<pid> absent); a live pid means a rebuild in flight, leave it.
-        let tmp_db = paths.db.with_extension(format!("db.tmp.{}", std::process::id()));
+        let tmp_db = paths
+            .db
+            .with_extension(format!("db.tmp.{}", std::process::id()));
         if let (Some(dir), Some(stem)) = (paths.db.parent(), paths.db.file_name()) {
             let prefix = format!("{}.tmp.", stem.to_string_lossy());
             if let Ok(rd) = fs::read_dir(dir) {
                 for e in rd.filter_map(|e| e.ok()) {
                     let name = e.file_name().to_string_lossy().to_string();
-                    let Some(pid_str) = name.strip_prefix(&prefix) else { continue };
+                    let Some(pid_str) = name.strip_prefix(&prefix) else {
+                        continue;
+                    };
                     let alive = pid_str
                         .parse::<u32>()
                         .is_ok_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
@@ -301,8 +306,7 @@ impl Rebuild {
         let db_str = paths.db.to_string_lossy();
         let _ = fs::remove_file(format!("{}-wal", db_str));
         let _ = fs::remove_file(format!("{}-shm", db_str));
-        fs::rename(&tmp_db, &paths.db)
-            .with_context(|| "rename rebuilt DB into place")?;
+        fs::rename(&tmp_db, &paths.db).with_context(|| "rename rebuilt DB into place")?;
 
         eprintln!("rebuild complete");
         Ok(())
@@ -329,11 +333,23 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "T"],
         ] {
-            Cmd::new("git").args(&args).current_dir(root).output().unwrap();
+            Cmd::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
         }
         fs::write(root.join("R"), "i").unwrap();
-        Cmd::new("git").args(["add", "."]).current_dir(root).output().unwrap();
-        Cmd::new("git").args(["commit", "-m", "i"]).current_dir(root).output().unwrap();
+        Cmd::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Cmd::new("git")
+            .args(["commit", "-m", "i"])
+            .current_dir(root)
+            .output()
+            .unwrap();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         (dir, paths)
@@ -376,7 +392,10 @@ mod tests {
         );
         Rebuild.execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 1);
-        assert_eq!(crate::components::query_hits::counts(&paths.query_hits).unwrap(), vec![("rb-hit".into(), 1)]);
+        assert_eq!(
+            crate::components::query_hits::counts(&paths.query_hits).unwrap(),
+            vec![("rb-hit".into(), 1)]
+        );
     }
 
     /// DB cleared (e.g. corrupted or missing) — rebuild reconstructs from event log.
@@ -662,9 +681,8 @@ mod tests {
 
         // Spawn rebuild thread.
         let emb_rebuild = Arc::clone(&emb);
-        let rebuild_handle = thread::spawn(move || {
-            Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref())
-        });
+        let rebuild_handle =
+            thread::spawn(move || Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref()));
 
         // Writer A: 50 entries with unique IDs, uses kb_core::add.
         let emb_a = Arc::clone(&emb);
@@ -735,7 +753,10 @@ mod tests {
         });
 
         // Join all threads.
-        rebuild_handle.join().unwrap().expect("rebuild must succeed");
+        rebuild_handle
+            .join()
+            .unwrap()
+            .expect("rebuild must succeed");
         writer_a.join().unwrap();
         writer_b.join().unwrap();
 
@@ -743,8 +764,8 @@ mod tests {
         Rebuild.execute_with(&paths, emb.as_ref()).unwrap();
 
         // AC2: no malformed JSONL — every line parses as valid JSON.
-        let log_content = std::fs::read_to_string(&paths.events)
-            .expect("events log must be readable");
+        let log_content =
+            std::fs::read_to_string(&paths.events).expect("events log must be readable");
         for (idx, line) in log_content.lines().enumerate() {
             serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
                 panic!("malformed JSONL at line {}: {e}\n  line: {line:?}", idx + 1)

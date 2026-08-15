@@ -30,7 +30,8 @@ const POOL_SIZE: usize = 4;
 /// Enough tasks to saturate the `pool_size * 2` channel and block the producer.
 const TASKS: usize = POOL_SIZE * 4;
 
-const STRONG_EXCERPT: &str = "fn relocate_me(input: &str) -> usize {\n    input.as_bytes().len()\n}";
+const STRONG_EXCERPT: &str =
+    "fn relocate_me(input: &str) -> usize {\n    input.as_bytes().len()\n}";
 
 /// One unit of verification work handed to the pool.
 ///
@@ -102,7 +103,11 @@ fn fixture_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     // The cited file no longer holds the excerpt, so every row is
     // relocation-eligible: only the policy keeps the walk off this lane.
-    fs::write(dir.path().join("old.rs"), "// the code moved away\n".repeat(4)).unwrap();
+    fs::write(
+        dir.path().join("old.rs"),
+        "// the code moved away\n".repeat(4),
+    )
+    .unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/new.rs"),
@@ -164,7 +169,12 @@ fn search_path_drain_stays_inside_the_tail_budget() {
 
     let repo = fixture_repo();
     let units: Vec<Unit> = (0..TASKS)
-        .map(|i| Unit::Verify(relocation_eligible_evidence(i), SEARCH_PATH_RELOCATION_POLICY))
+        .map(|i| {
+            Unit::Verify(
+                relocation_eligible_evidence(i),
+                SEARCH_PATH_RELOCATION_POLICY,
+            )
+        })
         .collect();
 
     let latencies = drain(units, repo.path());

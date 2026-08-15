@@ -47,10 +47,7 @@ impl Import {
         if !self.dry_run {
             if let Ok(existing) = std::fs::read_to_string(&stamp_path) {
                 if existing.trim() == hash {
-                    println!(
-                        "import: up-to-date (hash {}), skipping",
-                        &hash[..8]
-                    );
+                    println!("import: up-to-date (hash {}), skipping", &hash[..8]);
                     return Ok(());
                 }
             }
@@ -61,7 +58,8 @@ impl Import {
 
         // Construct embedder without env::set_var.
         // Directive: env::set_var is unsafe in Rust 2024 — never reintroduce.
-        let embedder: Box<dyn embedder::Embedder> = add::make_embedder_with_opts(&paths, self.no_embed);
+        let embedder: Box<dyn embedder::Embedder> =
+            add::make_embedder_with_opts(&paths, self.no_embed);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
 
         let mut imported = 0usize;
@@ -80,10 +78,7 @@ impl Import {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let raw_content = entry
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let raw_content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
             let content: String = raw_content.chars().take(MAX_CONTENT).collect();
             let tags = parse_tags(entry.get("tags"));
             let permanent = entry
@@ -125,7 +120,11 @@ impl Import {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&stamp_path, &hash)?;
-            println!("import: {} entries imported (stamp {})", imported, &hash[..8]);
+            println!(
+                "import: {} entries imported (stamp {})",
+                imported,
+                &hash[..8]
+            );
         }
         Ok(())
     }
@@ -277,7 +276,10 @@ mod tests {
     #[test]
     fn test_stamp_path_derivation() {
         let p = std::path::Path::new("/home/user/seeds.json");
-        assert_eq!(stamp_path_for(p), PathBuf::from("/home/user/seeds.json.stamp"));
+        assert_eq!(
+            stamp_path_for(p),
+            PathBuf::from("/home/user/seeds.json.stamp")
+        );
     }
 
     #[test]

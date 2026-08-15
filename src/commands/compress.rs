@@ -166,9 +166,7 @@ pub fn run(
     // preserves the original's evidential standing (required for mandated kinds).
     let conn2 = db::open_db(&paths.db)?;
     let tags_json: serde_json::Value = {
-        let mut stmt = conn2.prepare(
-            "SELECT tags FROM entries WHERE id = ?1",
-        )?;
+        let mut stmt = conn2.prepare("SELECT tags FROM entries WHERE id = ?1")?;
         let tags_str: String = stmt.query_row(params![entry_id], |r| r.get(0))?;
         serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]))
     };
@@ -177,18 +175,19 @@ pub fn run(
             "SELECT kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from
              FROM evidence WHERE entry_id = ?1 ORDER BY rowid",
         )?;
-        let rows: Vec<serde_json::Value> = stmt.query_map(params![entry_id], |r| {
-            Ok(serde_json::json!({
-                "kind":             r.get::<_, String>(0)?,
-                "citation_path":    r.get::<_, Option<String>>(1)?,
-                "citation_sha":     r.get::<_, Option<String>>(2)?,
-                "citation_hash":    r.get::<_, String>(3)?,
-                "citation_excerpt": r.get::<_, Option<String>>(4)?,
-                "derived_from":     r.get::<_, Option<String>>(5)?,
-            }))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(params![entry_id], |r| {
+                Ok(serde_json::json!({
+                    "kind":             r.get::<_, String>(0)?,
+                    "citation_path":    r.get::<_, Option<String>>(1)?,
+                    "citation_sha":     r.get::<_, Option<String>>(2)?,
+                    "citation_hash":    r.get::<_, String>(3)?,
+                    "citation_excerpt": r.get::<_, Option<String>>(4)?,
+                    "derived_from":     r.get::<_, Option<String>>(5)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         rows
     };
     drop(conn2);

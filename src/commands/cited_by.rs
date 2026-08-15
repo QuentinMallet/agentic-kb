@@ -216,7 +216,14 @@ mod tests {
             "INSERT INTO evidence(
                 id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2024-01-01T00:00:00Z')",
-            params![id, entry_id, kind, citation_path, citation_hash, citation_excerpt],
+            params![
+                id,
+                entry_id,
+                kind,
+                citation_path,
+                citation_hash,
+                citation_excerpt
+            ],
         )
         .unwrap();
     }
@@ -241,15 +248,20 @@ mod tests {
             "    println!(\"{message}\");\n",
             "}\n"
         );
-        let content = format!(
-            "// stale bytes here\n{verified_excerpt}\n// spacer\n{relocated_excerpt}"
-        );
+        let content =
+            format!("// stale bytes here\n{verified_excerpt}\n// spacer\n{relocated_excerpt}");
         write_repo_file(root, "src/foo.rs", &content);
 
         let (verified_start, verified_end) = byte_range(&content, verified_excerpt);
         let verified_hash = sha256_hex(&content.as_bytes()[verified_start..verified_end]);
 
-        insert_entry(conn, "deferred-entry", "docs/deferred.md", "Deferred summary", 0);
+        insert_entry(
+            conn,
+            "deferred-entry",
+            "docs/deferred.md",
+            "Deferred summary",
+            0,
+        );
         insert_evidence(
             conn,
             "ev-deferred",
@@ -260,7 +272,13 @@ mod tests {
             None,
         );
 
-        insert_entry(conn, "relocated-entry", "docs/relocated.md", "Relocated summary", 0);
+        insert_entry(
+            conn,
+            "relocated-entry",
+            "docs/relocated.md",
+            "Relocated summary",
+            0,
+        );
         insert_evidence(
             conn,
             "ev-relocated",
@@ -271,7 +289,13 @@ mod tests {
             Some(relocated_excerpt),
         );
 
-        insert_entry(conn, "unverified-entry", "docs/unverified.md", "Unverified summary", 0);
+        insert_entry(
+            conn,
+            "unverified-entry",
+            "docs/unverified.md",
+            "Unverified summary",
+            0,
+        );
         insert_evidence(
             conn,
             "ev-unverified",
@@ -282,7 +306,13 @@ mod tests {
             Some("fn missing_target() {\n    println!(\"nope\");\n}\n"),
         );
 
-        insert_entry(conn, "verified-entry", "docs/verified.md", "Verified summary", 0);
+        insert_entry(
+            conn,
+            "verified-entry",
+            "docs/verified.md",
+            "Verified summary",
+            0,
+        );
         insert_evidence(
             conn,
             "ev-verified",
@@ -316,7 +346,8 @@ mod tests {
             json: false,
         };
         let mut out = Vec::new();
-        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out).unwrap();
+        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out)
+            .unwrap();
 
         let stdout = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = stdout.lines().collect();
@@ -343,7 +374,8 @@ mod tests {
             json: false,
         };
         let mut out = Vec::new();
-        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out).unwrap();
+        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out)
+            .unwrap();
         assert!(out.is_empty());
     }
 
@@ -358,7 +390,8 @@ mod tests {
             json: true,
         };
         let mut out = Vec::new();
-        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out).unwrap();
+        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out)
+            .unwrap();
 
         let rows: Value = serde_json::from_slice(&out).unwrap();
         let arr = rows.as_array().unwrap();

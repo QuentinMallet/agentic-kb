@@ -53,7 +53,10 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
         .filter_map(Result::ok)
         .any(|name| name == "acted_on");
     if !has_acted_on {
-        conn.execute("ALTER TABLE injections ADD COLUMN acted_on INTEGER DEFAULT NULL", [])?;
+        conn.execute(
+            "ALTER TABLE injections ADD COLUMN acted_on INTEGER DEFAULT NULL",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -141,9 +144,8 @@ pub fn record_acted_on(path: &Path, session_id: &str, transcript_bytes: &[u8]) {
     let result = (|| -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
         let rows: Vec<(i64, String, Option<String>)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id,entry_id,cited_file FROM injections WHERE session_id=?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id,entry_id,cited_file FROM injections WHERE session_id=?1")?;
             let collected: Vec<_> = stmt
                 .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -151,7 +153,9 @@ pub fn record_acted_on(path: &Path, session_id: &str, transcript_bytes: &[u8]) {
         };
         for (id, entry_id, cited_file) in rows {
             let matched = tool_text.contains(&entry_id)
-                || cited_file.as_deref().is_some_and(|file| !file.is_empty() && tool_text.contains(file));
+                || cited_file
+                    .as_deref()
+                    .is_some_and(|file| !file.is_empty() && tool_text.contains(file));
             tx.execute(
                 "UPDATE injections SET acted_on=MAX(COALESCE(acted_on,0),?1) WHERE id=?2",
                 params![if matched { 1 } else { 0 }, id],
@@ -189,31 +193,58 @@ pub fn injection_telemetry(path: &Path) -> Option<InjectionTelemetry> {
             return None;
         }
     };
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM injections", [], |r| r.get(0)).ok()?;
-    let (scanned, matched): (i64, i64) = conn.query_row(
-        "SELECT COUNT(acted_on), COALESCE(SUM(acted_on),0) FROM injections",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ).ok()?;
-    let unknown: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM injections WHERE surface='unknown'", [], |r| r.get(0),
-    ).ok()?;
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM injections", [], |r| r.get(0))
+        .ok()?;
+    let (scanned, matched): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(acted_on), COALESCE(SUM(acted_on),0) FROM injections",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    let unknown: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM injections WHERE surface='unknown'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
     let mut per_surface = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT surface,COUNT(*),COUNT(acted_on),COALESCE(SUM(acted_on),0) \
+    let mut stmt = conn
+        .prepare(
+            "SELECT surface,COUNT(*),COUNT(acted_on),COALESCE(SUM(acted_on),0) \
          FROM injections GROUP BY surface ORDER BY surface",
-    ).ok()?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))).ok()?;
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .ok()?;
     for (surface, count, surface_scanned, surface_matched) in rows.filter_map(Result::ok) {
-        per_surface.insert(surface, SurfaceTelemetry {
-            count,
-            acted_on_rate: (surface_scanned > 0).then_some(surface_matched as f64 / surface_scanned as f64),
-        });
+        per_surface.insert(
+            surface,
+            SurfaceTelemetry {
+                count,
+                acted_on_rate: (surface_scanned > 0)
+                    .then_some(surface_matched as f64 / surface_scanned as f64),
+            },
+        );
     }
     Some(InjectionTelemetry {
         total_injections: total,
         acted_on_rate: (scanned > 0).then_some(matched as f64 / scanned as f64),
-        unknown_surface_rate: if total == 0 { 0.0 } else { unknown as f64 / total as f64 },
+        unknown_surface_rate: if total == 0 {
+            0.0
+        } else {
+            unknown as f64 / total as f64
+        },
         per_surface,
     })
 }
@@ -262,9 +293,8 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
     let result = (|| -> rusqlite::Result<()> {
         let tx = conn.transaction()?;
         {
-            let mut insert = tx.prepare(
-                "INSERT INTO hits(entry_id,queried_at,surface) VALUES(?1,?2,?3)",
-            )?;
+            let mut insert =
+                tx.prepare("INSERT INTO hits(entry_id,queried_at,surface) VALUES(?1,?2,?3)")?;
             for entry_id in entry_ids {
                 insert.execute(params![truncate_utf8(entry_id, 512), now, surface])?;
             }
@@ -299,9 +329,7 @@ pub fn counts(path: &Path) -> Option<Vec<(String, u64)>> {
     };
     let result = (|| -> rusqlite::Result<Vec<(String, u64)>> {
         let mut stmt = conn.prepare("SELECT entry_id, COUNT(*) FROM hits GROUP BY entry_id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?;
         Ok(rows.filter_map(Result::ok).collect())
     })();
     match result {
@@ -325,16 +353,14 @@ mod tests {
         let path = dir.path().join("hits.db");
         record_hits(&path, &["new".into()], "mcp");
         let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "INSERT INTO hits(entry_id,queried_at) VALUES('old',0)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO hits(entry_id,queried_at) VALUES('old',0)", [])
+            .unwrap();
         conn.execute(
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<=200000)
              INSERT INTO hits(entry_id,queried_at) SELECT 'bulk',strftime('%s','now') FROM n",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
         record_hits(&path, &["last".into()], "test");
         let conn = Connection::open(&path).unwrap();
@@ -347,11 +373,9 @@ mod tests {
             })
             .unwrap();
         let surface: String = conn
-            .query_row(
-                "SELECT surface FROM hits WHERE entry_id='last'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT surface FROM hits WHERE entry_id='last'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(total, MAX_ROWS);
         assert_eq!(old, 0);
@@ -371,7 +395,12 @@ mod tests {
     fn records_injections_and_prunes_expired_rows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hits.db");
-        record_injection(&path, "s1", &[("new".into(), Some("src/lib.rs".into()))], "cli");
+        record_injection(
+            &path,
+            "s1",
+            &[("new".into(), Some("src/lib.rs".into()))],
+            "cli",
+        );
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "INSERT INTO injections(session_id,entry_id,surface,injected_at) VALUES('s1','old','cli',0)",
@@ -380,31 +409,56 @@ mod tests {
         drop(conn);
         record_injection(&path, "s1", &[("last".into(), None)], "cli");
         let conn = Connection::open(&path).unwrap();
-        let rows: Vec<(String, Option<String>)> = conn.prepare(
-            "SELECT entry_id,cited_file FROM injections ORDER BY id",
-        ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
-            .map(Result::unwrap).collect();
-        assert_eq!(rows, vec![("new".into(), Some("src/lib.rs".into())), ("last".into(), None)]);
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT entry_id,cited_file FROM injections ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("new".into(), Some("src/lib.rs".into())),
+                ("last".into(), None)
+            ]
+        );
     }
 
     #[test]
     fn acted_on_matching_is_idempotent_and_reported() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hits.db");
-        record_injection(&path, "s1", &[
-            ("entry-a".into(), Some("src/touched.rs".into())),
-            ("entry-b".into(), Some("src/untouched.rs".into())),
-        ], "unknown");
+        record_injection(
+            &path,
+            "s1",
+            &[
+                ("entry-a".into(), Some("src/touched.rs".into())),
+                ("entry-b".into(), Some("src/untouched.rs".into())),
+            ],
+            "unknown",
+        );
         let fixture = br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/touched.rs"}}]}}
 {"type":"user","message":"entry-b outside a tool call"}
 "#;
         record_acted_on(&path, "s1", fixture);
-        record_acted_on(&path, "s1", br#"{"type":"tool_use","name":"Read","input":{"file_path":"other.rs"}}"#);
+        record_acted_on(
+            &path,
+            "s1",
+            br#"{"type":"tool_use","name":"Read","input":{"file_path":"other.rs"}}"#,
+        );
         let conn = Connection::open(&path).unwrap();
-        let flags: Vec<i64> = conn.prepare("SELECT acted_on FROM injections ORDER BY id").unwrap()
-            .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let flags: Vec<i64> = conn
+            .prepare("SELECT acted_on FROM injections ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(flags, vec![1, 0], "replay must not flip the prior match");
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM injections", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM injections", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2, "acted-on replay must not duplicate injections");
         drop(conn);
         let report = injection_telemetry(&path).unwrap();

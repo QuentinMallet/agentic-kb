@@ -9,7 +9,10 @@
 
 use kb::components::db::{apply_event, open_db_memory, SearchOptions};
 use kb::components::embedder::NoopEmbedder;
-use kb::components::retrieval_eval::{compare_reports, corpus_hash_from_event_log, evaluate, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, CaseResult, EvalReport, GoldenCase, Split, SplitManifest, Verdict};
+use kb::components::retrieval_eval::{
+    compare_reports, corpus_hash_from_event_log, evaluate, evaluate_split, parse_golden_jsonl,
+    validate_sealed_manifest, CaseResult, EvalReport, GoldenCase, Split, SplitManifest, Verdict,
+};
 use serde_json::json;
 
 fn make_entry(id: &str, path: &str, summary: &str, content: &str) -> serde_json::Value {
@@ -38,9 +41,24 @@ fn setup_corpus() -> rusqlite::Connection {
     let conn = open_db_memory().unwrap();
     let emb = NoopEmbedder;
     for (id, path, summary, content) in [
-        ("e-auth", "src/auth", "authentication jwt tokens", "verifies bearer jwt"),
-        ("e-search", "src/search", "hybrid search ranking", "rrf fusion of lanes"),
-        ("e-deploy", "ops/deploy", "deployment nixos flake", "nix build pipeline"),
+        (
+            "e-auth",
+            "src/auth",
+            "authentication jwt tokens",
+            "verifies bearer jwt",
+        ),
+        (
+            "e-search",
+            "src/search",
+            "hybrid search ranking",
+            "rrf fusion of lanes",
+        ),
+        (
+            "e-deploy",
+            "ops/deploy",
+            "deployment nixos flake",
+            "nix build pipeline",
+        ),
     ] {
         apply_event(&conn, &emb, &make_entry(id, path, summary, content)).unwrap();
     }
@@ -67,17 +85,42 @@ fn fts_opts(k: usize) -> SearchOptions {
 fn test_perfect_golden_set_scores_one() {
     let conn = setup_corpus();
     let cases = vec![
-        GoldenCase { query: "authentication jwt".into(), expected_ids: vec!["e-auth".into()], split: Split::Dev },
-        GoldenCase { query: "hybrid search ranking".into(), expected_ids: vec!["e-search".into()], split: Split::Dev },
-        GoldenCase { query: "deployment nixos".into(), expected_ids: vec!["e-deploy".into()], split: Split::Dev },
+        GoldenCase {
+            query: "authentication jwt".into(),
+            expected_ids: vec!["e-auth".into()],
+            split: Split::Dev,
+        },
+        GoldenCase {
+            query: "hybrid search ranking".into(),
+            expected_ids: vec!["e-search".into()],
+            split: Split::Dev,
+        },
+        GoldenCase {
+            query: "deployment nixos".into(),
+            expected_ids: vec!["e-deploy".into()],
+            split: Split::Dev,
+        },
     ];
     let report = evaluate(&conn, &NoopEmbedder, &cases, &fts_opts(10)).unwrap();
 
     assert_eq!(report.per_case.len(), 3);
-    assert!((report.recall_at_k() - 1.0).abs() < 1e-9, "recall@10 must be 1.0, got {}", report.recall_at_k());
-    assert!((report.mrr() - 1.0).abs() < 1e-9, "MRR must be 1.0, got {}", report.mrr());
+    assert!(
+        (report.recall_at_k() - 1.0).abs() < 1e-9,
+        "recall@10 must be 1.0, got {}",
+        report.recall_at_k()
+    );
+    assert!(
+        (report.mrr() - 1.0).abs() < 1e-9,
+        "MRR must be 1.0, got {}",
+        report.mrr()
+    );
     for c in &report.per_case {
-        assert_eq!(c.first_rank, Some(1), "expected id must be rank 1 for query '{}'", c.query);
+        assert_eq!(
+            c.first_rank,
+            Some(1),
+            "expected id must be rank 1 for query '{}'",
+            c.query
+        );
     }
 }
 
@@ -87,13 +130,29 @@ fn test_perfect_golden_set_scores_one() {
 fn test_miss_case_lowers_aggregates() {
     let conn = setup_corpus();
     let cases = vec![
-        GoldenCase { query: "authentication jwt".into(), expected_ids: vec!["e-auth".into()], split: Split::Dev },
-        GoldenCase { query: "zzz nonexistent query".into(), expected_ids: vec!["e-deploy".into()], split: Split::Dev },
+        GoldenCase {
+            query: "authentication jwt".into(),
+            expected_ids: vec!["e-auth".into()],
+            split: Split::Dev,
+        },
+        GoldenCase {
+            query: "zzz nonexistent query".into(),
+            expected_ids: vec!["e-deploy".into()],
+            split: Split::Dev,
+        },
     ];
     let report = evaluate(&conn, &NoopEmbedder, &cases, &fts_opts(10)).unwrap();
 
-    assert!((report.recall_at_k() - 0.5).abs() < 1e-9, "recall must be 0.5, got {}", report.recall_at_k());
-    assert!((report.mrr() - 0.5).abs() < 1e-9, "MRR must be 0.5, got {}", report.mrr());
+    assert!(
+        (report.recall_at_k() - 0.5).abs() < 1e-9,
+        "recall must be 0.5, got {}",
+        report.recall_at_k()
+    );
+    assert!(
+        (report.mrr() - 0.5).abs() < 1e-9,
+        "MRR must be 0.5, got {}",
+        report.mrr()
+    );
     assert_eq!(report.per_case[1].hits, 0);
     assert_eq!(report.per_case[1].first_rank, None);
 }
@@ -133,25 +192,55 @@ fn test_parse_golden_jsonl() {
     assert_eq!(cases[1].expected_ids.len(), 2);
 
     let bad = r#"{"query": "no expectations", "expected_ids": []}"#;
-    assert!(parse_golden_jsonl(bad).is_err(), "empty expected_ids must be rejected");
+    assert!(
+        parse_golden_jsonl(bad).is_err(),
+        "empty expected_ids must be rejected"
+    );
 
     let empty = "\n# only comments\n";
-    assert!(parse_golden_jsonl(empty).is_err(), "golden set with zero cases must be rejected");
+    assert!(
+        parse_golden_jsonl(empty).is_err(),
+        "golden set with zero cases must be rejected"
+    );
     let legacy = r#"{"query":"legacy","expected_ids":["e-auth"]}"#;
-    assert!(parse_golden_jsonl(legacy).unwrap_err().to_string().contains("invalid JSON"));
+    assert!(parse_golden_jsonl(legacy)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid JSON"));
 }
 
 #[test]
 fn sealed_case_is_refused_by_dev_scorer() {
-    let case = GoldenCase { query: "secret".into(), expected_ids: vec!["e-auth".into()], split: Split::Sealed };
-    let err = evaluate_split(&setup_corpus(), &NoopEmbedder, &[case], &fts_opts(10), Split::Dev).unwrap_err();
+    let case = GoldenCase {
+        query: "secret".into(),
+        expected_ids: vec!["e-auth".into()],
+        split: Split::Sealed,
+    };
+    let err = evaluate_split(
+        &setup_corpus(),
+        &NoopEmbedder,
+        &[case],
+        &fts_opts(10),
+        Split::Dev,
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("EVAL_SPLIT_REFUSAL"));
 }
 
 fn report(bits: &[bool]) -> EvalReport {
-    EvalReport { k: 10, per_case: bits.iter().enumerate().map(|(i, hit)| CaseResult {
-        query: format!("q{i}"), expected: 1, hits: usize::from(*hit), first_rank: hit.then_some(1),
-    }).collect() }
+    EvalReport {
+        k: 10,
+        per_case: bits
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| CaseResult {
+                query: format!("q{i}"),
+                expected: 1,
+                hits: usize::from(*hit),
+                first_rank: hit.then_some(1),
+            })
+            .collect(),
+    }
 }
 
 #[test]
@@ -173,19 +262,48 @@ fn manifest_hash_is_stable_and_absent_id_is_detected() {
     use std::fs;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
-    fs::write(&path, serde_json::to_string(&make_entry("present", "p", "s", "body")).unwrap() + "\n").unwrap();
-    let ids = ["present".to_string(), "absent".to_string()].into_iter().collect::<BTreeSet<_>>();
+    fs::write(
+        &path,
+        serde_json::to_string(&make_entry("present", "p", "s", "body")).unwrap() + "\n",
+    )
+    .unwrap();
+    let ids = ["present".to_string(), "absent".to_string()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let first = corpus_hash_from_event_log(&path, &ids).unwrap();
     let second = corpus_hash_from_event_log(&path, &ids).unwrap();
     assert_eq!(first, second);
-    assert!(!first.1.contains("absent"), "sealed preflight must hard-refuse this id");
-    let cases = vec![GoldenCase { query: "q".into(), expected_ids: vec!["absent".into()], split: Split::Sealed }];
-    let manifest = SplitManifest { corpus_hash: "irrelevant".into(), sealed_ids: vec!["absent".into()], dev_ids: vec![], frozen_at: "now".into(), corpus_hash_domain: "ids-only".into() };
+    assert!(
+        !first.1.contains("absent"),
+        "sealed preflight must hard-refuse this id"
+    );
+    let cases = vec![GoldenCase {
+        query: "q".into(),
+        expected_ids: vec!["absent".into()],
+        split: Split::Sealed,
+    }];
+    let manifest = SplitManifest {
+        corpus_hash: "irrelevant".into(),
+        sealed_ids: vec!["absent".into()],
+        dev_ids: vec![],
+        frozen_at: "now".into(),
+        corpus_hash_domain: "ids-only".into(),
+    };
     let err = validate_sealed_manifest(&cases, &path, &manifest).unwrap_err();
     assert!(err.to_string().contains("SEALED_CORPUS_STALE_OR_ABSENT"));
 
-    let present_cases = vec![GoldenCase { query: "q".into(), expected_ids: vec!["present".into()], split: Split::Sealed }];
-    let wrong_hash = SplitManifest { corpus_hash: "wrong".into(), sealed_ids: vec!["present".into()], dev_ids: vec![], frozen_at: "now".into(), corpus_hash_domain: "ids-only".into() };
+    let present_cases = vec![GoldenCase {
+        query: "q".into(),
+        expected_ids: vec!["present".into()],
+        split: Split::Sealed,
+    }];
+    let wrong_hash = SplitManifest {
+        corpus_hash: "wrong".into(),
+        sealed_ids: vec!["present".into()],
+        dev_ids: vec![],
+        frozen_at: "now".into(),
+        corpus_hash_domain: "ids-only".into(),
+    };
     let err = validate_sealed_manifest(&present_cases, &path, &wrong_hash).unwrap_err();
     assert!(err.to_string().contains("SEALED_MANIFEST_HASH_MISMATCH"));
 }
@@ -208,11 +326,20 @@ fn sealed_manifest_rejects_split_membership_drift() {
             .unwrap()
             .join("\n")
             + "\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let cases = vec![
-        GoldenCase { query: "dev".into(), expected_ids: vec!["case-dev".into()], split: Split::Sealed },
-        GoldenCase { query: "sealed".into(), expected_ids: vec!["case-sealed".into()], split: Split::Sealed },
+        GoldenCase {
+            query: "dev".into(),
+            expected_ids: vec!["case-dev".into()],
+            split: Split::Sealed,
+        },
+        GoldenCase {
+            query: "sealed".into(),
+            expected_ids: vec!["case-sealed".into()],
+            split: Split::Sealed,
+        },
     ];
     let manifest = SplitManifest {
         corpus_hash: kb::components::retrieval_eval::ids_only_corpus_hash(

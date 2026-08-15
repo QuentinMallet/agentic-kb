@@ -219,19 +219,13 @@ impl Paths {
                 .join(".state")
                 .join("agent-kb")
                 .join("agent-kb-events.jsonl"),
-            db: root
-                .join(".state")
-                .join("agent-kb")
-                .join("agent-kb.db"),
+            db: root.join(".state").join("agent-kb").join("agent-kb.db"),
             fastembed_cache: model_cache_dir(),
             compact_state: root
                 .join(".state")
                 .join("agent-kb")
                 .join("compact-state.json"),
-            query_hits: root
-                .join(".state")
-                .join("agent-kb")
-                .join("query-hits.db"),
+            query_hits: root.join(".state").join("agent-kb").join("query-hits.db"),
         }
     }
 }
@@ -403,7 +397,11 @@ mod tests {
             "db path must contain '/.state/agent-kb/' even with symlink, got: {db_str}"
         );
 
-        let symlink_path = root.join("agent-kb").join("agent-kb.db").to_string_lossy().to_string();
+        let symlink_path = root
+            .join("agent-kb")
+            .join("agent-kb.db")
+            .to_string_lossy()
+            .to_string();
         assert_ne!(
             discover_paths.db.to_string_lossy().as_ref(),
             symlink_path.as_str(),

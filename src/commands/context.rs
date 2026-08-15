@@ -87,15 +87,21 @@ impl Context {
         let mut out = stdout.lock();
         render(&selected, self.json, &mut out)?;
         if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
-            let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
-            let injected: Vec<_> = selected.entries.iter()
+            let session_id =
+                std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+            let injected: Vec<_> = selected
+                .entries
+                .iter()
                 .map(|entry| (entry.id.clone(), entry.cited_file.clone()))
                 .collect();
             query_hits::record_injection(&paths.query_hits, &session_id, &injected, &surface);
         }
         eprintln!(
             "context: entries considered/selected: {}/{}; tokens emitted/budget: {}/{}",
-            selected.considered, selected.entries.len(), spent, self.budget
+            selected.considered,
+            selected.entries.len(),
+            spent,
+            self.budget
         );
         Ok(())
     }
@@ -174,7 +180,7 @@ fn build_candidates(
     let mut evidence: HashMap<String, (usize, usize, Option<String>)> = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT ev.entry_id, ev.citation_path FROM evidence ev \
-         JOIN entries e ON e.id=ev.entry_id WHERE e.is_stale=0 AND ev.citation_path IS NOT NULL"
+         JOIN entries e ON e.id=ev.entry_id WHERE e.is_stale=0 AND ev.citation_path IS NOT NULL",
     )?;
     for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
         let (id, path) = row?;
@@ -241,7 +247,13 @@ fn greedy_select(
             entries.push(candidate);
         }
     }
-    (Selection { considered, entries }, spent)
+    (
+        Selection {
+            considered,
+            entries,
+        },
+        spent,
+    )
 }
 
 fn render<W: Write>(selection: &Selection, json: bool, writer: &mut W) -> anyhow::Result<()> {
@@ -307,7 +319,8 @@ fn enumerate_working_set(root: &Path) -> BTreeSet<String> {
         if record.len() < 4 {
             continue;
         }
-        let renamed_or_copied = matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
+        let renamed_or_copied =
+            matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
         files.insert(String::from_utf8_lossy(&record[3..]).into_owned());
         // In -z format a rename/copy has a second NUL-delimited record for
         // the source name. The first record above is the destination name.
@@ -316,7 +329,11 @@ fn enumerate_working_set(root: &Path) -> BTreeSet<String> {
         }
     }
     let base = ["main", "master"].into_iter().find(|name| {
-        git_output(root, &["rev-parse", "--verify", &format!("refs/heads/{name}")]).is_some()
+        git_output(
+            root,
+            &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+        )
+        .is_some()
     });
     if let Some(base) = base {
         if let Some(diff) = git_output(root, &["diff", "--name-only", &format!("{base}...HEAD")]) {
@@ -391,9 +408,18 @@ mod tests {
 
     #[test]
     fn branch_ticket_prefix_is_stripped_and_tokens_normalized() {
-        assert_eq!(branch_tokens("bd-rhx-context_budget/RRF"), ["context", "budget", "rrf"]);
-        assert_eq!(branch_tokens("bd-rhx.12-context"), ["bd", "rhx", "12", "context"]);
-        assert_eq!(branch_tokens("feature/context-budget"), ["feature", "context", "budget"]);
+        assert_eq!(
+            branch_tokens("bd-rhx-context_budget/RRF"),
+            ["context", "budget", "rrf"]
+        );
+        assert_eq!(
+            branch_tokens("bd-rhx.12-context"),
+            ["bd", "rhx", "12", "context"]
+        );
+        assert_eq!(
+            branch_tokens("feature/context-budget"),
+            ["feature", "context", "budget"]
+        );
     }
 
     #[test]
@@ -425,9 +451,20 @@ mod tests {
 
     #[test]
     fn oversized_middle_entry_is_skipped_not_truncated() {
-        let input = vec![candidate("a", 8, 3.0, true), candidate("b", 100, 2.0, true), candidate("c", 8, 1.0, true)];
+        let input = vec![
+            candidate("a", 8, 3.0, true),
+            candidate("b", 100, 2.0, true),
+            candidate("c", 8, 1.0, true),
+        ];
         let (selected, spent) = greedy_select(input, 4, None);
-        assert_eq!(selected.entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            selected
+                .entries
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
         assert_eq!(spent, 4);
     }
 
@@ -527,7 +564,10 @@ mod tests {
         let (selected, spent) = greedy_select(input, usize::MAX, None);
         let ids: Vec<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["030-top", "020-high"]);
-        assert_eq!(spent, selected.entries.iter().map(|e| e.tokens).sum::<usize>());
+        assert_eq!(
+            spent,
+            selected.entries.iter().map(|e| e.tokens).sum::<usize>()
+        );
 
         let mut bytes = Vec::new();
         render(&selected, false, &mut bytes).unwrap();

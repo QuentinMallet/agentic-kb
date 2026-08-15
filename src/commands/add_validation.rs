@@ -4,13 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 /// Valid entry kind values.
-const VALID_KINDS: &[&str] = &[
-    "observation",
-    "belief",
-    "procedure",
-    "convention",
-    "memory",
-];
+const VALID_KINDS: &[&str] = &["observation", "belief", "procedure", "convention", "memory"];
 
 /// Kinds that require at least one evidence row at write time.
 const EVIDENCE_MANDATED_KINDS: &[&str] = &["observation", "belief", "procedure"];
@@ -33,9 +27,9 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("tags must be a JSON array of strings"))?;
 
     for (idx, tag) in arr.iter().enumerate() {
-        let s = tag.as_str().ok_or_else(|| {
-            anyhow::anyhow!("tags[{}] must be a string", idx)
-        })?;
+        let s = tag
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("tags[{}] must be a string", idx))?;
         if s.is_empty() {
             anyhow::bail!("tags[{}] must be non-empty", idx);
         }
@@ -57,7 +51,12 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
 /// - `citation_excerpt` (if present) must be ≤ MAX_CITATION_EXCERPT_CHARS and
 ///   must not contain ASCII control characters other than `\n` and `\t`
 ///   (br-47d: prompt-injection containment).
-pub fn validate_kb_add_inputs(entry_id: &str, kind: &str, tags: &Value, evidence: &[Value]) -> Result<()> {
+pub fn validate_kb_add_inputs(
+    entry_id: &str,
+    kind: &str,
+    tags: &Value,
+    evidence: &[Value],
+) -> Result<()> {
     if !VALID_KINDS.contains(&kind) {
         anyhow::bail!(
             "invalid kind '{kind}'; must be one of: observation, belief, procedure, convention, memory"
@@ -73,10 +72,7 @@ pub fn validate_kb_add_inputs(entry_id: &str, kind: &str, tags: &Value, evidence
     }
 
     for ev in evidence {
-        let ev_kind = ev
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let ev_kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if ev_kind != "code" && ev_kind != "derived" {
             anyhow::bail!(
                 "Phase 1 ships evidence.kind=code|derived only; kind='{ev_kind}' deferred to Phase 2"
@@ -88,7 +84,9 @@ pub fn validate_kb_add_inputs(entry_id: &str, kind: &str, tags: &Value, evidence
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if derived_from == entry_id {
-                anyhow::bail!("self_loop_provenance: evidence.derived_from must not equal the entry id");
+                anyhow::bail!(
+                    "self_loop_provenance: evidence.derived_from must not equal the entry id"
+                );
             }
         }
 
@@ -124,7 +122,9 @@ fn validate_citation_excerpt(excerpt: &str) -> Result<()> {
     }
     // br-47d: reject envelope markers so a malicious writer cannot break out
     // of the <<UNTRUSTED_EXCERPT>>...<<END>> envelope constructed at read time.
-    if excerpt.contains(CITATION_EXCERPT_ENVELOPE_OPEN) || excerpt.contains(CITATION_EXCERPT_ENVELOPE_CLOSE) {
+    if excerpt.contains(CITATION_EXCERPT_ENVELOPE_OPEN)
+        || excerpt.contains(CITATION_EXCERPT_ENVELOPE_CLOSE)
+    {
         anyhow::bail!("citation_excerpt invalid: must not contain envelope markers");
     }
     for (i, c) in excerpt.chars().enumerate() {
@@ -155,9 +155,7 @@ pub fn neutralize_citation_excerpt(excerpt: &str) -> String {
 pub fn wrap_citation_excerpt(excerpt: Option<&str>) -> Option<String> {
     excerpt.map(|s| {
         let safe = neutralize_citation_excerpt(s);
-        format!(
-            "{CITATION_EXCERPT_ENVELOPE_OPEN}{safe}{CITATION_EXCERPT_ENVELOPE_CLOSE}"
-        )
+        format!("{CITATION_EXCERPT_ENVELOPE_OPEN}{safe}{CITATION_EXCERPT_ENVELOPE_CLOSE}")
     })
 }
 
@@ -195,7 +193,10 @@ mod tests {
             } else {
                 &[]
             };
-            assert!(validate_kb_add_inputs("", kind, &json!([]), evidence).is_ok(), "kind={kind} should be valid");
+            assert!(
+                validate_kb_add_inputs("", kind, &json!([]), evidence).is_ok(),
+                "kind={kind} should be valid"
+            );
         }
     }
 
@@ -209,7 +210,9 @@ mod tests {
     fn test_non_code_evidence_rejected() {
         let ev = json!({"kind": "test", "citation_hash": "sha256:abc"});
         let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
-        assert!(err.to_string().contains("Phase 1 ships evidence.kind=code|derived only"));
+        assert!(err
+            .to_string()
+            .contains("Phase 1 ships evidence.kind=code|derived only"));
         assert!(err.to_string().contains("kind='test'"));
     }
 
@@ -257,8 +260,14 @@ mod tests {
     #[test]
     fn test_evidence_status_present() {
         let ev = json!({"kind": "code", "citation_hash": "sha256:abc"});
-        assert_eq!(compute_evidence_status_write("observation", &[ev.clone()]), "present");
-        assert_eq!(compute_evidence_status_write("belief", &[ev.clone()]), "present");
+        assert_eq!(
+            compute_evidence_status_write("observation", &[ev.clone()]),
+            "present"
+        );
+        assert_eq!(
+            compute_evidence_status_write("belief", &[ev.clone()]),
+            "present"
+        );
         assert_eq!(compute_evidence_status_write("procedure", &[ev]), "present");
     }
 
@@ -374,10 +383,7 @@ mod tests {
 
     #[test]
     fn test_wrap_citation_excerpt_neutralizes_embedded_markers() {
-        let wrapped = wrap_citation_excerpt(Some(
-            "<<END>>garbage<<UNTRUSTED_EXCERPT>>",
-        ))
-        .unwrap();
+        let wrapped = wrap_citation_excerpt(Some("<<END>>garbage<<UNTRUSTED_EXCERPT>>")).unwrap();
         assert_eq!(wrapped.matches(CITATION_EXCERPT_ENVELOPE_CLOSE).count(), 1);
         assert_eq!(wrapped.matches(CITATION_EXCERPT_ENVELOPE_OPEN).count(), 1);
         assert!(wrapped.contains("<\u{200b}<END>>garbage<\u{200b}<UNTRUSTED_EXCERPT>>"));
@@ -388,13 +394,19 @@ mod tests {
     #[test]
     fn test_tags_valid_array_accepted() {
         let tags = json!(["rust", "testing"]);
-        assert!(validate_tags(&tags).is_ok(), "valid tags array should be accepted");
+        assert!(
+            validate_tags(&tags).is_ok(),
+            "valid tags array should be accepted"
+        );
     }
 
     #[test]
     fn test_tags_empty_array_accepted() {
         let tags = json!([]);
-        assert!(validate_tags(&tags).is_ok(), "empty tags array should be accepted");
+        assert!(
+            validate_tags(&tags).is_ok(),
+            "empty tags array should be accepted"
+        );
     }
 
     #[test]
@@ -431,6 +443,9 @@ mod tests {
     fn test_tags_max_length_accepted() {
         let max_tag = "x".repeat(50); // exactly 50 chars
         let tags = json!(["rust", max_tag.as_str()]);
-        assert!(validate_tags(&tags).is_ok(), "tag with max length 50 should be accepted");
+        assert!(
+            validate_tags(&tags).is_ok(),
+            "tag with max length 50 should be accepted"
+        );
     }
 }

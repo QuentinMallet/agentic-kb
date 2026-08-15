@@ -43,24 +43,39 @@ pub struct SplitManifest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict { Significant, Inconclusive, Regression }
+pub enum Verdict {
+    Significant,
+    Inconclusive,
+    Regression,
+}
 
 impl Verdict {
     pub fn name(self) -> &'static str {
-        match self { Self::Significant => "SIGNIFICANT", Self::Inconclusive => "INCONCLUSIVE", Self::Regression => "REGRESSION" }
+        match self {
+            Self::Significant => "SIGNIFICANT",
+            Self::Inconclusive => "INCONCLUSIVE",
+            Self::Regression => "REGRESSION",
+        }
     }
 }
 
-pub struct Comparison { pub verdict: Verdict, pub discordant_pairs: usize }
+pub struct Comparison {
+    pub verdict: Verdict,
+    pub discordant_pairs: usize,
+}
 
 /// Pre-registered exact McNemar decision table. A case is a success when it has
 /// at least one hit. Mixed-direction discordance is inconclusive by design.
 pub fn compare_reports(before: &EvalReport, after: &EvalReport) -> Result<Comparison> {
-    if before.per_case.len() != after.per_case.len() { bail!("compare requires paired result sets of equal length"); }
+    if before.per_case.len() != after.per_case.len() {
+        bail!("compare requires paired result sets of equal length");
+    }
     let mut favorable = 0;
     let mut against = 0;
     for (a, b) in before.per_case.iter().zip(&after.per_case) {
-        if a.query != b.query { bail!("compare requires paired same-corpus results in identical query order"); }
+        if a.query != b.query {
+            bail!("compare requires paired same-corpus results in identical query order");
+        }
         match (a.hits > 0, b.hits > 0) {
             (false, true) => favorable += 1,
             (true, false) => against += 1,
@@ -68,10 +83,17 @@ pub fn compare_reports(before: &EvalReport, after: &EvalReport) -> Result<Compar
         }
     }
     let discordant_pairs = favorable + against;
-    let verdict = if discordant_pairs >= 6 && against == 0 { Verdict::Significant }
-        else if discordant_pairs >= 6 && favorable == 0 { Verdict::Regression }
-        else { Verdict::Inconclusive };
-    Ok(Comparison { verdict, discordant_pairs })
+    let verdict = if discordant_pairs >= 6 && against == 0 {
+        Verdict::Significant
+    } else if discordant_pairs >= 6 && favorable == 0 {
+        Verdict::Regression
+    } else {
+        Verdict::Inconclusive
+    };
+    Ok(Comparison {
+        verdict,
+        discordant_pairs,
+    })
 }
 
 /// Per-case outcome.
@@ -140,7 +162,10 @@ pub fn parse_golden_jsonl(text: &str) -> Result<Vec<GoldenCase>> {
         let case: GoldenCase = serde_json::from_str(line)
             .with_context(|| format!("golden set line {}: invalid JSON", lineno + 1))?;
         if case.expected_ids.is_empty() {
-            bail!("golden set line {}: expected_ids must not be empty", lineno + 1);
+            bail!(
+                "golden set line {}: expected_ids must not be empty",
+                lineno + 1
+            );
         }
         cases.push(case);
     }
@@ -150,35 +175,56 @@ pub fn parse_golden_jsonl(text: &str) -> Result<Vec<GoldenCase>> {
     Ok(cases)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 /// Materialize only the live entry state needed by the freeze from JSONL.
 /// This intentionally never consults SQLite.
-pub fn corpus_hash_from_event_log(events_path: &Path, expected_ids: &BTreeSet<String>) -> Result<(String, BTreeSet<String>)> {
+pub fn corpus_hash_from_event_log(
+    events_path: &Path,
+    expected_ids: &BTreeSet<String>,
+) -> Result<(String, BTreeSet<String>)> {
     let events = crate::components::events::read_events(events_path)?;
     let mut live: BTreeMap<String, String> = BTreeMap::new();
     for event in events {
-        if event.get("table").and_then(|v| v.as_str()) != Some("entries") { continue; }
-        let Some(id) = event.get("id").and_then(|v| v.as_str()) else { continue };
+        if event.get("table").and_then(|v| v.as_str()) != Some("entries") {
+            continue;
+        }
+        let Some(id) = event.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
         match event.get("action").and_then(|v| v.as_str()) {
             Some("upsert") => {
-                if event.get("is_stale").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if event
+                    .get("is_stale")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     live.remove(id);
                 } else {
                     let content = event.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     live.insert(id.to_owned(), sha256_hex(content.as_bytes()));
                 }
             }
-            Some("expire") => { live.remove(id); }
+            Some("expire") => {
+                live.remove(id);
+            }
             _ => {}
         }
     }
-    let present = expected_ids.iter().filter(|id| live.contains_key(*id)).cloned().collect::<BTreeSet<_>>();
+    let present = expected_ids
+        .iter()
+        .filter(|id| live.contains_key(*id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut domain = Vec::new();
     for id in expected_ids {
         if let Some(content_hash) = live.get(id) {
-            domain.extend_from_slice(id.as_bytes()); domain.push(0);
-            domain.extend_from_slice(content_hash.as_bytes()); domain.push(b'\n');
+            domain.extend_from_slice(id.as_bytes());
+            domain.push(0);
+            domain.extend_from_slice(content_hash.as_bytes());
+            domain.push(b'\n');
         }
     }
     Ok((sha256_hex(&domain), present))
@@ -186,17 +232,39 @@ pub fn corpus_hash_from_event_log(events_path: &Path, expected_ids: &BTreeSet<St
 
 pub fn ids_only_corpus_hash(expected_ids: &BTreeSet<String>) -> String {
     let mut domain = Vec::new();
-    for id in expected_ids { domain.extend_from_slice(id.as_bytes()); domain.push(b'\n'); }
+    for id in expected_ids {
+        domain.extend_from_slice(id.as_bytes());
+        domain.push(b'\n');
+    }
     sha256_hex(&domain)
 }
 
 pub fn expected_ids(cases: &[GoldenCase]) -> BTreeSet<String> {
-    cases.iter().flat_map(|c| c.expected_ids.iter().cloned()).collect()
+    cases
+        .iter()
+        .flat_map(|c| c.expected_ids.iter().cloned())
+        .collect()
 }
 
-pub fn validate_sealed_manifest(cases: &[GoldenCase], events_path: &Path, manifest: &SplitManifest) -> Result<()> {
-    let dev_ids = expected_ids(&cases.iter().filter(|c| c.split == Split::Dev).cloned().collect::<Vec<_>>());
-    let sealed_ids = expected_ids(&cases.iter().filter(|c| c.split == Split::Sealed).cloned().collect::<Vec<_>>());
+pub fn validate_sealed_manifest(
+    cases: &[GoldenCase],
+    events_path: &Path,
+    manifest: &SplitManifest,
+) -> Result<()> {
+    let dev_ids = expected_ids(
+        &cases
+            .iter()
+            .filter(|c| c.split == Split::Dev)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let sealed_ids = expected_ids(
+        &cases
+            .iter()
+            .filter(|c| c.split == Split::Sealed)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     let frozen_dev = manifest.dev_ids.iter().cloned().collect::<BTreeSet<_>>();
     let frozen_sealed = manifest.sealed_ids.iter().cloned().collect::<BTreeSet<_>>();
     if dev_ids != frozen_dev || sealed_ids != frozen_sealed || !dev_ids.is_disjoint(&sealed_ids) {
@@ -205,14 +273,20 @@ pub fn validate_sealed_manifest(cases: &[GoldenCase], events_path: &Path, manife
     let ids = expected_ids(cases);
     let (event_hash, present) = corpus_hash_from_event_log(events_path, &ids)?;
     let absent: Vec<_> = ids.difference(&present).cloned().collect();
-    if !absent.is_empty() { bail!("SEALED_CORPUS_STALE_OR_ABSENT: {}", absent.join(",")); }
+    if !absent.is_empty() {
+        bail!("SEALED_CORPUS_STALE_OR_ABSENT: {}", absent.join(","));
+    }
     let actual_hash = match manifest.corpus_hash_domain.as_str() {
         "id-content-hash" => event_hash,
         "ids-only" => ids_only_corpus_hash(&ids),
         other => bail!("SEALED_MANIFEST_UNKNOWN_HASH_DOMAIN: {other}"),
     };
     if actual_hash != manifest.corpus_hash {
-        bail!("SEALED_MANIFEST_HASH_MISMATCH: expected {}, got {}", manifest.corpus_hash, actual_hash);
+        bail!(
+            "SEALED_MANIFEST_HASH_MISMATCH: expected {}, got {}",
+            manifest.corpus_hash,
+            actual_hash
+        );
     }
     Ok(())
 }
@@ -246,15 +320,26 @@ pub fn evaluate(
             first_rank,
         });
     }
-    Ok(EvalReport { k: opts.limit, per_case })
+    Ok(EvalReport {
+        k: opts.limit,
+        per_case,
+    })
 }
 
 pub fn evaluate_split(
-    conn: &rusqlite::Connection, embedder: &dyn Embedder, cases: &[GoldenCase],
-    opts: &SearchOptions, requested: Split,
+    conn: &rusqlite::Connection,
+    embedder: &dyn Embedder,
+    cases: &[GoldenCase],
+    opts: &SearchOptions,
+    requested: Split,
 ) -> Result<EvalReport> {
     if let Some(case) = cases.iter().find(|c| c.split != requested) {
-        bail!("EVAL_SPLIT_REFUSAL: {:?} case reached {:?} scorer: {}", case.split, requested, case.query);
+        bail!(
+            "EVAL_SPLIT_REFUSAL: {:?} case reached {:?} scorer: {}",
+            case.split,
+            requested,
+            case.query
+        );
     }
     evaluate(conn, embedder, cases, opts)
 }
@@ -266,16 +351,32 @@ mod tests {
     fn report(hits: &[bool]) -> EvalReport {
         EvalReport {
             k: 10,
-            per_case: hits.iter().enumerate().map(|(i, hit)| CaseResult {
-                query: format!("q{i}"), expected: 1, hits: usize::from(*hit),
-                first_rank: hit.then_some(1),
-            }).collect(),
+            per_case: hits
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| CaseResult {
+                    query: format!("q{i}"),
+                    expected: 1,
+                    hits: usize::from(*hit),
+                    first_rank: hit.then_some(1),
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn exact_mcnemar_boundary_is_six_unanimous_pairs() {
-        assert_eq!(compare_reports(&report(&[false; 6]), &report(&[true; 6])).unwrap().verdict, Verdict::Significant);
-        assert_eq!(compare_reports(&report(&[false; 5]), &report(&[true; 5])).unwrap().verdict, Verdict::Inconclusive);
+        assert_eq!(
+            compare_reports(&report(&[false; 6]), &report(&[true; 6]))
+                .unwrap()
+                .verdict,
+            Verdict::Significant
+        );
+        assert_eq!(
+            compare_reports(&report(&[false; 5]), &report(&[true; 5]))
+                .unwrap()
+                .verdict,
+            Verdict::Inconclusive
+        );
     }
 }

@@ -2,7 +2,10 @@
 
 use crate::components::db;
 use crate::components::embedder;
-use crate::components::retrieval_eval::{compare_reports, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, EvalReport, Split, SplitManifest};
+use crate::components::retrieval_eval::{
+    compare_reports, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, EvalReport,
+    Split, SplitManifest,
+};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -50,7 +53,9 @@ impl Runnable for Eval {
 
 impl Eval {
     pub fn execute(&self) -> anyhow::Result<()> {
-        if let Some(files) = &self.compare { return self.execute_compare(files); }
+        if let Some(files) = &self.compare {
+            return self.execute_compare(files);
+        }
         let paths = config::Paths::discover()?;
         let emb = crate::commands::add::make_embedder(&paths);
         crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
@@ -64,15 +69,30 @@ impl Eval {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        let golden = self.golden.as_ref().ok_or_else(|| anyhow::anyhow!("golden set is required outside --compare mode"))?;
+        let golden = self
+            .golden
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("golden set is required outside --compare mode"))?;
         let text = std::fs::read_to_string(golden)?;
         let all_cases = parse_golden_jsonl(&text)?;
-        let requested = if self.sealed { Split::Sealed } else { Split::Dev };
-        let cases: Vec<_> = all_cases.iter().filter(|c| c.split == requested).cloned().collect();
+        let requested = if self.sealed {
+            Split::Sealed
+        } else {
+            Split::Dev
+        };
+        let cases: Vec<_> = all_cases
+            .iter()
+            .filter(|c| c.split == requested)
+            .cloned()
+            .collect();
 
         if self.sealed {
-            let manifest_path = golden.parent().unwrap_or_else(|| std::path::Path::new(".")).join("split-manifest.json");
-            let manifest: SplitManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+            let manifest_path = golden
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("split-manifest.json");
+            let manifest: SplitManifest =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
             validate_sealed_manifest(&all_cases, &paths.events, &manifest)?;
         }
 
@@ -102,17 +122,31 @@ impl Eval {
                 #[serde(flatten)]
                 report: &'a crate::components::retrieval_eval::EvalReport,
             }
-            println!("{}", serde_json::to_string_pretty(&JsonOut { recall_at_k: recall, mrr, report: &report })?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&JsonOut {
+                    recall_at_k: recall,
+                    mrr,
+                    report: &report
+                })?
+            );
         } else {
             println!("=== Retrieval eval (k={}) ===", report.k);
             for c in &report.per_case {
                 let rank = c.first_rank.map_or("-".to_string(), |r| r.to_string());
                 println!(
                     "  recall={:.2}  first_rank={rank:>3}  hits={}/{}  {}",
-                    c.recall(), c.hits, c.expected, c.query
+                    c.recall(),
+                    c.hits,
+                    c.expected,
+                    c.query
                 );
             }
-            println!("cases={}  recall@{}={recall:.4}  mrr={mrr:.4}", report.per_case.len(), report.k);
+            println!(
+                "cases={}  recall@{}={recall:.4}  mrr={mrr:.4}",
+                report.per_case.len(),
+                report.k
+            );
         }
 
         let mut failed = Vec::new();
@@ -139,7 +173,11 @@ impl Eval {
         if comparison.verdict == crate::components::retrieval_eval::Verdict::Inconclusive {
             println!("INCONCLUSIVE: no information — NOT evidence of no regression (discordant_pairs={})", comparison.discordant_pairs);
         } else {
-            println!("{}: discordant_pairs={}", comparison.verdict.name(), comparison.discordant_pairs);
+            println!(
+                "{}: discordant_pairs={}",
+                comparison.verdict.name(),
+                comparison.discordant_pairs
+            );
         }
         Ok(())
     }
@@ -198,7 +236,9 @@ mod tests {
         let golden = dir.path().join("golden.jsonl");
         fs::write(&golden, "{\"query\": \"authentication jwt\", \"expected_ids\": [\"eval-cli-1\"], \"split\": \"dev\"}\n").unwrap();
 
-        eval_cmd(golden, Some(0.9)).execute_with(&paths, &NoopEmbedder).unwrap();
+        eval_cmd(golden, Some(0.9))
+            .execute_with(&paths, &NoopEmbedder)
+            .unwrap();
     }
 
     /// --min-recall above the achievable score must fail the gate (non-Ok).

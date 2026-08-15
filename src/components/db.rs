@@ -158,8 +158,8 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
         fs::create_dir_all(p)?;
     }
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open DB {}", db_path.display()))?;
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     // Fresh-DB detection BEFORE ensure_schema: a DB with no entries table was
     // just created and gets stamped current; a pre-existing DB keeps whatever
@@ -311,7 +311,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // Migration: add `kind` and `evidence_status` columns (Phase 1 defensibility).
     // Legacy entries default to kind='belief', evidence_status='n/a' via column DEFAULT.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN kind TEXT DEFAULT 'belief';");
-    let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
+    let _ =
+        conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
     // Migration: add session_id column for Phase 5 audit confidence per-session weighting.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
     // Migration: add run_id to audit_runs for Phase 5 idempotency (INSERT OR IGNORE on unique index).
@@ -325,7 +326,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
     // Migration: add updated_at to source_weights for Phase 5 weight tracking.
-    let _ = conn.execute_batch("ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));");
+    let _ = conn.execute_batch(
+        "ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));",
+    );
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -746,11 +749,10 @@ pub fn apply_event(
                     return Ok(false);
                 }
 
-                let rowid: i64 = conn.query_row(
-                    "SELECT rowid FROM entries WHERE id=?1",
-                    params![id],
-                    |r| r.get(0),
-                )?;
+                let rowid: i64 =
+                    conn.query_row("SELECT rowid FROM entries WHERE id=?1", params![id], |r| {
+                        r.get(0)
+                    })?;
 
                 // Sync FTS5 — v1 writes are no-ops after the deprecation gate drops entries_fts.
                 let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
@@ -875,8 +877,12 @@ pub fn apply_event(
 
         ("evidence_add", "evidence") => {
             let ev = &event["evidence"];
-            let ev_id = ev["id"].as_str().context("evidence_add: missing evidence.id")?;
-            let entry_id = event["entry_id"].as_str().context("evidence_add: missing entry_id")?;
+            let ev_id = ev["id"]
+                .as_str()
+                .context("evidence_add: missing evidence.id")?;
+            let entry_id = event["entry_id"]
+                .as_str()
+                .context("evidence_add: missing entry_id")?;
 
             // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
             let entry_exists: bool = conn
@@ -891,7 +897,9 @@ pub fn apply_event(
                 return Ok(());
             }
 
-            let kind = ev["kind"].as_str().context("evidence_add: missing evidence.kind")?;
+            let kind = ev["kind"]
+                .as_str()
+                .context("evidence_add: missing evidence.kind")?;
             let citation_path = ev["citation_path"].as_str();
             let citation_sha = ev["citation_sha"].as_str();
             let citation_hash = ev["citation_hash"]
@@ -945,8 +953,12 @@ pub fn apply_event(
         }
 
         ("evidence_expire", "evidence") => {
-            let ev_id = event["evidence_id"].as_str().context("evidence_expire: missing evidence_id")?;
-            let entry_id = event["entry_id"].as_str().context("evidence_expire: missing entry_id")?;
+            let ev_id = event["evidence_id"]
+                .as_str()
+                .context("evidence_expire: missing evidence_id")?;
+            let entry_id = event["entry_id"]
+                .as_str()
+                .context("evidence_expire: missing entry_id")?;
 
             conn.execute(
                 "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
@@ -1210,10 +1222,7 @@ pub fn fetch_evidence_for_entries(
         // Bind entry_id strings first, then the probe_limit.
         let rows_raw: Vec<Evidence> = {
             use rusqlite::types::ToSql;
-            let mut params_vec: Vec<&dyn ToSql> = chunk
-                .iter()
-                .map(|s| s as &dyn ToSql)
-                .collect();
+            let mut params_vec: Vec<&dyn ToSql> = chunk.iter().map(|s| s as &dyn ToSql).collect();
             params_vec.push(&probe_limit);
 
             stmt.query_map(params_vec.as_slice(), |r| {
@@ -1294,7 +1303,12 @@ pub fn fts_query_contentless(
     )?;
     let rows = stmt
         .query_map(
-            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            params![
+                safe_query,
+                opts.path_prefix,
+                opts.tag_filter,
+                opts.limit as i64
+            ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?
         .filter_map(|r| r.ok())
@@ -1320,7 +1334,12 @@ pub fn fts_query_content_entries(
     )?;
     let rows = stmt
         .query_map(
-            params![safe_query, opts.path_prefix, opts.tag_filter, opts.limit as i64],
+            params![
+                safe_query,
+                opts.path_prefix,
+                opts.tag_filter,
+                opts.limit as i64
+            ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?
         .filter_map(|r| r.ok())
@@ -1344,11 +1363,7 @@ pub fn fts_query_content_entries(
 /// STOP); this function only materializes the frontier. Seeds are excluded,
 /// stale entries are excluded, results sorted by facet count descending.
 /// `score` = facet count, `score_kind` = "expand".
-pub fn expand_entries(
-    conn: &Connection,
-    ids: &[String],
-    limit: usize,
-) -> Result<Vec<SearchEntry>> {
+pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result<Vec<SearchEntry>> {
     use std::collections::{HashMap, HashSet};
 
     if ids.is_empty() {
@@ -1370,18 +1385,21 @@ pub fn expand_entries(
             .unwrap_or_default()
     }
     fn citation_file(citation_path: &str) -> &str {
-        citation_path.rsplit_once(':').map_or(citation_path, |(f, _)| f)
+        citation_path
+            .rsplit_once(':')
+            .map_or(citation_path, |(f, _)| f)
     }
 
     // Seed facets.
     let mut seed_dirs: HashSet<String> = HashSet::new();
     let mut seed_tags: HashSet<String> = HashSet::new();
     {
-        let placeholders: String =
-            (1..=ids.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT path, tags FROM entries WHERE is_stale = 0 AND id IN ({placeholders})"
-        );
+        let placeholders: String = (1..=ids.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT path, tags FROM entries WHERE is_stale = 0 AND id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows: Vec<(String, String)> = stmt
             .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
@@ -1450,7 +1468,14 @@ pub fn expand_entries(
     )?;
     let candidates: Vec<(String, String, String, String, String, String)> = stmt
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -1730,7 +1755,7 @@ pub fn search_entries(
         // error, just an empty lane.
         let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
         if opts.do_fts {
-        if let Ok(mut stmt) = conn.prepare(
+            if let Ok(mut stmt) = conn.prepare(
             "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
@@ -1884,7 +1909,9 @@ pub fn search_entries(
             // With MMR enabled, keep a 2×limit pool so diversification has
             // candidates to swap in; the final truncate happens after MMR.
             entries.sort_by(|a, b| {
-                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             let pool = if opts.mmr_lambda > 0.0 {
                 opts.limit.saturating_mul(2)
@@ -1907,39 +1934,40 @@ pub fn search_entries(
                     placeholders
                 );
                 let now = chrono::Utc::now().naive_utc();
-                let decay_map: std::collections::HashMap<String, f32> =
-                    match conn.prepare(&sql) {
-                        Ok(mut stmt) => stmt
-                            .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                            })
-                            .map(|rows| {
-                                rows.filter_map(|r| r.ok())
-                                    .map(|(id, updated_at)| {
-                                        let days = chrono::NaiveDateTime::parse_from_str(
-                                            &updated_at,
-                                            "%Y-%m-%d %H:%M:%S",
-                                        )
-                                        .map(|dt| {
-                                            let secs = (now - dt).num_seconds() as f32;
-                                            (secs / 86400.0).max(0.0)
-                                        })
-                                        .unwrap_or(0.0);
-                                        let decay = (-opts.recency_lambda * days).exp();
-                                        (id, decay)
+                let decay_map: std::collections::HashMap<String, f32> = match conn.prepare(&sql) {
+                    Ok(mut stmt) => stmt
+                        .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map(|rows| {
+                            rows.filter_map(|r| r.ok())
+                                .map(|(id, updated_at)| {
+                                    let days = chrono::NaiveDateTime::parse_from_str(
+                                        &updated_at,
+                                        "%Y-%m-%d %H:%M:%S",
+                                    )
+                                    .map(|dt| {
+                                        let secs = (now - dt).num_seconds() as f32;
+                                        (secs / 86400.0).max(0.0)
                                     })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        Err(_) => std::collections::HashMap::new(),
-                    };
+                                    .unwrap_or(0.0);
+                                    let decay = (-opts.recency_lambda * days).exp();
+                                    (id, decay)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    Err(_) => std::collections::HashMap::new(),
+                };
                 for entry in &mut entries {
                     let decay = decay_map.get(&entry.id).copied().unwrap_or(1.0);
                     entry.score *= decay;
                 }
                 // Re-sort: multiplication may change relative order.
                 entries.sort_by(|a, b| {
-                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
 
@@ -2026,7 +2054,11 @@ pub fn search_entries(
         match conn.prepare(&sql) {
             Ok(mut stmt) => stmt
                 .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })
                 .map(|rows| {
                     rows.filter_map(|r| r.ok())
@@ -2059,7 +2091,8 @@ pub fn search_entries(
     //
     // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
     // min(1) guards against systems returning 0 physical CPUs.
-    let pool_size = opts.verify_pool_size
+    let pool_size = opts
+        .verify_pool_size
         .unwrap_or_else(num_cpus::get_physical)
         .max(1);
 
@@ -2108,7 +2141,12 @@ pub fn search_entries(
             );
         }
 
-        work_items.push(EntryWork { entry_idx: idx, ev_rows, do_verify, budget_exceeded });
+        work_items.push(EntryWork {
+            entry_idx: idx,
+            ev_rows,
+            do_verify,
+            budget_exceeded,
+        });
     }
 
     // --- Phase 2: flatten all verification tasks across entries ---
@@ -2214,7 +2252,8 @@ pub fn search_entries(
             entry.evidence = vec![];
         } else if item.do_verify && !item.budget_exceeded {
             let range = task_ranges[item.entry_idx].as_ref().unwrap();
-            entry.evidence = item.ev_rows
+            entry.evidence = item
+                .ev_rows
                 .into_iter()
                 .zip(range.clone())
                 .map(|(ev, task_idx)| SearchEvidence {
@@ -2230,7 +2269,8 @@ pub fn search_entries(
                 .collect();
         } else {
             // Beyond inline_verify_k or budget exceeded: verified=null.
-            entry.evidence = item.ev_rows
+            entry.evidence = item
+                .ev_rows
                 .into_iter()
                 .map(|ev| SearchEvidence {
                     id: ev.id,
@@ -2270,13 +2310,7 @@ mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
 
-    fn seed_entry_row(
-        conn: &Connection,
-        id: &str,
-        path: &str,
-        summary: &str,
-        is_stale: i64,
-    ) {
+    fn seed_entry_row(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
         conn.execute(
             "INSERT INTO entries (id, path, summary, content, tags, is_stale, updated_at)
              VALUES (?1, ?2, ?3, '', '[]', ?4, '2024-01-01T00:00:00Z')",
@@ -2342,8 +2376,9 @@ mod tests {
                 summary TEXT NOT NULL,
                 content TEXT NOT NULL,
                 tags TEXT NOT NULL
-            );"
-        ).unwrap();
+            );",
+        )
+        .unwrap();
         // Running ensure_schema on this legacy DB must not error.
         ensure_schema(&conn).unwrap();
         // Confirm session_id column now exists.
@@ -2354,7 +2389,10 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(cols.contains(&"session_id".to_string()), "session_id must be added to legacy entries table");
+        assert!(
+            cols.contains(&"session_id".to_string()),
+            "session_id must be added to legacy entries table"
+        );
     }
 
     #[test]
@@ -2432,7 +2470,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, "belief", "legacy entry must default to kind='belief'");
-        assert_eq!(evidence_status, "n/a", "legacy entry must default to evidence_status='n/a'");
+        assert_eq!(
+            evidence_status, "n/a",
+            "legacy entry must default to evidence_status='n/a'"
+        );
 
         // Replay a second legacy entry.
         let legacy2 = serde_json::json!({
@@ -2452,7 +2493,10 @@ mod tests {
         let audit_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM audit_runs", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(audit_count, 0, "audit_runs must be untouched after legacy event replay (L4 boundary)");
+        assert_eq!(
+            audit_count, 0,
+            "audit_runs must be untouched after legacy event replay (L4 boundary)"
+        );
     }
 
     #[test]
@@ -2473,22 +2517,18 @@ mod tests {
         apply_event(&conn, &embedder, &event).unwrap();
 
         let (path, summary): (String, String) = conn
-            .query_row(
-                "SELECT path, summary FROM entries WHERE id='e1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT path, summary FROM entries WHERE id='e1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(path, "src/lib.rs");
         assert_eq!(summary, "test summary");
 
         // Check FTS entry exists
         let fts_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM entries_fts WHERE id='e1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='e1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(fts_count, 1);
     }
@@ -2542,7 +2582,11 @@ mod tests {
 
         // Verify FTS entry exists before expire
         let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE id='fts1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(before, 1);
 
@@ -2553,7 +2597,11 @@ mod tests {
 
         // FTS entry must be gone after expire
         let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entries_fts WHERE id='fts1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM entries_fts WHERE id='fts1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(after, 0, "expire must remove entry from FTS index");
     }
@@ -2580,13 +2628,14 @@ mod tests {
 
         // Entry must be stale in DB
         let is_stale: i64 = conn
-            .query_row(
-                "SELECT is_stale FROM entries WHERE id='stale1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT is_stale FROM entries WHERE id='stale1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(is_stale, 1, "upsert with is_stale=true must persist staleness");
+        assert_eq!(
+            is_stale, 1,
+            "upsert with is_stale=true must persist staleness"
+        );
 
         // FTS must NOT contain the stale entry
         let fts_count: i64 = conn
@@ -2618,13 +2667,14 @@ mod tests {
         apply_event(&conn, &embedder, &event).unwrap();
 
         let is_stale: i64 = conn
-            .query_row(
-                "SELECT is_stale FROM entries WHERE id='old1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT is_stale FROM entries WHERE id='old1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(is_stale, 0, "events without is_stale must default to active");
+        assert_eq!(
+            is_stale, 0,
+            "events without is_stale must default to active"
+        );
     }
 
     /// br-h9g (security I2): fetch_evidence_for_entries must cap rows at
@@ -2649,8 +2699,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
                  VALUES(?1, ?2, 'code', 'sha256:abc', ?3)",
-                params![format!("ev-{i:04}"), "cap-host", format!("2024-01-01T00:00:{:02}Z", i % 60)],
-            ).unwrap();
+                params![
+                    format!("ev-{i:04}"),
+                    "cap-host",
+                    format!("2024-01-01T00:00:{:02}Z", i % 60)
+                ],
+            )
+            .unwrap();
         }
 
         let map = fetch_evidence_for_entries(&conn, &["cap-host".to_string()]).unwrap();
@@ -2903,7 +2958,11 @@ mod tests {
             .iter()
             .find(|r| r.id == "br-bhg-regression-1")
             .expect("entry must be returned by FTS");
-        assert_eq!(entry.evidence.len(), 1, "entry must have exactly 1 evidence row");
+        assert_eq!(
+            entry.evidence.len(),
+            1,
+            "entry must have exactly 1 evidence row"
+        );
         assert_eq!(
             entry.evidence[0].verified,
             Some(true),
@@ -3173,7 +3232,8 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
+        let results =
+            search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_fts).unwrap();
         assert!(!results.is_empty(), "FTS must return the entry");
         for r in &results {
             assert_eq!(r.score_kind, "fts", "FTS-only mode must set score_kind=fts");
@@ -3192,10 +3252,22 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let hybrid_results = search_entries(&conn, &embedder, "rrf fts score_kind test entry", &opts_hybrid).unwrap();
-        assert!(!hybrid_results.is_empty(), "Hybrid must return the entry via FTS lane");
+        let hybrid_results = search_entries(
+            &conn,
+            &embedder,
+            "rrf fts score_kind test entry",
+            &opts_hybrid,
+        )
+        .unwrap();
+        assert!(
+            !hybrid_results.is_empty(),
+            "Hybrid must return the entry via FTS lane"
+        );
         for r in &hybrid_results {
-            assert_eq!(r.score_kind, "fts", "Hybrid FTS-only path must set score_kind=fts");
+            assert_eq!(
+                r.score_kind, "fts",
+                "Hybrid FTS-only path must set score_kind=fts"
+            );
         }
     }
 
@@ -3243,12 +3315,16 @@ mod tests {
         apply_event(&conn, &embedder, &upsert_b).unwrap();
 
         // Get the rowids for A and B
-        let rowid_a: i64 = conn.query_row(
-            "SELECT rowid FROM entries WHERE id='rrf-dual-A'", [], |r| r.get(0)
-        ).unwrap();
-        let rowid_b: i64 = conn.query_row(
-            "SELECT rowid FROM entries WHERE id='rrf-dual-B'", [], |r| r.get(0)
-        ).unwrap();
+        let rowid_a: i64 = conn
+            .query_row("SELECT rowid FROM entries WHERE id='rrf-dual-A'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let rowid_b: i64 = conn
+            .query_row("SELECT rowid FROM entries WHERE id='rrf-dual-B'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
 
         // Query vector: [1.0, 0.0] (unit vector along dim-0)
         let q_vec: Vec<f32> = vec![1.0, 0.0];
@@ -3262,17 +3338,23 @@ mod tests {
         conn.execute(
             "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
             rusqlite::params![rowid_a, f32s_to_blob(&emb_a)],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
             rusqlite::params![rowid_b, f32s_to_blob(&emb_b)],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Use a FakeEmbedder that returns q_vec = [1.0, 0.0]
         struct FixedEmbedder(Vec<f32>);
         impl crate::components::embedder::Embedder for FixedEmbedder {
-            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> { Ok(self.0.clone()) }
-            fn is_noop(&self) -> bool { false }
+            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(self.0.clone())
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
         }
         let fixed_emb = FixedEmbedder(q_vec);
 
@@ -3296,12 +3378,23 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let results = search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
+        let results =
+            search_entries(&conn, &fixed_emb, "rrf dual source alpha needle", &opts).unwrap();
 
-        assert!(results.len() >= 2, "both entries must be returned, got {}", results.len());
+        assert!(
+            results.len() >= 2,
+            "both entries must be returned, got {}",
+            results.len()
+        );
 
-        let pos_a = results.iter().position(|r| r.id == "rrf-dual-A").expect("A must be in results");
-        let pos_b = results.iter().position(|r| r.id == "rrf-dual-B").expect("B must be in results");
+        let pos_a = results
+            .iter()
+            .position(|r| r.id == "rrf-dual-A")
+            .expect("A must be in results");
+        let pos_b = results
+            .iter()
+            .position(|r| r.id == "rrf-dual-B")
+            .expect("B must be in results");
         assert!(
             pos_a < pos_b,
             "RRF: dual-source A (rank={pos_a}) must beat single-source B (rank={pos_b}) even though B has higher raw semantic score"
@@ -3309,7 +3402,11 @@ mod tests {
 
         // score_kind for hybrid results must be "rrf"
         for r in &results {
-            assert_eq!(r.score_kind, "rrf", "hybrid RRF results must have score_kind=rrf, got {}", r.score_kind);
+            assert_eq!(
+                r.score_kind, "rrf",
+                "hybrid RRF results must have score_kind=rrf, got {}",
+                r.score_kind
+            );
         }
     }
 
@@ -3331,7 +3428,9 @@ mod tests {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
                 Ok(vec![0.1_f32, 0.2_f32, 0.3_f32])
             }
-            fn is_noop(&self) -> bool { false }
+            fn is_noop(&self) -> bool {
+                false
+            }
         }
 
         let conn = open_db_memory().unwrap();
@@ -3353,12 +3452,14 @@ mod tests {
         apply_event(&conn, &embedder, &upsert).unwrap();
 
         // entries_emb row must exist before expire
-        let before: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
              (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(before, 1, "entries_emb row must exist after upsert");
 
         // Expire
@@ -3370,13 +3471,18 @@ mod tests {
         apply_event(&conn, &embedder, &expire).unwrap();
 
         // entries_emb row must be gone after expire
-        let after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
              (SELECT rowid FROM entries WHERE id='emb-gc-e1')",
-            [],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(after, 0, "expire must delete the entries_emb row (GC regression)");
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "expire must delete the entries_emb row (GC regression)"
+        );
     }
 
     /// Regression: upsert with is_stale=true must delete any existing entries_emb row.
@@ -3392,7 +3498,9 @@ mod tests {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
                 Ok(vec![0.4_f32, 0.5_f32])
             }
-            fn is_noop(&self) -> bool { false }
+            fn is_noop(&self) -> bool {
+                false
+            }
         }
 
         let conn = open_db_memory().unwrap();
@@ -3413,12 +3521,14 @@ mod tests {
         });
         apply_event(&conn, &embedder, &upsert).unwrap();
 
-        let before: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
              (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(before, 1, "entries_emb row must exist after live upsert");
 
         // Stale upsert (as produced by compact for an expired entry)
@@ -3437,13 +3547,18 @@ mod tests {
         });
         apply_event(&conn, &embedder, &stale_upsert).unwrap();
 
-        let after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries_emb WHERE rowid = \
              (SELECT rowid FROM entries WHERE id='emb-gc-stale1')",
-            [],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(after, 0, "is_stale=true upsert must delete entries_emb row (GC regression)");
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "is_stale=true upsert must delete entries_emb row (GC regression)"
+        );
     }
 
     /// Steady-state invariant: after any sequence of upserts and expires,
@@ -3457,7 +3572,9 @@ mod tests {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
                 Ok(vec![1.0_f32, 0.0_f32])
             }
-            fn is_noop(&self) -> bool { false }
+            fn is_noop(&self) -> bool {
+                false
+            }
         }
 
         let conn = open_db_memory().unwrap();
@@ -3494,7 +3611,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries_emb", [], |r| r.get(0))
             .unwrap();
         let live_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         assert_eq!(
@@ -3557,7 +3676,9 @@ mod tests {
         let pool_size: usize = 2;
 
         #[cfg(target_os = "linux")]
-        let baseline = std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(1);
+        let baseline = std::fs::read_dir("/proc/self/task")
+            .map(|d| d.count())
+            .unwrap_or(1);
         #[cfg(not(target_os = "linux"))]
         let baseline = 1usize;
 
@@ -3715,7 +3836,12 @@ mod tests {
             apply_event(&conn, &embedder, ev).unwrap();
         }
 
-        let opts = SearchOptions { do_fts: true, do_semantic: false, limit: 20, ..Default::default() };
+        let opts = SearchOptions {
+            do_fts: true,
+            do_semantic: false,
+            limit: 20,
+            ..Default::default()
+        };
         let safe_q = "\"dual\"";
 
         let v1_ids: Vec<String> = fts_query_contentless(&conn, safe_q, &opts)
@@ -3734,7 +3860,10 @@ mod tests {
             v2_ids.iter().collect::<std::collections::BTreeSet<_>>(),
             "both FTS tables must return the same entry IDs"
         );
-        assert!(!v1_ids.contains(&"dw2".to_string()), "expired entry dw2 must be absent");
+        assert!(
+            !v1_ids.contains(&"dw2".to_string()),
+            "expired entry dw2 must be absent"
+        );
         assert!(v1_ids.contains(&"dw1".to_string()), "dw1 must be present");
         assert!(v1_ids.contains(&"dw3".to_string()), "dw3 must be present");
     }
@@ -3768,16 +3897,23 @@ mod tests {
                 [], |r| r.get(0),
             )
             .unwrap();
-        assert!(writes >= 1000, "expected ≥1000 post_cutover_writes, got {writes}");
+        assert!(
+            writes >= 1000,
+            "expected ≥1000 post_cutover_writes, got {writes}"
+        );
 
         // entries_fts still present — gate not yet open (other signals unset)
         let fts_exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(fts_exists, 1, "entries_fts must still exist before all gate signals are met");
+        assert_eq!(
+            fts_exists, 1,
+            "entries_fts must still exist before all gate signals are met"
+        );
 
         // Satisfy remaining gate signals
         set_deprecation_gate(&conn, "rollback_invocations", "0").unwrap();
@@ -3791,10 +3927,14 @@ mod tests {
         let fts_after: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(fts_after, 0, "entries_fts must be dropped after all gate signals are met");
+        assert_eq!(
+            fts_after, 0,
+            "entries_fts must be dropped after all gate signals are met"
+        );
 
         // Idempotency: calling again must not error
         maybe_drop_contentless_fts(&conn).unwrap();
@@ -3803,10 +3943,14 @@ mod tests {
         let v2_exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts_v2'",
-                [], |r| r.get(0),
+                [],
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v2_exists, 1, "entries_fts_v2 must remain after contentless drop");
+        assert_eq!(
+            v2_exists, 1,
+            "entries_fts_v2 must remain after contentless drop"
+        );
 
         // Post-drop writes must succeed: apply_event must not fail because entries_fts is gone.
         let post_drop_upsert = serde_json::json!({

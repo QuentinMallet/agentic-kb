@@ -376,9 +376,9 @@ pub fn run_stale_check(
                 continue;
             }
             let key = (version_ref.clone(), stored_path.clone());
-            let count = *count_cache.entry(key).or_insert_with(|| {
-                commits_since(&version_ref, &stored_path, repo_root)
-            });
+            let count = *count_cache
+                .entry(key)
+                .or_insert_with(|| commits_since(&version_ref, &stored_path, repo_root));
             if let Some(count) = count {
                 if count > 0 {
                     seen_ids.insert(id.clone());
@@ -637,7 +637,11 @@ pub fn normalize_path(file: &str, repo_root: Option<&Path>) -> String {
     if let Some(root) = repo_root {
         let p = Path::new(file);
         if p.is_absolute() {
-            return p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned();
+            return p
+                .strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
         }
     }
     file.to_string()
@@ -658,7 +662,13 @@ pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) ->
     if let Some(root) = repo_root {
         cmd.arg("-C").arg(root);
     }
-    cmd.args(["rev-list", "--count", &format!("{version_ref}..HEAD"), "--", path]);
+    cmd.args([
+        "rev-list",
+        "--count",
+        &format!("{version_ref}..HEAD"),
+        "--",
+        path,
+    ]);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
@@ -710,10 +720,10 @@ mod tests {
     #[test]
     fn parse_log_hashes_rejects_malformed_lines() {
         let blob = concat!(
-            "a1b2c3d4e5f6789012345678901234567890abcd\n",        // ok
-            "TOOSHORT\n",                                         // wrong length
+            "a1b2c3d4e5f6789012345678901234567890abcd\n", // ok
+            "TOOSHORT\n",                                 // wrong length
             "a1b2c3d4e5f6789012345678901234567890abcd abc def\n", // trailing junk
-            "ZZb2c3d4e5f6789012345678901234567890abcd\n",        // non-hex
+            "ZZb2c3d4e5f6789012345678901234567890abcd\n", // non-hex
         )
         .as_bytes();
         let shas = parse_log_hashes(blob);
@@ -813,7 +823,12 @@ mod tests {
         git(dir, &["add", "foo.rs"]);
         git(dir, &["commit", "-q", "-m", "c1"]);
         let c1 = String::from_utf8(
-            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -922,8 +937,8 @@ mod tests {
 
         let report = run_stale_check(
             &conn,
-            &[],                          // no files — Pass 2 only
-            &[ghost.to_string()],         // explicit unreachable commit
+            &[],                  // no files — Pass 2 only
+            &[ghost.to_string()], // explicit unreachable commit
             false,
             Some(dir),
             RelocationPolicy::Never,
@@ -949,7 +964,12 @@ mod tests {
         git(dir, &["add", "seed.rs"]);
         git(dir, &["commit", "-q", "-m", "seed"]);
         let head = String::from_utf8(
-            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -1117,15 +1137,18 @@ mod tests {
         };
 
         let lines = render_lines(&report);
-        let stale_lines: Vec<&String> =
-            lines.iter().filter(|l| l.starts_with("STALE")).collect();
+        let stale_lines: Vec<&String> = lines.iter().filter(|l| l.starts_with("STALE")).collect();
         assert_eq!(
             stale_lines.len(),
             1,
             "exactly the one real stale entry may match ^STALE: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.starts_with("RELOCATED [src/old.rs:0-66] -> [src/new.rs:11-77]")));
-        assert!(lines.iter().any(|l| l.starts_with("UNVERIFIED") && l.contains("reason=non_unique")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("RELOCATED [src/old.rs:0-66] -> [src/new.rs:11-77]")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("UNVERIFIED") && l.contains("reason=non_unique")));
     }
 
     /// A report-only relocation says so; the heal marker is not cosmetic.
@@ -1167,8 +1190,14 @@ mod tests {
     /// The CLI enum maps onto the engine's policy without a default.
     #[test]
     fn relocate_arg_maps_onto_policy() {
-        assert_eq!(RelocationPolicy::from(RelocateArg::Never), RelocationPolicy::Never);
-        assert_eq!(RelocationPolicy::from(RelocateArg::File), RelocationPolicy::FileOnly);
+        assert_eq!(
+            RelocationPolicy::from(RelocateArg::Never),
+            RelocationPolicy::Never
+        );
+        assert_eq!(
+            RelocationPolicy::from(RelocateArg::File),
+            RelocationPolicy::FileOnly
+        );
         assert_eq!(
             RelocationPolicy::from(RelocateArg::FileThenRepo),
             RelocationPolicy::FileThenRepo

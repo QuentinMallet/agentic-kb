@@ -106,7 +106,11 @@ pub fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
 /// Convert little-endian f32 byte blob back to f32 vec.
 /// Kept as backwards-compat helper for test code and legacy read paths.
 pub fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
-    debug_assert!(b.len().is_multiple_of(4), "blob length {} not divisible by 4 — corrupt embedding?", b.len());
+    debug_assert!(
+        b.len().is_multiple_of(4),
+        "blob length {} not divisible by 4 — corrupt embedding?",
+        b.len()
+    );
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -470,7 +474,9 @@ mod tests {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(42);
-        let raw: Vec<f32> = (0..EMB_DIMS).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+        let raw: Vec<f32> = (0..EMB_DIMS)
+            .map(|_| rng.gen::<f32>() * 2.0 - 1.0)
+            .collect();
         let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
         let unit: Vec<f32> = raw.iter().map(|x| x / norm).collect();
 
@@ -502,5 +508,4 @@ mod tests {
         decode_f16_blob_into(&blob, &mut scratch);
         assert_eq!(scratch.len(), EMB_DIMS);
     }
-
 }
