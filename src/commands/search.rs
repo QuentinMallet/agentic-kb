@@ -7,6 +7,21 @@ use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use std::collections::HashSet;
 
+fn evidence_display_line(ev: &db::SearchEvidence) -> String {
+    let verified_str = match ev.verified {
+        Some(true) => "verified=true",
+        Some(false) => "verified=false",
+        None => "verified=null",
+    };
+    format!(
+        "    evidence: kind={}  {}  status={}  {}",
+        ev.kind,
+        ev.citation_path.as_deref().unwrap_or(""),
+        ev.status_str(),
+        verified_str
+    )
+}
+
 /// Search knowledge entries (default: hybrid FTS5 + semantic re-rank)
 #[derive(Command, Debug, Parser)]
 pub struct Search {
@@ -164,15 +179,7 @@ impl Search {
                 println!("  content: {}", r.content);
             }
             for ev in &r.evidence {
-                let verified_str = match ev.verified {
-                    Some(true) => "verified=true",
-                    Some(false) => "verified=false",
-                    None => "verified=null",
-                };
-                println!("    evidence: kind={kind}  {path}  {verified}",
-                    kind = ev.kind,
-                    path = ev.citation_path.as_deref().unwrap_or(""),
-                    verified = verified_str);
+                println!("{}", evidence_display_line(ev));
             }
         }
 
@@ -313,9 +320,26 @@ mod tests {
     use super::*;
     use crate::commands::add::Add;
     use crate::components::embedder::NoopEmbedder;
+    use crate::models::VerificationStatus;
     use crate::config::Paths;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_evidence_display_line_includes_status() {
+        let line = evidence_display_line(&db::SearchEvidence {
+            id: "ev-1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/lib.rs:0-10".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            verified: Some(false),
+            verification_status: Some(VerificationStatus::Relocated),
+        });
+        assert!(line.contains("status=relocated"));
+        assert!(line.contains("verified=false"));
+    }
 
     #[test]
     fn test_cmd_search_fts_returns_match() {

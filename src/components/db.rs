@@ -1,13 +1,13 @@
 //! Database operations
 
 use crate::components::embedder::Embedder;
-use crate::components::verification::RelocationPolicy;
+use crate::components::verification::{RelocationPolicy, VerificationOutcome};
 use crate::models::{
     blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
-    f32s_to_f16_blob, Evidence, EMB_DIMS,
+    f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -971,6 +971,18 @@ pub struct SearchEvidence {
     pub citation_excerpt: Option<String>,
     /// `Some(true/false)` if verified inline; `None` if skipped by narrow-K fallback.
     pub verified: Option<bool>,
+    /// Full inline verification status when verification ran; `None` when
+    /// verification was deferred by inline_verify_k or the per-entry byte cap.
+    pub verification_status: Option<VerificationStatus>,
+}
+
+impl SearchEvidence {
+    pub fn status_str(&self) -> &'static str {
+        match self.verification_status {
+            Some(status) => status.as_str(),
+            None => "deferred",
+        }
+    }
 }
 
 /// A single result entry returned by `search_entries`.
@@ -997,6 +1009,65 @@ pub struct SearchEntry {
     pub audit_n: u32,
     /// Originating repo path. `None` means local DB; `Some(path)` means fetched from a peer.
     pub origin_repo: Option<String>,
+    /// DB `updated_at` for stale-warning checks in presentation layers.
+    pub updated_at: String,
+}
+
+pub struct FetchEntryByIdResult {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub content: String,
+    pub tags: String,
+    pub version_ref: Option<String>,
+    pub is_stale: bool,
+    pub permanent: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub kind: String,
+    pub evidence_status: String,
+    pub evidence: Vec<Evidence>,
+}
+
+pub fn fetch_entry_by_id(
+    conn: &Connection,
+    entry_id: &str,
+) -> Result<Option<FetchEntryByIdResult>> {
+    let row = conn
+        .query_row(
+            "SELECT id, path, summary, content, tags, version_ref, is_stale,
+                    permanent, created_at, updated_at, COALESCE(kind, 'belief'),
+                    COALESCE(evidence_status, 'n/a')
+             FROM entries
+             WHERE id = ?1",
+            params![entry_id],
+            |r| {
+                Ok(FetchEntryByIdResult {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    summary: r.get(2)?,
+                    content: r.get(3)?,
+                    tags: r.get(4)?,
+                    version_ref: r.get(5)?,
+                    is_stale: r.get::<_, i64>(6)? != 0,
+                    permanent: r.get::<_, i64>(7)? != 0,
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
+                    kind: r.get(10)?,
+                    evidence_status: r.get(11)?,
+                    evidence: vec![],
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(mut entry) = row else {
+        return Ok(None);
+    };
+
+    let mut evidence_map = fetch_evidence_for_entries(conn, &[entry_id.to_string()])?;
+    entry.evidence = evidence_map.remove(entry_id).unwrap_or_default();
+    Ok(Some(entry))
 }
 
 /// Fetch evidence rows for the given entry IDs, capped at
@@ -1297,17 +1368,17 @@ pub fn expand_entries(
 
     // Score all live candidates by facet overlap.
     let mut stmt = conn.prepare(
-        "SELECT id, path, summary, content, tags FROM entries WHERE is_stale = 0",
+        "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE is_stale = 0",
     )?;
-    let candidates: Vec<(String, String, String, String, String)> = stmt
+    let candidates: Vec<(String, String, String, String, String, String)> = stmt
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
 
     let mut scored: Vec<SearchEntry> = Vec::new();
-    for (id, path, summary, content, tags) in candidates {
+    for (id, path, summary, content, tags, updated_at) in candidates {
         if seed_set.contains(id.as_str()) {
             continue;
         }
@@ -1344,6 +1415,7 @@ pub fn expand_entries(
                 confidence: 0.5,
                 audit_n: 0,
                 origin_repo: None,
+                updated_at,
             });
         }
     }
@@ -1521,6 +1593,7 @@ pub fn search_entries(
                 confidence: 0.5,
                 audit_n: 0,
                 origin_repo: None,
+                updated_at: String::new(),
             });
         }
     }
@@ -1528,7 +1601,7 @@ pub fn search_entries(
     if opts.do_semantic && !embedder.is_noop() {
         let q_emb = embedder.embed(query)?;
         let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags, emb.embedding
+            "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
@@ -1541,7 +1614,7 @@ pub fn search_entries(
         // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
         // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
         // decode_emb_blob fallback via length dispatch.
-        let rows: Vec<(String, String, String, String, String, Vec<u8>)> = stmt
+        let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
             .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -1549,16 +1622,17 @@ pub fn search_entries(
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, Vec<u8>>(5)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Vec<u8>>(6)?,
                 ))
             })?
             .filter_map(|r| r.ok())
             .collect();
 
         let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
-        let mut candidates: Vec<(f32, String, String, String, String, String)> =
+        let mut candidates: Vec<(f32, String, String, String, String, String, String)> =
             Vec::with_capacity(rows.len());
-        for (id, path, summary, content, tags, blob) in rows {
+        for (id, path, summary, content, tags, updated_at, blob) in rows {
             decode_f16_blob_into(&blob, &mut scratch);
             let sim = if scratch.is_empty() {
                 // blob was not canonical f16 — fall back to graceful decode
@@ -1567,7 +1641,7 @@ pub fn search_entries(
             } else {
                 cosine_similarity(&q_emb, &scratch)
             };
-            candidates.push((sim, id, path, summary, content, tags));
+            candidates.push((sim, id, path, summary, content, tags, updated_at));
         }
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1576,10 +1650,10 @@ pub fn search_entries(
         // cue anchor. Ranked separately so RRF fuses it as a third source.
         // Best-effort: absence of the cues table (pre-migration DB) is not an
         // error, just an empty lane.
-        let mut cue_ranked: Vec<(f32, String, String, String, String, String)> = Vec::new();
+        let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
         if opts.do_fts {
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags
+            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
@@ -1587,7 +1661,7 @@ pub fn search_entries(
                AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         ) {
-            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String)> = stmt
+            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String, String)> = stmt
                 .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -1596,15 +1670,16 @@ pub fn search_entries(
                         r.get::<_, String>(4)?,
                         r.get::<_, String>(5)?,
                         r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
                     ))
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
 
             // Best cue score per entry.
-            let mut best: std::collections::HashMap<String, (f32, String, String, String, String)> =
+            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String)> =
                 std::collections::HashMap::new();
-            for (entry_id, blob, path, summary, content, tags) in cue_rows {
+            for (entry_id, blob, path, summary, content, tags, updated_at) in cue_rows {
                 decode_f16_blob_into(&blob, &mut scratch);
                 let sim = if scratch.is_empty() {
                     let fallback = decode_emb_blob(&blob);
@@ -1615,13 +1690,15 @@ pub fn search_entries(
                 match best.get(&entry_id) {
                     Some((prev, ..)) if *prev >= sim => {}
                     _ => {
-                        best.insert(entry_id, (sim, path, summary, content, tags));
+                        best.insert(entry_id, (sim, path, summary, content, tags, updated_at));
                     }
                 }
             }
             cue_ranked = best
                 .into_iter()
-                .map(|(id, (sim, path, summary, content, tags))| (sim, id, path, summary, content, tags))
+                .map(|(id, (sim, path, summary, content, tags, updated_at))| {
+                    (sim, id, path, summary, content, tags, updated_at)
+                })
                 .collect();
             cue_ranked
                 .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1672,7 +1749,9 @@ pub fn search_entries(
 
             // For semantic-only entries (not in FTS), create new SearchEntry values.
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
-            for (_, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit * 2) {
+            for (_, id, path, summary, content, tags, updated_at) in
+                candidates.into_iter().take(opts.limit * 2)
+            {
                 if !fts_meta.contains_key(&id) {
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
@@ -1688,13 +1767,14 @@ pub fn search_entries(
                         confidence: 0.5,
                         audit_n: 0,
                         origin_repo: None,
+                        updated_at,
                     });
                 }
             }
 
             // Cue-only entries (reached via a cue anchor, absent from both the
             // FTS and entry-embedding lanes) still need materializing.
-            for (_, id, path, summary, content, tags) in cue_ranked.into_iter() {
+            for (_, id, path, summary, content, tags, updated_at) in cue_ranked.into_iter() {
                 if !fts_meta.contains_key(&id) {
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
@@ -1710,6 +1790,7 @@ pub fn search_entries(
                         confidence: 0.5,
                         audit_n: 0,
                         origin_repo: None,
+                        updated_at,
                     });
                 }
             }
@@ -1796,7 +1877,9 @@ pub fn search_entries(
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
-            for (sim, id, path, summary, content, tags) in candidates.into_iter().take(opts.limit) {
+            for (sim, id, path, summary, content, tags, updated_at) in
+                candidates.into_iter().take(opts.limit)
+            {
                 entries.push(SearchEntry {
                     id,
                     path,
@@ -1810,6 +1893,7 @@ pub fn search_entries(
                     confidence: 0.5,
                     audit_n: 0,
                     origin_repo: None,
+                    updated_at,
                 });
             }
         }
@@ -1817,6 +1901,31 @@ pub fn search_entries(
 
     // Fetch evidence rows for all result entries and attach with inline verification.
     let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+
+    if !entry_ids.is_empty() {
+        let placeholders: String = (1..=entry_ids.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, updated_at FROM entries WHERE id IN ({})",
+            placeholders
+        );
+        let updated_at_map: std::collections::HashMap<String, String> = match conn.prepare(&sql) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+        for entry in &mut entries {
+            if let Some(updated_at) = updated_at_map.get(&entry.id) {
+                entry.updated_at = updated_at.clone();
+            }
+        }
+    }
 
     // Prefetch source_weights in ONE query (br-ei2.8 AC5: not per-row subquery).
     // Uses COALESCE(entries.session_id, '__GLOBAL__') to match the write path.
@@ -1925,7 +2034,7 @@ pub fn search_entries(
     }
 
     // --- Phase 2: flatten all verification tasks across entries ---
-    // task_ranges[entry_idx] = Some(start..end) within verified_flat, or None.
+    // task_ranges[entry_idx] = Some(start..end) within outcomes_flat, or None.
     let mut flat_tasks: Vec<crate::models::Evidence> = Vec::new();
     let mut task_ranges: Vec<Option<std::ops::Range<usize>>> = vec![None; entries.len()];
     for item in &work_items {
@@ -1938,7 +2047,14 @@ pub fn search_entries(
 
     // --- Phase 3: run all verification tasks through the bounded pool ---
     let total_tasks = flat_tasks.len();
-    let mut verified_flat: Vec<bool> = vec![false; total_tasks];
+    let mut outcomes_flat: Vec<VerificationOutcome> = vec![
+        VerificationOutcome {
+            status: VerificationStatus::Unverified,
+            relocated_to: None,
+            reason: None,
+        };
+        total_tasks
+    ];
 
     if total_tasks > 0 {
         // Work channel: bounded at pool_size * 2 to bound in-flight tasks and
@@ -1957,28 +2073,35 @@ pub fn search_entries(
             let (tx_work, rx_work) =
                 crossbeam_channel::bounded::<(usize, crate::models::Evidence)>(work_chan_cap);
             let (tx_result, rx_result) =
-                crossbeam_channel::unbounded::<(usize, bool)>();
+                crossbeam_channel::unbounded::<(usize, VerificationOutcome)>();
 
             // Spawn pool_size worker threads. Each consumes (task_idx, Evidence)
-            // from rx_work and sends (task_idx, bool) to tx_result.
+            // from rx_work and sends (task_idx, VerificationOutcome) to tx_result.
             for _ in 0..pool_size {
                 let rx = rx_work.clone();
                 let tx = tx_result.clone();
                 let root_ref = repo_root.as_ref();
                 scope.spawn(move || {
                     for (task_idx, ev) in rx {
-                        let verified = if let Some(root) = root_ref {
+                        let outcome = if let Some(root) = root_ref {
                             crate::components::verification::verify_evidence(
                                 &ev,
                                 root,
                                 SEARCH_PATH_RELOCATION_POLICY,
                             )
-                            .map(|o| o.is_verified())
-                            .unwrap_or(false)
+                            .unwrap_or(VerificationOutcome {
+                                status: VerificationStatus::Unverified,
+                                relocated_to: None,
+                                reason: None,
+                            })
                         } else {
-                            false
+                            VerificationOutcome {
+                                status: VerificationStatus::Unverified,
+                                relocated_to: None,
+                                reason: None,
+                            }
                         };
-                        let _ = tx.send((task_idx, verified));
+                        let _ = tx.send((task_idx, outcome));
                     }
                 });
             }
@@ -2000,8 +2123,8 @@ pub fn search_entries(
 
             // Sequential drain: workers have all exited by the time scope
             // joins; rx_result is fully populated before we iterate.
-            for (task_idx, v) in rx_result {
-                verified_flat[task_idx] = v;
+            for (task_idx, outcome) in rx_result {
+                outcomes_flat[task_idx] = outcome;
             }
         });
     }
@@ -2023,7 +2146,8 @@ pub fn search_entries(
                     citation_sha: ev.citation_sha,
                     citation_hash: ev.citation_hash,
                     citation_excerpt: ev.citation_excerpt,
-                    verified: Some(verified_flat[task_idx]),
+                    verified: Some(outcomes_flat[task_idx].is_verified()),
+                    verification_status: Some(outcomes_flat[task_idx].status),
                 })
                 .collect();
         } else {
@@ -2038,6 +2162,7 @@ pub fn search_entries(
                     citation_hash: ev.citation_hash,
                     citation_excerpt: ev.citation_excerpt,
                     verified: None,
+                    verification_status: None,
                 })
                 .collect();
         }

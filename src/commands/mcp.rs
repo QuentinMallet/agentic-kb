@@ -13,11 +13,14 @@ use crate::components::{db, embedder, events, kb_core};
 use crate::config;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Run MCP port protocol server (line-delimited JSON over stdio)
 #[derive(Command, Debug, Parser)]
@@ -37,10 +40,34 @@ impl Runnable for Mcp {
     }
 }
 
-/// Derive the repo root from the db path (<root>/agent-kb/agent-kb.db).
+/// Derive the repo root from the db path.
+///
+/// Supports both supported layouts:
+/// - `<root>/agent-kb/agent-kb.db`
+/// - `<root>/.state/agent-kb/agent-kb.db`
 fn root_from_db(db: &Path) -> PathBuf {
-    db.parent()
-        .and_then(|p| p.parent())
+    let Some(db_dir) = db.parent() else {
+        return Path::new(".").to_path_buf();
+    };
+
+    let is_state_agent_kb = db_dir
+        .file_name()
+        .is_some_and(|name| name == "agent-kb")
+        && db_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == ".state");
+
+    if is_state_agent_kb {
+        return db_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+    }
+
+    db_dir
+        .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf()
 }
@@ -154,6 +181,7 @@ fn handle_request(
         "audit_record" => handle_audit_record(&id, &req, paths, emb),
         "audit_report" => handle_audit_report(&id, paths),
         "provenance" => handle_provenance(&id, &req, paths),
+        "kb_get" => handle_kb_get(&id, &req, paths),
         "kb_peers_add" => handle_kb_peers_add(&id, &req, paths),
         "kb_peers_list" => handle_kb_peers_list(&id, &req, paths),
         "kb_peers_remove" => handle_kb_peers_remove(&id, &req, paths),
@@ -251,8 +279,9 @@ fn handle_search(
 
     match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
+            let meta = search_meta(paths, &results);
             let entries = entries_to_json(results);
-            json!({"id": id, "type": "result", "entries": entries})
+            json!({"id": id, "type": "result", "entries": entries, "_meta": meta})
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
@@ -291,6 +320,7 @@ fn entries_to_json(results: Vec<db::SearchEntry>) -> Vec<Value> {
                                 "citation_sha": ev.citation_sha,
                                 "citation_hash": ev.citation_hash,
                                 "citation_excerpt": wrapped_excerpt,
+                                "status": ev.status_str(),
                                 "verified": ev.verified,
                             })
                         })
@@ -311,6 +341,141 @@ fn entries_to_json(results: Vec<db::SearchEntry>) -> Vec<Value> {
                     })
                 })
                 .collect()
+}
+
+fn format_system_time(st: SystemTime) -> String {
+    DateTime::<Utc>::from(st).to_rfc3339()
+}
+
+fn metadata_mtime_iso(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(format_system_time)
+}
+
+fn metadata_age_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .map(|d| d.as_secs())
+}
+
+fn parse_entry_updated_at(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+        })
+}
+
+fn citation_file_rel(citation_path: &str) -> &str {
+    citation_path
+        .rsplit_once(':')
+        .map(|(path, _)| path)
+        .unwrap_or(citation_path)
+}
+
+fn returned_entries_stale_warning(paths: &config::Paths, results: &[db::SearchEntry]) -> bool {
+    let local_repo_root = root_from_db(&paths.db);
+    results.iter().any(|entry| {
+        let Some(updated_at) = parse_entry_updated_at(&entry.updated_at) else {
+            return false;
+        };
+        let repo_root = entry
+            .origin_repo
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| local_repo_root.clone());
+        entry.evidence.iter().any(|ev| {
+            let Some(citation_path) = ev.citation_path.as_deref() else {
+                return false;
+            };
+            let abs = repo_root.join(citation_file_rel(citation_path));
+            let Ok(meta) = fs::metadata(abs) else {
+                return false;
+            };
+            let Ok(mtime) = meta.modified() else {
+                return false;
+            };
+            DateTime::<Utc>::from(mtime) > updated_at
+        })
+    })
+}
+
+fn search_meta(paths: &config::Paths, results: &[db::SearchEntry]) -> Value {
+    json!({
+        "index_age": metadata_age_seconds(&paths.db),
+        "db_rebuilt_at": metadata_mtime_iso(&paths.db),
+        "events_head_at": metadata_mtime_iso(&paths.events),
+        "stale_warning": returned_entries_stale_warning(paths, results),
+    })
+}
+
+fn full_evidence_to_json(evidence: Vec<crate::models::Evidence>) -> Vec<Value> {
+    evidence
+        .into_iter()
+        .map(|ev| {
+            json!({
+                "id": ev.id,
+                "entry_id": ev.entry_id,
+                "kind": ev.kind,
+                "citation_path": ev.citation_path,
+                "citation_sha": ev.citation_sha,
+                "citation_hash": ev.citation_hash,
+                "citation_excerpt": wrap_citation_excerpt(ev.citation_excerpt.as_deref()),
+                "derived_from": ev.derived_from,
+                "recorded_at": ev.recorded_at,
+            })
+        })
+        .collect()
+}
+
+fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
+        Some(entry_id) => entry_id,
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"});
+        }
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    match db::fetch_entry_by_id(&conn, entry_id) {
+        Ok(Some(entry)) => json!({
+            "id": id,
+            "type": "result",
+            "entry": {
+                "id": entry.id,
+                "path": entry.path,
+                "summary": entry.summary,
+                "content": entry.content,
+                "tags": serde_json::from_str::<Value>(&entry.tags).unwrap_or(Value::Array(vec![])),
+                "version_ref": entry.version_ref,
+                "is_stale": entry.is_stale,
+                "permanent": entry.permanent,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+                "kind": entry.kind,
+                "evidence_status": entry.evidence_status,
+                "evidence": full_evidence_to_json(entry.evidence),
+            }
+        }),
+        Ok(None) => json!({
+            "id": id,
+            "type": "error",
+            "code": "entry_not_found",
+            "message": format!("entry '{}' not found", entry_id)
+        }),
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    }
 }
 
 /// MCP kb_add handler.
@@ -1412,6 +1577,7 @@ fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Val
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use crate::models::VerificationStatus;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1421,6 +1587,162 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = config::Paths::from_root(root);
         (dir, paths, NoopEmbedder)
+    }
+
+    fn search_entry_with_statuses() -> db::SearchEntry {
+        db::SearchEntry {
+            id: "entry-1".to_string(),
+            path: "src/example.rs".to_string(),
+            summary: "example".to_string(),
+            content: "content".to_string(),
+            tags: "[\"demo\"]".to_string(),
+            score: 1.0,
+            source: "fts",
+            score_kind: "fts",
+            evidence: vec![
+                db::SearchEvidence {
+                    id: "ev-verified".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:0-10".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:a".to_string(),
+                    citation_excerpt: Some("verified".to_string()),
+                    verified: Some(true),
+                    verification_status: Some(VerificationStatus::Verified),
+                },
+                db::SearchEvidence {
+                    id: "ev-relocated".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:11-20".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:b".to_string(),
+                    citation_excerpt: Some("relocated".to_string()),
+                    verified: Some(false),
+                    verification_status: Some(VerificationStatus::Relocated),
+                },
+                db::SearchEvidence {
+                    id: "ev-unverified".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:21-30".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:c".to_string(),
+                    citation_excerpt: Some("unverified".to_string()),
+                    verified: Some(false),
+                    verification_status: Some(VerificationStatus::Unverified),
+                },
+                db::SearchEvidence {
+                    id: "ev-deferred".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:31-40".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:d".to_string(),
+                    citation_excerpt: Some("deferred".to_string()),
+                    verified: None,
+                    verification_status: None,
+                },
+            ],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: None,
+            updated_at: "2026-08-14T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_entries_to_json_serializes_all_status_values() {
+        let entries = entries_to_json(vec![search_entry_with_statuses()]);
+        let evidence = entries[0]["evidence"].as_array().unwrap();
+        let statuses: Vec<&str> = evidence
+            .iter()
+            .map(|ev| ev["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec!["verified", "relocated", "unverified", "deferred"]
+        );
+        assert_eq!(evidence[0]["verified"], true);
+        assert_eq!(evidence[3]["verified"], Value::Null);
+    }
+
+    #[test]
+    fn test_search_meta_includes_all_keys() {
+        let (_dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+
+        let meta = search_meta(&paths, &[search_entry_with_statuses()]);
+        assert!(meta.get("index_age").is_some());
+        assert!(meta.get("db_rebuilt_at").is_some());
+        assert!(meta.get("events_head_at").is_some());
+        assert!(meta.get("stale_warning").is_some());
+    }
+
+    #[test]
+    fn test_handle_search_includes_meta_envelope() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("meta-search");
+
+        handle_add(
+            &id,
+            &json!({
+                "method":"add",
+                "id":"meta-add",
+                "path":"src/meta.rs",
+                "summary":"meta envelope entry",
+                "content":"body",
+                "tags":[]
+            }),
+            &paths,
+            &emb,
+        );
+
+        let resp = handle_search(
+            &id,
+            &json!({"method":"search","id":"meta-search","query":"meta envelope","mode":"fts"}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+        let meta = &resp["_meta"];
+        assert!(meta.get("index_age").is_some());
+        assert!(meta.get("db_rebuilt_at").is_some());
+        assert!(meta.get("events_head_at").is_some());
+        assert!(meta.get("stale_warning").is_some());
+    }
+
+    #[test]
+    fn test_search_meta_stale_warning_true_when_citation_newer_than_entry() {
+        let (dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
+
+        let mut entry = search_entry_with_statuses();
+        entry.evidence.truncate(1);
+        entry.updated_at = "2000-01-01T00:00:00Z".to_string();
+
+        let meta = search_meta(&paths, &[entry]);
+        assert_eq!(meta["stale_warning"], true);
+    }
+
+    #[test]
+    fn test_search_meta_stale_warning_false_when_citation_not_newer_than_entry() {
+        let (dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
+
+        let mut entry = search_entry_with_statuses();
+        entry.evidence.truncate(1);
+        entry.updated_at = "2999-01-01T00:00:00Z".to_string();
+
+        let meta = search_meta(&paths, &[entry]);
+        assert_eq!(meta["stale_warning"], false);
     }
 
     // ── br-improvement-catalog-23b.9: source_weights / audit_runs state machine proptests ──
@@ -1823,6 +2145,57 @@ mod tests {
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
+    }
+
+    #[test]
+    fn test_handle_kb_get_round_trip() {
+        use crate::commands::add_validation::CITATION_EXCERPT_ENVELOPE_OPEN;
+
+        let (dir, paths, emb) = setup();
+        let id = json!("kg1");
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/get.rs"), "fn kb_get() {}\n").unwrap();
+
+        let req_add = json!({
+            "method":"add",
+            "id":"kg-add",
+            "path":"src/get.rs",
+            "summary":"kb_get entry",
+            "content":"full content body",
+            "tags":["kb","get"],
+            "kind":"observation",
+            "evidence":[{
+                "kind":"code",
+                "citation_path":"src/get.rs:0-10",
+                "citation_sha":null,
+                "citation_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "citation_excerpt":"fn kb_get"
+            }]
+        });
+        let added = handle_add(&id, &req_add, &paths, &emb);
+        let entry_id = added["entry_id"].as_str().unwrap().to_string();
+
+        let resp = handle_kb_get(&id, &json!({"entry_id": entry_id}), &paths);
+        assert_eq!(resp["type"], "result");
+        let entry = &resp["entry"];
+        assert_eq!(entry["summary"], "kb_get entry");
+        assert_eq!(entry["content"], "full content body");
+        assert_eq!(entry["kind"], "observation");
+        assert!(entry["evidence"].is_array());
+        let excerpt = entry["evidence"][0]["citation_excerpt"].as_str().unwrap();
+        assert!(excerpt.starts_with(CITATION_EXCERPT_ENVELOPE_OPEN));
+    }
+
+    #[test]
+    fn test_handle_kb_get_unknown_id_error() {
+        let (_dir, paths, _emb) = setup();
+        let id = json!("kg-miss");
+
+        let resp = handle_kb_get(&id, &json!({"entry_id": "no-such-entry"}), &paths);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "entry_not_found");
+        assert!(resp["message"].as_str().unwrap().contains("no-such-entry"));
     }
 
     /// br-h9g (security I2): a request with limit far above MAX_LIMIT must be
@@ -2269,7 +2642,8 @@ mod tests {
                         let known = matches!(method,
                             "search" | "add" | "import" | "expire" | "stale_check" |
                             "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild" |
-                            "audit_run" | "audit_record" | "audit_report" | "provenance"
+                            "audit_run" | "audit_record" | "audit_report" | "provenance" |
+                            "kb_get"
                         );
                         if !known {
                             proptest::prop_assert_eq!(
