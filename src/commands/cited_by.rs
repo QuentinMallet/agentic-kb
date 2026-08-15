@@ -133,6 +133,12 @@ fn build_rows(
     Ok(rows)
 }
 
+/// Run the cited-by query and FileOnly verification path without rendering.
+#[doc(hidden)]
+pub fn benchmark_cited_by(conn: &Connection, file: &str, repo_root: &Path) -> anyhow::Result<usize> {
+    Ok(build_rows(conn, file, Some(repo_root))?.len())
+}
+
 fn classify_evidence(ev: &Evidence, file: &str, repo_root: Option<&Path>) -> CitedByStatus {
     let Some(citation_path) = ev.citation_path.as_deref() else {
         return CitedByStatus::Deferred;

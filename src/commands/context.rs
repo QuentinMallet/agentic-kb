@@ -263,6 +263,46 @@ fn greedy_select(
     )
 }
 
+/// Narrow benchmark API for the allocation/sort/greedy-pack portion of context.
+#[doc(hidden)]
+pub fn benchmark_greedy_select(
+    candidates: &[(String, usize, f32, bool)],
+    budget: usize,
+) -> (usize, usize) {
+    let candidates = candidates.iter().map(|(id, tokens, score, has_signal)| Candidate {
+        id: id.clone(), path: id.clone(), summary: id.clone(), rendered: id.clone(),
+        tokens: *tokens, score: *score, has_signal: *has_signal, cited_file: None,
+    }).collect();
+    let (selection, spent) = greedy_select(candidates, budget, None);
+    (selection.entries.len(), spent)
+}
+
+/// Narrow benchmark API for DB-backed FTS/evidence scoring and selection.
+#[doc(hidden)]
+pub fn benchmark_db_selection(
+    conn: &Connection,
+    working_set: &BTreeSet<String>,
+    branch_tokens: &[String],
+    budget: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let embedder = crate::components::embedder::NoopEmbedder;
+    let candidates = build_candidates(conn, &embedder, working_set, branch_tokens)?;
+    let (selection, spent) = greedy_select(candidates, budget, None);
+    Ok((selection.entries.len(), spent))
+}
+
+/// Benchmark the complete git-enumeration plus DB-scoring context path.
+#[doc(hidden)]
+pub fn benchmark_context_path(
+    conn: &Connection,
+    repo_root: &Path,
+    budget: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let working_set = enumerate_working_set(repo_root);
+    let tokens = current_branch(repo_root).map(|b| branch_tokens(&b)).unwrap_or_default();
+    benchmark_db_selection(conn, &working_set, &tokens, budget)
+}
+
 fn render<W: Write>(selection: &Selection, json: bool, writer: &mut W) -> anyhow::Result<()> {
     if selection.entries.is_empty() {
         if json {

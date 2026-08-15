@@ -53,7 +53,7 @@ impl Default for VacuumConfig {
 }
 
 /// kb configuration
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KbConfig {
     /// Embedding configuration
@@ -99,6 +99,24 @@ pub struct KbConfig {
     /// `citation_healed` event so it stays auditable and revertible.
     #[serde(default)]
     pub relocation_autoheal: bool,
+}
+
+impl Default for KbConfig {
+    fn default() -> Self {
+        Self {
+            embed: EmbedConfig::default(),
+            inline_verify_k: default_inline_verify_k(),
+            dep_depth: None,
+            vacuum: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            compress_threshold: default_compress_threshold(),
+            compress_cosine_cutoff: default_compress_cosine_cutoff(),
+            dedup_cosine_cutoff: None,
+            mmr_lambda: 0.0,
+            relocation_autoheal: false,
+        }
+    }
 }
 
 impl KbConfig {

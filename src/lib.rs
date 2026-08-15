@@ -7,6 +7,8 @@
 #![warn(rust_2018_idioms, trivial_casts, unused_lifetimes, unused_qualifications)]
 
 pub mod application;
+#[doc(hidden)]
+pub mod bench_fixture;
 pub mod commands;
 pub mod components;
 pub mod config;
