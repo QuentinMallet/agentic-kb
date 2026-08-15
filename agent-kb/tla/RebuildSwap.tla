@@ -24,6 +24,12 @@
   converges.  If that fix is pursued, fairness plus an explicit liveness
   property is the follow-up.
 
+  Modeling constraint for that future fix: releasing the write lock while
+  REMAINING in phase "P3" is still rejected by MutualExclusionOnLock.  A
+  lock-free stage must therefore be introduced as a NEW phase name (for
+  example a "P2b" catch-up phase), followed by a short final locked hold for
+  the residual catch-up and swap.
+
   This module models the phase structure beneath InnerGap's atomic Rebuild with
   a matching abstraction function: it uses the same order-sensitive FoldLog and
   the same event shape [kind, id], and RebuildRestoresMaterialization mirrors
@@ -316,7 +322,9 @@ NoEventLostAcrossSwap ==
 WritersProgressOutsideLock ==
   \A w \in Writers :
     (phase = "P2" /\ w \in wantsWrite /\ Len(jsonl) < MaxEvents) =>
-      (lockHolder = w \/ (lockHolder = NoLock /\ ENABLED AcquireWriterLock(w)))
+      (lockHolder = w
+        \/ (lockHolder = NoLock /\ ENABLED AcquireWriterLock(w))
+        \/ lockHolder # RebuildLock)
 
 NoDuplicateApply ==
   Cardinality({appliedIndices[i] : i \in 1..Len(appliedIndices)}) = Len(appliedIndices)
