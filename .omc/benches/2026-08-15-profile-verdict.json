@@ -1,0 +1,207 @@
+{
+  "meta": {
+    "artifact": "profile-verdict",
+    "date": "2026-08-15",
+    "generated_at": "2026-08-15T18:49:13+02:00",
+    "branch": "epic/kb-profiling",
+    "benchmark_commit": "b3ab607",
+    "current_head": "0fc8316",
+    "seed": 42,
+    "embedder": "BenchEmbedder deterministic 384-dim pool",
+    "sample_size": {
+      "cli_10000": 20,
+      "cli_100000": 10
+    },
+    "elapsed_seconds": {
+      "cli_cold": 5286.0,
+      "cli_warm": 4995.0
+    },
+    "source_files": [
+      ".omc/benches/2026-08-15-interactive-cli-cold.json",
+      ".omc/benches/2026-08-15-interactive-cli-warm.json",
+      "target/criterion/cue_lane_10000/cue_heavy/new/estimates.json",
+      "target/criterion/cue_lane_100000/cue_heavy/new/estimates.json",
+      "target/criterion/interactive_db_10000/cited_by_file_only/new/estimates.json",
+      "target/criterion/interactive_db_100000/cited_by_file_only/new/estimates.json",
+      "target/criterion/interactive_db_10000/context_scoring_fixed_git/new/estimates.json",
+      "target/criterion/interactive_db_100000/context_scoring_fixed_git/new/estimates.json",
+      "target/criterion/search_vs_size/1000_fts_only/new/estimates.json",
+      "target/criterion/search_vs_size/10000_fts_only/new/estimates.json",
+      "target/criterion/search_vs_size/1000_semantic_only/new/estimates.json",
+      "target/criterion/search_vs_size/10000_semantic_only/new/estimates.json",
+      "target/criterion/search_vs_size/1000_hybrid/new/estimates.json",
+      "target/criterion/search_vs_size/10000_hybrid/new/estimates.json",
+      "target/criterion/search_vs_size/1000_hybrid_verify_k10/new/estimates.json",
+      "target/criterion/search_vs_size/10000_hybrid_verify_k10/new/estimates.json"
+    ],
+    "notes": [
+      "Task prompt supplied the T3 acceptance criteria; .omc/plans/kb-profiling.md was not present in this worktree at generation time.",
+      "CLI 100k lanes are contaminated by concurrent builds and are not citable as precise p95 values.",
+      "Cold/warm inversion at 10k hybrid (357ms cold vs 563ms warm) proves contamination directionally.",
+      "search_vs_size/100000 criterion groups were absent in this worktree and are recorded as absent rather than inferred.",
+      "Pre-fix rerun was intentionally skipped; AC-58 final CLI verdict is deferred to one clean post-optimization run."
+    ]
+  },
+  "budget_verdicts": {
+    "budget_10k_cold_p95_ms": 500.0,
+    "surfaces": [
+      {
+        "surface": "cited-by",
+        "observed_p95_ms": 12.299,
+        "reported_ms": 12.0,
+        "verdict": "PASS",
+        "reason": "Below 500ms budget; contamination could only inflate, so PASS is conservative."
+      },
+      {
+        "surface": "context",
+        "observed_p95_ms": 66.109,
+        "reported_ms": 66.0,
+        "verdict": "PASS",
+        "reason": "Below 500ms budget; contamination could only inflate, so PASS is conservative."
+      },
+      {
+        "surface": "search-verify",
+        "observed_p95_ms": 7.415,
+        "reported_ms": 7.0,
+        "verdict": "PASS",
+        "reason": "Below 500ms budget; contamination could only inflate, so PASS is conservative."
+      },
+      {
+        "surface": "hybrid-embed",
+        "observed_p95_ms": 356.757,
+        "reported_ms": 357.0,
+        "verdict": "PASS",
+        "reason": "Below 500ms budget; contamination could only inflate, so PASS is conservative."
+      }
+    ]
+  },
+  "graceful_100k": {
+    "verdict": "BREACH-ESTABLISHED-BY-FLOOR",
+    "absolute_bound_ms": 2000.0,
+    "ratio_bound_multiple": 4.0,
+    "hybrid_10k_cold_p95_ms": 356.757,
+    "ratio_bound_ms": 1427.026,
+    "cli_100k_status": "CONTAMINATED",
+    "cli_contamination_evidence": [
+      "Concurrent builds during both CLI lanes.",
+      "Cold/warm inversion at 10k hybrid: 356.757ms cold vs 563.054ms warm."
+    ],
+    "criterion_floor": {
+      "cue_scan_100k_ms": 689.0,
+      "cue_scan_100k_exact_ms": 688.999,
+      "semantic_scan_100k_ms": 647.0,
+      "semantic_scan_100k_exact_ms": 646.967,
+      "in_process_floor_ms": 1335.966,
+      "logic": "The in-process floor excludes process startup, model invocation, merge, scoring, verification, and result formatting overhead. That remaining overhead is materially greater than the 91.060ms slack to the 4x ratio bound, so the ratio breach is already proven from clean criterion data alone."
+    },
+    "ac_58": {
+      "status": "DEFERRED",
+      "reason": "Final end-to-end 100k graceful verdict awaits one clean post-optimization CLI run."
+    }
+  },
+  "attribution_inventory": [
+    {
+      "component": "cue-row scan",
+      "value_10k_ms": 67.0,
+      "value_10k_exact_ms": 66.958,
+      "value_100k_ms": 689.0,
+      "value_100k_exact_ms": 688.999,
+      "shape": "LINEAR",
+      "assessment": "DOMINANT"
+    },
+    {
+      "component": "semantic brute-force scan",
+      "value_10k_ms": 60.0,
+      "value_10k_exact_ms": 58.697,
+      "value_100k_ms": 647.0,
+      "value_100k_exact_ms": 646.967,
+      "shape": "LINEAR",
+      "assessment": "DOMINANT"
+    },
+    {
+      "component": "context scoring",
+      "value_10k_ms": 47.0,
+      "value_10k_exact_ms": 42.993,
+      "value_100k_ms": 515.0,
+      "value_100k_exact_ms": 517.514,
+      "shape": "LINEAR",
+      "assessment": "IN-PROCESS; high but secondary to scan costs"
+    },
+    {
+      "component": "cited-by",
+      "value_10k_ms": 2.6,
+      "value_10k_exact_ms": 2.725,
+      "value_100k_ms": 27.0,
+      "value_100k_exact_ms": 26.925,
+      "shape": "LINEAR",
+      "assessment": "LINEAR DESPITE idx_evidence_citation_path; investigate query plan"
+    },
+    {
+      "component": "fts",
+      "value_10k_ms": 5.5,
+      "value_10k_exact_ms": 5.952,
+      "value_100k_ms": null,
+      "value_100k_exact_ms": null,
+      "shape": "SUB-LINEAR SO FAR",
+      "assessment": "FINE",
+      "status": "100k absent"
+    },
+    {
+      "component": "verification pool + query-hit write + _meta checks",
+      "value_10k_ms": null,
+      "value_100k_ms": null,
+      "shape": "INDISTINGUISHABLE FROM NOISE",
+      "assessment": "Not separable at these scales from the available artifacts"
+    },
+    {
+      "component": "embedder first-touch",
+      "first_touch_outlier_ms": 91863.751,
+      "steady_state_cold_p50_ms": 303.723,
+      "assessment": "PM-1 finding: model materialization cost; treat as follow-up epic candidate",
+      "budget_interpretation": "Steady-state cold artifact is the basis for budget verdicts."
+    }
+  ],
+  "anomaly_register": [
+    {
+      "name": "10k hybrid inversion",
+      "hybrid_10k_median_ms": 171.600,
+      "hybrid_verify_k10_10k_median_ms": 14.300,
+      "ratio": 12.0,
+      "finding": "Not physical; the simpler hybrid path cannot be 12x slower than the verified path.",
+      "control_pair_1k": {
+        "hybrid_median_ms": 11.9,
+        "hybrid_verify_k10_median_ms": 10.9
+      },
+      "disposition": "Both 10k search_vs_size hybrid rows are non-citable pending harness investigation."
+    }
+  ],
+  "recommended_fanout": [
+    {
+      "item": "cue+semantic candidate prefilter before scoring",
+      "priority": "high",
+      "evidence": "100k floor is already 1.336s from scan stages alone.",
+      "risk": "ranking-sensitive; sealed-split protocol required and REGRESSION blocks promotion"
+    },
+    {
+      "item": "cited-by query-shape fix",
+      "priority": "medium",
+      "evidence": "2.7ms -> 26.9ms linear despite idx_evidence_citation_path"
+    },
+    {
+      "item": "bench anomaly investigation",
+      "priority": "medium",
+      "evidence": "search_vs_size 10k hybrid vs hybrid_verify_k10 inversion is non-physical"
+    },
+    {
+      "item": "follow-up epic candidate: embedder warm-start/first-touch",
+      "priority": "medium",
+      "evidence": "91.9s one-time materialization outlier vs ~304ms steady state"
+    }
+  ],
+  "absent_cells": [
+    "target/criterion/search_vs_size/100000/fts_only/new/estimates.json",
+    "target/criterion/search_vs_size/100000/semantic_only/new/estimates.json",
+    "target/criterion/search_vs_size/100000/hybrid/new/estimates.json",
+    "target/criterion/search_vs_size/100000/hybrid_verify_k10/new/estimates.json"
+  ]
+}
