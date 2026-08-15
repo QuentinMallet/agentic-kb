@@ -1,0 +1,36 @@
+# retrieval golden set — machines_conf corpus (37 live entries), frozen 2026-08-15; split = first 17 queries by sha256(query) are dev
+{"query":"phase 3 post implementation blocks merge cascade","expected_ids":["c5c9898a-8299-4d6d-98fc-e1b00e8581ea"],"split":"dev"}
+{"query":"bao agent race jwt svid missing on boot","expected_ids":["c10d42ec-f5fb-4c17-95b0-e05ba0900dc5"],"split":"sealed"}
+{"query":"packages catalog special build patterns omc beads","expected_ids":["30c7f6b1-eda0-4cc4-af38-855421f25860","03b6dbce-1130-4fbd-9aef-46efbce96907"],"split":"sealed"}
+{"query":"claude code model override ccusage hooks","expected_ids":["bc8d01d3-6a73-4132-85f3-7a9255c320e5"],"split":"sealed"}
+{"query":"how do app services fetch secrets from openbao via spire","expected_ids":["9e53c0cf-27e3-4937-9b3a-ceb0a5de37a6"],"split":"dev"}
+{"query":"mdbook documentation structure llm optimized","expected_ids":["6de76ced-dabb-4171-937a-98a846da201e"],"split":"dev"}
+{"query":"haveno downgrade prevention version error","expected_ids":["6eaead8a-0c3b-448b-8ed4-f9fff7937546"],"split":"sealed"}
+{"query":"browser e2e testing protocol screenshots auth","expected_ids":["607ac4bd-aade-4f2d-bcbf-9132671ac54a"],"split":"sealed"}
+{"query":"package hash update recipe npm deps","expected_ids":["f1b3271e-c0dc-4dc8-8750-9e1e78eb5035"],"split":"sealed"}
+{"query":"tor hidden service key format ed25519 raw binary","expected_ids":["85784742-a31d-42aa-8cf9-eb3785b61558"],"split":"sealed"}
+{"query":"deploy homeserver skip checks ssh username","expected_ids":["c89ca762-7029-4c05-b3d0-23e9d6cd2b02"],"split":"dev"}
+{"query":"opencode integration branch merge validate","expected_ids":["bc391604-cbb5-4a97-adfd-486a871e038f"],"split":"sealed"}
+{"query":"agent kb protocol when to search add expire","expected_ids":["f829fa5d-b921-4147-a044-12d18cf9a6c0"],"split":"dev"}
+{"query":"zitadel master key generation postgresql","expected_ids":["7434195d-d228-4c23-ac7b-9e6cfc29730b"],"split":"dev"}
+{"query":"paperless mcp api token not delivered boatmurdered","expected_ids":["0ad64ae7-ca99-4837-a299-867ed5060d64"],"split":"dev"}
+{"query":"homelab mission sovereignty privacy no saas","expected_ids":["ca480fda-bc7c-4135-8c44-91c9ffc1bcd4"],"split":"sealed"}
+{"query":"elixir mix release nix beam packages pattern","expected_ids":["e416e6a9-4d09-4600-bfeb-e917621f5da8"],"split":"dev"}
+{"query":"scaffold new snowfall module boilerplate","expected_ids":["c3c73827-9bdc-4581-922b-2e5d180971e1"],"split":"sealed"}
+{"query":"list of nixos home manager modules catalog","expected_ids":["e9766289-1c79-46f2-aabd-8e7664b96a50"],"split":"sealed"}
+{"query":"assent oidc scope silently ignored","expected_ids":["95aa80e1-6b34-45fd-9d71-276e0d70a74f"],"split":"dev"}
+{"query":"authorization opa rego no inline role checks","expected_ids":["1a7dc275-5dff-4c9d-a76f-2353f0efd91a"],"split":"dev"}
+{"query":"security patterns oidc apparmor opa playbook","expected_ids":["6ec62120-7a60-439b-be40-aa7cd1989355"],"split":"dev"}
+{"query":"ralplan persistence ultraresearch session phases","expected_ids":["a17d7f4e-d5ad-4918-9462-213651e6ee76"],"split":"sealed"}
+{"query":"nginx phoenix redirect loop x-forwarded-proto duplicate","expected_ids":["dfef9abe-f799-4e27-98a8-b53cdf8b059b"],"split":"sealed"}
+{"query":"tla plus spec workflow tlc validation","expected_ids":["c17ebbb3-002b-4fc3-b1e7-136db5e11982"],"split":"dev"}
+{"query":"normatix production port oidc zitadel setup","expected_ids":["71cb3715-478a-4949-a2d4-efec976fb143"],"split":"dev"}
+{"query":"disaster recovery backup restore test qemu vm","expected_ids":["65716bd0-8550-4ce8-b4f4-e450ecbdf9ec"],"split":"sealed"}
+{"query":"project scaffolding required components beads docs folder","expected_ids":["93404925-383f-4911-a302-561a07395deb"],"split":"dev"}
+{"query":"which secrets go in agenix vs openbao vs sops","expected_ids":["cc7d46ae-9b87-424d-83a9-a97042399a2e"],"split":"dev"}
+{"query":"openbao setup script second policy never created set -e","expected_ids":["0facddbc-5d30-495a-a67c-bc0232bddaa3"],"split":"dev"}
+{"query":"fetchGit ssh contacts remote as root nixos-rebuild broken","expected_ids":["a3baeb34-a776-4d8a-881f-289004cee78a"],"split":"sealed"}
+{"query":"flake structure hosts directories overview snowfall","expected_ids":["69423537-bb19-4160-804e-78a502a6a042"],"split":"dev"}
+{"query":"universal test output format cross language harness","expected_ids":["a0e312e2-3a0e-4b42-a363-b80a4e824a1d"],"split":"sealed"}
+{"query":"openbao unseal key provisioner token admin","expected_ids":["b21fd6eb-56cd-4508-892b-d6f908970e82"],"split":"sealed"}
+{"query":"spire workload api grpc service name jwt","expected_ids":["ef84b611-a710-4e13-8427-fe4b992c3d6b"],"split":"sealed"}
