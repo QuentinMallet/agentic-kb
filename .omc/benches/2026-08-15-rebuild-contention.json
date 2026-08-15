@@ -1,0 +1,88 @@
+{
+  "ceilings_ms": {
+    "single_writer_stall": 250.0,
+    "swap_window": 50.0
+  },
+  "finding": "Phase-3 holds the write lock across the entire catch-up replay; rename + WAL/SHM unlink are ~0.15ms combined; lock-hold duration therefore scales with events accumulated during Phase 2, not with the swap itself.",
+  "meta": {
+    "branch": "epic/kb-profiling",
+    "commit": "0eb9c85cd893770f29c2b3ec4bc5f18afdf4de17",
+    "control_run_present": true,
+    "corpus_size": 220,
+    "date": "2026-08-15",
+    "events_per_writer": 50,
+    "writers": 4
+  },
+  "overlap_evidence": {
+    "intersects_at_least_one_writer": true,
+    "phase3_lock_interval_ms": {
+      "end": 5230.744463999999,
+      "start": 2956.293043
+    },
+    "writer_intervals_in_writers": true
+  },
+  "phase3_subphases_ms": {
+    "catch_up_replay": 2274.323194,
+    "dominant": "catch_up_replay",
+    "post_rename_lock_release": 0.007684,
+    "rename": 0.104223,
+    "wal_shm_unlink": 0.01632
+  },
+  "swap_window_samples_ms": {
+    "max": 2274.451421,
+    "median": 2274.451421,
+    "min": 2274.451421,
+    "samples": [
+      2274.451421
+    ]
+  },
+  "swap_window_verdict": "BREACH",
+  "verdict": "BREACH",
+  "writer_stall_verdict": "INDETERMINATE (single trial: raw deltas recorded, repeated trials required for a supportable figure)",
+  "writers": [
+    {
+      "contended_interval_ms": {
+        "end": 11727.319589,
+        "start": 0.465801
+      },
+      "contended_ms": 11726.853788,
+      "control_ms": 12181.015161,
+      "overlaps_phase3": true,
+      "stall_delta_ms": -454.1613729999998,
+      "writer": 0
+    },
+    {
+      "contended_interval_ms": {
+        "end": 11600.623573,
+        "start": 0.467464
+      },
+      "contended_ms": 11600.156109,
+      "control_ms": 12096.718427000002,
+      "overlaps_phase3": true,
+      "stall_delta_ms": -496.5623180000005,
+      "writer": 1
+    },
+    {
+      "contended_interval_ms": {
+        "end": 11648.36501,
+        "start": 0.467694
+      },
+      "contended_ms": 11647.897316,
+      "control_ms": 12057.194271,
+      "overlaps_phase3": true,
+      "stall_delta_ms": -409.2969550000003,
+      "writer": 2
+    },
+    {
+      "contended_interval_ms": {
+        "end": 11769.854551,
+        "start": 0.467704
+      },
+      "contended_ms": 11769.386847,
+      "control_ms": 12135.908195,
+      "overlaps_phase3": true,
+      "stall_delta_ms": -366.5213480000009,
+      "writer": 3
+    }
+  ]
+}
