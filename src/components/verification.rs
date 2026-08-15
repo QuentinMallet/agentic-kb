@@ -973,6 +973,69 @@ mod tests {
         assert_eq!(budget, 1024, "candidate count must remain unchanged on swap");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_containment_rejects_sibling_prefix_path() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo = sandbox.path().join("repo");
+        let sibling = sandbox.path().join("repo-sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+
+        let sibling_file = sibling.join("secret.txt");
+        let sibling_content = concat!(
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\n",
+            "sibling bytes must never verify through a repo-contained symlink\n"
+        )
+        .as_bytes();
+        std::fs::write(&sibling_file, sibling_content).unwrap();
+
+        let repo_link = repo.join("linked.txt");
+        symlink(&sibling_file, &repo_link).unwrap();
+
+        let expected_hash = hash_bytes(sibling_content);
+        let ev = Evidence {
+            id: "ev-test".to_string(),
+            entry_id: "entry-test".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some(format!("linked.txt:0-{}", sibling_content.len())),
+            citation_sha: None,
+            citation_hash: expected_hash,
+            citation_excerpt: Some(String::from_utf8(sibling_content.to_vec()).unwrap()),
+            derived_from: None,
+            recorded_at: None,
+        };
+
+        let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly).unwrap();
+        assert_eq!(outcome.status, VerificationStatus::Unverified);
+        assert_eq!(outcome.reason, Some(UnverifiedReason::NoCandidate));
+        assert_eq!(outcome.relocated_to, None);
+        assert!(!outcome.is_verified(), "sibling content must never verify");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_opened_descriptor_containment_rejects_sibling() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo = sandbox.path().join("repo");
+        let sibling = sandbox.path().join("repo-sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+
+        let repo_file = repo.join("inside.txt");
+        let sibling_file = sibling.join("outside.txt");
+        std::fs::write(&repo_file, b"inside").unwrap();
+        std::fs::write(&sibling_file, b"outside").unwrap();
+
+        let inside = std::fs::File::open(&repo_file).unwrap();
+        let outside = std::fs::File::open(&sibling_file).unwrap();
+
+        assert!(opened_file_within_repo(&inside, &repo));
+        assert!(!opened_file_within_repo(&outside, &repo));
+    }
+
     #[test]
     fn test_count_occurrences_is_non_overlapping_and_reports_first() {
         assert_eq!(count_occurrences(b"aaaa", b"aa"), (2, Some(0)));
