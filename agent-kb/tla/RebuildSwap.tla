@@ -13,10 +13,34 @@
   RebuildSwap_compact.cfg enables compaction and is EXPECTED to violate
   SnapshotIndexRemainsValid, reproducing bd-3mr.9 (the snapshot_len.min clamp
   silently treats an index from the old log as an index into the replacement).
+  SnapshotIndexRemainsValid is a generation proxy for the dropped tail rather
+  than the drop itself; it fires exactly in the bd-3mr.9 hazard window.
 
-  This refines InnerGap's order-sensitive FoldLog: events have an id and a kind;
-  upsert adds the id, expire removes it, and the last write wins.  Applied log
-  indices expose duplicate and out-of-order replay across P2 and P3.
+  LIMITATION: Spec == Init /\ [][Next]_vars has no WF_vars/SF_vars conjuncts, so
+  this module checks SAFETY only.  For the leading fix candidate (iterative
+  catch-up outside the lock, then a short final locked hold), this spec can
+  validate that lockedWork stays under budget and that the safety invariants
+  still hold, but it cannot prove termination/progress or that the iteration
+  converges.  If that fix is pursued, fairness plus an explicit liveness
+  property is the follow-up.
+
+  This module models the phase structure beneath InnerGap's atomic Rebuild with
+  a matching abstraction function: it uses the same order-sensitive FoldLog and
+  the same event shape [kind, id], and RebuildRestoresMaterialization mirrors
+  InnerGap's Safety_Rebuild_Restores.  This is an asserted invariant
+  correspondence, not a machine-checked refinement: there is no INSTANCE
+  mapping and no PROPERTY Spec => InnerGap!Spec.  Future work can add a
+  machine-checked refinement mapping.
+
+  lockedWork resets at EnterCatchUp and is charged only in P3 stages, so work
+  moved outside the lock scores zero.
+  FullLogParse charges Len(jsonl) unconditionally, so eliminating only the
+  backlog still floors lockedWork at Len(jsonl) + OpenTmpCost; the spec
+  therefore shows that fix (a) alone is insufficient.
+
+  InnerGap correspondence detail: events have an id and a kind; upsert adds the
+  id, expire removes it, and the last write wins.  Applied log indices expose
+  duplicate and out-of-order replay across P2 and P3.
 
   I3/I4 residuals (deliberately outside this state machine): db = {} at Snapshot
   means creation of a fresh TMP DB; the live DB continues serving readers and no
