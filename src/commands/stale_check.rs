@@ -6,7 +6,7 @@
 //! invocation should be duplicated between the two call sites.
 
 use crate::components::db;
-use crate::components::verification::{verify_evidence, RelocationPolicy};
+use crate::components::verification::{verify_evidence, RelocationPolicy, VerificationOutcome};
 use crate::config;
 use crate::models::VerificationStatus;
 use abscissa_core::{Command, Runnable};
@@ -500,11 +500,18 @@ fn relocation_pass(
             None => continue,
         };
         for ev in rows {
-            let outcome = match verify_evidence(ev, root, policy) {
-                Ok(o) => o,
+            let (outcome, malformed_citation) = match verify_evidence(ev, root, policy) {
+                Ok(o) => (o, false),
                 // A malformed citation_path is a data defect, not a reason to
-                // fail the whole stale check.
-                Err(_) => continue,
+                // fail the whole stale check or disappear from the report.
+                Err(_) => (
+                    VerificationOutcome {
+                        status: VerificationStatus::Unverified,
+                        relocated_to: None,
+                        reason: None,
+                    },
+                    true,
+                ),
             };
             if outcome.status == VerificationStatus::Verified {
                 continue;
@@ -515,7 +522,15 @@ fn relocation_pass(
                 status: outcome.status,
                 old_path: ev.citation_path.clone().unwrap_or_default(),
                 new_path: outcome.relocated_to,
-                reason: outcome.reason.as_ref().map(|r| r.as_str()),
+                reason: outcome
+                    .reason
+                    .as_ref()
+                    .map(|r| r.as_str())
+                    .or(if malformed_citation {
+                        Some("malformed_citation")
+                    } else {
+                        None
+                    }),
                 healed: false,
             });
         }
@@ -1167,6 +1182,78 @@ mod tests {
             ..Default::default()
         });
         assert!(healed[0].ends_with("(healed)"), "{healed:?}");
+    }
+
+    #[test]
+    fn run_stale_check_reports_malformed_citation_as_unverified() {
+        use crate::components::db::open_db_memory;
+        use rusqlite::params;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("seed.rs"), "fn seed() {}\n").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(dir.join("seed.rs"), "fn seed() {}\nfn changed() {}\n").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "change seed"]);
+
+        let conn = open_db_memory().unwrap();
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", &head],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
+            params![
+                "ev-malformed",
+                "e1",
+                "seed.rs:not-a-range",
+                "sha256:deadbeef",
+                Some("fn seed() {}")
+            ],
+        )
+        .unwrap();
+
+        let report = run_stale_check(
+            &conn,
+            &["seed.rs".to_string()],
+            &[],
+            false,
+            Some(dir),
+            RelocationPolicy::FileOnly,
+        )
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1, "fixture must surface entry in pass 1");
+        assert_eq!(report.relocation.len(), 1, "malformed row must not vanish");
+        let row = &report.relocation[0];
+        assert_eq!(row.entry_id, "e1");
+        assert_eq!(row.evidence_id, "ev-malformed");
+        assert_eq!(row.status, VerificationStatus::Unverified);
+        assert_eq!(row.reason, Some("malformed_citation"));
+
+        let lines = render_lines(&report);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("UNVERIFIED [seed.rs:not-a-range]")
+                && l.contains("reason=malformed_citation")));
     }
 
     /// `--relocate never` (the default) runs no relocation pass at all.
