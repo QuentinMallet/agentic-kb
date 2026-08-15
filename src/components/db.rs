@@ -1283,7 +1283,7 @@ impl FtsReadPath {
     }
 }
 
-pub type FtsRow = (String, String, String, String, String);
+pub type FtsRow = (String, String, String, String, String, String);
 
 pub fn fts_query_contentless(
     conn: &Connection,
@@ -1291,7 +1291,7 @@ pub fn fts_query_contentless(
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
          FROM entries_fts f
          JOIN entries e ON e.id = f.id
          WHERE f.entries_fts MATCH ?1
@@ -1309,7 +1309,16 @@ pub fn fts_query_contentless(
                 opts.tag_filter,
                 opts.limit as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )?
         .filter_map(|r| r.ok())
         .collect();
@@ -1322,7 +1331,7 @@ pub fn fts_query_content_entries(
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
          FROM entries_fts_v2 f
          JOIN entries e ON e.rowid = f.rowid
          WHERE f.entries_fts_v2 MATCH ?1
@@ -1340,7 +1349,16 @@ pub fn fts_query_content_entries(
                 opts.tag_filter,
                 opts.limit as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )?
         .filter_map(|r| r.ok())
         .collect();
@@ -1681,7 +1699,7 @@ pub fn search_entries(
             );
         }
 
-        for (id, path, summary, content, tags) in rows {
+        for (id, path, summary, content, tags, updated_at) in rows {
             seen_ids.insert(id.clone());
             entries.push(SearchEntry {
                 id,
@@ -1696,7 +1714,7 @@ pub fn search_entries(
                 confidence: 0.5,
                 audit_n: 0,
                 origin_repo: None,
-                updated_at: String::new(),
+                updated_at,
             });
         }
     }
@@ -2008,31 +2026,6 @@ pub fn search_entries(
     // Fetch evidence rows for all result entries and attach with inline verification.
     let entry_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
 
-    if !entry_ids.is_empty() {
-        let placeholders: String = (1..=entry_ids.len())
-            .map(|i| format!("?{}", i))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT id, updated_at FROM entries WHERE id IN ({})",
-            placeholders
-        );
-        let updated_at_map: std::collections::HashMap<String, String> = match conn.prepare(&sql) {
-            Ok(mut stmt) => stmt
-                .query_map(rusqlite::params_from_iter(entry_ids.iter()), |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => std::collections::HashMap::new(),
-        };
-        for entry in &mut entries {
-            if let Some(updated_at) = updated_at_map.get(&entry.id) {
-                entry.updated_at = updated_at.clone();
-            }
-        }
-    }
-
     // Prefetch source_weights in ONE query (br-ei2.8 AC5: not per-row subquery).
     // Uses COALESCE(entries.session_id, '__GLOBAL__') to match the write path.
     let weights_map: std::collections::HashMap<String, (i64, i64)> = if entry_ids.is_empty() {
@@ -2309,6 +2302,144 @@ fn find_repo_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static UPDATED_AT_FETCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_updated_at_fetches(sql: &str) {
+        if sql.starts_with("SELECT id, updated_at FROM entries WHERE id IN (") {
+            UPDATED_AT_FETCH_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    struct SearchTestEmbedder;
+
+    impl crate::components::embedder::Embedder for SearchTestEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let first = if text.contains("rank-c") {
+                0.7
+            } else if text.contains("rank-b") {
+                0.8
+            } else {
+                0.9
+            };
+            Ok(vec![first, (1.0_f32 - first * first).sqrt()])
+        }
+
+        fn is_noop(&self) -> bool {
+            false
+        }
+    }
+
+    fn seed_single_fetch_search_corpus(conn: &Connection) {
+        let embedder = SearchTestEmbedder;
+        for (id, summary) in [
+            ("rank-a", "sealedwaiver sealedwaiver rank-a"),
+            ("rank-b", "sealedwaiver rank-b with deliberately longer filler text"),
+            ("rank-c", "semantic-only rank-c"),
+        ] {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": format!("tests/{id}.md"), "summary": summary,
+                "content": "fixed corpus", "tags": [], "kind": "observation",
+                "evidence_status": "missing", "is_stale": false,
+                "ts": "2999-01-01 00:00:00"
+            });
+            apply_event(conn, &embedder, &event).unwrap();
+            conn.execute(
+                "UPDATE entries SET updated_at = '2999-01-01 00:00:00' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+
+    fn single_fetch_opts(do_fts: bool, do_semantic: bool, recency_lambda: f32) -> SearchOptions {
+        SearchOptions {
+            limit: 10,
+            do_fts,
+            do_semantic,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda,
+            mmr_lambda: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_search_updated_at_fetch_count_is_lambda_gated() {
+        let mut conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.trace(Some(count_updated_at_fetches));
+
+        for (lambda, expected) in [(0.0, 0), (0.1, 1)] {
+            UPDATED_AT_FETCH_COUNT.store(0, AtomicOrdering::SeqCst);
+            let results = search_entries(
+                &conn,
+                &SearchTestEmbedder,
+                "sealedwaiver",
+                &single_fetch_opts(true, true, lambda),
+            )
+            .unwrap();
+            assert!(!results.is_empty());
+            assert_eq!(
+                UPDATED_AT_FETCH_COUNT.load(AtomicOrdering::SeqCst),
+                expected,
+                "recency_lambda={lambda} must execute exactly {expected} updated_at fetches"
+            );
+        }
+    }
+
+    #[test]
+    fn test_single_fetch_preserves_sealed_recency_ranking_bytes() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let results = search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.1),
+        )
+        .unwrap();
+        let actual = results
+            .iter()
+            .map(|entry| format!("{}:{:08x}", entry.id, entry.score.to_bits()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // This byte-identical ranking fixture constitutes the stated sealed-split
+        // waiver in the kb-profiling epic plan; it seals the pre-single-fetch path.
+        let expected = "rank-a:3d064b8a\nrank-b:3d042108\nrank-c:3c820821";
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn test_search_returns_non_empty_updated_at_in_every_lane_mode() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+
+        for (mode, do_fts, do_semantic, query) in [
+            ("fts-only", true, false, "sealedwaiver"),
+            ("semantic-only", false, true, "semantic query"),
+            ("hybrid", true, true, "sealedwaiver"),
+        ] {
+            let results = search_entries(
+                &conn,
+                &SearchTestEmbedder,
+                query,
+                &single_fetch_opts(do_fts, do_semantic, 0.0),
+            )
+            .unwrap();
+            assert!(!results.is_empty(), "{mode} must return seeded entries");
+            assert!(
+                results.iter().all(|entry| !entry.updated_at.is_empty()),
+                "every {mode} result must carry updated_at from its retrieval lane"
+            );
+        }
+    }
 
     fn seed_entry_row(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
         conn.execute(
