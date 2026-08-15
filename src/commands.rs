@@ -7,6 +7,7 @@ pub mod hook;
 pub mod add_validation;
 pub mod compact;
 pub mod compress;
+pub mod cited_by;
 pub mod expire;
 pub mod import_cmd;
 pub mod ingest;
@@ -42,6 +43,8 @@ pub enum KbCmd {
     Compact(compact::Compact),
     /// Compress a KB entry via semantic paragraph deduplication
     Compress(compress::Compress),
+    /// List live KB entries that cite a file
+    CitedBy(cited_by::CitedBy),
     /// Evaluate retrieval quality against a golden set (recall@k, MRR)
     Eval(eval::Eval),
     /// Mark an entry stale

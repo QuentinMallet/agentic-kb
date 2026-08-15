@@ -341,6 +341,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             recorded_at      TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_evidence_entry_id ON evidence(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_citation_path ON evidence(citation_path);
 
         CREATE TABLE IF NOT EXISTS audit_runs (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,6 +417,77 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
     maybe_drop_contentless_fts(conn)?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct CitingEntry {
+    pub id: String,
+    pub path: String,
+    pub summary: String,
+    pub evidence: Vec<Evidence>,
+}
+
+fn entries_citing_sql() -> &'static str {
+    "SELECT e.id, e.path, e.summary,
+            ev.id, ev.kind, ev.citation_path, ev.citation_sha, ev.citation_hash,
+            ev.citation_excerpt, ev.derived_from, ev.recorded_at
+     FROM (
+         SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                citation_excerpt, derived_from, recorded_at
+         FROM evidence
+         WHERE citation_path = ?1
+         UNION ALL
+         SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                citation_excerpt, derived_from, recorded_at
+         FROM evidence
+         WHERE citation_path >= ?2 AND citation_path < ?3
+     ) ev
+     JOIN entries e ON e.id = ev.entry_id
+     WHERE e.is_stale = 0
+     ORDER BY e.path, e.id, ev.citation_path, ev.id"
+}
+
+pub fn entries_citing(conn: &Connection, path_query: &str) -> Result<Vec<CitingEntry>> {
+    let lower = format!("{path_query}:");
+    let upper = format!("{path_query};");
+    let mut stmt = conn.prepare(entries_citing_sql())?;
+    let rows: Vec<(String, String, String, Evidence)> = stmt
+        .query_map(params![path_query, lower, upper], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                Evidence {
+                    id: r.get(3)?,
+                    entry_id: r.get(0)?,
+                    kind: r.get(4)?,
+                    citation_path: r.get(5)?,
+                    citation_sha: r.get(6)?,
+                    citation_hash: r.get(7).unwrap_or_default(),
+                    citation_excerpt: r.get(8)?,
+                    derived_from: r.get(9)?,
+                    recorded_at: r.get(10)?,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out: Vec<CitingEntry> = Vec::new();
+    for (id, path, summary, evidence) in rows {
+        if let Some(last) = out.last_mut() {
+            if last.id == id {
+                last.evidence.push(evidence);
+                continue;
+            }
+        }
+        out.push(CitingEntry {
+            id,
+            path,
+            summary,
+            evidence: vec![evidence],
+        });
+    }
+    Ok(out)
 }
 
 /// Set a deprecation gate signal (key → value as string).
@@ -2198,6 +2270,31 @@ mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
 
+    fn seed_entry_row(
+        conn: &Connection,
+        id: &str,
+        path: &str,
+        summary: &str,
+        is_stale: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, is_stale, updated_at)
+             VALUES (?1, ?2, ?3, '', '[]', ?4, '2024-01-01T00:00:00Z')",
+            rusqlite::params![id, path, summary, is_stale],
+        )
+        .unwrap();
+    }
+
+    fn seed_evidence_row(conn: &Connection, id: &str, entry_id: &str, citation_path: &str) {
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, 'sha256:test', 'excerpt long enough', '2024-01-01T00:00:00Z')",
+            rusqlite::params![id, entry_id, citation_path],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_db_ensure_schema_creates_tables() {
         let conn = open_db_memory().unwrap();
@@ -2258,6 +2355,55 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(cols.contains(&"session_id".to_string()), "session_id must be added to legacy entries table");
+    }
+
+    #[test]
+    fn test_entries_citing_matches_bare_and_ranged_paths_and_excludes_stale_entries() {
+        let conn = open_db_memory().unwrap();
+
+        seed_entry_row(&conn, "live-bare", "docs/live-bare.md", "live bare", 0);
+        seed_entry_row(&conn, "live-range", "docs/live-range.md", "live range", 0);
+        seed_entry_row(&conn, "stale-range", "docs/stale.md", "stale range", 1);
+        seed_entry_row(&conn, "other-file", "docs/other.md", "other file", 0);
+
+        seed_evidence_row(&conn, "ev-bare", "live-bare", "src/foo.rs");
+        seed_evidence_row(&conn, "ev-range", "live-range", "src/foo.rs:42-58");
+        seed_evidence_row(&conn, "ev-stale", "stale-range", "src/foo.rs:10-20");
+        seed_evidence_row(&conn, "ev-other", "other-file", "src/bar.rs:1-5");
+
+        let rows = entries_citing(&conn, "src/foo.rs").unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["live-bare", "live-range"]);
+        assert_eq!(
+            rows[0].evidence[0].citation_path.as_deref(),
+            Some("src/foo.rs")
+        );
+        assert_eq!(
+            rows[1].evidence[0].citation_path.as_deref(),
+            Some("src/foo.rs:42-58")
+        );
+    }
+
+    #[test]
+    fn test_entries_citing_query_plan_uses_citation_path_index() {
+        let conn = open_db_memory().unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", entries_citing_sql());
+        let lower = "src/foo.rs:".to_string();
+        let upper = "src/foo.rs;".to_string();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let details: Vec<String> = stmt
+            .query_map(rusqlite::params!["src/foo.rs", lower, upper], |r| r.get(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_evidence_citation_path")),
+            "query plan should mention idx_evidence_citation_path, got {details:?}"
+        );
     }
 
     #[test]
