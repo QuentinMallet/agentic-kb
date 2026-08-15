@@ -316,6 +316,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
     // Migration: add run_id to audit_runs for Phase 5 idempotency (INSERT OR IGNORE on unique index).
     let _ = conn.execute_batch("ALTER TABLE audit_runs ADD COLUMN run_id TEXT;");
+    // Traffic-weighted audit sampling: arm metadata lives on the sampled
+    // candidate and is joined by audit_report after a verdict is recorded.
+    let _ = conn.execute_batch(
+        "ALTER TABLE audit_run_candidates ADD COLUMN arm TEXT NOT NULL DEFAULT 'uniform';",
+    );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
@@ -359,6 +364,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             run_id     TEXT NOT NULL,
             entry_id   TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            arm        TEXT NOT NULL DEFAULT 'uniform',
             PRIMARY KEY (run_id, entry_id)
         );
         "#,

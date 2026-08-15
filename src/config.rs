@@ -170,6 +170,8 @@ pub struct Paths {
     pub fastembed_cache: PathBuf,
     /// Compact state file path (persists VACUUM counter across invocations).
     pub compact_state: PathBuf,
+    /// Best-effort query telemetry database (separate from the rebuildable entries DB).
+    pub query_hits: PathBuf,
 }
 
 impl Paths {
@@ -195,6 +197,7 @@ impl Paths {
                         .join(".state")
                         .join("agent-kb")
                         .join("compact-state.json"),
+                    query_hits: dir.join(".state").join("agent-kb").join("query-hits.db"),
                 });
             }
             match dir.parent() {
@@ -225,6 +228,10 @@ impl Paths {
                 .join(".state")
                 .join("agent-kb")
                 .join("compact-state.json"),
+            query_hits: root
+                .join(".state")
+                .join("agent-kb")
+                .join("query-hits.db"),
         }
     }
 }

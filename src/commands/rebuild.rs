@@ -364,6 +364,21 @@ mod tests {
         assert_eq!(count_entries(&paths), 2);
     }
 
+    #[test]
+    fn test_rebuild_swap_preserves_separate_query_hit_log() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+        events::append_event(&paths.events, &upsert("rb-hit", 1)).unwrap();
+        crate::components::query_hits::record_hits(
+            &paths.query_hits,
+            &["rb-hit".to_string()],
+            "test",
+        );
+        Rebuild.execute_with(&paths, &emb).unwrap();
+        assert_eq!(count_entries(&paths), 1);
+        assert_eq!(crate::components::query_hits::counts(&paths.query_hits).unwrap(), vec![("rb-hit".into(), 1)]);
+    }
+
     /// DB cleared (e.g. corrupted or missing) — rebuild reconstructs from event log.
     #[test]
     fn test_rebuild_restores_cleared_db() {
@@ -626,6 +641,7 @@ mod tests {
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
             compact_state: paths.compact_state.clone(),
+            query_hits: paths.query_hits.clone(),
         };
         let paths_a = Paths {
             lock: paths.lock.clone(),
@@ -633,6 +649,7 @@ mod tests {
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
             compact_state: paths.compact_state.clone(),
+            query_hits: paths.query_hits.clone(),
         };
         let paths_b = Paths {
             lock: paths.lock.clone(),
@@ -640,6 +657,7 @@ mod tests {
             db: paths.db.clone(),
             fastembed_cache: paths.fastembed_cache.clone(),
             compact_state: paths.compact_state.clone(),
+            query_hits: paths.query_hits.clone(),
         };
 
         // Spawn rebuild thread.

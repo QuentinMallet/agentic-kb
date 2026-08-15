@@ -9,7 +9,7 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
-use crate::components::{db, embedder, events, kb_core};
+use crate::components::{db, embedder, events, kb_core, query_hits};
 use crate::config;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
@@ -92,6 +92,7 @@ impl Mcp {
                 paths.events = dir.join("agent-kb-events.jsonl");
                 paths.lock = dir.join("agent-kb.lock");
             }
+            paths.query_hits = dir.join("query-hits.db");
         }
         let paths = paths;
 
@@ -222,6 +223,7 @@ fn handle_search(
         };
         return match db::expand_entries(&conn, &ids, limit) {
             Ok(results) => {
+                record_query_results(paths, &results);
                 let entries = entries_to_json(results);
                 json!({"id": id, "type": "result", "entries": entries})
             }
@@ -280,11 +282,18 @@ fn handle_search(
     match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
             let meta = search_meta(paths, &results);
+            record_query_results(paths, &results);
             let entries = entries_to_json(results);
             json!({"id": id, "type": "result", "entries": entries, "_meta": meta})
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
+}
+
+fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
+    let ids: Vec<String> = results.iter().map(|entry| entry.id.clone()).collect();
+    let surface = std::env::var("KB_INJECTION_SOURCE").unwrap_or_else(|_| "unknown".into());
+    query_hits::record_hits(&paths.query_hits, &ids, &surface);
 }
 
 /// Serialize SearchEntry rows to the MCP wire shape (shared by search and
@@ -1058,6 +1067,59 @@ fn audit_sample_entries(
     })
 }
 
+type AuditEntry = (String, String, String, String, String);
+
+/// Weighted sampling without replacement. The uniform arm has already been
+/// fixed, so excluded IDs can never move into the traffic arm.
+fn audit_traffic_entries(
+    conn: &rusqlite::Connection,
+    sample_size: usize,
+    excluded: &[String],
+    hit_counts: &[(String, u64)],
+) -> rusqlite::Result<Vec<AuditEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,path,summary,kind,evidence_status FROM entries
+             WHERE is_stale=0 AND evidence_status='present'",
+    )?;
+    let mut rows: Vec<AuditEntry> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .filter_map(Result::ok)
+        .filter(|row: &AuditEntry| !excluded.contains(&row.0))
+        .collect();
+    let weights: std::collections::HashMap<&str, u64> =
+        hit_counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+    let mut seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut chosen = Vec::new();
+    while !rows.is_empty() && chosen.len() < sample_size {
+        let total: u64 = rows
+            .iter()
+            .map(|r| weights.get(r.0.as_str()).copied().unwrap_or(0))
+            .sum();
+        if total == 0 {
+            break;
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut ticket = seed % total;
+        let index = rows.iter().position(|r| {
+            let weight = weights.get(r.0.as_str()).copied().unwrap_or(0);
+            if ticket < weight {
+                true
+            } else {
+                ticket -= weight;
+                false
+            }
+        })
+        .unwrap_or(0);
+        chosen.push(rows.swap_remove(index));
+    }
+    Ok(chosen)
+}
+
 /// Fetch evidence rows for a single entry as JSON values.
 ///
 /// Same owned-statement pattern as `audit_sample_entries`.
@@ -1084,6 +1146,10 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
 fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
     let sample_size = sample_size.clamp(1, 50) as usize;
+    let mode = req.get("mode").and_then(|v| v.as_str()).unwrap_or("uniform");
+    if mode != "uniform" && mode != "traffic" {
+        return json!({"id":id,"type":"error","code":"parse_error","message":"mode must be 'uniform' or 'traffic'"});
+    }
 
     let _lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -1095,7 +1161,7 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let entry_rows = match audit_sample_entries(&conn, sample_size) {
+    let uniform_rows = match audit_sample_entries(&conn, sample_size) {
         Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1103,12 +1169,29 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let run_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
 
+    // Uniform-first: complete and freeze the unbiased arm before consulting
+    // the separate telemetry file for the additive traffic arm.
+    let uniform_ids: Vec<String> = uniform_rows.iter().map(|row| row.0.clone()).collect();
+    let traffic_rows = if mode == "traffic" {
+        query_hits::counts(&paths.query_hits)
+            .and_then(|counts| audit_traffic_entries(&conn, sample_size, &uniform_ids, &counts).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut entry_rows: Vec<(AuditEntry, &str)> = uniform_rows
+        .into_iter()
+        .map(|r| (r, "uniform"))
+        .collect();
+    entry_rows.extend(traffic_rows.into_iter().map(|r| (r, "traffic")));
+
     let samples: Vec<Value> = entry_rows
         .iter()
-        .map(|(eid, path, summary, kind, evidence_status)| {
+        .map(|((eid, path, summary, kind, evidence_status), arm)| {
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,?3)",
-                params![run_id, eid, ts],
+                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,arm) VALUES(?1,?2,?3,?4)",
+                params![run_id, eid, ts, arm],
             );
             let evidence = audit_evidence_rows(&conn, eid);
             json!({
@@ -1118,6 +1201,7 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                 "kind": kind,
                 "evidence_status": evidence_status,
                 "evidence": evidence,
+                "arm": arm,
             })
         })
         .collect();
@@ -1310,12 +1394,23 @@ fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
         })
         .unwrap_or((None, 0));
 
+    let per_arm: Vec<Value> = conn.prepare(
+        "SELECT c.arm, COUNT(*),
+                SUM(CASE WHEN ar.verdict='true' THEN 1.0 ELSE 0.0 END) / COUNT(*)
+         FROM audit_runs ar JOIN audit_run_candidates c
+           ON c.run_id=ar.run_id AND c.entry_id=ar.entry_id
+         GROUP BY c.arm ORDER BY c.arm",
+    ).ok().and_then(|mut stmt| stmt.query_map([], |r| Ok(json!({
+        "arm": r.get::<_,String>(0)?, "n": r.get::<_,i64>(1)?, "precision": r.get::<_,f64>(2)?
+    }))).ok().map(|rows| rows.filter_map(Result::ok).collect())).unwrap_or_default();
+
     json!({
         "id": id,
         "type": "result",
         "per_kind_session_precision": per_kind_session,
         "last_run_at": last_run_at,
         "total_runs": total_runs,
+        "per_arm_precision": per_arm,
     })
 }
 
@@ -2712,6 +2807,75 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_run_absent_mode_remains_uniform() {
+        let (_dir, paths, emb) = setup();
+        let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
+        let response = handle_audit_run(&json!(null), &json!({"sample_size": 1}), &paths);
+        assert_eq!(response["type"], "ok");
+        let samples = response["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["id"], entry_id);
+        assert_eq!(samples[0]["arm"], "uniform");
+        assert!(!paths.query_hits.exists(), "uniform mode must not open the hit log");
+    }
+
+    #[test]
+    fn test_audit_run_traffic_prefers_high_hit_entries_and_is_disjoint() {
+        let (_dir, paths, emb) = setup();
+        let hot = add_live_entry(&paths, &emb, "p/hot", None);
+        let cold_a = add_live_entry(&paths, &emb, "p/cold-a", None);
+        let cold_b = add_live_entry(&paths, &emb, "p/cold-b", None);
+        query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 500], "test");
+        query_hits::record_hits(&paths.query_hits, &[cold_a.clone(), cold_b.clone()], "test");
+
+        let mut hot_traffic = 0;
+        let mut cold_traffic = 0;
+        for _ in 0..60 {
+            let resp = handle_audit_run(&json!(null), &json!({"sample_size":1,"mode":"traffic"}), &paths);
+            assert_eq!(resp["type"], "ok");
+            let samples = resp["samples"].as_array().unwrap();
+            let uniform: Vec<&str> = samples.iter().filter(|s| s["arm"] == "uniform")
+                .filter_map(|s| s["id"].as_str()).collect();
+            let traffic: Vec<&str> = samples.iter().filter(|s| s["arm"] == "traffic")
+                .filter_map(|s| s["id"].as_str()).collect();
+            assert!(traffic.iter().all(|id| !uniform.contains(id)), "uniform-first arms must be disjoint");
+            for id in traffic {
+                if id == hot.as_str() {
+                    hot_traffic += 1
+                } else {
+                    cold_traffic += 1
+                }
+            }
+        }
+        assert!(hot_traffic > cold_traffic, "high-traffic entry should be sampled more often");
+    }
+
+    #[test]
+    fn test_audit_run_missing_hit_log_degrades_to_uniform() {
+        let (_dir, paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/degrade", None);
+        assert!(!paths.query_hits.exists());
+        let resp = handle_audit_run(&json!(null), &json!({"sample_size":1,"mode":"traffic"}), &paths);
+        assert_eq!(resp["type"], "ok");
+        let samples = resp["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["arm"], "uniform");
+    }
+
+    #[test]
+    fn test_search_response_ignores_unwritable_hit_log() {
+        let (dir, mut paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/search-hit", None);
+        let req = json!({"query":"s","mode":"fts"});
+        let expected = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let blocked = dir.path().join("hit-log-is-a-directory");
+        fs::create_dir(&blocked).unwrap();
+        paths.query_hits = blocked;
+        let actual = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_handle_audit_run_excludes_stale() {
         let (_dir, paths, emb) = setup();
         let eid = add_live_entry(&paths, &emb, "p/stale", None);
@@ -2860,6 +3024,26 @@ mod tests {
         assert_eq!(rows[0]["n"], 4);
         assert!(resp["last_run_at"].as_str().is_some());
         assert_eq!(resp["total_runs"], 4);
+    }
+
+    #[test]
+    fn test_handle_audit_report_separates_arms() {
+        let (_dir, paths, emb) = setup();
+        let uniform = add_live_entry(&paths, &emb, "p/report-uniform", None);
+        let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
+        let conn = db::open_db(&paths.db).unwrap();
+        conn.execute("INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')", [&uniform]).unwrap();
+        conn.execute("INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')", [&traffic]).unwrap();
+        drop(conn);
+        let req = json!({"run_id":"arms","verdicts":[
+            {"entry_id":uniform,"verdict":true}, {"entry_id":traffic,"verdict":true}
+        ]});
+        assert_eq!(handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"], 2);
+        let report = handle_audit_report(&json!(null), &paths);
+        let arms = report["per_arm_precision"].as_array().unwrap();
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().any(|r| r["arm"] == "uniform" && r["n"] == 1));
+        assert!(arms.iter().any(|r| r["arm"] == "traffic" && r["n"] == 1));
     }
 
     #[test]
