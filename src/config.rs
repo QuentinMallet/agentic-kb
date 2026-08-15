@@ -92,10 +92,11 @@ pub struct KbConfig {
     #[serde(default)]
     pub mmr_lambda: f32,
     /// Whether a successful relocation may rewrite `evidence.citation_path`.
-    /// Default `false`: relocation computes and reports, and mutates evidence
-    /// only under this explicit opt-in (plan P4 "no autonomous mutation of
-    /// evidence"). A heal writes the path only, never the stored hash, and
-    /// emits a `citation_healed` event so it stays auditable and revertible.
+    /// Default `false`: `kb stale-check --relocate ...` computes and reports
+    /// `RELOCATED` / `UNVERIFIED` findings, but mutates evidence only under
+    /// this explicit opt-in (plan P4 "no autonomous mutation of evidence").
+    /// A heal writes the path only, never the stored hash, and emits a
+    /// `citation_healed` event so it stays auditable and revertible.
     #[serde(default)]
     pub relocation_autoheal: bool,
 }

@@ -17,15 +17,22 @@ use std::process::Command as ProcessCommand;
 const RRF_K: f32 = 60.0;
 
 /// Select working-set-relevant KB entries without exceeding a token budget.
+///
+/// Scoring blends working-set evidence overlap with branch-token FTS matches,
+/// then greedily packs whole entries until the budget is exhausted. Text mode
+/// prints summary + first paragraph + a `[kb#<id>]` handle for later expansion.
+/// With no qualifying entries the command is silent. When `KB_INJECTION_SOURCE`
+/// is set, selected ids are recorded to the best-effort query-hits telemetry DB.
 #[derive(Command, Debug, Parser)]
 pub struct Context {
-    /// Approximate token budget (tokens are estimated as ceil(UTF-8 bytes / 4))
+    /// Approximate token budget; tokens are estimated as ceil(UTF-8 bytes / 4)
     #[arg(long)]
     pub budget: usize,
-    /// Minimum blended relevance score; by default, only zero-signal entries are excluded
+    /// Minimum blended relevance score. Unset means "relevance or silence":
+    /// keep any entry with non-zero signal, otherwise emit nothing.
     #[arg(long)]
     pub floor: Option<f32>,
-    /// Emit a JSON array instead of context text
+    /// Emit a JSON array instead of context text with `[kb#<id>]` handles
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

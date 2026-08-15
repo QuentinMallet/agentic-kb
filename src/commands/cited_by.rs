@@ -12,11 +12,16 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// List live KB entries whose evidence cites a given file.
+///
+/// Text mode emits one `GOVERNED <STATUS> [<path>] <summary> id=<entry_id>`
+/// line per live entry. Status is one of `VERIFIED`, `RELOCATED`,
+/// `UNVERIFIED`, or `DEFERRED`. `--json` emits the same information as a JSON
+/// array instead of line-oriented output.
 #[derive(Command, Debug, Parser)]
 pub struct CitedBy {
     /// Repo-relative file path to match against evidence.citation_path
     pub file: String,
-    /// Emit machine-readable JSON instead of line-oriented text
+    /// Emit a JSON array instead of `GOVERNED ...` text lines
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

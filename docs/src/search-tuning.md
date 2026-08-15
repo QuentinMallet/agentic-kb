@@ -119,6 +119,37 @@ dedup_cosine_cutoff = 0.85   # Default when unset: 0.85. Values > 1.0 disable.
 
 Internal re-add paths (rebuild, digest, compress, import) skip the probe.
 
+## Relocation Auto-Heal
+
+`kb stale-check --relocate ...` can verify whether a cited byte range still
+exists at the recorded path and, if not, whether it moved. This produces a
+citation-level status lattice:
+
+- `VERIFIED` — the recorded `citation_path` still hashes at HEAD.
+- `RELOCATED` — the excerpt was found at exactly one new location.
+- `UNVERIFIED` — the excerpt could not be re-proven.
+- `DEFERRED` — verification was intentionally skipped elsewhere, such as
+  `kb_search` beyond the inline verification budget.
+
+CLI stale-check surfaces only the actionable relocation findings:
+
+- `RELOCATED [old] -> [new]  id=<entry>  ev=<evidence>  (report-only|healed)`
+- `UNVERIFIED [old]  id=<entry>  ev=<evidence>  reason=<reason>`
+
+Configuration lives in `kb.toml`:
+
+```toml
+relocation_autoheal = false   # Default
+```
+
+Default `false` means relocation is compute-and-report only. Setting it to
+`true` allows `kb stale-check --relocate file` or `--relocate file-then-repo`
+to write a `citation_healed` event for each successful relocation. The heal
+rewrites `evidence.citation_path` only; it never rewrites the stored hash.
+
+The `citation_healed` event is the durable record. Rebuild replays it, and the
+CLI marks healed lines with `(healed)` instead of `(report-only)`.
+
 ## Embedding Text Mode (`KB_EMBED_TEXT`)
 
 What gets embedded per entry:

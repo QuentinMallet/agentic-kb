@@ -112,6 +112,8 @@ pub struct RelocationEntry {
 ///   REVIEW  — entry was recorded at one of the supplied commit SHAs
 ///   UNKNOWN — entry's recorded version_ref is unreachable from current HEAD
 ///             (deleted branch, garbage-collected commit, orphan-branch KB)
+///   RELOCATED / UNVERIFIED — citation-level relocation findings when
+///             `--relocate` is not `never`
 ///
 /// Two lookup modes (can be combined):
 ///   1. File-based: pass file paths; finds entries whose KB path overlaps
@@ -121,6 +123,10 @@ pub struct RelocationEntry {
 ///      recorded *at* specific commit SHAs.  With `--blame`, the SHA set
 ///      is "commits that touched the file" (`git log --pretty=%H -- file`),
 ///      not the file's full blame line history.
+///
+/// Relocation is report-only by default. A successful relocation writes a
+/// `citation_healed` event only when `relocation_autoheal = true` in
+/// `kb.toml`.
 #[derive(Command, Debug, Parser)]
 pub struct StaleCheck {
     /// File paths to check for stale KB entries (by path match + git log)
@@ -138,9 +144,10 @@ pub struct StaleCheck {
     pub blame: bool,
 
     /// How hard to look for citations that moved: `never` (default),
-    /// `file` (search the cited file), `file-then-repo` (also walk the repo).
-    /// Anything other than `never` reads file content and is off the
-    /// interactive path by design (plan §6 S2).
+    /// `file` (search only the cited file), `file-then-repo` (fall back to a
+    /// repo walk). When enabled, emits `RELOCATED` and `UNVERIFIED` lines in
+    /// addition to entry-level `STALE` / `REVIEW` / `UNKNOWN`. Auto-heal
+    /// remains gated by `relocation_autoheal = true` in `kb.toml`.
     #[arg(long = "relocate", value_enum, default_value_t = RelocateArg::Never)]
     pub relocate: RelocateArg,
 }

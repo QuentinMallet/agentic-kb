@@ -61,9 +61,12 @@ Source: `src/components/redactor.rs`, `tests/redaction_corpus.rs`
 
 ## Read-Time Complement
 
-Redaction is the write-time half of the defense. At read time, `kb_search` results wrap `citation_excerpt` values in the envelope `<<UNTRUSTED_EXCERPT>>...<<END>>` to signal that data is sourced from user input and may contain injection payloads. These two layers work together:
+Redaction is the write-time half of the defense. At read time, `kb_search`
+withholds `citation_excerpt` entirely; `kb_get` returns excerpts wrapped in the
+envelope `<<UNTRUSTED_EXCERPT>>...<<END>>` to signal that data is sourced from
+user input and may contain injection payloads. These two layers work together:
 - Write time: remove known secrets before they enter the store
-- Read time: mark user-supplied excerpts as untrusted for the consumer to handle with care
+- Read time: mark user-supplied excerpts as untrusted when they are explicitly fetched
 
 ## Configuration
 

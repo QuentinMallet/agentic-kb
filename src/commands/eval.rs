@@ -12,16 +12,25 @@ use clap::Parser;
 
 const EXIT_COMPARE_REGRESSION: i32 = 3;
 
-/// Evaluate retrieval quality against a golden set (recall@k, MRR)
+/// Evaluate retrieval quality against a golden set (recall@k, MRR).
+///
+/// Golden-set JSONL now includes a `split` field (`dev` or `sealed`; legacy
+/// lines default to `dev`). `--sealed` hard-fails unless the adjacent
+/// `split-manifest.json` validates. `--compare` prints one McNemar outcome:
+/// `SIGNIFICANT`, `INCONCLUSIVE`, or `REGRESSION`; only `REGRESSION` exits 3.
 #[derive(Command, Debug, Parser)]
 pub struct Eval {
-    /// Path to golden set JSONL ({"query": ..., "expected_ids": [...]})
+    /// Path to golden set JSONL (`query`, `expected_ids`, optional `split`)
     #[arg(required_unless_present = "compare")]
     pub golden: Option<std::path::PathBuf>,
-    /// Run the frozen sealed partition (manifest must be beside the golden file)
+    /// Run the frozen sealed partition. Hard-fails unless
+    /// `split-manifest.json` beside the golden file validates.
     #[arg(long)]
     pub sealed: bool,
-    /// Compare two JSON EvalReport files from paired same-corpus, same-time arms
+    /// Compare two JSON EvalReport files from paired same-corpus, same-time
+    /// arms. Outputs `SIGNIFICANT`, `INCONCLUSIVE`, or `REGRESSION`;
+    /// `REGRESSION` exits 3. `INCONCLUSIVE` means "no information, NOT no
+    /// regression".
     #[arg(long, num_args = 2, value_names = ["BEFORE", "AFTER"])]
     pub compare: Option<Vec<std::path::PathBuf>>,
     /// FTS5 keyword search only
