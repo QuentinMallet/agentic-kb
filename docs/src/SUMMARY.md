@@ -4,6 +4,7 @@
 - [Peer Graph (kb peers)](./peer-graph-cli.md)
 - [MCP Surfaces](./mcp.md)
 - [Search Tuning](./search-tuning.md)
+- [Performance Baselines](./performance-baselines.md)
 - [Retrieval Eval (kb eval)](./retrieval-eval.md)
 - [Query-Hits Telemetry](./query-hits-telemetry.md)
 - [Cue Anchors](./cue-anchors.md)
