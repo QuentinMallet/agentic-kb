@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 /// Maximum file size allowed for verification: 64 MiB.
@@ -257,6 +258,9 @@ fn hash_check_at_citation(
         Ok(m) => m,
         Err(_) => return HashCheck::Failed(UnverifiedReason::ReadError),
     };
+    if !opened_file_within_repo(&file, repo_root) {
+        return HashCheck::Failed(UnverifiedReason::ReadError);
+    }
 
     let file_size = metadata.len();
 
@@ -291,6 +295,19 @@ fn hash_check_at_citation(
     } else {
         HashCheck::Mismatch
     }
+}
+
+fn opened_file_within_repo(file: &File, repo_root: &Path) -> bool {
+    let canonical_root = match repo_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let fd = file.as_raw_fd();
+    let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    resolved.starts_with(&canonical_root)
 }
 
 /// An excerpt is strong enough to relocate from only if it clears BOTH floors.
@@ -553,10 +570,7 @@ fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> 
         Ok(m) if m.is_file() => m,
         _ => return FileScan::Skipped,
     };
-    let (Ok(canonical_path), Ok(canonical_root)) = (path.canonicalize(), repo_root.canonicalize()) else {
-        return FileScan::Skipped;
-    };
-    if !canonical_path.starts_with(&canonical_root) {
+    if !opened_file_within_repo(&file, repo_root) {
         return FileScan::Skipped;
     }
     let size = meta.len();
@@ -933,6 +947,30 @@ mod tests {
             FileScan::Skipped
         ));
         assert_eq!(budget, 1024, "the outside target must not be charged or read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_file_swap_to_symlink_never_matches_outside_content() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside secret needle").unwrap();
+        let candidate = repo.path().join("candidate.txt");
+        std::fs::write(&candidate, b"inside only").unwrap();
+
+        let path_meta = std::fs::symlink_metadata(&candidate).unwrap();
+        assert!(path_meta.is_file());
+        std::fs::remove_file(&candidate).unwrap();
+        symlink(outside.path(), &candidate).unwrap();
+
+        let mut budget = 1024;
+        assert!(matches!(
+            scan_file(&candidate, repo.path(), b"outside secret", &mut budget),
+            FileScan::Skipped
+        ));
+        assert_eq!(budget, 1024, "candidate count must remain unchanged on swap");
     }
 
     #[test]
