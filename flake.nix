@@ -96,7 +96,9 @@
             apiDocs = platform.buildRustPackage {
               name = "package-rustdoc";
               dontCheck = true;
-              nativeBuildInputs = with pkgs; [ cmake ];
+              nativeBuildInputs = with pkgs; [ pkg-config cmake ];
+              buildInputs = with pkgs; [ openssl ];
+              OPENSSL_NO_VENDOR = "1";
               cargoLock.lockFile = ./Cargo.lock;
               src = ./.;
               buildPhase = "cargo doc --offline --no-deps";
@@ -161,6 +163,7 @@
               tlaps
               tlaplus18
               mdbook
+              hyperfine
               act # Run GitHub Actions locally
 
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
