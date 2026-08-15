@@ -8,6 +8,7 @@ pub mod add_validation;
 pub mod compact;
 pub mod compress;
 pub mod cited_by;
+pub mod context;
 pub mod expire;
 pub mod import_cmd;
 pub mod ingest;
@@ -45,6 +46,8 @@ pub enum KbCmd {
     Compress(compress::Compress),
     /// List live KB entries that cite a file
     CitedBy(cited_by::CitedBy),
+    /// Select relevant KB context within an approximate token budget
+    Context(context::Context),
     /// Evaluate retrieval quality against a golden set (recall@k, MRR)
     Eval(eval::Eval),
     /// Mark an entry stale
