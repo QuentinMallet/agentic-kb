@@ -10,10 +10,13 @@ against numbers instead of tuned blind.
 JSONL, one case per line. Blank lines and `#` comments are skipped. Cases with
 empty `expected_ids` are rejected.
 
+Each case may set `split` to `dev` or `sealed`. Legacy lines without `split`
+default to `dev`.
+
 ```jsonl
 # retrieval golden set — agentic-kb
-{"query": "recency decay half-life", "expected_ids": ["<entry-uuid>"]}
-{"query": "how does rebuild avoid blocking writers", "expected_ids": ["<uuid-1>", "<uuid-2>"]}
+{"query": "recency decay half-life", "expected_ids": ["<entry-uuid>"], "split": "dev"}
+{"query": "how does rebuild avoid blocking writers", "expected_ids": ["<uuid-1>", "<uuid-2>"], "split": "sealed"}
 ```
 
 Build cases from real queries you expect the KB to answer: take an entry,
@@ -26,6 +29,7 @@ id. 20–50 cases is enough to catch regressions.
 kb eval golden.jsonl                 # hybrid (default), k=10
 kb eval golden.jsonl --fts --k 5     # FTS lane only
 kb eval golden.jsonl --semantic      # semantic lane only
+kb eval golden.jsonl --sealed        # sealed split only; manifest must validate
 kb eval golden.jsonl --json          # machine-readable report
 ```
 
@@ -58,3 +62,26 @@ kb eval golden.jsonl --min-recall 0.8 --min-mrr 0.6
 2. Apply the change (e.g. set `KB_EMBED_TEXT=abstraction` + `kb reembed`).
 3. Compare: `kb eval golden.jsonl --json > after.json`
 4. Keep the change only if recall/MRR hold or improve.
+
+## Sealed Split
+
+`kb eval --sealed` runs only the `split = "sealed"` cases and hard-fails unless
+`split-manifest.json` beside the golden file validates against the current
+event log. This is the "frozen holdout" path: if the manifest no longer matches
+the corpus, the command stops instead of silently reinterpreting the benchmark.
+
+## Comparing Two Runs
+
+Use `--compare` with two JSON reports from paired same-corpus, same-time arms:
+
+```bash
+kb eval --compare before.json after.json
+```
+
+The output is one of:
+
+- `SIGNIFICANT` — the paired comparison shows a significant improvement.
+- `INCONCLUSIVE` — no information, NOT evidence of no regression.
+- `REGRESSION` — significant negative movement; exits with code `3`.
+
+`SIGNIFICANT` and `INCONCLUSIVE` exit `0`. Only `REGRESSION` is a hard CI gate.

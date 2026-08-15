@@ -106,7 +106,11 @@ pub fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
 /// Convert little-endian f32 byte blob back to f32 vec.
 /// Kept as backwards-compat helper for test code and legacy read paths.
 pub fn blob_to_f32s(b: &[u8]) -> Vec<f32> {
-    debug_assert!(b.len().is_multiple_of(4), "blob length {} not divisible by 4 — corrupt embedding?", b.len());
+    debug_assert!(
+        b.len().is_multiple_of(4),
+        "blob length {} not divisible by 4 — corrupt embedding?",
+        b.len()
+    );
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -147,6 +151,46 @@ pub struct Entry {
     /// Session ID that created this entry (NULL for legacy entries)
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// Status lattice for a citation, mirroring `Statuses` in
+/// `agent-kb/tla/CitationRelocation.tla`.
+///
+/// `Relocated` is deliberately NOT a weak form of `Verified`: an excerpt match
+/// says where the code went, never that the recorded hash still describes it.
+/// Only a later pass that re-hashes the content at the healed path against the
+/// unchanged stored hash may reach `Verified` (spec `NoSilentPromotion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationStatus {
+    /// The stored hash matches the bytes currently under the citation.
+    Verified,
+    /// The excerpt was found at exactly one new location; the citation can be
+    /// repointed there. Says nothing about the hash.
+    Relocated,
+    /// Neither verified nor safely relocatable.
+    Unverified,
+}
+
+impl VerificationStatus {
+    /// Wire/CLI spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VerificationStatus::Verified => "verified",
+            VerificationStatus::Relocated => "relocated",
+            VerificationStatus::Unverified => "unverified",
+        }
+    }
+
+    /// Mirrors `Rank` in `CitationRelocation.tla`: status never regresses
+    /// inside one verification pass.
+    pub fn rank(&self) -> u8 {
+        match self {
+            VerificationStatus::Unverified => 0,
+            VerificationStatus::Relocated => 1,
+            VerificationStatus::Verified => 2,
+        }
+    }
 }
 
 /// A piece of evidence attached to a KB entry.
@@ -430,7 +474,9 @@ mod tests {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(42);
-        let raw: Vec<f32> = (0..EMB_DIMS).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+        let raw: Vec<f32> = (0..EMB_DIMS)
+            .map(|_| rng.gen::<f32>() * 2.0 - 1.0)
+            .collect();
         let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
         let unit: Vec<f32> = raw.iter().map(|x| x / norm).collect();
 
@@ -462,5 +508,4 @@ mod tests {
         decode_f16_blob_into(&blob, &mut scratch);
         assert_eq!(scratch.len(), EMB_DIMS);
     }
-
 }

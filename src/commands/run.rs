@@ -3,8 +3,8 @@
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::{db, events};
 use crate::config;
-use anyhow::bail;
 use abscissa_core::{Command, Runnable};
+use anyhow::bail;
 use clap::Parser;
 
 /// Record a test run result
@@ -62,7 +62,12 @@ impl Run {
         let embedder = crate::components::embedder::NoopEmbedder;
         db::apply_event(&conn, &embedder, &event)?;
 
-        println!("recorded run {}  {} -> {}", run_id.get(..8).unwrap_or(&run_id), self.test_id, self.result);
+        println!(
+            "recorded run {}  {} -> {}",
+            run_id.get(..8).unwrap_or(&run_id),
+            self.test_id,
+            self.result
+        );
         Ok(())
     }
 }

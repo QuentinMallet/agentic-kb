@@ -4,6 +4,7 @@ pub mod db;
 pub mod embedder;
 pub mod events;
 pub mod kb_core;
+pub mod query_hits;
 pub mod redactor;
 pub mod retrieval_eval;
 pub mod text_chunker;

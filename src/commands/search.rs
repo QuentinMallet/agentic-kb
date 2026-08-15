@@ -1,11 +1,26 @@
 //! `search` subcommand
 
-use crate::components::db;
 use crate::components::embedder;
+use crate::components::{db, query_hits};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use std::collections::HashSet;
+
+fn evidence_display_line(ev: &db::SearchEvidence) -> String {
+    let verified_str = match ev.verified {
+        Some(true) => "verified=true",
+        Some(false) => "verified=false",
+        None => "verified=null",
+    };
+    format!(
+        "    evidence: kind={}  {}  status={}  {}",
+        ev.kind,
+        ev.citation_path.as_deref().unwrap_or(""),
+        ev.status_str(),
+        verified_str
+    )
+}
 
 /// Search knowledge entries (default: hybrid FTS5 + semantic re-rank)
 #[derive(Command, Debug, Parser)]
@@ -102,7 +117,12 @@ impl Search {
 
         // Peer federation: collect results from peer DBs and merge.
         let results = if !self.local_only && (self.peers || self.reachable_from.is_some()) {
-            let peer_paths = collect_peer_paths(&conn, self.reachable_from.as_deref(), self.max_hops, self.slug.as_deref());
+            let peer_paths = collect_peer_paths(
+                &conn,
+                self.reachable_from.as_deref(),
+                self.max_hops,
+                self.slug.as_deref(),
+            );
 
             // Deduplicate: local results take priority.
             let local_ids: HashSet<String> = local_results.iter().map(|r| r.id.clone()).collect();
@@ -164,15 +184,7 @@ impl Search {
                 println!("  content: {}", r.content);
             }
             for ev in &r.evidence {
-                let verified_str = match ev.verified {
-                    Some(true) => "verified=true",
-                    Some(false) => "verified=false",
-                    None => "verified=null",
-                };
-                println!("    evidence: kind={kind}  {path}  {verified}",
-                    kind = ev.kind,
-                    path = ev.citation_path.as_deref().unwrap_or(""),
-                    verified = verified_str);
+                println!("{}", evidence_display_line(ev));
             }
         }
 
@@ -204,7 +216,38 @@ impl Search {
             }
         }
 
+        if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
+            let session_id =
+                std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+            let injected: Vec<_> = results
+                .iter()
+                .map(|entry| {
+                    let cited_file = entry
+                        .evidence
+                        .iter()
+                        .find_map(|ev| ev.citation_path.as_deref())
+                        .map(citation_file_component);
+                    (entry.id.clone(), cited_file)
+                })
+                .collect();
+            query_hits::record_injection(&paths.query_hits, &session_id, &injected, &surface);
+        }
+
         Ok(())
+    }
+}
+
+fn citation_file_component(path: &str) -> String {
+    let Some((file, suffix)) = path.rsplit_once(':') else {
+        return path.to_owned();
+    };
+    if suffix
+        .split('-')
+        .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+    {
+        file.to_owned()
+    } else {
+        path.to_owned()
     }
 }
 
@@ -244,10 +287,7 @@ fn query_target_repos(
 }
 
 /// Query direct target_repo values from the peers table.
-fn query_direct_peers(
-    conn: &rusqlite::Connection,
-    slug_filter: Option<&str>,
-) -> Vec<String> {
+fn query_direct_peers(conn: &rusqlite::Connection, slug_filter: Option<&str>) -> Vec<String> {
     match slug_filter {
         Some(slug) => query_target_repos(
             conn,
@@ -314,8 +354,25 @@ mod tests {
     use crate::commands::add::Add;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
+    use crate::models::VerificationStatus;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_evidence_display_line_includes_status() {
+        let line = evidence_display_line(&db::SearchEvidence {
+            id: "ev-1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/lib.rs:0-10".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            verified: Some(false),
+            verification_status: Some(VerificationStatus::Relocated),
+        });
+        assert!(line.contains("status=relocated"));
+        assert!(line.contains("verified=false"));
+    }
 
     #[test]
     fn test_cmd_search_fts_returns_match() {
@@ -334,10 +391,10 @@ mod tests {
             id: Some("search-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -378,10 +435,10 @@ mod tests {
             id: Some("remote-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&remote_paths, &embedder).unwrap();
 
@@ -468,15 +525,20 @@ mod tests {
             id: Some("inj-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
         // These queries contain FTS5 operators — should not error out
-        for q in &["auth AND security", "auth OR security", "auth NOT security", "auth*"] {
+        for q in &[
+            "auth AND security",
+            "auth OR security",
+            "auth NOT security",
+            "auth*",
+        ] {
             let search_cmd = Search {
                 query: q.to_string(),
                 fts: true,
@@ -612,7 +674,9 @@ mod tests {
         // the tempdir), we test verification via the MCP path which passes repo_root
         // explicitly. Instead, verify the evidence array is populated and the
         // verified field is Some (true or false) — not None.
-        let results = crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts).unwrap();
+        let results =
+            crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts)
+                .unwrap();
         assert!(!results.is_empty(), "search must return at least 1 result");
 
         let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
@@ -620,7 +684,10 @@ mod tests {
 
         // verified is Some(bool) — inline verification was attempted
         // (true if CWD happens to be the tempdir, false otherwise — both are acceptable)
-        assert!(entry.evidence[0].verified.is_some(), "verified must not be null for top-K results");
+        assert!(
+            entry.evidence[0].verified.is_some(),
+            "verified must not be null for top-K results"
+        );
         assert_eq!(entry.evidence[0].kind, "code");
     }
 
@@ -685,20 +752,30 @@ mod tests {
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
-            &conn, &embedder, "narrow k fallback entry authentication", &opts,
-        ).unwrap();
+            &conn,
+            &embedder,
+            "narrow k fallback entry authentication",
+            &opts,
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 3, "all 3 entries must be returned");
 
         // First result: verified=Some(...)
         let first = &results[0];
         assert_eq!(first.evidence.len(), 1);
-        assert!(first.evidence[0].verified.is_some(), "top-1 result must have verified=Some(...)");
+        assert!(
+            first.evidence[0].verified.is_some(),
+            "top-1 result must have verified=Some(...)"
+        );
 
         // Remaining results: verified=None
         for r in &results[1..] {
             assert_eq!(r.evidence.len(), 1);
-            assert!(r.evidence[0].verified.is_none(), "results beyond K must have verified=null");
+            assert!(
+                r.evidence[0].verified.is_none(),
+                "results beyond K must have verified=null"
+            );
         }
     }
 
@@ -828,11 +905,13 @@ mod tests {
 
         let local_conn = crate::components::db::open_db(&local_paths.db).unwrap();
         let peer_root_str = peer_root.to_str().unwrap().to_string();
-        local_conn.execute(
-            "INSERT INTO graphs(id, graph_type, epic_slug, source_repo, expires_at)
+        local_conn
+            .execute(
+                "INSERT INTO graphs(id, graph_type, epic_slug, source_repo, expires_at)
              VALUES('g1', 'dep', NULL, 'local', NULL)",
-            rusqlite::params![],
-        ).unwrap();
+                rusqlite::params![],
+            )
+            .unwrap();
         local_conn.execute(
             "INSERT INTO peers(id, graph_id, source_repo, target_repo, edge_type, epic_slug, expires_at)
              VALUES('p1', 'g1', 'local', ?1, 'dep', NULL, NULL)",
@@ -860,8 +939,12 @@ mod tests {
             ..opts.clone()
         };
         let mut peer_results = crate::components::db::search_entries(
-            &peer_conn, &embedder, "peer score_kind roundtrip", &peer_opts,
-        ).unwrap();
+            &peer_conn,
+            &embedder,
+            "peer score_kind roundtrip",
+            &peer_opts,
+        )
+        .unwrap();
 
         // Simulate the federation merge: set origin_repo, push into merged vec
         for r in &mut peer_results {

@@ -38,11 +38,7 @@ impl OlderThan {
     }
 
     /// Execute using an already-open connection (exposed for testing).
-    pub fn execute_with_conn(
-        &self,
-        conn: &rusqlite::Connection,
-        days: i64,
-    ) -> anyhow::Result<()> {
+    pub fn execute_with_conn(&self, conn: &rusqlite::Connection, days: i64) -> anyhow::Result<()> {
         let mut stmt = conn.prepare(
             "SELECT path, summary, MAX(updated_at) AS latest_upsert
              FROM entries
@@ -124,11 +120,32 @@ mod tests {
         ensure_schema(&conn).unwrap();
 
         // Stale entry — should appear
-        seed_entry(&conn, "e1", "docs/old.md", "old doc", "2020-01-01T00:00:00", 0);
+        seed_entry(
+            &conn,
+            "e1",
+            "docs/old.md",
+            "old doc",
+            "2020-01-01T00:00:00",
+            0,
+        );
         // Fresh entry — must not appear
-        seed_entry(&conn, "e2", "docs/new.md", "new doc", "2099-12-31T00:00:00", 0);
+        seed_entry(
+            &conn,
+            "e2",
+            "docs/new.md",
+            "new doc",
+            "2099-12-31T00:00:00",
+            0,
+        );
         // Stale but is_stale=1 (expired) — must be excluded
-        seed_entry(&conn, "e3", "docs/expired.md", "expired", "2020-01-01T00:00:00", 1);
+        seed_entry(
+            &conn,
+            "e3",
+            "docs/expired.md",
+            "expired",
+            "2020-01-01T00:00:00",
+            1,
+        );
         // Multiple entries for same path: old then new → path must NOT appear
         seed_entry(&conn, "e4", "arch/foo", "foo old", "2020-01-01T00:00:00", 0);
         seed_entry(&conn, "e5", "arch/foo", "foo new", "2099-01-01T00:00:00", 0);
@@ -152,7 +169,9 @@ mod tests {
     fn test_empty_corpus() {
         let conn = open_db_memory().unwrap();
         ensure_schema(&conn).unwrap();
-        let cmd = OlderThan { days: "30".to_string() };
+        let cmd = OlderThan {
+            days: "30".to_string(),
+        };
         cmd.execute_with_conn(&conn, 30).unwrap();
         let out = collect_sql_output(&conn, 30);
         assert!(out.is_empty(), "empty corpus should produce no output");
@@ -165,7 +184,10 @@ mod tests {
         seed_entry(&conn, "e1", "docs/a", "summary a", "2099-01-01T00:00:00", 0);
         seed_entry(&conn, "e2", "docs/b", "summary b", "2099-01-01T00:00:00", 0);
         let out = collect_sql_output(&conn, 30);
-        assert!(out.is_empty(), "all-current corpus should produce no stale rows");
+        assert!(
+            out.is_empty(),
+            "all-current corpus should produce no stale rows"
+        );
     }
 
     #[test]
@@ -196,13 +218,45 @@ mod tests {
         let conn = open_db_memory().unwrap();
         ensure_schema(&conn).unwrap();
         // arch/foo: old then fresh — must NOT appear
-        seed_entry(&conn, "e1", "arch/foo", "old summary", "2020-01-01T00:00:00", 0);
-        seed_entry(&conn, "e2", "arch/foo", "new summary", "2099-01-01T00:00:00", 0);
+        seed_entry(
+            &conn,
+            "e1",
+            "arch/foo",
+            "old summary",
+            "2020-01-01T00:00:00",
+            0,
+        );
+        seed_entry(
+            &conn,
+            "e2",
+            "arch/foo",
+            "new summary",
+            "2099-01-01T00:00:00",
+            0,
+        );
         // arch/bar: two old entries — MUST appear (GROUP BY keeps latest)
-        seed_entry(&conn, "e3", "arch/bar", "bar old 1", "2020-01-01T00:00:00", 0);
-        seed_entry(&conn, "e4", "arch/bar", "bar old 2", "2020-06-01T00:00:00", 0);
+        seed_entry(
+            &conn,
+            "e3",
+            "arch/bar",
+            "bar old 1",
+            "2020-01-01T00:00:00",
+            0,
+        );
+        seed_entry(
+            &conn,
+            "e4",
+            "arch/bar",
+            "bar old 2",
+            "2020-06-01T00:00:00",
+            0,
+        );
         let out = collect_sql_output(&conn, 30);
-        assert_eq!(out.len(), 1, "only arch/bar should be stale; arch/foo has a fresh entry");
+        assert_eq!(
+            out.len(),
+            1,
+            "only arch/bar should be stale; arch/foo has a fresh entry"
+        );
         assert_eq!(out[0].0, "arch/bar");
     }
 
@@ -210,7 +264,14 @@ mod tests {
     fn test_stale_entries_excluded() {
         let conn = open_db_memory().unwrap();
         ensure_schema(&conn).unwrap();
-        seed_entry(&conn, "e1", "docs/expired", "expired", "2020-01-01T00:00:00", 1);
+        seed_entry(
+            &conn,
+            "e1",
+            "docs/expired",
+            "expired",
+            "2020-01-01T00:00:00",
+            1,
+        );
         seed_entry(&conn, "e2", "docs/live", "live", "2020-01-01T00:00:00", 0);
         let out = collect_sql_output(&conn, 30);
         assert_eq!(out.len(), 1);
@@ -221,7 +282,9 @@ mod tests {
     fn test_days_d_suffix() {
         let conn = open_db_memory().unwrap();
         ensure_schema(&conn).unwrap();
-        let cmd = OlderThan { days: "30d".to_string() };
+        let cmd = OlderThan {
+            days: "30d".to_string(),
+        };
         cmd.execute_with_conn(&conn, 30).unwrap();
     }
 

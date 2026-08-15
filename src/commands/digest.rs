@@ -2,7 +2,9 @@
 
 use crate::commands::add::read_omc_session;
 use crate::commands::add_validation::compute_evidence_status_write;
-use crate::components::{embedder::NoopEmbedder, kb_core, redactor, transcript_state::TranscriptState};
+use crate::components::{
+    embedder::NoopEmbedder, kb_core, query_hits, redactor, transcript_state::TranscriptState,
+};
 use crate::config;
 use anyhow::{Context, Result};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -102,6 +104,7 @@ pub fn digest_session(
     if let Ok(existing_hash) = read_digest_hash(paths, &kb_path) {
         if existing_hash == digest_hash {
             // Content unchanged — advance offset then skip KB write.
+            query_hits::record_acted_on(&paths.query_hits, session_id, unread);
             let current_offset = ts_state.offset(transcript_path).unwrap_or(0);
             if new_offset > current_offset {
                 ts_state.advance(transcript_path, new_offset)?;
@@ -151,6 +154,9 @@ pub fn digest_session(
             cues: vec![],
         },
     )?;
+
+    // Telemetry consumes the same unread bytes. Offset advancement remains last.
+    query_hits::record_acted_on(&paths.query_hits, session_id, unread);
 
     // LAST step — crash before here re-queues turns on next run.
     ts_state.advance(transcript_path, new_offset)?;
@@ -224,8 +230,7 @@ fn read_digest_hash(paths: &config::Paths, kb_path: &str) -> Result<String> {
         .ok();
 
     let tags_json = row.ok_or_else(|| anyhow::anyhow!("no existing digest entry"))?;
-    let tags: serde_json::Value =
-        serde_json::from_str(&tags_json).context("parse tags JSON")?;
+    let tags: serde_json::Value = serde_json::from_str(&tags_json).context("parse tags JSON")?;
     tags.as_array()
         .and_then(|arr| {
             arr.iter()
@@ -321,7 +326,10 @@ mod tests {
         assert!(out2.skipped_no_change);
 
         let events_after = fs::read_to_string(&paths.events).unwrap().lines().count();
-        assert_eq!(events_before, events_after, "no new events on no-change run");
+        assert_eq!(
+            events_before, events_after,
+            "no new events on no-change run"
+        );
 
         std::env::remove_var("KB_STATE_DIR");
     }
@@ -350,7 +358,10 @@ mod tests {
         assert!(out2.skipped_no_change, "same content hash must skip write");
 
         let events_after = fs::read_to_string(&paths.events).unwrap().lines().count();
-        assert_eq!(events_before, events_after, "no new KB events on hash-match skip");
+        assert_eq!(
+            events_before, events_after,
+            "no new KB events on hash-match skip"
+        );
 
         std::env::remove_var("KB_STATE_DIR");
     }
@@ -388,7 +399,10 @@ mod tests {
 
     #[test]
     fn test_split_turns_cap() {
-        let text = (0..10).map(|i| format!("Turn {i}")).collect::<Vec<_>>().join("\n\n");
+        let text = (0..10)
+            .map(|i| format!("Turn {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let turns = split_turns(&text, 3);
         assert_eq!(turns.len(), 3);
     }

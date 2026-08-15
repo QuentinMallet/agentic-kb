@@ -53,7 +53,11 @@ impl Hook {
                     })?;
                 let session_id = session_id
                     .clone()
-                    .or_else(|| std::env::var("KB_SESSION_ID").ok().filter(|v| !v.is_empty()))
+                    .or_else(|| {
+                        std::env::var("KB_SESSION_ID")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "session ID required: pass --session-id or set KB_SESSION_ID"

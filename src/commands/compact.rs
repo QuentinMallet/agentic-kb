@@ -5,7 +5,7 @@ use crate::components::events;
 use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 
@@ -92,14 +92,16 @@ impl Compact {
         // Track index of the LAST expire per id (not just membership) so that
         // upsert→expire→upsert sequences honour last-write-wins (br-joj).
         let mut expire_last: HashMap<String, usize> = HashMap::new();
+        let mut live_entry_ids: HashSet<String> = HashSet::new();
         let mut run_indices: Vec<usize> = Vec::new();
+        let mut evidence_indices: Vec<usize> = Vec::new();
 
         for (i, ev) in evts.iter().enumerate() {
             let action = ev["action"].as_str().unwrap_or("");
             let table = ev["table"].as_str().unwrap_or("");
             let id = ev["id"].as_str().unwrap_or("").to_string();
             // Warn on structurally malformed events (missing or non-string action/table).
-            // These differ from intentionally-skipped event types (e.g. evidence_add).
+            // These differ from well-formed events compact may still choose to drop.
             if !ev["action"].is_string() || !ev["table"].is_string() {
                 eprintln!("compact: warn: event at index {i} missing valid action/table, dropped");
             }
@@ -116,11 +118,14 @@ impl Compact {
                 ("insert", "run_history") => {
                     run_indices.push(i);
                 }
+                ("evidence_add", "evidence") | ("citation_healed", "evidence") => {
+                    evidence_indices.push(i);
+                }
                 _ => {}
             }
         }
 
-        let mut compacted: Vec<serde_json::Value> = Vec::new();
+        let mut retained_indices: Vec<usize> = Vec::new();
 
         // Entry upserts ordered by original position. Drop entries whose last
         // expire comes after their last upsert (absent == stale for all query paths).
@@ -128,16 +133,15 @@ impl Compact {
         // implicitly dropped — they never appear in entry_pairs, so they are never
         // emitted. This is safe: absent == stale, so rebuild from the compacted log
         // produces identical search-visible state.
-        let mut entry_pairs: Vec<(usize, &str)> = entry_last
-            .iter()
-            .map(|(id, &i)| (i, id.as_str()))
-            .collect();
+        let mut entry_pairs: Vec<(usize, &str)> =
+            entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
             if expire_last.get(id).is_some_and(|&e| e > i) {
                 continue;
             }
-            compacted.push(evts[i].clone());
+            live_entry_ids.insert(id.to_string());
+            retained_indices.push(i);
         }
 
         // Test case upserts.
@@ -145,14 +149,33 @@ impl Compact {
             test_last.into_iter().map(|(id, i)| (i, id)).collect();
         test_pairs.sort_by_key(|&(i, _)| i);
         for (i, _) in test_pairs {
-            compacted.push(evts[i].clone());
+            retained_indices.push(i);
         }
 
         // Run history: keep only the last RUN_HISTORY_CAP records (original order).
         let run_start = run_indices.len().saturating_sub(RUN_HISTORY_CAP);
         for i in run_indices[run_start..].iter().copied() {
-            compacted.push(evts[i].clone());
+            retained_indices.push(i);
         }
+
+        // Evidence events are retained verbatim for live parent entries so a
+        // compacted log still rebuilds their evidence rows and healed paths.
+        // Compact still does not synthesize a minimal evidence history; it
+        // preserves the live-entry subset and leaves deeper evidence compaction
+        // work out of scope.
+        for i in evidence_indices {
+            let ev = &evts[i];
+            let entry_id = ev["entry_id"].as_str().unwrap_or("");
+            if live_entry_ids.contains(entry_id) {
+                retained_indices.push(i);
+            }
+        }
+
+        retained_indices.sort_unstable();
+        let compacted: Vec<serde_json::Value> = retained_indices
+            .into_iter()
+            .map(|i| evts[i].clone())
+            .collect();
 
         let tmp = paths.events.with_extension("jsonl.tmp");
         {
@@ -286,7 +309,11 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 0, "force-expired entry must be purged from the log");
+        assert_eq!(
+            after.len(),
+            0,
+            "force-expired entry must be purged from the log"
+        );
     }
 
     #[test]
@@ -328,9 +355,16 @@ mod tests {
         cmd.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1, "compact must produce exactly one entry event");
+        assert_eq!(
+            after.len(),
+            1,
+            "compact must produce exactly one entry event"
+        );
         // The compact must emit the LATEST upsert (v2) and must NOT mark stale.
-        assert_eq!(after[0]["summary"], "v2", "compact must keep the last upsert content");
+        assert_eq!(
+            after[0]["summary"], "v2",
+            "compact must keep the last upsert content"
+        );
         assert!(
             after[0]["is_stale"].is_null() || after[0]["is_stale"] == false,
             "re-upsert after expire must NOT be marked stale (br-joj)"
@@ -380,10 +414,14 @@ mod tests {
             });
             append_event(&paths.events, &ev).unwrap();
         }
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "dead", "ts": "2024-01-01T01:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "dead", "ts": "2024-01-01T01:00:00Z"
+            }),
+        )
+        .unwrap();
 
         Compact.execute_with_paths(&paths).unwrap();
 
@@ -449,9 +487,77 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), RUN_HISTORY_CAP, "exactly RUN_HISTORY_CAP events must not be trimmed");
+        assert_eq!(
+            after.len(),
+            RUN_HISTORY_CAP,
+            "exactly RUN_HISTORY_CAP events must not be trimmed"
+        );
         assert_eq!(after[0]["test_id"], "0");
-        assert_eq!(after[RUN_HISTORY_CAP - 1]["test_id"], format!("{}", RUN_HISTORY_CAP - 1));
+        assert_eq!(
+            after[RUN_HISTORY_CAP - 1]["test_id"],
+            format!("{}", RUN_HISTORY_CAP - 1)
+        );
+    }
+
+    #[test]
+    fn test_cmd_compact_preserves_healed_citation_paths_through_rebuild() {
+        use crate::components::db::{apply_event, open_db_memory};
+        use crate::components::embedder::NoopEmbedder;
+        use crate::components::events::{citation_healed_event, evidence_add_event};
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "e1", "path": "src/a.rs", "summary": "entry",
+            "content": "c", "tags": [], "kind": "observation",
+            "evidence_status": "present", "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &upsert).unwrap();
+
+        let evidence = Evidence {
+            id: "ev-1".to_string(),
+            entry_id: "e1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/old.rs:0-66".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: Some("strong excerpt".to_string()),
+            derived_from: None,
+            recorded_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        append_event(&paths.events, &evidence_add_event("e1", &evidence, Some("deadbeef"))).unwrap();
+        append_event(
+            &paths.events,
+            &citation_healed_event(
+                "e1",
+                "ev-1",
+                "src/old.rs:0-66",
+                "src/new.rs:11-77",
+                "sha256:abc",
+                Some("cafebabe"),
+            ),
+        )
+        .unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let replay = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        for ev in events::read_events(&paths.events).unwrap() {
+            apply_event(&replay, &embedder, &ev).unwrap();
+        }
+
+        let citation_path: String = replay
+            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(citation_path, "src/new.rs:11-77");
     }
 
     #[test]
@@ -468,22 +574,34 @@ mod tests {
         let paths = Paths::from_root(root);
 
         // Case (a): pure orphan expire.
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "ghost", "ts": "2024-01-01T00:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "ghost", "ts": "2024-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(after.len(), 0, "pure orphan expire must be dropped");
 
         // Case (b): post-compact orphan — another expire after log is empty.
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries",
-            "id": "ghost", "ts": "2024-01-01T01:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "ghost", "ts": "2024-01-01T01:00:00Z"
+            }),
+        )
+        .unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         let after2 = events::read_events(&paths.events).unwrap();
-        assert_eq!(after2.len(), 0, "post-compact orphan expire must also be dropped");
+        assert_eq!(
+            after2.len(),
+            0,
+            "post-compact orphan expire must also be dropped"
+        );
     }
 
     // br-h7c: proptest target #4 — expire/compact state machine.
@@ -564,8 +682,7 @@ mod tests {
     /// Raw op generator — unrestricted alphabet across 4 ids.
     fn arb_raw_op() -> impl proptest::strategy::Strategy<Value = CompactOp> {
         use proptest::prelude::*;
-        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"])
-            .prop_map(|s| s.to_string());
+        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
         prop_oneof![
             arb_id.clone().prop_map(CompactOp::Upsert),
             arb_id.prop_map(CompactOp::Expire),
@@ -679,7 +796,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
             assert_eq!(
                 read_counter(&paths),
                 n,
@@ -695,7 +814,9 @@ mod tests {
             "ts": "2024-01-01T00:00:00Z"
         });
         append_event(&paths.events, &ev).unwrap();
-        Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+        Compact
+            .execute_with_paths_and_vacuum(&paths, &vcfg)
+            .unwrap();
 
         assert_eq!(
             read_counter(&paths),
@@ -722,7 +843,10 @@ mod tests {
             vacuum_min_free_pages: 1024,
         };
 
-        assert!(freelist_count(&paths) >= 1024, "AC2 precondition: >=1024 free pages");
+        assert!(
+            freelist_count(&paths) >= 1024,
+            "AC2 precondition: >=1024 free pages"
+        );
 
         for n in 1..=7_u64 {
             let ev = serde_json::json!({
@@ -732,7 +856,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
         }
 
         assert_eq!(
@@ -774,7 +900,9 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             append_event(&paths.events, &ev).unwrap();
-            Compact.execute_with_paths_and_vacuum(&paths, &vcfg).unwrap();
+            Compact
+                .execute_with_paths_and_vacuum(&paths, &vcfg)
+                .unwrap();
         }
 
         assert_eq!(
@@ -793,8 +921,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_sigkill_during_vacuum_leaves_db_readable() {
-        use std::process::{Command, Stdio};
         use libc;
+        use std::process::{Command, Stdio};
 
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();

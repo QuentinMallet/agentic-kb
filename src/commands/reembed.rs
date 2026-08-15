@@ -117,9 +117,7 @@ impl Reembed {
             }
         }
 
-        println!(
-            "reembed: {done} embedded, {failed} failed, {skipped_size} skipped (too large)"
-        );
+        println!("reembed: {done} embedded, {failed} failed, {skipped_size} skipped (too large)");
         Ok(())
     }
 }
@@ -151,15 +149,18 @@ mod tests {
             id: Some("re-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
         // Dry-run must not error
-        let cmd = Reembed { dry_run: true, max_chars: 1800 };
+        let cmd = Reembed {
+            dry_run: true,
+            max_chars: 1800,
+        };
         cmd.execute_with(&paths, &embedder).unwrap();
     }
 
@@ -182,15 +183,18 @@ mod tests {
             id: Some("re-large-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
         // Reembed with max_chars=100 → large entry must be skipped without error
-        let cmd = Reembed { dry_run: true, max_chars: 100 };
+        let cmd = Reembed {
+            dry_run: true,
+            max_chars: 100,
+        };
         cmd.execute_with(&paths, &embedder).unwrap();
     }
 }

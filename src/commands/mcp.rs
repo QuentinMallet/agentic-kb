@@ -9,15 +9,18 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
-use crate::components::{db, embedder, events, kb_core};
+use crate::components::{db, embedder, events, kb_core, query_hits};
 use crate::config;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Run MCP port protocol server (line-delimited JSON over stdio)
 #[derive(Command, Debug, Parser)]
@@ -37,12 +40,31 @@ impl Runnable for Mcp {
     }
 }
 
-/// Derive the repo root from the db path (<root>/agent-kb/agent-kb.db).
+/// Derive the repo root from the db path.
+///
+/// Supports both supported layouts:
+/// - `<root>/agent-kb/agent-kb.db`
+/// - `<root>/.state/agent-kb/agent-kb.db`
 fn root_from_db(db: &Path) -> PathBuf {
-    db.parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(Path::new("."))
-        .to_path_buf()
+    let Some(db_dir) = db.parent() else {
+        return Path::new(".").to_path_buf();
+    };
+
+    let is_state_agent_kb = db_dir.file_name().is_some_and(|name| name == "agent-kb")
+        && db_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == ".state");
+
+    if is_state_agent_kb {
+        return db_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+    }
+
+    db_dir.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
 impl Mcp {
@@ -65,6 +87,7 @@ impl Mcp {
                 paths.events = dir.join("agent-kb-events.jsonl");
                 paths.lock = dir.join("agent-kb.lock");
             }
+            paths.query_hits = dir.join("query-hits.db");
         }
         let paths = paths;
 
@@ -104,7 +127,15 @@ impl Mcp {
             if line.trim().is_empty() {
                 continue;
             }
-            let response = handle_request(&line, &paths, emb.as_ref(), inline_verify_k_default, verify_pool_size_default, recency_lambda_default, mmr_lambda_default);
+            let response = handle_request(
+                &line,
+                &paths,
+                emb.as_ref(),
+                inline_verify_k_default,
+                verify_pool_size_default,
+                recency_lambda_default,
+                mmr_lambda_default,
+            );
             println!("{response}");
             io::stdout().flush()?;
         }
@@ -132,7 +163,16 @@ fn handle_request(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "search" => handle_search(&id, &req, paths, emb, inline_verify_k_default, verify_pool_size_default, recency_lambda_default, mmr_lambda_default),
+        "search" => handle_search(
+            &id,
+            &req,
+            paths,
+            emb,
+            inline_verify_k_default,
+            verify_pool_size_default,
+            recency_lambda_default,
+            mmr_lambda_default,
+        ),
         "add" => handle_add(&id, &req, paths, emb),
         "import" => handle_import(&id, &req, paths, emb),
         "expire" => handle_expire(&id, &req, paths, emb),
@@ -154,6 +194,7 @@ fn handle_request(
         "audit_record" => handle_audit_record(&id, &req, paths, emb),
         "audit_report" => handle_audit_report(&id, paths),
         "provenance" => handle_provenance(&id, &req, paths),
+        "kb_get" => handle_kb_get(&id, &req, paths),
         "kb_peers_add" => handle_kb_peers_add(&id, &req, paths),
         "kb_peers_list" => handle_kb_peers_list(&id, &req, paths),
         "kb_peers_remove" => handle_kb_peers_remove(&id, &req, paths),
@@ -190,10 +231,13 @@ fn handle_search(
         let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
         let conn = match db::open_db(&paths.db) {
             Ok(c) => c,
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
         };
         return match db::expand_entries(&conn, &ids, limit) {
             Ok(results) => {
+                record_query_results(paths, &results);
                 let entries = entries_to_json(results);
                 json!({"id": id, "type": "result", "entries": entries})
             }
@@ -203,17 +247,31 @@ fn handle_search(
 
     let query = match req.get("query").and_then(|q| q.as_str()) {
         Some(q) => q.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"})
+        }
     };
     let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
     let mode = req.get("mode").and_then(|m| m.as_str()).unwrap_or("hybrid");
-    let path_prefix = req.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let tag_filter = req.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let path_prefix = req
+        .get("path_prefix")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let tag_filter = req
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     // Peer federation params — parsed and accepted but federation is local-only in MCP for now.
     let _peers: bool = req.get("peers").and_then(|v| v.as_bool()).unwrap_or(false);
-    let _reachable_from: Option<String> = req.get("reachable_from").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let _reachable_from: Option<String> = req
+        .get("reachable_from")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let _max_hops: u8 = req.get("max_hops").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-    let _slug: Option<String> = req.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let _slug: Option<String> = req
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // br-3gp: request override falls back to KbConfig::inline_verify_k (default
     // 10) rather than `limit`, so the configured cap is reachable.
@@ -251,10 +309,49 @@ fn handle_search(
 
     match db::search_entries(&conn, emb, &query, &opts) {
         Ok(results) => {
+            let meta = search_meta(paths, &results);
+            record_query_results(paths, &results);
             let entries = entries_to_json(results);
-            json!({"id": id, "type": "result", "entries": entries})
+            json!({"id": id, "type": "result", "entries": entries, "_meta": meta})
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    }
+}
+
+fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
+    let ids: Vec<String> = results.iter().map(|entry| entry.id.clone()).collect();
+    let surface = std::env::var("KB_INJECTION_SOURCE").ok();
+    query_hits::record_hits(
+        &paths.query_hits,
+        &ids,
+        surface.as_deref().unwrap_or("unknown"),
+    );
+    if let Some(surface) = surface {
+        let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+        let injections: Vec<_> = results
+            .iter()
+            .map(|entry| {
+                let cited_file = entry
+                    .evidence
+                    .iter()
+                    .find_map(|e| e.citation_path.as_deref())
+                    .map(|path| {
+                        let Some((file, suffix)) = path.rsplit_once(':') else {
+                            return path.to_owned();
+                        };
+                        if suffix
+                            .split('-')
+                            .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+                        {
+                            file.to_owned()
+                        } else {
+                            path.to_owned()
+                        }
+                    });
+                (entry.id.clone(), cited_file)
+            })
+            .collect();
+        query_hits::record_injection(&paths.query_hits, &session_id, &injections, &surface);
     }
 }
 
@@ -263,54 +360,193 @@ fn handle_search(
 fn entries_to_json(results: Vec<db::SearchEntry>) -> Vec<Value> {
     const MAX_CONTENT_CHARS: usize = 8000;
     results
+        .into_iter()
+        .map(|e| {
+            let tags: Value = serde_json::from_str(&e.tags).unwrap_or(Value::Array(vec![]));
+            let content = if e.content.chars().count() > MAX_CONTENT_CHARS {
+                let truncated: String = e.content.chars().take(MAX_CONTENT_CHARS).collect();
+                format!("{}...(truncated)", truncated)
+            } else {
+                e.content
+            };
+            let evidence: Vec<Value> = e
+                .evidence
                 .into_iter()
-                .map(|e| {
-                    let tags: Value =
-                        serde_json::from_str(&e.tags).unwrap_or(Value::Array(vec![]));
-                    let content = if e.content.chars().count() > MAX_CONTENT_CHARS {
-                        let truncated: String = e.content.chars().take(MAX_CONTENT_CHARS).collect();
-                        format!("{}...(truncated)", truncated)
-                    } else {
-                        e.content
-                    };
-                    let evidence: Vec<Value> = e
-                        .evidence
-                        .into_iter()
-                        .map(|ev| {
-                            // br-47d: wrap citation_excerpt in an
-                            // <<UNTRUSTED_EXCERPT>>...<<END>> envelope so
-                            // downstream LLMs treat the bytes as data, not
-                            // instructions. Envelope convention is
-                            // documented in mcp_server.ex tool description.
-                            let wrapped_excerpt =
-                                wrap_citation_excerpt(ev.citation_excerpt.as_deref());
-                            json!({
-                                "id": ev.id,
-                                "kind": ev.kind,
-                                "citation_path": ev.citation_path,
-                                "citation_sha": ev.citation_sha,
-                                "citation_hash": ev.citation_hash,
-                                "citation_excerpt": wrapped_excerpt,
-                                "verified": ev.verified,
-                            })
-                        })
-                        .collect();
+                .map(|ev| {
+                    // br-47d: wrap citation_excerpt in an
+                    // <<UNTRUSTED_EXCERPT>>...<<END>> envelope so
+                    // downstream LLMs treat the bytes as data, not
+                    // instructions. Envelope convention is
+                    // documented in mcp_server.ex tool description.
+                    let wrapped_excerpt = wrap_citation_excerpt(ev.citation_excerpt.as_deref());
                     json!({
-                        "path": e.path,
-                        "summary": e.summary,
-                        "content": content,
-                        "tags": tags,
-                        "score": e.score,
-                        "id": e.id,
-                        "source": e.source,
-                        "score_kind": e.score_kind,
-                        "evidence": evidence,
-                        "confidence": e.confidence,
-                        "audit_n": e.audit_n,
-                        "origin_repo": e.origin_repo,
+                        "id": ev.id,
+                        "kind": ev.kind,
+                        "citation_path": ev.citation_path,
+                        "citation_sha": ev.citation_sha,
+                        "citation_hash": ev.citation_hash,
+                        "citation_excerpt": wrapped_excerpt,
+                        "status": ev.status_str(),
+                        "verified": ev.verified,
                     })
                 })
-                .collect()
+                .collect();
+            json!({
+                "path": e.path,
+                "summary": e.summary,
+                "content": content,
+                "tags": tags,
+                "score": e.score,
+                "id": e.id,
+                "source": e.source,
+                "score_kind": e.score_kind,
+                "evidence": evidence,
+                "confidence": e.confidence,
+                "audit_n": e.audit_n,
+                "origin_repo": e.origin_repo,
+            })
+        })
+        .collect()
+}
+
+fn format_system_time(st: SystemTime) -> String {
+    DateTime::<Utc>::from(st).to_rfc3339()
+}
+
+fn metadata_mtime_iso(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(format_system_time)
+}
+
+fn metadata_age_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .map(|d| d.as_secs())
+}
+
+fn parse_entry_updated_at(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+        })
+}
+
+fn citation_file_rel(citation_path: &str) -> &str {
+    citation_path
+        .rsplit_once(':')
+        .map(|(path, _)| path)
+        .unwrap_or(citation_path)
+}
+
+fn returned_entries_stale_warning(paths: &config::Paths, results: &[db::SearchEntry]) -> bool {
+    let local_repo_root = root_from_db(&paths.db);
+    results.iter().any(|entry| {
+        let Some(updated_at) = parse_entry_updated_at(&entry.updated_at) else {
+            return false;
+        };
+        let repo_root = entry
+            .origin_repo
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| local_repo_root.clone());
+        entry.evidence.iter().any(|ev| {
+            let Some(citation_path) = ev.citation_path.as_deref() else {
+                return false;
+            };
+            let Some(abs) = crate::components::verification::safe_join(
+                &repo_root,
+                citation_file_rel(citation_path),
+            ) else {
+                return false;
+            };
+            let Ok(meta) = fs::metadata(abs) else {
+                return false;
+            };
+            let Ok(mtime) = meta.modified() else {
+                return false;
+            };
+            DateTime::<Utc>::from(mtime) > updated_at
+        })
+    })
+}
+
+fn search_meta(paths: &config::Paths, results: &[db::SearchEntry]) -> Value {
+    json!({
+        "index_age": metadata_age_seconds(&paths.db),
+        "db_rebuilt_at": metadata_mtime_iso(&paths.db),
+        "events_head_at": metadata_mtime_iso(&paths.events),
+        "stale_warning": returned_entries_stale_warning(paths, results),
+    })
+}
+
+fn full_evidence_to_json(evidence: Vec<crate::models::Evidence>) -> Vec<Value> {
+    evidence
+        .into_iter()
+        .map(|ev| {
+            json!({
+                "id": ev.id,
+                "entry_id": ev.entry_id,
+                "kind": ev.kind,
+                "citation_path": ev.citation_path,
+                "citation_sha": ev.citation_sha,
+                "citation_hash": ev.citation_hash,
+                "citation_excerpt": wrap_citation_excerpt(ev.citation_excerpt.as_deref()),
+                "derived_from": ev.derived_from,
+                "recorded_at": ev.recorded_at,
+            })
+        })
+        .collect()
+}
+
+fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
+        Some(entry_id) => entry_id,
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"});
+        }
+    };
+
+    let conn = match db::open_db(&paths.db) {
+        Ok(c) => c,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
+    match db::fetch_entry_by_id(&conn, entry_id) {
+        Ok(Some(entry)) => json!({
+            "id": id,
+            "type": "result",
+            "entry": {
+                "id": entry.id,
+                "path": entry.path,
+                "summary": entry.summary,
+                "content": entry.content,
+                "tags": serde_json::from_str::<Value>(&entry.tags).unwrap_or(Value::Array(vec![])),
+                "version_ref": entry.version_ref,
+                "is_stale": entry.is_stale,
+                "permanent": entry.permanent,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+                "kind": entry.kind,
+                "evidence_status": entry.evidence_status,
+                "evidence": full_evidence_to_json(entry.evidence),
+            }
+        }),
+        Ok(None) => json!({
+            "id": id,
+            "type": "error",
+            "code": "entry_not_found",
+            "message": format!("entry '{}' not found", entry_id)
+        }),
+        Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    }
 }
 
 /// MCP kb_add handler.
@@ -332,29 +568,61 @@ fn entries_to_json(results: Vec<db::SearchEntry>) -> Vec<Value> {
 ///   "derived_from": null
 /// }
 /// ```
-fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_add(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     let path = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
+        }
     };
-    let summary = req.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let summary = req
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let content = req
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let tags = req.get("tags").cloned().unwrap_or(Value::Array(vec![]));
-    let permanent = req.get("permanent").and_then(|v| v.as_bool()).unwrap_or(false);
-    let replace_path = req.get("replace_path").and_then(|v| v.as_bool()).unwrap_or(false);
-    let kind = req.get("kind").and_then(|v| v.as_str()).unwrap_or("belief").to_string();
+    let permanent = req
+        .get("permanent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let replace_path = req
+        .get("replace_path")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let kind = req
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("belief")
+        .to_string();
     let evidence_rows: Vec<Value> = req
         .get("evidence")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let session_id = req.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let session_id = req
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     // Cue anchors (Memora pickup .4): "[Main Entity] + [Key Aspect]" strings,
     // e.g. "recency bias decay". Optional; validated/capped in kb_core::add.
     let cues: Vec<String> = req
         .get("cues")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let entry_id = uuid::Uuid::new_v4().to_string();
@@ -406,21 +674,32 @@ fn handle_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
     }
 }
 
-fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_import(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     let file_path = match req.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
+        }
     };
     let upsert = req.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let content = match std::fs::read_to_string(&file_path) {
         Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()}),
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()})
+        }
     };
 
     let seeds: Vec<Value> = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(e) => return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()}),
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()})
+        }
     };
 
     let omc_session_id = std::env::var("OMC_SESSION_ID")
@@ -431,14 +710,20 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
     let mut skipped: u32 = 0;
 
     for seed in &seeds {
-        let path = seed.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = seed
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Upsert=false: skip entries already present. Open a short-lived read
         // connection for the check; kb_core::add acquires the write lock below.
         if !upsert {
             let conn = match db::open_db(&paths.db) {
                 Ok(c) => c,
-                Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+                Err(e) => {
+                    return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                }
             };
             let exists: bool = conn
                 .query_row(
@@ -456,11 +741,24 @@ fn handle_import(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embed
 
         let entry_id = uuid::Uuid::new_v4().to_string();
         let ts = chrono::Utc::now().to_rfc3339();
-        let summary = seed.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let seed_content = seed.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let summary = seed
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let seed_content = seed
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let tags = seed.get("tags").cloned().unwrap_or(Value::Array(vec![]));
-        let kind = seed.get("kind").and_then(|v| v.as_str()).unwrap_or("convention").to_string();
-        let evidence_rows: Vec<Value> = seed.get("evidence")
+        let kind = seed
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("convention")
+            .to_string();
+        let evidence_rows: Vec<Value> = seed
+            .get("evidence")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -524,17 +822,32 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
 // user-authored KB content; they carry structured test outcome data.  Routing
 // through kb_core::add is not applicable here because the event targets a
 // different table and schema.  No credential redaction is needed.
-fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_run(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     let test_id = match req.get("test_id").and_then(|v| v.as_str()) {
         Some(t) => t.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing test_id"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing test_id"})
+        }
     };
     let result = match req.get("result").and_then(|v| v.as_str()) {
         Some(r) if r == "pass" || r == "fail" => r.to_string(),
-        _ => return json!({"id":id,"type":"error","code":"parse_error","message":"result must be 'pass' or 'fail'"}),
+        _ => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"result must be 'pass' or 'fail'"})
+        }
     };
-    let adapter = req.get("adapter").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let detail = req.get("detail").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let adapter = req
+        .get("adapter")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let detail = req
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let _lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -570,25 +883,38 @@ fn handle_run(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder
 // free-form KB content authored by the user.  Routing through kb_core::add is
 // not applicable here because the event targets a different table and schema.
 // No credential redaction is needed.
-fn handle_test_add(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_test_add(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     let app = match req.get("app").and_then(|v| v.as_str()) {
         Some(a) => a.to_string(),
         None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing app"}),
     };
     let name = match req.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing name"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing name"})
+        }
     };
     let protocol = match req.get("protocol").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing protocol"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing protocol"})
+        }
     };
     let config_str = match req.get("config").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing config"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing config"})
+        }
     };
 
-    let test_id = req.get("test_id").and_then(|v| v.as_str())
+    let test_id = req
+        .get("test_id")
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}-{}", app, name.replace(' ', "-")));
 
@@ -624,32 +950,56 @@ fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    let app_filter = req.get("app").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let app_filter = req
+        .get("app")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let results: Vec<Value> = if let Some(ref app) = app_filter {
         let mut stmt = conn.prepare(
             "SELECT id, app, name, protocol FROM test_cases WHERE app=?1 AND is_stale=0 ORDER BY name"
         ).unwrap();
         stmt.query_map(params![app], |r| {
-            Ok(json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
-                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+            Ok(
+                json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
+                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}),
+            )
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
     } else {
         let mut stmt = conn.prepare(
             "SELECT id, app, name, protocol FROM test_cases WHERE is_stale=0 ORDER BY app, name"
         ).unwrap();
         stmt.query_map([], |r| {
-            Ok(json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
-                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}))
-        }).unwrap().filter_map(|r| r.ok()).collect()
+            Ok(
+                json!({"id": r.get::<_,String>(0)?, "app": r.get::<_,String>(1)?,
+                       "name": r.get::<_,String>(2)?, "protocol": r.get::<_,String>(3)?}),
+            )
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
     };
 
     json!({"id": id, "type": "result", "test_cases": results, "count": results.len()})
 }
 
-fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
-    let dry_run = req.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
-    let max_chars = req.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(1800) as usize;
+fn handle_reembed(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
+    let dry_run = req
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let max_chars = req
+        .get("max_chars")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1800) as usize;
 
     if emb.is_noop() {
         return json!({"id":id,"type":"ok","embedded":0,"skipped":0,"missing":0,
@@ -671,20 +1021,31 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let candidates: Vec<(i64, String, String, String, String, String)> = match stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+    let candidates: Vec<(i64, String, String, String, String, String)> =
+        match stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         }) {
-        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
 
     let total_missing = candidates.len();
     // Filter on the actual embed text for the active mode (review finding).
     let mode = crate::components::db::EmbedTextMode::from_env();
-    let to_embed: Vec<_> = candidates.iter()
+    let to_embed: Vec<_> = candidates
+        .iter()
         .filter(|(_, _, path, summary, content, tags)| {
-            crate::components::db::entry_embed_text(mode, path, summary, content, tags).len() <= max_chars
+            crate::components::db::entry_embed_text(mode, path, summary, content, tags).len()
+                <= max_chars
         })
         .collect();
     let skipped = total_missing - to_embed.len();
@@ -711,7 +1072,9 @@ fn handle_reembed(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embe
                 );
                 done += 1;
             }
-            Err(_) => { failed += 1; }
+            Err(_) => {
+                failed += 1;
+            }
         }
     }
 
@@ -732,13 +1095,21 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let files: Vec<String> = req
         .get("files")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let explicit_commits: Vec<String> = req
         .get("commits")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let blame = req.get("blame").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -752,7 +1123,16 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
     let repo_root = config::git_repo_root();
-    let report = match run_stale_check(&conn, &files, &explicit_commits, blame, repo_root.as_deref()) {
+    // MCP `kb_stale_check` is an agent-interactive call: no filesystem walk on
+    // this lane (plan §6 S2). Relocation surfaces via the CLI's `--relocate`.
+    let report = match run_stale_check(
+        &conn,
+        &files,
+        &explicit_commits,
+        blame,
+        repo_root.as_deref(),
+        crate::components::verification::RelocationPolicy::Never,
+    ) {
         Ok(r) => r,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -760,33 +1140,39 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let stale: Vec<Value> = report
         .stale
         .iter()
-        .map(|e| json!({
-            "id": e.id,
-            "path": e.path,
-            "summary": e.summary,
-            "version_ref": e.version_ref,
-            "commits_behind": e.commits_behind,
-        }))
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "path": e.path,
+                "summary": e.summary,
+                "version_ref": e.version_ref,
+                "commits_behind": e.commits_behind,
+            })
+        })
         .collect();
     let review: Vec<Value> = report
         .review
         .iter()
-        .map(|e| json!({
-            "id": e.id,
-            "path": e.path,
-            "summary": e.summary,
-            "version_ref": e.version_ref,
-        }))
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "path": e.path,
+                "summary": e.summary,
+                "version_ref": e.version_ref,
+            })
+        })
         .collect();
     let unreachable: Vec<Value> = report
         .unreachable
         .iter()
-        .map(|e| json!({
-            "id": e.id,
-            "path": e.path,
-            "summary": e.summary,
-            "version_ref": e.version_ref,
-        }))
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "path": e.path,
+                "summary": e.summary,
+                "version_ref": e.version_ref,
+            })
+        })
         .collect();
 
     json!({
@@ -799,12 +1185,22 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     })
 }
 
-fn handle_expire(id: &Value, req: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_expire(
+    id: &Value,
+    req: &Value,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
         Some(i) => i.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"})
+        }
     };
-    let reason = req.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let reason = req
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let _lock = match acquire_lock(&paths.lock) {
@@ -884,32 +1280,94 @@ fn audit_sample_entries(
     })
 }
 
+type AuditEntry = (String, String, String, String, String);
+
+/// Weighted sampling without replacement. The uniform arm has already been
+/// fixed, so excluded IDs can never move into the traffic arm.
+fn audit_traffic_entries(
+    conn: &rusqlite::Connection,
+    sample_size: usize,
+    excluded: &[String],
+    hit_counts: &[(String, u64)],
+) -> rusqlite::Result<Vec<AuditEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,path,summary,kind,evidence_status FROM entries
+             WHERE is_stale=0 AND evidence_status='present'",
+    )?;
+    let mut rows: Vec<AuditEntry> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .filter_map(Result::ok)
+        .filter(|row: &AuditEntry| !excluded.contains(&row.0))
+        .collect();
+    let weights: std::collections::HashMap<&str, u64> =
+        hit_counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+    let mut seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut chosen = Vec::new();
+    while !rows.is_empty() && chosen.len() < sample_size {
+        let total: u64 = rows
+            .iter()
+            .map(|r| weights.get(r.0.as_str()).copied().unwrap_or(0))
+            .sum();
+        if total == 0 {
+            break;
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut ticket = seed % total;
+        let index = rows
+            .iter()
+            .position(|r| {
+                let weight = weights.get(r.0.as_str()).copied().unwrap_or(0);
+                if ticket < weight {
+                    true
+                } else {
+                    ticket -= weight;
+                    false
+                }
+            })
+            .unwrap_or(0);
+        chosen.push(rows.swap_remove(index));
+    }
+    Ok(chosen)
+}
+
 /// Fetch evidence rows for a single entry as JSON values.
 ///
 /// Same owned-statement pattern as `audit_sample_entries`.
 fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value> {
-    conn.prepare(
-        "SELECT id, kind, citation_path, citation_hash FROM evidence WHERE entry_id=?1",
-    )
-    .ok()
-    .and_then(|mut stmt| {
-        stmt.query_map(params![entry_id], |r| {
-            Ok(json!({
-                "id": r.get::<_, String>(0)?,
-                "kind": r.get::<_, String>(1)?,
-                "citation_path": r.get::<_, Option<String>>(2)?,
-                "citation_hash": r.get::<_, String>(3)?,
-            }))
-        })
+    conn.prepare("SELECT id, kind, citation_path, citation_hash FROM evidence WHERE entry_id=?1")
         .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    })
-    .unwrap_or_default()
+        .and_then(|mut stmt| {
+            stmt.query_map(params![entry_id], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "kind": r.get::<_, String>(1)?,
+                    "citation_path": r.get::<_, Option<String>>(2)?,
+                    "citation_hash": r.get::<_, String>(3)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
 }
 
 fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
     let sample_size = sample_size.clamp(1, 50) as usize;
+    let mode = req
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("uniform");
+    if mode != "uniform" && mode != "traffic" {
+        return json!({"id":id,"type":"error","code":"parse_error","message":"mode must be 'uniform' or 'traffic'"});
+    }
 
     let _lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -921,7 +1379,7 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let entry_rows = match audit_sample_entries(&conn, sample_size) {
+    let uniform_rows = match audit_sample_entries(&conn, sample_size) {
         Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -929,12 +1387,29 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let run_id = uuid::Uuid::new_v4().to_string();
     let ts = chrono::Utc::now().to_rfc3339();
 
+    // Uniform-first: complete and freeze the unbiased arm before consulting
+    // the separate telemetry file for the additive traffic arm.
+    let uniform_ids: Vec<String> = uniform_rows.iter().map(|row| row.0.clone()).collect();
+    let traffic_rows = if mode == "traffic" {
+        query_hits::counts(&paths.query_hits)
+            .and_then(|counts| {
+                audit_traffic_entries(&conn, sample_size, &uniform_ids, &counts).ok()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut entry_rows: Vec<(AuditEntry, &str)> =
+        uniform_rows.into_iter().map(|r| (r, "uniform")).collect();
+    entry_rows.extend(traffic_rows.into_iter().map(|r| (r, "traffic")));
+
     let samples: Vec<Value> = entry_rows
         .iter()
-        .map(|(eid, path, summary, kind, evidence_status)| {
+        .map(|((eid, path, summary, kind, evidence_status), arm)| {
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,?3)",
-                params![run_id, eid, ts],
+                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,arm) VALUES(?1,?2,?3,?4)",
+                params![run_id, eid, ts, arm],
             );
             let evidence = audit_evidence_rows(&conn, eid);
             json!({
@@ -944,6 +1419,7 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                 "kind": kind,
                 "evidence_status": evidence_status,
                 "evidence": evidence,
+                "arm": arm,
             })
         })
         .collect();
@@ -964,7 +1440,9 @@ fn handle_audit_record(
             }
             r.to_string()
         }
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing run_id"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing run_id"})
+        }
     };
 
     let verdicts: Vec<Value> = req
@@ -996,8 +1474,13 @@ fn handle_audit_record(
     for v in &verdicts {
         if let Some(eid) = v.get("entry_id").and_then(|x| x.as_str()) {
             let exists: bool = conn
-                .query_row("SELECT COUNT(*) FROM entries WHERE id=?1", params![eid], |r| r.get::<_, i64>(0))
-                .unwrap_or(0) > 0;
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    params![eid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
             if !exists {
                 return json!({"id":id,"type":"error","code":"invalid_entry_id","message":format!("entry '{}' not found", eid)});
             }
@@ -1014,7 +1497,8 @@ fn handle_audit_record(
                     params![run_id, eid],
                     |r| r.get::<_, i64>(0),
                 )
-                .unwrap_or(0) > 0;
+                .unwrap_or(0)
+                > 0;
             if !in_candidates {
                 return json!({"id":id,"type":"error","code":"unknown_run_candidates",
                     "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", eid, run_id)});
@@ -1031,8 +1515,14 @@ fn handle_audit_record(
             Some(e) => e.to_string(),
             None => continue,
         };
-        let verdict = verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false);
-        let note = verdict_obj.get("note").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let verdict = verdict_obj
+            .get("verdict")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let note = verdict_obj
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         if !verdict {
             let expire_event = json!({
@@ -1131,18 +1621,41 @@ fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
     };
 
     let (last_run_at, total_runs): (Option<String>, i64) = conn
-        .query_row("SELECT MAX(audited_at), COUNT(*) FROM audit_runs", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+        .query_row(
+            "SELECT MAX(audited_at), COUNT(*) FROM audit_runs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap_or((None, 0));
 
-    json!({
+    let per_arm: Vec<Value> = conn
+        .prepare(
+            "SELECT c.arm, COUNT(*),
+                SUM(CASE WHEN ar.verdict='true' THEN 1.0 ELSE 0.0 END) / COUNT(*)
+         FROM audit_runs ar JOIN audit_run_candidates c
+           ON c.run_id=ar.run_id AND c.entry_id=ar.entry_id
+         GROUP BY c.arm ORDER BY c.arm",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok(json!({
+        "arm": r.get::<_,String>(0)?, "n": r.get::<_,i64>(1)?, "precision": r.get::<_,f64>(2)?
+    }))).ok().map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+
+    let mut report = json!({
         "id": id,
         "type": "result",
         "per_kind_session_precision": per_kind_session,
         "last_run_at": last_run_at,
         "total_runs": total_runs,
-    })
+        "per_arm_precision": per_arm,
+    });
+    if let Some(telemetry) = query_hits::injection_telemetry(&paths.query_hits) {
+        report["injection_telemetry"] = serde_json::to_value(telemetry).unwrap_or(Value::Null);
+    }
+    report
 }
 
 fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
@@ -1215,13 +1728,12 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                     }
                 };
 
-                let parents: Vec<String> =
-                    match stmt.query_map(params![node_id], |r| r.get(0)) {
-                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                        Err(e) => {
-                            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
-                        }
-                    };
+                let parents: Vec<String> = match stmt.query_map(params![node_id], |r| r.get(0)) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(e) => {
+                        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                    }
+                };
 
                 if parents.is_empty() {
                     roots.push(node_id.clone());
@@ -1251,17 +1763,27 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let target_repo = match req.get("target_repo").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing target_repo"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing target_repo"})
+        }
     };
     let graph_type = match req.get("graph_type").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing graph_type"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing graph_type"})
+        }
     };
     if graph_type != "epic" && graph_type != "dep" {
         return json!({"id":id,"type":"error","code":"validation_error","message":"graph_type must be 'epic' or 'dep'"});
     }
-    let epic_slug: Option<String> = req.get("epic_slug").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let ttl_days: Option<u32> = req.get("ttl_days").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let epic_slug: Option<String> = req
+        .get("epic_slug")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let ttl_days: Option<u32> = req
+        .get("ttl_days")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
 
     let conn = match db::open_db(&paths.db) {
         Ok(c) => c,
@@ -1278,7 +1800,9 @@ fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value 
             |r| r.get(0),
         ) {
             Ok(v) => Some(v),
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
         }
     } else {
         None
@@ -1287,14 +1811,19 @@ fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value 
     // Find or create graph row.
     let graph_id: String = {
         use rusqlite::OptionalExtension;
-        let existing: Option<String> = match conn.query_row(
-            "SELECT id FROM graphs WHERE graph_type=?1 AND source_repo=?2 AND \
+        let existing: Option<String> = match conn
+            .query_row(
+                "SELECT id FROM graphs WHERE graph_type=?1 AND source_repo=?2 AND \
              (epic_slug IS ?3 OR (epic_slug IS NULL AND ?3 IS NULL))",
-            params![graph_type, source_repo, epic_slug],
-            |r| r.get(0),
-        ).optional() {
+                params![graph_type, source_repo, epic_slug],
+                |r| r.get(0),
+            )
+            .optional()
+        {
             Ok(v) => v,
-            Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
         };
         match existing {
             Some(gid) => gid,
@@ -1376,7 +1905,9 @@ fn handle_kb_peers_list(id: &Value, req: &Value, paths: &config::Paths) -> Value
 fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let peer_id = match req.get("peer_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing peer_id"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing peer_id"})
+        }
     };
 
     let conn = match db::open_db(&paths.db) {
@@ -1403,6 +1934,7 @@ fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Val
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use crate::models::VerificationStatus;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1412,6 +1944,217 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = config::Paths::from_root(root);
         (dir, paths, NoopEmbedder)
+    }
+
+    fn search_entry_with_statuses() -> db::SearchEntry {
+        db::SearchEntry {
+            id: "entry-1".to_string(),
+            path: "src/example.rs".to_string(),
+            summary: "example".to_string(),
+            content: "content".to_string(),
+            tags: "[\"demo\"]".to_string(),
+            score: 1.0,
+            source: "fts",
+            score_kind: "fts",
+            evidence: vec![
+                db::SearchEvidence {
+                    id: "ev-verified".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:0-10".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:a".to_string(),
+                    citation_excerpt: Some("verified".to_string()),
+                    verified: Some(true),
+                    verification_status: Some(VerificationStatus::Verified),
+                },
+                db::SearchEvidence {
+                    id: "ev-relocated".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:11-20".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:b".to_string(),
+                    citation_excerpt: Some("relocated".to_string()),
+                    verified: Some(false),
+                    verification_status: Some(VerificationStatus::Relocated),
+                },
+                db::SearchEvidence {
+                    id: "ev-unverified".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:21-30".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:c".to_string(),
+                    citation_excerpt: Some("unverified".to_string()),
+                    verified: Some(false),
+                    verification_status: Some(VerificationStatus::Unverified),
+                },
+                db::SearchEvidence {
+                    id: "ev-deferred".to_string(),
+                    kind: "code".to_string(),
+                    citation_path: Some("src/example.rs:31-40".to_string()),
+                    citation_sha: None,
+                    citation_hash: "sha256:d".to_string(),
+                    citation_excerpt: Some("deferred".to_string()),
+                    verified: None,
+                    verification_status: None,
+                },
+            ],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: None,
+            updated_at: "2026-08-14T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_entries_to_json_serializes_all_status_values() {
+        let entries = entries_to_json(vec![search_entry_with_statuses()]);
+        let evidence = entries[0]["evidence"].as_array().unwrap();
+        let statuses: Vec<&str> = evidence
+            .iter()
+            .map(|ev| ev["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec!["verified", "relocated", "unverified", "deferred"]
+        );
+        assert_eq!(evidence[0]["verified"], true);
+        assert_eq!(evidence[3]["verified"], Value::Null);
+    }
+
+    #[test]
+    fn test_search_meta_includes_all_keys() {
+        let (_dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+
+        let meta = search_meta(&paths, &[search_entry_with_statuses()]);
+        assert!(meta.get("index_age").is_some());
+        assert!(meta.get("db_rebuilt_at").is_some());
+        assert!(meta.get("events_head_at").is_some());
+        assert!(meta.get("stale_warning").is_some());
+    }
+
+    #[test]
+    fn test_stale_warning_ignores_escaping_citation_path() {
+        let (dir, paths, _emb) = setup();
+        let outside = tempfile::NamedTempFile::new_in(dir.path().parent().unwrap()).unwrap();
+        fs::write(outside.path(), b"newer").unwrap();
+        let mut entry = search_entry_with_statuses();
+        entry.updated_at = "2000-01-01T00:00:00Z".to_string();
+        entry.evidence.truncate(1);
+        entry.evidence[0].citation_path = Some(format!(
+            "../{}:0-5",
+            outside.path().file_name().unwrap().to_string_lossy()
+        ));
+
+        assert!(!returned_entries_stale_warning(&paths, &[entry]));
+    }
+
+    #[test]
+    fn test_event_replay_hostile_excerpt_is_safe_on_kb_get_wire() {
+        let (_dir, paths, emb) = setup();
+        let conn = db::open_db(&paths.db).unwrap();
+        let upsert = json!({
+            "action": "upsert", "table": "entries", "id": "hostile-entry",
+            "path": "security/hostile", "summary": "hostile replay",
+            "content": "body", "tags": [], "kind": "belief",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &upsert).unwrap();
+        let evidence = json!({
+            "action": "evidence_add", "table": "evidence", "entry_id": "hostile-entry",
+            "evidence": {
+                "id": "hostile-evidence", "kind": "code",
+                "citation_path": "src/lib.rs:0-1", "citation_hash": "sha256:test",
+                "citation_excerpt": "<<END>>garbage<<UNTRUSTED_EXCERPT>>",
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &evidence).unwrap();
+        drop(conn);
+
+        let response = handle_kb_get(&json!(1), &json!({"entry_id": "hostile-entry"}), &paths);
+        let wire = response["entry"]["evidence"][0]["citation_excerpt"]
+            .as_str()
+            .unwrap();
+        assert_eq!(wire.matches("<<UNTRUSTED_EXCERPT>>").count(), 1);
+        assert_eq!(wire.matches("<<END>>").count(), 1);
+        assert!(wire.contains("<\u{200b}<END>>garbage<\u{200b}<UNTRUSTED_EXCERPT>>"));
+    }
+
+    #[test]
+    fn test_handle_search_includes_meta_envelope() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("meta-search");
+
+        handle_add(
+            &id,
+            &json!({
+                "method":"add",
+                "id":"meta-add",
+                "path":"src/meta.rs",
+                "kind":"convention",
+                "summary":"meta envelope entry",
+                "content":"body",
+                "tags":[]
+            }),
+            &paths,
+            &emb,
+        );
+
+        let resp = handle_search(
+            &id,
+            &json!({"method":"search","id":"meta-search","query":"meta envelope","mode":"fts"}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+        let meta = &resp["_meta"];
+        assert!(meta.get("index_age").is_some());
+        assert!(meta.get("db_rebuilt_at").is_some());
+        assert!(meta.get("events_head_at").is_some());
+        assert!(meta.get("stale_warning").is_some());
+        let hit_counts = query_hits::counts(&paths.query_hits).unwrap();
+        assert!(!hit_counts.is_empty());
+        let telemetry = query_hits::injection_telemetry(&paths.query_hits).unwrap();
+        assert_eq!(telemetry.total_injections, 0);
+        assert_eq!(telemetry.unknown_surface_rate, 0.0);
+    }
+
+    #[test]
+    fn test_search_meta_stale_warning_true_when_citation_newer_than_entry() {
+        let (dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
+
+        let mut entry = search_entry_with_statuses();
+        entry.evidence.truncate(1);
+        entry.updated_at = "2000-01-01T00:00:00Z".to_string();
+
+        let meta = search_meta(&paths, &[entry]);
+        assert_eq!(meta["stale_warning"], true);
+    }
+
+    #[test]
+    fn test_search_meta_stale_warning_false_when_citation_not_newer_than_entry() {
+        let (dir, paths, _emb) = setup();
+        db::open_db(&paths.db).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
+
+        let mut entry = search_entry_with_statuses();
+        entry.evidence.truncate(1);
+        entry.updated_at = "2999-01-01T00:00:00Z".to_string();
+
+        let meta = search_meta(&paths, &[entry]);
+        assert_eq!(meta["stale_warning"], false);
     }
 
     // ── br-improvement-catalog-23b.9: source_weights / audit_runs state machine proptests ──
@@ -1424,13 +2167,14 @@ mod tests {
     // "__GLOBAL__" which must NOT be used as a real session_id (it's the NULL sentinel in
     // source_weights).  We exercise the NULL path via sid_index=0 → None below.
     const AUDIT_SESSION_IDS: &[Option<&str>] = &[
-        None,              // → COALESCE(session_id,'__GLOBAL__') in source_weights
+        None, // → COALESCE(session_id,'__GLOBAL__') in source_weights
         Some("sess-a"),
         Some("sess-b"),
     ];
 
     /// One verdict triple: (kind_index, session_index, verdict_bool).
-    fn arb_audit_verdict_triple() -> impl proptest::strategy::Strategy<Value = (usize, usize, bool)> {
+    fn arb_audit_verdict_triple() -> impl proptest::strategy::Strategy<Value = (usize, usize, bool)>
+    {
         use proptest::prelude::*;
         (
             0..AUDIT_KINDS.len(),
@@ -1735,21 +2479,30 @@ mod tests {
         let resp = handle_add(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "validation_error");
-        assert!(resp["message"].as_str().unwrap().contains("tags must be a JSON array"));
+        assert!(resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("tags must be a JSON array"));
 
         // tags contains a non-string element
         let req2 = json!({"method":"add","id":"bad-tags-2","path":"test/bt2","summary":"s","content":"c","tags":["good", 42]});
         let resp2 = handle_add(&id, &req2, &paths, &emb);
         assert_eq!(resp2["type"], "error");
         assert_eq!(resp2["code"], "validation_error");
-        assert!(resp2["message"].as_str().unwrap().contains("tags[1] must be a string"));
+        assert!(resp2["message"]
+            .as_str()
+            .unwrap()
+            .contains("tags[1] must be a string"));
 
         // tags contains an empty string
         let req3 = json!({"method":"add","id":"bad-tags-3","path":"test/bt3","summary":"s","content":"c","tags":["good",""]});
         let resp3 = handle_add(&id, &req3, &paths, &emb);
         assert_eq!(resp3["type"], "error");
         assert_eq!(resp3["code"], "validation_error");
-        assert!(resp3["message"].as_str().unwrap().contains("tags[1] must be non-empty"));
+        assert!(resp3["message"]
+            .as_str()
+            .unwrap()
+            .contains("tags[1] must be non-empty"));
     }
 
     #[test]
@@ -1772,9 +2525,13 @@ mod tests {
 
         let conn = db::open_db(&paths.db).unwrap();
         let entry_id = resp["entry_id"].as_str().unwrap();
-        let perm: i64 = conn.query_row(
-            &format!("SELECT permanent FROM entries WHERE id='{}'", entry_id), [], |r| r.get(0)
-        ).unwrap();
+        let perm: i64 = conn
+            .query_row(
+                &format!("SELECT permanent FROM entries WHERE id='{}'", entry_id),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(perm, 1);
     }
 
@@ -1792,9 +2549,13 @@ mod tests {
         handle_add(&id, &req2, &paths, &emb);
 
         let conn = db::open_db(&paths.db).unwrap();
-        let stale: i64 = conn.query_row(
-            &format!("SELECT is_stale FROM entries WHERE id='{}'", old_id), [], |r| r.get(0)
-        ).unwrap();
+        let stale: i64 = conn
+            .query_row(
+                &format!("SELECT is_stale FROM entries WHERE id='{}'", old_id),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(stale, 1, "old entry must be stale after replace_path");
     }
 
@@ -1809,11 +2570,65 @@ mod tests {
         handle_add(&id, &req_add2, &paths, &emb);
 
         // Search with path_prefix filter
-        let req = json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
+        let req =
+            json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
         let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
-        assert!(entries.iter().all(|e| e["path"].as_str().unwrap().starts_with("src/")));
+        assert!(entries
+            .iter()
+            .all(|e| e["path"].as_str().unwrap().starts_with("src/")));
+    }
+
+    #[test]
+    fn test_handle_kb_get_round_trip() {
+        use crate::commands::add_validation::CITATION_EXCERPT_ENVELOPE_OPEN;
+
+        let (dir, paths, emb) = setup();
+        let id = json!("kg1");
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/get.rs"), "fn kb_get() {}\n").unwrap();
+
+        let req_add = json!({
+            "method":"add",
+            "id":"kg-add",
+            "path":"src/get.rs",
+            "summary":"kb_get entry",
+            "content":"full content body",
+            "tags":["kb","get"],
+            "kind":"observation",
+            "evidence":[{
+                "kind":"code",
+                "citation_path":"src/get.rs:0-10",
+                "citation_sha":null,
+                "citation_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "citation_excerpt":"fn kb_get"
+            }]
+        });
+        let added = handle_add(&id, &req_add, &paths, &emb);
+        let entry_id = added["entry_id"].as_str().unwrap().to_string();
+
+        let resp = handle_kb_get(&id, &json!({"entry_id": entry_id}), &paths);
+        assert_eq!(resp["type"], "result");
+        let entry = &resp["entry"];
+        assert_eq!(entry["summary"], "kb_get entry");
+        assert_eq!(entry["content"], "full content body");
+        assert_eq!(entry["kind"], "observation");
+        assert!(entry["evidence"].is_array());
+        let excerpt = entry["evidence"][0]["citation_excerpt"].as_str().unwrap();
+        assert!(excerpt.starts_with(CITATION_EXCERPT_ENVELOPE_OPEN));
+    }
+
+    #[test]
+    fn test_handle_kb_get_unknown_id_error() {
+        let (_dir, paths, _emb) = setup();
+        let id = json!("kg-miss");
+
+        let resp = handle_kb_get(&id, &json!({"entry_id": "no-such-entry"}), &paths);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "entry_not_found");
+        assert!(resp["message"].as_str().unwrap().contains("no-such-entry"));
     }
 
     /// br-h9g (security I2): a request with limit far above MAX_LIMIT must be
@@ -1849,7 +2664,8 @@ mod tests {
         assert!(
             entries.len() <= db::MAX_LIMIT,
             "limit must be clamped to MAX_LIMIT={}, got {}",
-            db::MAX_LIMIT, entries.len()
+            db::MAX_LIMIT,
+            entries.len()
         );
     }
 
@@ -1916,7 +2732,8 @@ mod tests {
         let verified_count = entries
             .iter()
             .filter(|e| {
-                e["evidence"].as_array()
+                e["evidence"]
+                    .as_array()
                     .and_then(|arr| arr.first())
                     .and_then(|ev| ev.get("verified"))
                     .map(|v| !v.is_null())
@@ -1926,7 +2743,8 @@ mod tests {
         assert!(
             verified_count <= db::MAX_INLINE_VERIFY_K,
             "inline_verify_k must be clamped to MAX_INLINE_VERIFY_K={}, got {} verified",
-            db::MAX_INLINE_VERIFY_K, verified_count
+            db::MAX_INLINE_VERIFY_K,
+            verified_count
         );
     }
 
@@ -2123,11 +2941,13 @@ mod tests {
 
         // Verify entry still exists after rebuild
         let conn = db::open_db(&paths.db).unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE path='test/rb'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path='test/rb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -2196,7 +3016,11 @@ mod tests {
             1,
             "entry must appear in exactly one bucket"
         );
-        let bucket = if !review.is_empty() { review } else { unreachable };
+        let bucket = if !review.is_empty() {
+            review
+        } else {
+            unreachable
+        };
         assert_eq!(bucket[0]["id"], "sc-commit-entry");
         assert_eq!(bucket[0]["version_ref"], sha);
 
@@ -2260,7 +3084,8 @@ mod tests {
                         let known = matches!(method,
                             "search" | "add" | "import" | "expire" | "stale_check" |
                             "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild" |
-                            "audit_run" | "audit_record" | "audit_report" | "provenance"
+                            "audit_run" | "audit_record" | "audit_report" | "provenance" |
+                            "kb_get"
                         );
                         if !known {
                             proptest::prop_assert_eq!(
@@ -2285,7 +3110,12 @@ mod tests {
         ).unwrap();
     }
 
-    fn add_live_entry(paths: &config::Paths, emb: &NoopEmbedder, path: &str, session_id: Option<&str>) -> String {
+    fn add_live_entry(
+        paths: &config::Paths,
+        emb: &NoopEmbedder,
+        path: &str,
+        session_id: Option<&str>,
+    ) -> String {
         let id = json!(null);
         let mut req = json!({"path": path, "summary": "s", "content": "c", "tags": [], "kind": "observation",
                               "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
@@ -2324,8 +3154,106 @@ mod tests {
         assert!(!samples.is_empty());
         let s = &samples[0];
         assert!(s["kind"].as_str().is_some(), "sample must include kind");
-        assert!(s["evidence"].is_array(), "sample must include evidence array");
-        assert!(!s["evidence"].as_array().unwrap().is_empty(), "evidence array must have rows");
+        assert!(
+            s["evidence"].is_array(),
+            "sample must include evidence array"
+        );
+        assert!(
+            !s["evidence"].as_array().unwrap().is_empty(),
+            "evidence array must have rows"
+        );
+    }
+
+    #[test]
+    fn test_audit_run_absent_mode_remains_uniform() {
+        let (_dir, paths, emb) = setup();
+        let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
+        let response = handle_audit_run(&json!(null), &json!({"sample_size": 1}), &paths);
+        assert_eq!(response["type"], "ok");
+        let samples = response["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["id"], entry_id);
+        assert_eq!(samples[0]["arm"], "uniform");
+        assert!(
+            !paths.query_hits.exists(),
+            "uniform mode must not open the hit log"
+        );
+    }
+
+    #[test]
+    fn test_audit_run_traffic_prefers_high_hit_entries_and_is_disjoint() {
+        let (_dir, paths, emb) = setup();
+        let hot = add_live_entry(&paths, &emb, "p/hot", None);
+        let cold_a = add_live_entry(&paths, &emb, "p/cold-a", None);
+        let cold_b = add_live_entry(&paths, &emb, "p/cold-b", None);
+        query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 500], "test");
+        query_hits::record_hits(&paths.query_hits, &[cold_a.clone(), cold_b.clone()], "test");
+
+        let mut hot_traffic = 0;
+        let mut cold_traffic = 0;
+        for _ in 0..60 {
+            let resp = handle_audit_run(
+                &json!(null),
+                &json!({"sample_size":1,"mode":"traffic"}),
+                &paths,
+            );
+            assert_eq!(resp["type"], "ok");
+            let samples = resp["samples"].as_array().unwrap();
+            let uniform: Vec<&str> = samples
+                .iter()
+                .filter(|s| s["arm"] == "uniform")
+                .filter_map(|s| s["id"].as_str())
+                .collect();
+            let traffic: Vec<&str> = samples
+                .iter()
+                .filter(|s| s["arm"] == "traffic")
+                .filter_map(|s| s["id"].as_str())
+                .collect();
+            assert!(
+                traffic.iter().all(|id| !uniform.contains(id)),
+                "uniform-first arms must be disjoint"
+            );
+            for id in traffic {
+                if id == hot.as_str() {
+                    hot_traffic += 1
+                } else {
+                    cold_traffic += 1
+                }
+            }
+        }
+        assert!(
+            hot_traffic > cold_traffic,
+            "high-traffic entry should be sampled more often"
+        );
+    }
+
+    #[test]
+    fn test_audit_run_missing_hit_log_degrades_to_uniform() {
+        let (_dir, paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/degrade", None);
+        assert!(!paths.query_hits.exists());
+        let resp = handle_audit_run(
+            &json!(null),
+            &json!({"sample_size":1,"mode":"traffic"}),
+            &paths,
+        );
+        assert_eq!(resp["type"], "ok");
+        let samples = resp["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["arm"], "uniform");
+    }
+
+    #[test]
+    fn test_search_response_ignores_unwritable_hit_log() {
+        let (dir, mut paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/search-hit", None);
+        let req = json!({"query":"s","mode":"fts"});
+        let expected = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let blocked = dir.path().join("hit-log-is-a-directory");
+        fs::create_dir(&blocked).unwrap();
+        paths.query_hits = blocked;
+        let actual = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2340,7 +3268,10 @@ mod tests {
         let req2 = json!({"sample_size": 10});
         let resp = handle_audit_run(&id, &req2, &paths);
         let samples = resp["samples"].as_array().unwrap();
-        assert!(!samples.iter().any(|s| s["id"] == eid), "stale entry must be excluded");
+        assert!(
+            !samples.iter().any(|s| s["id"] == eid),
+            "stale entry must be excluded"
+        );
     }
 
     #[test]
@@ -2355,7 +3286,10 @@ mod tests {
         let req2 = json!({"sample_size": 10});
         let resp2 = handle_audit_run(&id, &req2, &paths);
         let samples = resp2["samples"].as_array().unwrap();
-        assert!(!samples.iter().any(|s| s["id"] == eid), "entry without evidence must be excluded");
+        assert!(
+            !samples.iter().any(|s| s["id"] == eid),
+            "entry without evidence must be excluded"
+        );
     }
 
     #[test]
@@ -2372,10 +3306,13 @@ mod tests {
         assert_eq!(resp["expired"], 0);
 
         let conn = db::open_db(&paths.db).unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
-            params![run_id, eid], |r| r.get(0),
-        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, eid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -2390,9 +3327,13 @@ mod tests {
         assert_eq!(resp["expired"], 1);
 
         let conn = db::open_db(&paths.db).unwrap();
-        let stale: i64 = conn.query_row(
-            "SELECT is_stale FROM entries WHERE id=?1", params![eid], |r| r.get(0),
-        ).unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(stale, 1);
     }
 
@@ -2406,10 +3347,13 @@ mod tests {
         handle_audit_record(&id, &req, &paths, &emb);
 
         let conn = db::open_db(&paths.db).unwrap();
-        let successes: i64 = conn.query_row(
-            "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let successes: i64 = conn
+            .query_row(
+                "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(successes, 1);
     }
 
@@ -2427,10 +3371,13 @@ mod tests {
         assert_eq!(resp2["recorded"], 0, "replay must be a no-op");
 
         let conn = db::open_db(&paths.db).unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-idem'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-idem'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(n, 1, "exactly one row after idempotent replay");
     }
 
@@ -2438,7 +3385,8 @@ mod tests {
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
+        let req =
+            json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
         let resp = handle_audit_record(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "invalid_entry_id");
@@ -2450,9 +3398,39 @@ mod tests {
         let id = json!(null);
         let resp = handle_audit_report(&id, &paths);
         assert_eq!(resp["type"], "result");
-        assert_eq!(resp["per_kind_session_precision"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            resp["per_kind_session_precision"].as_array().unwrap().len(),
+            0
+        );
         assert!(resp["last_run_at"].is_null());
         assert_eq!(resp["total_runs"], 0);
+        assert!(resp.get("injection_telemetry").is_none());
+    }
+
+    #[test]
+    fn test_handle_audit_report_includes_injection_telemetry() {
+        let (_dir, paths, _emb) = setup();
+        query_hits::record_injection(
+            &paths.query_hits,
+            "report-session",
+            &[
+                ("entry-a".into(), Some("src/a.rs".into())),
+                ("entry-b".into(), None),
+            ],
+            "hook",
+        );
+        query_hits::record_acted_on(
+            &paths.query_hits,
+            "report-session",
+            br#"{"type":"tool_use","input":{"file_path":"src/a.rs"}}"#,
+        );
+        let resp = handle_audit_report(&json!(null), &paths);
+        let telemetry = &resp["injection_telemetry"];
+        assert_eq!(telemetry["total_injections"], 2);
+        assert_eq!(telemetry["acted_on_rate"], 0.5);
+        assert_eq!(telemetry["unknown_surface_rate"], 0.0);
+        assert_eq!(telemetry["per_surface"]["hook"]["count"], 2);
+        assert_eq!(telemetry["per_surface"]["hook"]["acted_on_rate"], 0.5);
     }
 
     #[test]
@@ -2460,11 +3438,17 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
         // Add 4 entries (same kind+session_id), record 3 true + 1 false
-        let eids: Vec<String> = (0..4).map(|i| add_live_entry(&paths, &emb, &format!("p/r{}", i), None)).collect();
-        for eid in &eids { seed_audit_candidate(&paths, "run-report", eid); }
-        let verdicts: Vec<Value> = eids.iter().enumerate().map(|(i, eid)| {
-            json!({"entry_id": eid, "verdict": i < 3})
-        }).collect();
+        let eids: Vec<String> = (0..4)
+            .map(|i| add_live_entry(&paths, &emb, &format!("p/r{}", i), None))
+            .collect();
+        for eid in &eids {
+            seed_audit_candidate(&paths, "run-report", eid);
+        }
+        let verdicts: Vec<Value> = eids
+            .iter()
+            .enumerate()
+            .map(|(i, eid)| json!({"entry_id": eid, "verdict": i < 3}))
+            .collect();
         let req = json!({"run_id": "run-report", "verdicts": verdicts});
         handle_audit_record(&id, &req, &paths, &emb);
 
@@ -2473,10 +3457,106 @@ mod tests {
         let rows = resp["per_kind_session_precision"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         let precision = rows[0]["precision"].as_f64().unwrap();
-        assert!((precision - 0.75).abs() < 1e-6, "3 true / 4 total = 0.75; got {}", precision);
+        assert!(
+            (precision - 0.75).abs() < 1e-6,
+            "3 true / 4 total = 0.75; got {}",
+            precision
+        );
         assert_eq!(rows[0]["n"], 4);
         assert!(resp["last_run_at"].as_str().is_some());
         assert_eq!(resp["total_runs"], 4);
+    }
+
+    #[test]
+    fn test_handle_audit_report_separates_arms() {
+        let (_dir, paths, emb) = setup();
+        let uniform = add_live_entry(&paths, &emb, "p/report-uniform", None);
+        let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
+        let conn = db::open_db(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
+            [&uniform],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')",
+            [&traffic],
+        )
+        .unwrap();
+        drop(conn);
+        let req = json!({"run_id":"arms","verdicts":[
+            {"entry_id":uniform,"verdict":true}, {"entry_id":traffic,"verdict":true}
+        ]});
+        assert_eq!(
+            handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"],
+            2
+        );
+        let report = handle_audit_report(&json!(null), &paths);
+        let arms = report["per_arm_precision"].as_array().unwrap();
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().any(|r| r["arm"] == "uniform" && r["n"] == 1));
+        assert!(arms.iter().any(|r| r["arm"] == "traffic" && r["n"] == 1));
+    }
+
+    #[test]
+    fn test_handle_audit_report_counts_match_distinct_sampled_entries_per_arm() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let (_dir, paths, emb) = setup();
+        let hot = add_live_entry(&paths, &emb, "p/exact-hot", None);
+        let warm = add_live_entry(&paths, &emb, "p/exact-warm", None);
+        let cold = add_live_entry(&paths, &emb, "p/exact-cold", None);
+        query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 200], "test");
+        query_hits::record_hits(&paths.query_hits, &[warm.clone(), cold.clone()], "test");
+
+        let run = handle_audit_run(
+            &json!(null),
+            &json!({"sample_size": 2, "mode": "traffic"}),
+            &paths,
+        );
+        assert_eq!(run["type"], "ok");
+        let samples = run["samples"].as_array().unwrap();
+        assert!(samples.iter().any(|s| s["arm"] == "uniform"));
+        assert!(samples.iter().any(|s| s["arm"] == "traffic"));
+
+        let expected_counts: BTreeMap<String, usize> = samples
+            .iter()
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut acc, sample| {
+                    let arm = sample["arm"].as_str().unwrap().to_string();
+                    let id = sample["id"].as_str().unwrap().to_string();
+                    acc.entry(arm).or_default().insert(id);
+                    acc
+                },
+            )
+            .into_iter()
+            .map(|(arm, ids)| (arm, ids.len()))
+            .collect();
+
+        let verdicts: Vec<Value> = samples
+            .iter()
+            .map(|sample| json!({"entry_id": sample["id"].as_str().unwrap(), "verdict": true}))
+            .collect();
+        let req = json!({"run_id": run["run_id"].as_str().unwrap(), "verdicts": verdicts});
+        assert_eq!(
+            handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"],
+            samples.len()
+        );
+
+        let report = handle_audit_report(&json!(null), &paths);
+        let actual_counts: BTreeMap<String, usize> = report["per_arm_precision"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["arm"].as_str().unwrap().to_string(),
+                    row["n"].as_i64().unwrap() as usize,
+                )
+            })
+            .collect();
+        assert_eq!(actual_counts, expected_counts);
     }
 
     #[test]
@@ -2484,21 +3564,35 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
         // Add entry A (root)
-        let ra = handle_add(&id, &json!({"path":"p/a","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let ra = handle_add(
+            &id,
+            &json!({"path":"p/a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
         let a_id = ra["entry_id"].as_str().unwrap().to_string();
 
         // Add entry B derived from A
-        let rb = handle_add(&id, &json!({
-            "path": "p/b", "summary": "b", "content": "b", "tags": [], "kind": "observation",
-            "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:0"}]
-        }), &paths, &emb);
+        let rb = handle_add(
+            &id,
+            &json!({
+                "path": "p/b", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+                "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:0"}]
+            }),
+            &paths,
+            &emb,
+        );
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
 
         let req = json!({"entry_id": b_id});
         let resp = handle_provenance(&id, &req, &paths);
         assert_eq!(resp["type"], "result");
-        let roots: Vec<String> = resp["roots"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let roots: Vec<String> = resp["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert_eq!(roots, vec![a_id.clone()]);
         let graph = resp["graph"].as_array().unwrap();
         assert_eq!(graph.len(), 1);
@@ -2510,24 +3604,43 @@ mod tests {
     fn test_handle_provenance_multi_hop() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let ra = handle_add(&id, &json!({"path":"p/a2","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let ra = handle_add(
+            &id,
+            &json!({"path":"p/a2","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
         let a_id = ra["entry_id"].as_str().unwrap().to_string();
-        let rb = handle_add(&id, &json!({
-            "path": "p/b2", "summary": "b", "content": "b", "tags": [], "kind": "observation",
-            "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:1"}]
-        }), &paths, &emb);
+        let rb = handle_add(
+            &id,
+            &json!({
+                "path": "p/b2", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+                "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:1"}]
+            }),
+            &paths,
+            &emb,
+        );
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
-        let rc = handle_add(&id, &json!({
-            "path": "p/c2", "summary": "c", "content": "c", "tags": [], "kind": "belief",
-            "evidence": [{"kind": "derived", "derived_from": b_id, "citation_hash": "sha256:2"}]
-        }), &paths, &emb);
+        let rc = handle_add(
+            &id,
+            &json!({
+                "path": "p/c2", "summary": "c", "content": "c", "tags": [], "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": b_id, "citation_hash": "sha256:2"}]
+            }),
+            &paths,
+            &emb,
+        );
         let c_id = rc["entry_id"].as_str().unwrap().to_string();
 
         let req = json!({"entry_id": c_id});
         let resp = handle_provenance(&id, &req, &paths);
         assert_eq!(resp["type"], "result");
-        let roots: Vec<String> = resp["roots"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let roots: Vec<String> = resp["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert_eq!(roots, vec![a_id.clone()]);
         assert_eq!(resp["graph"].as_array().unwrap().len(), 2);
     }
@@ -2538,9 +3651,19 @@ mod tests {
         let id = json!(null);
         // Create A with a derived evidence pointing to a future B_ID
         // Simulate cycle by directly inserting into evidence table
-        let ra = handle_add(&id, &json!({"path":"p/cyc-a","summary":"a","content":"a","tags":[],"kind":"convention"}), &paths, &emb);
+        let ra = handle_add(
+            &id,
+            &json!({"path":"p/cyc-a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
         let a_id = ra["entry_id"].as_str().unwrap().to_string();
-        let rb = handle_add(&id, &json!({"path":"p/cyc-b","summary":"b","content":"b","tags":[],"kind":"convention"}), &paths, &emb);
+        let rb = handle_add(
+            &id,
+            &json!({"path":"p/cyc-b","summary":"b","content":"b","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
 
         // Manually inject cycle: evidence row on A pointing to B, and on B pointing to A
@@ -2568,14 +3691,24 @@ mod tests {
         let id = json!(null);
         // Build a chain of 5 entries; cap at depth=2 → truncated=true
         let mut prev_id = {
-            let r = handle_add(&id, &json!({"path":"p/d0","summary":"s","content":"c","tags":[],"kind":"convention"}), &paths, &emb);
+            let r = handle_add(
+                &id,
+                &json!({"path":"p/d0","summary":"s","content":"c","tags":[],"kind":"convention"}),
+                &paths,
+                &emb,
+            );
             r["entry_id"].as_str().unwrap().to_string()
         };
         for i in 1..5 {
-            let r = handle_add(&id, &json!({
-                "path": format!("p/d{}", i), "summary": "s", "content": "c", "tags": [], "kind": "belief",
-                "evidence": [{"kind": "derived", "derived_from": prev_id, "citation_hash": format!("sha256:{}", i)}]
-            }), &paths, &emb);
+            let r = handle_add(
+                &id,
+                &json!({
+                    "path": format!("p/d{}", i), "summary": "s", "content": "c", "tags": [], "kind": "belief",
+                    "evidence": [{"kind": "derived", "derived_from": prev_id, "citation_hash": format!("sha256:{}", i)}]
+                }),
+                &paths,
+                &emb,
+            );
             prev_id = r["entry_id"].as_str().unwrap().to_string();
         }
 
@@ -2589,13 +3722,18 @@ mod tests {
     fn test_handle_add_session_id_null() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"path":"test/sid","summary":"s","content":"c","tags":[],"kind":"convention"});
+        let req =
+            json!({"path":"test/sid","summary":"s","content":"c","tags":[],"kind":"convention"});
         let resp = handle_add(&id, &req, &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();
-        let sid: Option<String> = conn.query_row(
-            "SELECT session_id FROM entries WHERE id=?1", params![eid], |r| r.get(0),
-        ).unwrap();
+        let sid: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM entries WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(sid.is_none(), "session_id must be NULL when not provided");
     }
 
@@ -2607,9 +3745,13 @@ mod tests {
         let resp = handle_add(&id, &req, &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();
-        let sid: Option<String> = conn.query_row(
-            "SELECT session_id FROM entries WHERE id=?1", params![eid], |r| r.get(0),
-        ).unwrap();
+        let sid: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM entries WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sid, Some("abc".to_string()));
     }
 
@@ -2623,7 +3765,11 @@ mod tests {
         let entries = resp["entries"].as_array().unwrap();
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
-        assert!((conf - 0.5).abs() < 1e-6, "bootstrap confidence must be 0.5; got {}", conf);
+        assert!(
+            (conf - 0.5).abs() < 1e-6,
+            "bootstrap confidence must be 0.5; got {}",
+            conf
+        );
         assert_eq!(entry["audit_n"], 0);
     }
 
@@ -2643,7 +3789,11 @@ mod tests {
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
         // (1+1)/(1+0+2) = 2/3
-        assert!((conf - 2.0/3.0).abs() < 1e-5, "expected 2/3; got {}", conf);
+        assert!(
+            (conf - 2.0 / 3.0).abs() < 1e-5,
+            "expected 2/3; got {}",
+            conf
+        );
         assert_eq!(entry["audit_n"], 1);
     }
 
@@ -2654,15 +3804,19 @@ mod tests {
         seed_audit_candidate(&paths, "run-null-sid", &eid);
         let id = json!(null);
         // Record verdict for this entry (uses COALESCE → __GLOBAL__)
-        let req = json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req =
+            json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(&id, &req, &paths, &emb);
 
         // The weight should be stored under __GLOBAL__
         let conn = db::open_db(&paths.db).unwrap();
-        let s: i64 = conn.query_row(
-            "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let s: i64 = conn
+            .query_row(
+                "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(s, 1, "NULL session_id must map to __GLOBAL__ sentinel");
     }
 
@@ -2816,9 +3970,21 @@ mod tests {
         let rec_resp = handle_audit_record(&id, &rec_req, &paths, &emb);
         assert_eq!(rec_resp["expired"], 1);
 
-        let search = handle_search(&id, &json!({"query":"e2e entry","mode":"fts"}), &paths, &emb, 10, None, 0.0, 0.0);
+        let search = handle_search(
+            &id,
+            &json!({"query":"e2e entry","mode":"fts"}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         let hits = search["entries"].as_array().unwrap();
-        assert!(!hits.iter().any(|e| e["id"] == eid), "expired entry must not appear in search");
+        assert!(
+            !hits.iter().any(|e| e["id"] == eid),
+            "expired entry must not appear in search"
+        );
 
         // Step 4: kb_audit_report
         let report = handle_audit_report(&id, &paths);
@@ -2827,18 +3993,32 @@ mod tests {
         assert!(report["last_run_at"].as_str().is_some());
 
         // Step 5: kb_add with derived evidence + kb_provenance
-        let r_root = handle_add(&id, &json!({"path":"e2e/root","summary":"root","content":"r","tags":[],"kind":"convention"}), &paths, &emb);
+        let r_root = handle_add(
+            &id,
+            &json!({"path":"e2e/root","summary":"root","content":"r","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
         let root_id = r_root["entry_id"].as_str().unwrap().to_string();
-        let r_child = handle_add(&id, &json!({
-            "path": "e2e/child", "summary": "child", "content": "ch", "tags": [], "kind": "belief",
-            "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:e2e"}]
-        }), &paths, &emb);
+        let r_child = handle_add(
+            &id,
+            &json!({
+                "path": "e2e/child", "summary": "child", "content": "ch", "tags": [], "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:e2e"}]
+            }),
+            &paths,
+            &emb,
+        );
         let child_id = r_child["entry_id"].as_str().unwrap().to_string();
 
         let prov = handle_provenance(&id, &json!({"entry_id": child_id}), &paths);
         assert_eq!(prov["type"], "result");
-        let roots: Vec<&str> = prov["roots"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap()).collect();
+        let roots: Vec<&str> = prov["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert_eq!(roots, vec![root_id.as_str()]);
 
         // Step 6: record verdict=true → confidence changes.
@@ -2846,13 +4026,27 @@ mod tests {
         // sess-1 already has failures=1 from Step 3 and would yield confidence=0.5.
         let e2 = add_live_entry(&paths, &emb, "e2e/conf", Some("sess-conf"));
         seed_audit_candidate(&paths, "run-conf-e2e", &e2);
-        let req_true = json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
+        let req_true =
+            json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
         handle_audit_record(&id, &req_true, &paths, &emb);
-        let search2 = handle_search(&id, &json!({"query":"e2e conf","mode":"fts"}), &paths, &emb, 10, None, 0.0, 0.0);
+        let search2 = handle_search(
+            &id,
+            &json!({"query":"e2e conf","mode":"fts"}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         let entries2 = search2["entries"].as_array().unwrap();
         if let Some(e) = entries2.iter().find(|e| e["id"] == e2) {
             let conf = e["confidence"].as_f64().unwrap();
-            assert!(conf > 0.5, "confidence must increase after verdict=true; got {}", conf);
+            assert!(
+                conf > 0.5,
+                "confidence must increase after verdict=true; got {}",
+                conf
+            );
         }
     }
 }

@@ -433,10 +433,7 @@ impl PeersImport {
 
         for entry in &entries {
             if entry.graph_type != "epic" && entry.graph_type != "dep" {
-                anyhow::bail!(
-                    "--type must be 'epic' or 'dep', got '{}'",
-                    entry.graph_type
-                );
+                anyhow::bail!("--type must be 'epic' or 'dep', got '{}'", entry.graph_type);
             }
 
             // Skip if this peer edge already exists.
@@ -773,10 +770,7 @@ impl PeersEdgeCleanupEpic {
         let paths = config::Paths::discover()?;
         let conn = db::open_db(&paths.db)?;
 
-        conn.execute(
-            "DELETE FROM peers WHERE epic_slug = ?1",
-            params![self.slug],
-        )?;
+        conn.execute("DELETE FROM peers WHERE epic_slug = ?1", params![self.slug])?;
 
         // Delete orphaned graphs (graphs with no remaining peer edges).
         conn.execute(
@@ -907,7 +901,14 @@ mod tests {
         let conn = db::open_db_memory().unwrap();
 
         // Insert edge with expires_at in the past
-        insert_peer(&conn, "r1", "r2", "epic", Some("s1"), Some("2020-01-01T00:00:00Z"));
+        insert_peer(
+            &conn,
+            "r1",
+            "r2",
+            "epic",
+            Some("s1"),
+            Some("2020-01-01T00:00:00Z"),
+        );
 
         // Insert edge with no expiry (NULL)
         insert_peer(&conn, "r1", "r3", "dep", None, None);
@@ -1027,7 +1028,11 @@ mod tests {
         }
 
         // All 3 nodes reachable, traversal terminated (no infinite loop)
-        assert_eq!(visited.len(), 3, "BFS must visit all 3 nodes in cycle graph");
+        assert_eq!(
+            visited.len(),
+            3,
+            "BFS must visit all 3 nodes in cycle graph"
+        );
         assert!(visited.contains("r1"));
         assert!(visited.contains("r2"));
         assert!(visited.contains("r3"));

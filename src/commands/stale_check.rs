@@ -6,10 +6,12 @@
 //! invocation should be duplicated between the two call sites.
 
 use crate::components::db;
+use crate::components::verification::{verify_evidence, RelocationPolicy, VerificationOutcome};
 use crate::config;
+use crate::models::VerificationStatus;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -73,8 +75,34 @@ pub struct StaleCheckReport {
     pub stale: Vec<StaleEntry>,
     pub review: Vec<ReviewEntry>,
     pub unreachable: Vec<UnreachableEntry>,
+    /// Citation-level relocation findings (V1).  Empty unless the caller asked
+    /// for a relocation policy other than [`RelocationPolicy::Never`].  Rendered
+    /// on its own line prefixes, disjoint from the `^STALE` contract that the
+    /// machines_conf hooks grep (plan N5).
+    pub relocation: Vec<RelocationEntry>,
     /// Number of input files checked (echoed back in the MCP response).
     pub checked: usize,
+}
+
+/// One evidence row whose citation no longer hashes at its recorded path.
+///
+/// `Relocated` means the excerpt was found at exactly one new location;
+/// `Unverified` means it was not, and `reason` says why.  `Verified` rows are
+/// not reported — there is nothing to act on.
+#[derive(Debug, Clone)]
+pub struct RelocationEntry {
+    pub entry_id: String,
+    pub evidence_id: String,
+    pub status: VerificationStatus,
+    /// The `path:start-end` citation as currently recorded.
+    pub old_path: String,
+    /// Proposed citation, `Some` exactly when `status == Relocated`.
+    pub new_path: Option<String>,
+    /// Machine-readable reason, `Some` exactly when `status == Unverified`.
+    pub reason: Option<&'static str>,
+    /// Whether a `citation_healed` event was written for this row.  Always
+    /// false unless `relocation_autoheal = true` in `kb.toml`.
+    pub healed: bool,
 }
 
 /// Check if KB entries for given files (or commits) are stale.
@@ -84,6 +112,8 @@ pub struct StaleCheckReport {
 ///   REVIEW  — entry was recorded at one of the supplied commit SHAs
 ///   UNKNOWN — entry's recorded version_ref is unreachable from current HEAD
 ///             (deleted branch, garbage-collected commit, orphan-branch KB)
+///   RELOCATED / UNVERIFIED — citation-level relocation findings when
+///             `--relocate` is not `never`
 ///
 /// Two lookup modes (can be combined):
 ///   1. File-based: pass file paths; finds entries whose KB path overlaps
@@ -93,6 +123,10 @@ pub struct StaleCheckReport {
 ///      recorded *at* specific commit SHAs.  With `--blame`, the SHA set
 ///      is "commits that touched the file" (`git log --pretty=%H -- file`),
 ///      not the file's full blame line history.
+///
+/// Relocation is report-only by default. A successful relocation writes a
+/// `citation_healed` event only when `relocation_autoheal = true` in
+/// `kb.toml`.
 #[derive(Command, Debug, Parser)]
 pub struct StaleCheck {
     /// File paths to check for stale KB entries (by path match + git log)
@@ -108,6 +142,32 @@ pub struct StaleCheck {
     /// those commits for review
     #[arg(long, default_value_t = false)]
     pub blame: bool,
+
+    /// How hard to look for citations that moved: `never` (default),
+    /// `file` (search only the cited file), `file-then-repo` (fall back to a
+    /// repo walk). When enabled, emits `RELOCATED` and `UNVERIFIED` lines in
+    /// addition to entry-level `STALE` / `REVIEW` / `UNKNOWN`. Auto-heal
+    /// remains gated by `relocation_autoheal = true` in `kb.toml`.
+    #[arg(long = "relocate", value_enum, default_value_t = RelocateArg::Never)]
+    pub relocate: RelocateArg,
+}
+
+/// CLI spelling of [`RelocationPolicy`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RelocateArg {
+    Never,
+    File,
+    FileThenRepo,
+}
+
+impl From<RelocateArg> for RelocationPolicy {
+    fn from(a: RelocateArg) -> Self {
+        match a {
+            RelocateArg::Never => RelocationPolicy::Never,
+            RelocateArg::File => RelocationPolicy::FileOnly,
+            RelocateArg::FileThenRepo => RelocationPolicy::FileThenRepo,
+        }
+    }
 }
 
 impl Runnable for StaleCheck {
@@ -129,18 +189,76 @@ impl StaleCheck {
         let paths = config::Paths::discover()?;
         let conn = db::open_db(&paths.db)?;
         let repo_root = config::git_repo_root();
+        let policy: RelocationPolicy = self.relocate.into();
 
-        let report = run_stale_check(
+        let mut report = run_stale_check(
             &conn,
             &self.files,
             &self.commits,
             self.blame,
             repo_root.as_deref(),
+            policy,
         )?;
+
+        // P4: relocation computes and reports by default.  Rewriting a citation
+        // is a separate, off-by-default decision, and even then it writes the
+        // path only — never the stored hash.
+        let cfg = config::KbConfig::from_paths(&paths);
+        if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
+            heal_relocations(&paths, &conn, &mut report)?;
+        }
 
         render_cli(&report);
         Ok(())
     }
+}
+
+/// Write one `citation_healed` event per relocated row and apply it.
+///
+/// The event log is the durable substrate (P2/F1): the DB update alone would
+/// not survive `kb rebuild`.  Runs under the same flock as every other writer.
+fn heal_relocations(
+    paths: &config::Paths,
+    conn: &Connection,
+    report: &mut StaleCheckReport,
+) -> anyhow::Result<()> {
+    use crate::commands::add::acquire_lock;
+    use crate::components::embedder::NoopEmbedder;
+    use crate::components::events;
+
+    let version_ref = config::git_head_sha();
+    let _lock = acquire_lock(&paths.lock)?;
+
+    for r in report.relocation.iter_mut() {
+        let new_path = match &r.new_path {
+            Some(p) if r.status == VerificationStatus::Relocated => p.clone(),
+            _ => continue,
+        };
+        // The stored hash is read back and echoed into the event unchanged;
+        // it is audit data, never an input to the UPDATE.
+        let Some(citation_hash): Option<String> = conn
+            .query_row(
+                "SELECT citation_hash FROM evidence WHERE id=?1 AND entry_id=?2",
+                params![r.evidence_id, r.entry_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        let event = events::citation_healed_event(
+            &r.entry_id,
+            &r.evidence_id,
+            &r.old_path,
+            &new_path,
+            &citation_hash,
+            version_ref.as_deref(),
+        );
+        events::append_event(&paths.events, &event)?;
+        db::apply_event(conn, &NoopEmbedder, &event)?;
+        r.healed = true;
+    }
+    Ok(())
 }
 
 /// Shared orchestration for the CLI subcommand and the MCP `kb_stale_check`
@@ -164,12 +282,18 @@ impl StaleCheck {
 /// match (uses `idx_entries_path`) plus a substring fallback (full scan).
 /// Both prepared statements are hoisted out of the file loop so SQLite
 /// statement compilation runs once per call, not once per input file.
+///
+/// The third pass is citation relocation (V1).  It is read-only: it computes
+/// statuses and proposed paths, and never writes.  `relocation` is a required
+/// argument with no default — passing [`RelocationPolicy::Never`] (the only
+/// value that touches no file content) has to be a choice, not an omission.
 pub fn run_stale_check(
     conn: &Connection,
     files: &[String],
     explicit_commits: &[String],
     blame: bool,
     repo_root: Option<&Path>,
+    relocation: RelocationPolicy,
 ) -> anyhow::Result<StaleCheckReport> {
     use std::collections::HashMap;
 
@@ -264,9 +388,9 @@ pub fn run_stale_check(
                 continue;
             }
             let key = (version_ref.clone(), stored_path.clone());
-            let count = *count_cache.entry(key).or_insert_with(|| {
-                commits_since(&version_ref, &stored_path, repo_root)
-            });
+            let count = *count_cache
+                .entry(key)
+                .or_insert_with(|| commits_since(&version_ref, &stored_path, repo_root));
             if let Some(count) = count {
                 if count > 0 {
                     seen_ids.insert(id.clone());
@@ -345,36 +469,146 @@ pub fn run_stale_check(
         }
     }
 
+    // -- Pass 3: citation relocation --
+    if relocation != RelocationPolicy::Never {
+        report.relocation = relocation_pass(conn, &report, repo_root, relocation)?;
+    }
+
     Ok(report)
+}
+
+/// Compute relocation status for every evidence row of every entry already
+/// surfaced by passes 1 and 2.
+///
+/// Scoping to the surfaced entries is what keeps this bounded: a stale-check
+/// over three edited files verifies the citations of the handful of entries
+/// that mention them, not the whole KB.
+fn relocation_pass(
+    conn: &Connection,
+    report: &StaleCheckReport,
+    repo_root: Option<&Path>,
+    policy: RelocationPolicy,
+) -> anyhow::Result<Vec<RelocationEntry>> {
+    let root = match repo_root {
+        Some(r) => r,
+        // Without a repo root there is nothing to hash against, and guessing
+        // one would search an arbitrary directory.
+        None => return Ok(vec![]),
+    };
+
+    let mut entry_ids: Vec<String> = Vec::new();
+    entry_ids.extend(report.stale.iter().map(|e| e.id.clone()));
+    entry_ids.extend(report.review.iter().map(|e| e.id.clone()));
+    entry_ids.extend(report.unreachable.iter().map(|e| e.id.clone()));
+    if entry_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let evidence_map = db::fetch_evidence_for_entries(conn, &entry_ids)?;
+    let mut out = Vec::new();
+    for entry_id in &entry_ids {
+        let rows = match evidence_map.get(entry_id) {
+            Some(r) => r,
+            None => continue,
+        };
+        for ev in rows {
+            let (outcome, malformed_citation) = match verify_evidence(ev, root, policy) {
+                Ok(o) => (o, false),
+                // A malformed citation_path is a data defect, not a reason to
+                // fail the whole stale check or disappear from the report.
+                Err(_) => (
+                    VerificationOutcome {
+                        status: VerificationStatus::Unverified,
+                        relocated_to: None,
+                        reason: None,
+                    },
+                    true,
+                ),
+            };
+            if outcome.status == VerificationStatus::Verified {
+                continue;
+            }
+            out.push(RelocationEntry {
+                entry_id: entry_id.clone(),
+                evidence_id: ev.id.clone(),
+                status: outcome.status,
+                old_path: ev.citation_path.clone().unwrap_or_default(),
+                new_path: outcome.relocated_to,
+                reason: outcome
+                    .reason
+                    .as_ref()
+                    .map(|r| r.as_str())
+                    .or(if malformed_citation {
+                        Some("malformed_citation")
+                    } else {
+                        None
+                    }),
+                healed: false,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Build the CLI's line-oriented rendering of a [`StaleCheckReport`].
+///
+/// Separated from printing so the line contract — which the machines_conf edit
+/// hook greps (`^STALE`) — is assertable in a test.
+fn render_lines(report: &StaleCheckReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for e in &report.stale {
+        let plural = if e.commits_behind == 1 { "" } else { "s" };
+        lines.push(format!(
+            "STALE  [{}] {}  id={}  recorded-at={}  ({} commit{} ago)",
+            e.path, e.summary, e.id, e.version_ref, e.commits_behind, plural
+        ));
+    }
+    for e in &report.review {
+        lines.push(format!(
+            "REVIEW [{}] {}  id={}  recorded-at={}  (matches blame/commit)",
+            e.path, e.summary, e.id, e.version_ref
+        ));
+    }
+    for e in &report.unreachable {
+        lines.push(format!(
+            "UNKNOWN [{}] {}  id={}  recorded-at={}  (version_ref unreachable from HEAD)",
+            e.path, e.summary, e.id, e.version_ref
+        ));
+    }
+    // V1 relocation lines.  Distinct prefixes, deliberately NOT `STALE`: the
+    // machines_conf edit hook greps `^STALE` and must not start seeing
+    // citation-level findings as entry-level staleness (plan N5).
+    for r in &report.relocation {
+        match r.status {
+            VerificationStatus::Relocated => lines.push(format!(
+                "RELOCATED [{}] -> [{}]  id={}  ev={}  ({})",
+                r.old_path,
+                r.new_path.as_deref().unwrap_or("?"),
+                r.entry_id,
+                r.evidence_id,
+                if r.healed { "healed" } else { "report-only" }
+            )),
+            VerificationStatus::Unverified => lines.push(format!(
+                "UNVERIFIED [{}]  id={}  ev={}  reason={}",
+                r.old_path,
+                r.entry_id,
+                r.evidence_id,
+                r.reason.unwrap_or("unknown")
+            )),
+            // Verified rows are filtered out before they reach the report.
+            VerificationStatus::Verified => {}
+        }
+    }
+    if lines.is_empty() {
+        lines.push("ok".to_string());
+    }
+    lines
 }
 
 /// Render a [`StaleCheckReport`] to stdout in the CLI's line-oriented format.
 fn render_cli(report: &StaleCheckReport) {
-    let mut found_any = false;
-    for e in &report.stale {
-        let plural = if e.commits_behind == 1 { "" } else { "s" };
-        println!(
-            "STALE  [{}] {}  id={}  recorded-at={}  ({} commit{} ago)",
-            e.path, e.summary, e.id, e.version_ref, e.commits_behind, plural
-        );
-        found_any = true;
-    }
-    for e in &report.review {
-        println!(
-            "REVIEW [{}] {}  id={}  recorded-at={}  (matches blame/commit)",
-            e.path, e.summary, e.id, e.version_ref
-        );
-        found_any = true;
-    }
-    for e in &report.unreachable {
-        println!(
-            "UNKNOWN [{}] {}  id={}  recorded-at={}  (version_ref unreachable from HEAD)",
-            e.path, e.summary, e.id, e.version_ref
-        );
-        found_any = true;
-    }
-    if !found_any {
-        println!("ok");
+    for line in render_lines(report) {
+        println!("{line}");
     }
 }
 
@@ -430,7 +664,11 @@ pub fn normalize_path(file: &str, repo_root: Option<&Path>) -> String {
     if let Some(root) = repo_root {
         let p = Path::new(file);
         if p.is_absolute() {
-            return p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned();
+            return p
+                .strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
         }
     }
     file.to_string()
@@ -451,7 +689,13 @@ pub fn commits_since(version_ref: &str, path: &str, repo_root: Option<&Path>) ->
     if let Some(root) = repo_root {
         cmd.arg("-C").arg(root);
     }
-    cmd.args(["rev-list", "--count", &format!("{version_ref}..HEAD"), "--", path]);
+    cmd.args([
+        "rev-list",
+        "--count",
+        &format!("{version_ref}..HEAD"),
+        "--",
+        path,
+    ]);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
@@ -503,10 +747,10 @@ mod tests {
     #[test]
     fn parse_log_hashes_rejects_malformed_lines() {
         let blob = concat!(
-            "a1b2c3d4e5f6789012345678901234567890abcd\n",        // ok
-            "TOOSHORT\n",                                         // wrong length
+            "a1b2c3d4e5f6789012345678901234567890abcd\n", // ok
+            "TOOSHORT\n",                                 // wrong length
             "a1b2c3d4e5f6789012345678901234567890abcd abc def\n", // trailing junk
-            "ZZb2c3d4e5f6789012345678901234567890abcd\n",        // non-hex
+            "ZZb2c3d4e5f6789012345678901234567890abcd\n", // non-hex
         )
         .as_bytes();
         let shas = parse_log_hashes(blob);
@@ -606,7 +850,12 @@ mod tests {
         git(dir, &["add", "foo.rs"]);
         git(dir, &["commit", "-q", "-m", "c1"]);
         let c1 = String::from_utf8(
-            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -676,6 +925,7 @@ mod tests {
             &[],
             false,
             Some(dir),
+            RelocationPolicy::Never,
         )
         .unwrap();
 
@@ -714,10 +964,11 @@ mod tests {
 
         let report = run_stale_check(
             &conn,
-            &[],                          // no files — Pass 2 only
-            &[ghost.to_string()],         // explicit unreachable commit
+            &[],                  // no files — Pass 2 only
+            &[ghost.to_string()], // explicit unreachable commit
             false,
             Some(dir),
+            RelocationPolicy::Never,
         )
         .unwrap();
 
@@ -740,7 +991,12 @@ mod tests {
         git(dir, &["add", "seed.rs"]);
         git(dir, &["commit", "-q", "-m", "seed"]);
         let head = String::from_utf8(
-            Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout,
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
         )
         .unwrap()
         .trim()
@@ -760,6 +1016,7 @@ mod tests {
             &[],
             false,
             Some(dir),
+            RelocationPolicy::Never,
         )
         .unwrap();
 
@@ -831,6 +1088,7 @@ mod tests {
                     &[],
                     false,
                     None,
+                    RelocationPolicy::Never,
                 )
                 .expect("run_stale_check");
 
@@ -870,5 +1128,255 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- V1 relocation surface --
+
+    fn relocation_entry(status: VerificationStatus) -> RelocationEntry {
+        RelocationEntry {
+            entry_id: "entry-1".to_string(),
+            evidence_id: "ev-1".to_string(),
+            status,
+            old_path: "src/old.rs:0-66".to_string(),
+            new_path: Some("src/new.rs:11-77".to_string()),
+            reason: Some("non_unique"),
+            healed: false,
+        }
+    }
+
+    /// The `^STALE` grep contract the machines_conf edit hook depends on (plan
+    /// N5) must not start matching citation-level relocation findings.
+    #[test]
+    fn relocation_lines_never_match_the_stale_contract() {
+        let report = StaleCheckReport {
+            stale: vec![StaleEntry {
+                id: "e1".to_string(),
+                path: "src/a.rs".to_string(),
+                summary: "sum".to_string(),
+                version_ref: "abc".to_string(),
+                commits_behind: 2,
+            }],
+            relocation: vec![
+                relocation_entry(VerificationStatus::Relocated),
+                relocation_entry(VerificationStatus::Unverified),
+            ],
+            ..Default::default()
+        };
+
+        let lines = render_lines(&report);
+        let stale_lines: Vec<&String> = lines.iter().filter(|l| l.starts_with("STALE")).collect();
+        assert_eq!(
+            stale_lines.len(),
+            1,
+            "exactly the one real stale entry may match ^STALE: {lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("RELOCATED [src/old.rs:0-66] -> [src/new.rs:11-77]")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("UNVERIFIED") && l.contains("reason=non_unique")));
+    }
+
+    /// A report-only relocation says so; the heal marker is not cosmetic.
+    #[test]
+    fn relocation_line_distinguishes_healed_from_report_only() {
+        let mut e = relocation_entry(VerificationStatus::Relocated);
+        let report_only = render_lines(&StaleCheckReport {
+            relocation: vec![e.clone()],
+            ..Default::default()
+        });
+        assert!(report_only[0].ends_with("(report-only)"), "{report_only:?}");
+
+        e.healed = true;
+        let healed = render_lines(&StaleCheckReport {
+            relocation: vec![e],
+            ..Default::default()
+        });
+        assert!(healed[0].ends_with("(healed)"), "{healed:?}");
+    }
+
+    #[test]
+    fn heal_relocations_skips_missing_evidence_rows_and_keeps_renderable_report() {
+        use crate::components::events;
+        use crate::config::Paths;
+        use rusqlite::params;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(dir.path());
+        let conn = db::open_db_memory().unwrap();
+
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", "deadbeef"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
+            params![
+                "ev-live",
+                "e1",
+                "seed.rs:0-10",
+                "sha256:live",
+                Some("strong excerpt")
+            ],
+        )
+        .unwrap();
+
+        let mut report = StaleCheckReport {
+            relocation: vec![
+                RelocationEntry {
+                    entry_id: "e1".to_string(),
+                    evidence_id: "ev-missing".to_string(),
+                    status: VerificationStatus::Relocated,
+                    old_path: "seed.rs:10-20".to_string(),
+                    new_path: Some("seed.rs:30-40".to_string()),
+                    reason: None,
+                    healed: false,
+                },
+                RelocationEntry {
+                    entry_id: "e1".to_string(),
+                    evidence_id: "ev-live".to_string(),
+                    status: VerificationStatus::Relocated,
+                    old_path: "seed.rs:0-10".to_string(),
+                    new_path: Some("seed.rs:20-30".to_string()),
+                    reason: None,
+                    healed: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        heal_relocations(&paths, &conn, &mut report).unwrap();
+
+        assert!(!report.relocation[0].healed, "missing rows are skipped");
+        assert!(report.relocation[1].healed, "remaining rows still heal");
+
+        let lines = render_lines(&report);
+        assert!(lines.iter().any(|l| l.contains("seed.rs:10-20") && l.ends_with("(report-only)")));
+        assert!(lines.iter().any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
+
+        let events = events::read_events(&paths.events).unwrap();
+        assert_eq!(events.len(), 1, "only the surviving heal is appended");
+
+        let healed_path: String = conn
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id=?1 AND entry_id=?2",
+                params!["ev-live", "e1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healed_path, "seed.rs:20-30");
+    }
+
+    #[test]
+    fn run_stale_check_reports_malformed_citation_as_unverified() {
+        use crate::components::db::open_db_memory;
+        use rusqlite::params;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("seed.rs"), "fn seed() {}\n").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+        let head = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::fs::write(dir.join("seed.rs"), "fn seed() {}\nfn changed() {}\n").unwrap();
+        git(dir, &["add", "seed.rs"]);
+        git(dir, &["commit", "-q", "-m", "change seed"]);
+
+        let conn = open_db_memory().unwrap();
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", &head],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
+            params![
+                "ev-malformed",
+                "e1",
+                "seed.rs:not-a-range",
+                "sha256:deadbeef",
+                Some("fn seed() {}")
+            ],
+        )
+        .unwrap();
+
+        let report = run_stale_check(
+            &conn,
+            &["seed.rs".to_string()],
+            &[],
+            false,
+            Some(dir),
+            RelocationPolicy::FileOnly,
+        )
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1, "fixture must surface entry in pass 1");
+        assert_eq!(report.relocation.len(), 1, "malformed row must not vanish");
+        let row = &report.relocation[0];
+        assert_eq!(row.entry_id, "e1");
+        assert_eq!(row.evidence_id, "ev-malformed");
+        assert_eq!(row.status, VerificationStatus::Unverified);
+        assert_eq!(row.reason, Some("malformed_citation"));
+
+        let lines = render_lines(&report);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("UNVERIFIED [seed.rs:not-a-range]")
+                && l.contains("reason=malformed_citation")));
+    }
+
+    /// `--relocate never` (the default) runs no relocation pass at all.
+    #[test]
+    fn never_policy_leaves_the_relocation_bucket_empty() {
+        let dir = TempDir::new().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let conn = db::open_db_memory().unwrap();
+        let report = run_stale_check(
+            &conn,
+            &["seed.rs".to_string()],
+            &[],
+            false,
+            Some(dir.path()),
+            RelocationPolicy::Never,
+        )
+        .unwrap();
+        assert!(report.relocation.is_empty());
+    }
+
+    /// The CLI enum maps onto the engine's policy without a default.
+    #[test]
+    fn relocate_arg_maps_onto_policy() {
+        assert_eq!(
+            RelocationPolicy::from(RelocateArg::Never),
+            RelocationPolicy::Never
+        );
+        assert_eq!(
+            RelocationPolicy::from(RelocateArg::File),
+            RelocationPolicy::FileOnly
+        );
+        assert_eq!(
+            RelocationPolicy::from(RelocateArg::FileThenRepo),
+            RelocationPolicy::FileThenRepo
+        );
     }
 }

@@ -37,6 +37,35 @@ pub fn evidence_add_event(
     })
 }
 
+/// Build a `citation_healed` event payload — the durable record of a citation
+/// that was repointed after a relocation search.
+///
+/// The event carries `citation_hash` for audit only: it is the UNCHANGED hash
+/// recorded at `kb_add`, and `apply_event` never writes it. Relocation status
+/// is computed at read time, so this event — not any row — is the trace of what
+/// moved where (plan §6 S1 residual, spec `StoredHashImmutable`).
+pub fn citation_healed_event(
+    entry_id: &str,
+    evidence_id: &str,
+    old_path: &str,
+    new_path: &str,
+    citation_hash: &str,
+    version_ref: Option<&str>,
+) -> serde_json::Value {
+    let ts = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "action": "citation_healed",
+        "table": "evidence",
+        "entry_id": entry_id,
+        "evidence_id": evidence_id,
+        "old_path": old_path,
+        "new_path": new_path,
+        "citation_hash": citation_hash,
+        "version_ref": version_ref,
+        "ts": ts,
+    })
+}
+
 /// Build an `evidence_expire` event payload.
 pub fn evidence_expire_event(entry_id: &str, evidence_id: &str, reason: &str) -> serde_json::Value {
     let ts = chrono::Utc::now().to_rfc3339();

@@ -57,10 +57,7 @@ impl Expire {
                 .optional()
                 .unwrap_or(None);
             if permanent == Some(1) {
-                anyhow::bail!(
-                    "entry '{}' is permanent; use --force to expire it",
-                    self.id
-                );
+                anyhow::bail!("entry '{}' is permanent; use --force to expire it", self.id);
             }
         }
 
@@ -113,10 +110,10 @@ mod tests {
             id: Some("expire-test-1".to_string()),
             permanent: false,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -156,10 +153,10 @@ mod tests {
             id: Some("perm-expire-1".to_string()),
             permanent: true,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
@@ -169,7 +166,10 @@ mod tests {
             force: false,
         };
         let result = expire_cmd.execute_with(&paths, &embedder);
-        assert!(result.is_err(), "expire without --force must fail for permanent entry");
+        assert!(
+            result.is_err(),
+            "expire without --force must fail for permanent entry"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("permanent"), "error must mention 'permanent'");
     }
@@ -191,10 +191,10 @@ mod tests {
             id: Some("perm-expire-2".to_string()),
             permanent: true,
             replace_path: false,
-                kind: "convention".to_string(),
-                evidence: vec![],
-                evidence_file: None,
-                cues: vec![],
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
         };
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
