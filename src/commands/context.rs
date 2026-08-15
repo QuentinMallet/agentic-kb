@@ -3,7 +3,7 @@
 //! Token counts use the deliberately simple heuristic `ceil(UTF-8 bytes / 4)`.
 //! Entries are indivisible: the selector never truncates content to meet a budget.
 
-use crate::components::{db, embedder::Embedder};
+use crate::components::{db, embedder::Embedder, query_hits};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -39,6 +39,7 @@ struct Candidate {
     tokens: usize,
     score: f32,
     has_signal: bool,
+    cited_file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +86,13 @@ impl Context {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         render(&selected, self.json, &mut out)?;
+        if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
+            let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+            let injected: Vec<_> = selected.entries.iter()
+                .map(|entry| (entry.id.clone(), entry.cited_file.clone()))
+                .collect();
+            query_hits::record_injection(&paths.query_hits, &session_id, &injected, &surface);
+        }
         eprintln!(
             "context: entries considered/selected: {}/{}; tokens emitted/budget: {}/{}",
             selected.considered, selected.entries.len(), spent, self.budget
@@ -163,7 +171,7 @@ fn build_candidates(
             .collect()
     };
 
-    let mut evidence: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut evidence: HashMap<String, (usize, usize, Option<String>)> = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT ev.entry_id, ev.citation_path FROM evidence ev \
          JOIN entries e ON e.id=ev.entry_id WHERE e.is_stale=0 AND ev.citation_path IS NOT NULL"
@@ -172,6 +180,9 @@ fn build_candidates(
         let (id, path) = row?;
         let counts = evidence.entry(id).or_default();
         counts.1 += 1;
+        if counts.2.is_none() {
+            counts.2 = Some(citation_file(&path).to_owned());
+        }
         if working_set.contains(citation_file(&path)) {
             counts.0 += 1;
         }
@@ -190,7 +201,7 @@ fn build_candidates(
     let mut out = Vec::new();
     for row in rows {
         let (id, path, summary, content) = row?;
-        let (matching, total) = evidence.get(&id).copied().unwrap_or_default();
+        let (matching, total, cited_file) = evidence.get(&id).cloned().unwrap_or_default();
         let overlap = if total == 0 {
             0.0
         } else {
@@ -208,6 +219,7 @@ fn build_candidates(
             rendered,
             score: overlap + fts,
             has_signal: overlap > 0.0 || fts > 0.0,
+            cited_file,
         });
     }
     Ok(out)
@@ -336,6 +348,7 @@ mod tests {
             rendered,
             score,
             has_signal: signal,
+            cited_file: None,
         }
     }
 
@@ -420,7 +433,7 @@ mod tests {
         fn emitted_multibyte_chunks_are_utf8_valid(chars in prop::collection::vec(prop_oneof![Just('é'), Just('界'), Just('🦀')], 1..30)) {
             let content: String = chars.into_iter().collect();
             let rendered = entry_text("utf8", "résumé", &content);
-            let input = vec![Candidate { id: "utf8".into(), path: "p".into(), summary: "résumé".into(), tokens: approx_tokens(&rendered), rendered, score: 1.0, has_signal: true }];
+            let input = vec![Candidate { id: "utf8".into(), path: "p".into(), summary: "résumé".into(), tokens: approx_tokens(&rendered), rendered, score: 1.0, has_signal: true, cited_file: None }];
             let (selected, _) = greedy_select(input, usize::MAX, None);
             for entry in selected.entries { prop_assert!(String::from_utf8(entry.rendered.into_bytes()).is_ok()); }
         }

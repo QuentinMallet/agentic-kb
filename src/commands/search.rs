@@ -1,6 +1,6 @@
 //! `search` subcommand
 
-use crate::components::db;
+use crate::components::{db, query_hits};
 use crate::components::embedder;
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -211,7 +211,26 @@ impl Search {
             }
         }
 
+        if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
+            let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+            let injected: Vec<_> = results.iter().map(|entry| {
+                let cited_file = entry.evidence.iter().find_map(|ev| ev.citation_path.as_deref())
+                    .map(citation_file_component);
+                (entry.id.clone(), cited_file)
+            }).collect();
+            query_hits::record_injection(&paths.query_hits, &session_id, &injected, &surface);
+        }
+
         Ok(())
+    }
+}
+
+fn citation_file_component(path: &str) -> String {
+    let Some((file, suffix)) = path.rsplit_once(':') else { return path.to_owned(); };
+    if suffix.split('-').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())) {
+        file.to_owned()
+    } else {
+        path.to_owned()
     }
 }
 

@@ -294,6 +294,20 @@ fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
     let ids: Vec<String> = results.iter().map(|entry| entry.id.clone()).collect();
     let surface = std::env::var("KB_INJECTION_SOURCE").unwrap_or_else(|_| "unknown".into());
     query_hits::record_hits(&paths.query_hits, &ids, &surface);
+    let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+    let injections: Vec<_> = results.iter().map(|entry| {
+        let cited_file = entry.evidence.iter().find_map(|e| e.citation_path.as_deref())
+            .map(|path| {
+                let Some((file, suffix)) = path.rsplit_once(':') else { return path.to_owned(); };
+                if suffix.split('-').all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())) {
+                    file.to_owned()
+                } else {
+                    path.to_owned()
+                }
+            });
+        (entry.id.clone(), cited_file)
+    }).collect();
+    query_hits::record_injection(&paths.query_hits, &session_id, &injections, &surface);
 }
 
 /// Serialize SearchEntry rows to the MCP wire shape (shared by search and
@@ -1404,14 +1418,18 @@ fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
         "arm": r.get::<_,String>(0)?, "n": r.get::<_,i64>(1)?, "precision": r.get::<_,f64>(2)?
     }))).ok().map(|rows| rows.filter_map(Result::ok).collect())).unwrap_or_default();
 
-    json!({
+    let mut report = json!({
         "id": id,
         "type": "result",
         "per_kind_session_precision": per_kind_session,
         "last_run_at": last_run_at,
         "total_runs": total_runs,
         "per_arm_precision": per_arm,
-    })
+    });
+    if let Some(telemetry) = query_hits::injection_telemetry(&paths.query_hits) {
+        report["injection_telemetry"] = serde_json::to_value(telemetry).unwrap_or(Value::Null);
+    }
+    report
 }
 
 fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
@@ -1806,6 +1824,9 @@ mod tests {
         assert!(meta.get("db_rebuilt_at").is_some());
         assert!(meta.get("events_head_at").is_some());
         assert!(meta.get("stale_warning").is_some());
+        let telemetry = query_hits::injection_telemetry(&paths.query_hits).unwrap();
+        assert!(telemetry.total_injections > 0);
+        assert_eq!(telemetry.unknown_surface_rate, 1.0);
     }
 
     #[test]
@@ -3000,6 +3021,30 @@ mod tests {
         assert_eq!(resp["per_kind_session_precision"].as_array().unwrap().len(), 0);
         assert!(resp["last_run_at"].is_null());
         assert_eq!(resp["total_runs"], 0);
+        assert!(resp.get("injection_telemetry").is_none());
+    }
+
+    #[test]
+    fn test_handle_audit_report_includes_injection_telemetry() {
+        let (_dir, paths, _emb) = setup();
+        query_hits::record_injection(
+            &paths.query_hits,
+            "report-session",
+            &[("entry-a".into(), Some("src/a.rs".into())), ("entry-b".into(), None)],
+            "hook",
+        );
+        query_hits::record_acted_on(
+            &paths.query_hits,
+            "report-session",
+            br#"{"type":"tool_use","input":{"file_path":"src/a.rs"}}"#,
+        );
+        let resp = handle_audit_report(&json!(null), &paths);
+        let telemetry = &resp["injection_telemetry"];
+        assert_eq!(telemetry["total_injections"], 2);
+        assert_eq!(telemetry["acted_on_rate"], 0.5);
+        assert_eq!(telemetry["unknown_surface_rate"], 0.0);
+        assert_eq!(telemetry["per_surface"]["hook"]["count"], 2);
+        assert_eq!(telemetry["per_surface"]["hook"]["acted_on_rate"], 0.5);
     }
 
     #[test]

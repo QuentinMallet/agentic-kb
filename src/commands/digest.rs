@@ -2,7 +2,7 @@
 
 use crate::commands::add::read_omc_session;
 use crate::commands::add_validation::compute_evidence_status_write;
-use crate::components::{embedder::NoopEmbedder, kb_core, redactor, transcript_state::TranscriptState};
+use crate::components::{embedder::NoopEmbedder, kb_core, query_hits, redactor, transcript_state::TranscriptState};
 use crate::config;
 use anyhow::{Context, Result};
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -102,6 +102,7 @@ pub fn digest_session(
     if let Ok(existing_hash) = read_digest_hash(paths, &kb_path) {
         if existing_hash == digest_hash {
             // Content unchanged — advance offset then skip KB write.
+            query_hits::record_acted_on(&paths.query_hits, session_id, unread);
             let current_offset = ts_state.offset(transcript_path).unwrap_or(0);
             if new_offset > current_offset {
                 ts_state.advance(transcript_path, new_offset)?;
@@ -151,6 +152,9 @@ pub fn digest_session(
             cues: vec![],
         },
     )?;
+
+    // Telemetry consumes the same unread bytes. Offset advancement remains last.
+    query_hits::record_acted_on(&paths.query_hits, session_id, unread);
 
     // LAST step — crash before here re-queues turns on next run.
     ts_state.advance(transcript_path, new_offset)?;
