@@ -95,7 +95,7 @@
             hasCargoLock = builtins.pathExists ./Cargo.lock;
             apiDocs = platform.buildRustPackage {
               name = "package-rustdoc";
-              dontCheck = true;
+              doCheck = false;
               nativeBuildInputs = with pkgs; [ pkg-config cmake ];
               buildInputs = with pkgs; [ openssl ];
               OPENSSL_NO_VENDOR = "1";
