@@ -3,196 +3,308 @@
   RebuildSwap.tla -- phased rebuild/swap protocol
   =================================================
 
-  Empirical motivation (2026-08-15 rebuild-contention benchmark): the Phase-3
-  write-lock hold was 2432 ms.  Catch-up replay consumed 2431.99 ms, while the
-  rename plus WAL/SHM unlink operations consumed about 0.15 ms combined.
+  This module models the CURRENT protocol.  In Phase 3 the lock is held for an
+  O(full log) parse, a fixed tmp-DB open/configure cost, and one unit for every
+  backlog event.  LockedWorkBounded makes that cost executable.  The default
+  RebuildSwap.cfg uses LockBudget = 7 and passes; LockBudget = 6 fails.  Making
+  the current small model pass at 6 is the contention-fix target.
 
-  This module models the CURRENT protocol.  A future fix must preserve
-  invariants 1-4 below while improving invariant 5: Phase-3 work must remain a
-  function only of the events accumulated in the lock-free Phase 2 backlog.
+  RebuildSwap.cfg disables compaction and is expected to be green.
+  RebuildSwap_compact.cfg enables compaction and is EXPECTED to violate
+  SnapshotIndexRemainsValid, reproducing bd-3mr.9 (the snapshot_len.min clamp
+  silently treats an index from the old log as an index into the replacement).
 
-  This refines InnerGap's atomic Safety_Rebuild_Restores by exposing Snapshot
-  (P1, locked), Replay (P2, lock-free), and CatchUp+Swap (P3, locked).
-  Events are unique natural-number tokens, so materialization is simply the set
-  of tokens in a log prefix.  MaxEvents and MaxWriters keep TLC's model tiny.
+  This refines InnerGap's order-sensitive FoldLog: events have an id and a kind;
+  upsert adds the id, expire removes it, and the last write wins.  Applied log
+  indices expose duplicate and out-of-order replay across P2 and P3.
+
+  I3/I4 residuals (deliberately outside this state machine): db = {} at Snapshot
+  means creation of a fresh TMP DB; the live DB continues serving readers and no
+  reader agent is modeled.  Fresh-DB/swap behavior is covered by the M2
+  rebuild-swap regression test.  WAL/SHM and file-identity behavior is covered by
+  that regression test and bd-3mr.9; lock-duration realism is covered by the
+  rebuild-contention artifact.
+
+  MaxEvents, MaxWriters, and EntryIds keep TLC's state space finite and small.
 *)
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS MaxEvents, MaxWriters
+CONSTANTS EntryIds, MaxEvents, MaxWriters, OpenTmpCost, LockBudget, EnableCompact
 
 NoLock == "None"
 RebuildLock == "Rebuild"
 Writers == {"w" \o ToString(i) : i \in 1..MaxWriters}
 LockOwners == {NoLock, RebuildLock} \union Writers
 Phases == {"Idle", "P1", "P2", "P3", "Done"}
+P3Stages == {"None", "FullLogParse", "OpenTmpDb", "CatchUp", "Ready"}
+Event == [kind : {"upsert", "expire"}, id : EntryIds]
 
 VARIABLES
-  jsonl,       \* durable sequence of appended event tokens
-  db,          \* live DB in Idle; rebuild candidate after Snapshot
-  snapshotAt,  \* length of JSONL captured under the P1 lock
-  replayed,    \* number of snapshot events replayed into the candidate
-  lockHolder,  \* NoLock, RebuildLock, or one writer id
-  phase,
-  backlog,     \* events appended during P2 and awaiting P3 catch-up
-  wantsWrite,  \* writers that currently want to append
-  swapAt,      \* JSONL length frozen on entry to P3
-  p3Initial,   \* backlog size on entry to P3
-  p3Applied    \* number of backlog events applied under the P3 lock
+  jsonl, snapshotAt, snapshotGeneration, logGeneration,
+  db, replayed, appliedIndices,
+  lockHolder, phase, p3Stage, wantsWrite, writerAppended, pendingEvent,
+  swapAt, p3Initial, p3Applied, lockedWork
 
-vars == << jsonl, db, snapshotAt, replayed, lockHolder, phase,
-           backlog, wantsWrite, swapAt, p3Initial, p3Applied >>
+vars == << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+           db, replayed, appliedIndices,
+           lockHolder, phase, p3Stage, wantsWrite, writerAppended, pendingEvent,
+           swapAt, p3Initial, p3Applied, lockedWork >>
 
 Prefix(log, n) == SubSeq(log, 1, n)
-Materialize(log) == {log[i] : i \in 1..Len(log)}
+
+ApplyEvent(live, ev) ==
+  IF ev.kind = "upsert" THEN live \union {ev.id} ELSE live \ {ev.id}
+
+RECURSIVE FoldLog(_, _)
+FoldLog(log, live) ==
+  IF log = << >>
+  THEN live
+  ELSE FoldLog(Tail(log), ApplyEvent(live, Head(log)))
+
+Materialize(log) == FoldLog(log, {})
 
 TypeOK ==
-  /\ jsonl \in Seq(1..MaxEvents)
+  /\ jsonl \in Seq(Event)
   /\ Len(jsonl) <= MaxEvents
-  /\ db \subseteq 1..MaxEvents
   /\ snapshotAt \in 0..MaxEvents
+  /\ snapshotGeneration \in Nat
+  /\ logGeneration \in Nat
+  /\ db \subseteq EntryIds
   /\ replayed \in 0..MaxEvents
+  /\ appliedIndices \in Seq(1..MaxEvents)
+  /\ Len(appliedIndices) <= MaxEvents
   /\ lockHolder \in LockOwners
   /\ phase \in Phases
-  /\ backlog \in Seq(1..MaxEvents)
-  /\ Len(backlog) <= MaxEvents
+  /\ p3Stage \in P3Stages
   /\ wantsWrite \subseteq Writers
+  /\ writerAppended \subseteq Writers
+  /\ pendingEvent \in [Writers -> Event]
   /\ swapAt \in 0..MaxEvents
   /\ p3Initial \in 0..MaxEvents
   /\ p3Applied \in 0..MaxEvents
+  /\ lockedWork \in Nat
 
 Init ==
   /\ jsonl = << >>
-  /\ db = {}
   /\ snapshotAt = 0
+  /\ snapshotGeneration = 0
+  /\ logGeneration = 0
+  /\ db = {}
   /\ replayed = 0
+  /\ appliedIndices = << >>
   /\ lockHolder = NoLock
   /\ phase = "Idle"
-  /\ backlog = << >>
+  /\ p3Stage = "None"
   /\ wantsWrite = {}
+  /\ writerAppended = {}
+  /\ pendingEvent \in [Writers -> Event]
   /\ swapAt = 0
   /\ p3Initial = 0
   /\ p3Applied = 0
+  /\ lockedWork = 0
 
-WantWrite(w) ==
+WantWrite(w, ev) ==
   /\ w \in Writers
   /\ w \notin wantsWrite
   /\ Len(jsonl) < MaxEvents
   /\ wantsWrite' = wantsWrite \union {w}
-  /\ UNCHANGED << jsonl, db, snapshotAt, replayed, lockHolder, phase,
-                  backlog, swapAt, p3Initial, p3Applied >>
+  /\ pendingEvent' = [pendingEvent EXCEPT ![w] = ev]
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, lockHolder, phase, p3Stage, writerAppended,
+                  swapAt, p3Initial, p3Applied, lockedWork >>
 
-\* Lock acquisition and the append are one atomic writer-path step. Thus every
-\* requesting writer is enabled in P2 whenever capacity remains; lock owners
-\* remain type-uniform strings to keep TLC comparisons fingerprintable.
-AppendWriter(w) ==
+AcquireWriterLock(w) ==
   /\ w \in wantsWrite
   /\ lockHolder = NoLock
   /\ phase \in {"Idle", "P2"}
   /\ Len(jsonl) < MaxEvents
-  /\ LET ev == Len(jsonl) + 1 IN
-       /\ jsonl' = Append(jsonl, ev)
-       /\ db' = IF phase = "Idle" THEN db \union {ev} ELSE db
-       /\ backlog' = IF phase = "P2" THEN Append(backlog, ev) ELSE backlog
+  /\ w \notin writerAppended
+  /\ lockHolder' = w
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, phase, p3Stage, wantsWrite, writerAppended,
+                  pendingEvent, swapAt, p3Initial, p3Applied, lockedWork >>
+
+AppendWriter(w) ==
+  /\ lockHolder = w
+  /\ w \in wantsWrite
+  /\ w \notin writerAppended
+  /\ Len(jsonl) < MaxEvents
+  /\ jsonl' = Append(jsonl, pendingEvent[w])
+  /\ db' = IF phase = "Idle" THEN ApplyEvent(db, pendingEvent[w]) ELSE db
+  /\ writerAppended' = writerAppended \union {w}
+  /\ UNCHANGED << snapshotAt, snapshotGeneration, logGeneration,
+                  replayed, appliedIndices, lockHolder, phase, p3Stage,
+                  wantsWrite, pendingEvent, swapAt, p3Initial, p3Applied,
+                  lockedWork >>
+
+ReleaseWriterLock(w) ==
+  /\ lockHolder = w
+  /\ w \in wantsWrite
+  /\ w \in writerAppended
   /\ lockHolder' = NoLock
   /\ wantsWrite' = wantsWrite \ {w}
-  /\ UNCHANGED << snapshotAt, replayed, phase, swapAt,
-                  p3Initial, p3Applied >>
+  /\ writerAppended' = writerAppended \ {w}
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, phase, p3Stage, pendingEvent,
+                  swapAt, p3Initial, p3Applied, lockedWork >>
 
 BeginRebuild ==
   /\ phase = "Idle"
   /\ lockHolder = NoLock
   /\ phase' = "P1"
   /\ lockHolder' = RebuildLock
-  /\ UNCHANGED << jsonl, db, snapshotAt, replayed, backlog, wantsWrite,
-                  swapAt, p3Initial, p3Applied >>
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, p3Stage, wantsWrite, writerAppended,
+                  pendingEvent, swapAt, p3Initial, p3Applied, lockedWork >>
 
 Snapshot ==
   /\ phase = "P1"
   /\ lockHolder = RebuildLock
   /\ snapshotAt' = Len(jsonl)
+  /\ snapshotGeneration' = logGeneration
   /\ replayed' = 0
+  /\ appliedIndices' = << >>
   /\ db' = {}
-  /\ backlog' = << >>
   /\ phase' = "P2"
   /\ lockHolder' = NoLock
+  /\ p3Stage' = "None"
+  /\ swapAt' = 0
   /\ p3Initial' = 0
   /\ p3Applied' = 0
-  /\ UNCHANGED << jsonl, wantsWrite, swapAt >>
+  /\ lockedWork' = 0
+  /\ UNCHANGED << jsonl, logGeneration, wantsWrite, writerAppended, pendingEvent >>
 
 ReplayOne ==
   /\ phase = "P2"
   /\ replayed < snapshotAt
+  /\ replayed < Len(jsonl)
   /\ replayed' = replayed + 1
-  /\ db' = db \union {jsonl[replayed + 1]}
-  /\ UNCHANGED << jsonl, snapshotAt, lockHolder, phase, backlog,
-                  wantsWrite, swapAt, p3Initial, p3Applied >>
+  /\ db' = ApplyEvent(db, jsonl[replayed + 1])
+  /\ appliedIndices' = Append(appliedIndices, replayed + 1)
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  lockHolder, phase, p3Stage, wantsWrite, writerAppended, pendingEvent,
+                  swapAt, p3Initial, p3Applied, lockedWork >>
 
 EnterCatchUp ==
   /\ phase = "P2"
   /\ replayed = snapshotAt
   /\ lockHolder = NoLock
   /\ phase' = "P3"
+  /\ p3Stage' = "FullLogParse"
   /\ lockHolder' = RebuildLock
   /\ swapAt' = Len(jsonl)
-  /\ p3Initial' = Len(backlog)
+  /\ p3Initial' = Len(jsonl) - snapshotAt
   /\ p3Applied' = 0
-  /\ UNCHANGED << jsonl, db, snapshotAt, replayed, backlog, wantsWrite >>
+  /\ lockedWork' = 0
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, wantsWrite, writerAppended, pendingEvent >>
+
+FullLogParse ==
+  /\ phase = "P3"
+  /\ lockHolder = RebuildLock
+  /\ p3Stage = "FullLogParse"
+  /\ lockedWork' = lockedWork + Len(jsonl)
+  /\ p3Stage' = "OpenTmpDb"
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, lockHolder, phase, wantsWrite, writerAppended,
+                  pendingEvent, swapAt, p3Initial, p3Applied >>
+
+OpenTmpDb ==
+  /\ phase = "P3"
+  /\ lockHolder = RebuildLock
+  /\ p3Stage = "OpenTmpDb"
+  /\ lockedWork' = lockedWork + OpenTmpCost
+  /\ p3Stage' = IF p3Initial = 0 THEN "Ready" ELSE "CatchUp"
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, lockHolder, phase, wantsWrite, writerAppended,
+                  pendingEvent, swapAt, p3Initial, p3Applied >>
 
 CatchUpOne ==
   /\ phase = "P3"
   /\ lockHolder = RebuildLock
+  /\ p3Stage = "CatchUp"
   /\ p3Applied < p3Initial
+  /\ LET idx == snapshotAt + p3Applied + 1 IN
+       /\ db' = ApplyEvent(db, jsonl[idx])
+       /\ appliedIndices' = Append(appliedIndices, idx)
   /\ p3Applied' = p3Applied + 1
-  /\ db' = db \union {backlog[p3Applied + 1]}
-  /\ UNCHANGED << jsonl, snapshotAt, replayed, lockHolder, phase,
-                  backlog, wantsWrite, swapAt, p3Initial >>
+  /\ lockedWork' = lockedWork + 1
+  /\ p3Stage' = IF p3Applied + 1 = p3Initial THEN "Ready" ELSE "CatchUp"
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  replayed, lockHolder, phase, wantsWrite, writerAppended, pendingEvent,
+                  swapAt, p3Initial >>
 
 Swap ==
   /\ phase = "P3"
   /\ lockHolder = RebuildLock
-  /\ p3Applied = p3Initial
+  /\ p3Stage = "Ready"
   /\ phase' = "Done"
+  /\ p3Stage' = "None"
   /\ lockHolder' = NoLock
-  /\ UNCHANGED << jsonl, db, snapshotAt, replayed, backlog, wantsWrite,
-                  swapAt, p3Initial, p3Applied >>
+  /\ UNCHANGED << jsonl, snapshotAt, snapshotGeneration, logGeneration,
+                  db, replayed, appliedIndices, wantsWrite, writerAppended, pendingEvent,
+                  swapAt, p3Initial, p3Applied, lockedWork >>
+
+(* Compact holds the same flock and atomically installs a shorter prefix whose
+   fold is equivalent to the old log.  Its replacement has a new generation. *)
+Compact(n) ==
+  /\ EnableCompact
+  /\ phase = "P2"
+  /\ lockHolder = NoLock
+  /\ Len(jsonl) > 0
+  /\ n \in 0..MaxEvents
+  /\ n < Len(jsonl)
+  /\ Materialize(Prefix(jsonl, n)) = Materialize(jsonl)
+  /\ jsonl' = Prefix(jsonl, n)
+  /\ logGeneration' = logGeneration + 1
+  /\ UNCHANGED << snapshotAt, snapshotGeneration, db, replayed,
+                  appliedIndices, lockHolder, phase, p3Stage, wantsWrite, writerAppended,
+                  pendingEvent, swapAt, p3Initial, p3Applied, lockedWork >>
 
 Next ==
-  \/ \E w \in Writers : WantWrite(w)
+  \/ \E w \in Writers, ev \in Event : WantWrite(w, ev)
+  \/ \E w \in Writers : AcquireWriterLock(w)
   \/ \E w \in Writers : AppendWriter(w)
+  \/ \E w \in Writers : ReleaseWriterLock(w)
   \/ BeginRebuild
   \/ Snapshot
   \/ ReplayOne
   \/ EnterCatchUp
+  \/ FullLogParse
+  \/ OpenTmpDb
   \/ CatchUpOne
   \/ Swap
+  \/ \E n \in 0..MaxEvents : Compact(n)
 
-(* 1. Refinement of InnerGap.Safety_Rebuild_Restores at the swap boundary. *)
 RebuildRestoresMaterialization ==
   phase = "Done" => db = Materialize(Prefix(jsonl, swapAt))
 
-(* 2. A scalar owner gives uniqueness; phase clauses tie ownership to protocol. *)
 MutualExclusionOnLock ==
   /\ lockHolder \in LockOwners
   /\ (phase \in {"P1", "P3"} => lockHolder = RebuildLock)
   /\ (lockHolder = RebuildLock => phase \in {"P1", "P3"})
+  /\ \A w \in Writers : lockHolder = w => w \in wantsWrite
 
-(* 3. No token durable before the swap boundary disappears from the candidate. *)
 NoEventLostAcrossSwap ==
-  phase = "Done" => Materialize(Prefix(jsonl, swapAt)) \subseteq db
+  phase = "Done" => {appliedIndices[i] : i \in 1..Len(appliedIndices)} = 1..swapAt
 
-(* 4. In P2, a requesting writer is enabled now or can acquire the free lock. *)
 WritersProgressOutsideLock ==
   \A w \in Writers :
     (phase = "P2" /\ w \in wantsWrite /\ Len(jsonl) < MaxEvents) =>
-      (lockHolder # RebuildLock /\ ENABLED AppendWriter(w))
+      (lockHolder = w \/ (lockHolder = NoLock /\ ENABLED AcquireWriterLock(w)))
 
-(* 5. Exactly one P3 catch-up unit exists per event accumulated in P2. *)
-CatchUpBoundedByBacklog ==
-  (phase \in {"P3", "Done"}) =>
-    /\ p3Initial = Len(backlog)
-    /\ p3Applied <= p3Initial
-    /\ swapAt = snapshotAt + p3Initial
+NoDuplicateApply ==
+  Cardinality({appliedIndices[i] : i \in 1..Len(appliedIndices)}) = Len(appliedIndices)
+
+NoOutOfOrderApply ==
+  \A i \in 1..(Len(appliedIndices) - 1) :
+    appliedIndices[i] < appliedIndices[i + 1]
+
+LockedWorkBounded == lockedWork <= LockBudget
+
+SnapshotIndexRemainsValid ==
+  phase \in {"P2", "P3", "Done"} => snapshotGeneration = logGeneration
 
 Spec == Init /\ [][Next]_vars
 
