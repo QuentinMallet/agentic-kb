@@ -320,33 +320,39 @@ fn handle_search(
 
 fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
     let ids: Vec<String> = results.iter().map(|entry| entry.id.clone()).collect();
-    let surface = std::env::var("KB_INJECTION_SOURCE").unwrap_or_else(|_| "unknown".into());
-    query_hits::record_hits(&paths.query_hits, &ids, &surface);
-    let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
-    let injections: Vec<_> = results
-        .iter()
-        .map(|entry| {
-            let cited_file = entry
-                .evidence
-                .iter()
-                .find_map(|e| e.citation_path.as_deref())
-                .map(|path| {
-                    let Some((file, suffix)) = path.rsplit_once(':') else {
-                        return path.to_owned();
-                    };
-                    if suffix
-                        .split('-')
-                        .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
-                    {
-                        file.to_owned()
-                    } else {
-                        path.to_owned()
-                    }
-                });
-            (entry.id.clone(), cited_file)
-        })
-        .collect();
-    query_hits::record_injection(&paths.query_hits, &session_id, &injections, &surface);
+    let surface = std::env::var("KB_INJECTION_SOURCE").ok();
+    query_hits::record_hits(
+        &paths.query_hits,
+        &ids,
+        surface.as_deref().unwrap_or("unknown"),
+    );
+    if let Some(surface) = surface {
+        let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());
+        let injections: Vec<_> = results
+            .iter()
+            .map(|entry| {
+                let cited_file = entry
+                    .evidence
+                    .iter()
+                    .find_map(|e| e.citation_path.as_deref())
+                    .map(|path| {
+                        let Some((file, suffix)) = path.rsplit_once(':') else {
+                            return path.to_owned();
+                        };
+                        if suffix
+                            .split('-')
+                            .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+                        {
+                            file.to_owned()
+                        } else {
+                            path.to_owned()
+                        }
+                    });
+                (entry.id.clone(), cited_file)
+            })
+            .collect();
+        query_hits::record_injection(&paths.query_hits, &session_id, &injections, &surface);
+    }
 }
 
 /// Serialize SearchEntry rows to the MCP wire shape (shared by search and
@@ -2112,9 +2118,11 @@ mod tests {
         assert!(meta.get("db_rebuilt_at").is_some());
         assert!(meta.get("events_head_at").is_some());
         assert!(meta.get("stale_warning").is_some());
+        let hit_counts = query_hits::counts(&paths.query_hits).unwrap();
+        assert!(!hit_counts.is_empty());
         let telemetry = query_hits::injection_telemetry(&paths.query_hits).unwrap();
-        assert!(telemetry.total_injections > 0);
-        assert_eq!(telemetry.unknown_surface_rate, 1.0);
+        assert_eq!(telemetry.total_injections, 0);
+        assert_eq!(telemetry.unknown_surface_rate, 0.0);
     }
 
     #[test]

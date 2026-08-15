@@ -258,6 +258,9 @@ fn greedy_select(
 
 fn render<W: Write>(selection: &Selection, json: bool, writer: &mut W) -> anyhow::Result<()> {
     if selection.entries.is_empty() {
+        if json {
+            writer.write_all(b"[]\n")?;
+        }
         return Ok(());
     }
     if json {
@@ -466,6 +469,17 @@ mod tests {
             ["a", "c"]
         );
         assert_eq!(spent, 4);
+    }
+
+    #[test]
+    fn empty_json_selection_renders_empty_array() {
+        let selection = Selection {
+            considered: 0,
+            entries: Vec::new(),
+        };
+        let mut out = Vec::new();
+        render(&selection, true, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "[]\n");
     }
 
     proptest! {

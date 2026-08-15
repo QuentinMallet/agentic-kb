@@ -184,6 +184,76 @@ fn absent_excerpt_is_too_weak() {
     assert_eq!(out.reason, Some(UnverifiedReason::ExcerptTooWeak));
 }
 
+/// Path-escaping citations never enter relocation; the original failure wins.
+#[test]
+fn path_escape_skips_relocation_and_preserves_the_original_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/new.rs", &format!("// preamble\n{STRONG_EXCERPT}\n"));
+    write_file(root, "../outside.rs", &format!("{STRONG_EXCERPT}\n"));
+
+    let ev = evidence(
+        "../outside.rs",
+        0,
+        STRONG_EXCERPT.len(),
+        STRONG_EXCERPT.as_bytes(),
+        Some(STRONG_EXCERPT),
+    );
+
+    for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
+        let out = verify_evidence(&ev, root, policy).unwrap();
+        assert_eq!(out.status, VerificationStatus::Unverified);
+        assert_eq!(out.reason, Some(UnverifiedReason::PathEscape));
+        assert!(out.relocated_to.is_none());
+    }
+}
+
+/// Missing files also skip relocation outright; a repo candidate must not mask that.
+#[test]
+fn file_missing_skips_relocation_and_preserves_the_original_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/new.rs", &format!("// preamble\n{STRONG_EXCERPT}\n"));
+
+    let ev = evidence(
+        "src/missing.rs",
+        0,
+        STRONG_EXCERPT.len(),
+        STRONG_EXCERPT.as_bytes(),
+        Some(STRONG_EXCERPT),
+    );
+
+    for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
+        let out = verify_evidence(&ev, root, policy).unwrap();
+        assert_eq!(out.status, VerificationStatus::Unverified);
+        assert_eq!(out.reason, Some(UnverifiedReason::FileMissing));
+        assert!(out.relocated_to.is_none());
+    }
+}
+
+/// Non-content decay reasons must survive weak excerpts under relocation-enabled policies.
+#[test]
+fn weak_excerpt_preserves_non_hash_failure_reasons() {
+    use std::fs::File;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let file_path = root.join("big.bin");
+    let f = File::create(&file_path).unwrap();
+    f.set_len(64 * 1024 * 1024 + 1).unwrap();
+    drop(f);
+
+    let mut ev = evidence("big.bin", 0, 1, b"x", Some("x"));
+    ev.citation_excerpt = Some("x".to_string());
+
+    for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
+        let out = verify_evidence(&ev, root, policy).unwrap();
+        assert_eq!(out.status, VerificationStatus::Unverified);
+        assert_eq!(out.reason, Some(UnverifiedReason::FileTooLarge));
+        assert!(out.relocated_to.is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Policy semantics
 // ---------------------------------------------------------------------------

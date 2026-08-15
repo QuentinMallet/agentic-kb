@@ -11,7 +11,7 @@ use crate::config;
 use crate::models::VerificationStatus;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -229,11 +229,16 @@ fn heal_relocations(
         };
         // The stored hash is read back and echoed into the event unchanged;
         // it is audit data, never an input to the UPDATE.
-        let citation_hash: String = conn.query_row(
-            "SELECT citation_hash FROM evidence WHERE id=?1 AND entry_id=?2",
-            params![r.evidence_id, r.entry_id],
-            |row| row.get(0),
-        )?;
+        let Some(citation_hash): Option<String> = conn
+            .query_row(
+                "SELECT citation_hash FROM evidence WHERE id=?1 AND entry_id=?2",
+                params![r.evidence_id, r.entry_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
         let event = events::citation_healed_event(
             &r.entry_id,
             &r.evidence_id,
@@ -1182,6 +1187,83 @@ mod tests {
             ..Default::default()
         });
         assert!(healed[0].ends_with("(healed)"), "{healed:?}");
+    }
+
+    #[test]
+    fn heal_relocations_skips_missing_evidence_rows_and_keeps_renderable_report() {
+        use crate::components::events;
+        use crate::config::Paths;
+        use rusqlite::params;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(dir.path());
+        let conn = db::open_db_memory().unwrap();
+
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params!["e1", "seed.rs", "test entry", "body", "[]", "deadbeef"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
+            params![
+                "ev-live",
+                "e1",
+                "seed.rs:0-10",
+                "sha256:live",
+                Some("strong excerpt")
+            ],
+        )
+        .unwrap();
+
+        let mut report = StaleCheckReport {
+            relocation: vec![
+                RelocationEntry {
+                    entry_id: "e1".to_string(),
+                    evidence_id: "ev-missing".to_string(),
+                    status: VerificationStatus::Relocated,
+                    old_path: "seed.rs:10-20".to_string(),
+                    new_path: Some("seed.rs:30-40".to_string()),
+                    reason: None,
+                    healed: false,
+                },
+                RelocationEntry {
+                    entry_id: "e1".to_string(),
+                    evidence_id: "ev-live".to_string(),
+                    status: VerificationStatus::Relocated,
+                    old_path: "seed.rs:0-10".to_string(),
+                    new_path: Some("seed.rs:20-30".to_string()),
+                    reason: None,
+                    healed: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        heal_relocations(&paths, &conn, &mut report).unwrap();
+
+        assert!(!report.relocation[0].healed, "missing rows are skipped");
+        assert!(report.relocation[1].healed, "remaining rows still heal");
+
+        let lines = render_lines(&report);
+        assert!(lines.iter().any(|l| l.contains("seed.rs:10-20") && l.ends_with("(report-only)")));
+        assert!(lines.iter().any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
+
+        let events = events::read_events(&paths.events).unwrap();
+        assert_eq!(events.len(), 1, "only the surviving heal is appended");
+
+        let healed_path: String = conn
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id=?1 AND entry_id=?2",
+                params!["ev-live", "e1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healed_path, "seed.rs:20-30");
     }
 
     #[test]

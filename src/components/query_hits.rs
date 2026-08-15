@@ -5,7 +5,7 @@
 //! `rebuild`. Hits are operational telemetry only; they produce no JSONL events
 //! and are neither a rebuild input nor part of backups.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +36,7 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
            surface TEXT NOT NULL DEFAULT 'unknown'
          );
          CREATE INDEX IF NOT EXISTS idx_hits_entry_id ON hits(entry_id);
+         CREATE INDEX IF NOT EXISTS idx_hits_queried_at ON hits(queried_at);
          CREATE TABLE IF NOT EXISTS injections(
            id INTEGER PRIMARY KEY,
            session_id TEXT NOT NULL,
@@ -45,7 +46,8 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
            injected_at INTEGER NOT NULL,
            acted_on INTEGER DEFAULT NULL
          );
-         CREATE INDEX IF NOT EXISTS idx_injections_session_id ON injections(session_id);",
+         CREATE INDEX IF NOT EXISTS idx_injections_session_id ON injections(session_id);
+         CREATE INDEX IF NOT EXISTS idx_injections_injected_at ON injections(injected_at);",
     )?;
     let has_acted_on = conn
         .prepare("PRAGMA table_info(injections)")?
@@ -61,6 +63,41 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn is_corruption_error(err: &SqlError) -> bool {
+    match err {
+        SqlError::SqliteFailure(inner, _) => {
+            matches!(inner.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+        }
+        _ => false,
+    }
+}
+
+fn open_or_recreate(path: &Path, create: bool) -> Option<Connection> {
+    match open(path, create) {
+        Ok(conn) => Some(conn),
+        Err(err) if is_corruption_error(&err) => drop_and_recreate(path),
+        Err(_) => None,
+    }
+}
+
+fn prune_to_cap(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    ts_column: &str,
+) -> rusqlite::Result<()> {
+    let count_sql = format!("SELECT COUNT(*) FROM {table}");
+    let total: i64 = tx.query_row(&count_sql, [], |r| r.get(0))?;
+    if total <= MAX_ROWS {
+        return Ok(());
+    }
+    let prune_sql = format!(
+        "DELETE FROM {table} WHERE id IN
+         (SELECT id FROM {table} ORDER BY {ts_column} DESC, id DESC LIMIT -1 OFFSET ?1)"
+    );
+    tx.execute(&prune_sql, [MAX_ROWS])?;
+    Ok(())
+}
+
 /// Record one row per injected entry. Every failure is swallowed.
 pub fn record_injection(
     path: &Path,
@@ -71,12 +108,9 @@ pub fn record_injection(
     if entries.is_empty() {
         return;
     }
-    let mut conn = match open(path, true) {
-        Ok(conn) => conn,
-        Err(_) => match drop_and_recreate(path) {
-            Some(conn) => conn,
-            None => return,
-        },
+    let mut conn = match open_or_recreate(path, true) {
+        Some(conn) => conn,
+        None => return,
     };
     let now = chrono::Utc::now().timestamp();
     let session_id = truncate_utf8(session_id, 64);
@@ -98,14 +132,10 @@ pub fn record_injection(
             "DELETE FROM injections WHERE injected_at < ?1",
             [now - RETENTION_SECONDS],
         )?;
-        tx.execute(
-            "DELETE FROM injections WHERE id IN
-             (SELECT id FROM injections ORDER BY injected_at DESC, id DESC LIMIT -1 OFFSET ?1)",
-            [MAX_ROWS],
-        )?;
+        prune_to_cap(&tx, "injections", "injected_at")?;
         tx.commit()
     })();
-    if result.is_err() {
+    if result.as_ref().err().is_some_and(is_corruption_error) {
         let _ = drop_and_recreate(path);
     }
 }
@@ -129,8 +159,8 @@ pub fn record_acted_on(path: &Path, session_id: &str, transcript_bytes: &[u8]) {
     let session_id = truncate_utf8(session_id, 64);
     let mut conn = match open(path, false) {
         Ok(conn) => conn,
-        Err(_) => {
-            if path.exists() {
+        Err(err) => {
+            if path.exists() && is_corruption_error(&err) {
                 let _ = drop_and_recreate(path);
             }
             return;
@@ -163,7 +193,7 @@ pub fn record_acted_on(path: &Path, session_id: &str, transcript_bytes: &[u8]) {
         }
         tx.commit()
     })();
-    if result.is_err() {
+    if result.as_ref().err().is_some_and(is_corruption_error) {
         let _ = drop_and_recreate(path);
     }
 }
@@ -186,8 +216,8 @@ pub struct InjectionTelemetry {
 pub fn injection_telemetry(path: &Path) -> Option<InjectionTelemetry> {
     let conn = match open(path, false) {
         Ok(conn) => conn,
-        Err(_) => {
-            if path.exists() {
+        Err(err) => {
+            if path.exists() && is_corruption_error(&err) {
                 let _ = drop_and_recreate(path);
             }
             return None;
@@ -281,12 +311,9 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
     if entry_ids.is_empty() {
         return;
     }
-    let mut conn = match open(path, true) {
-        Ok(conn) => conn,
-        Err(_) => match drop_and_recreate(path) {
-            Some(conn) => conn,
-            None => return,
-        },
+    let mut conn = match open_or_recreate(path, true) {
+        Some(conn) => conn,
+        None => return,
     };
     let now = chrono::Utc::now().timestamp();
     let surface = truncate_utf8(surface, 32);
@@ -303,14 +330,10 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
             "DELETE FROM hits WHERE queried_at < ?1",
             [now - RETENTION_SECONDS],
         )?;
-        tx.execute(
-            "DELETE FROM hits WHERE id IN
-             (SELECT id FROM hits ORDER BY queried_at DESC, id DESC LIMIT -1 OFFSET ?1)",
-            [MAX_ROWS],
-        )?;
+        prune_to_cap(&tx, "hits", "queried_at")?;
         tx.commit()
     })();
-    if result.is_err() {
+    if result.as_ref().err().is_some_and(is_corruption_error) {
         let _ = drop_and_recreate(path);
     }
 }
@@ -320,8 +343,8 @@ pub fn record_hits(path: &Path, entry_ids: &[String], surface: &str) {
 pub fn counts(path: &Path) -> Option<Vec<(String, u64)>> {
     let conn = match open(path, false) {
         Ok(conn) => conn,
-        Err(_) => {
-            if path.exists() {
+        Err(err) => {
+            if path.exists() && is_corruption_error(&err) {
                 let _ = drop_and_recreate(path);
             }
             return None;
@@ -334,9 +357,11 @@ pub fn counts(path: &Path) -> Option<Vec<(String, u64)>> {
     })();
     match result {
         Ok(counts) => Some(counts),
-        Err(_) => {
+        Err(err) => {
             drop(conn);
-            let _ = drop_and_recreate(path);
+            if is_corruption_error(&err) {
+                let _ = drop_and_recreate(path);
+            }
             None
         }
     }
@@ -389,6 +414,37 @@ mod tests {
         fs::write(&path, b"not sqlite").unwrap();
         record_hits(&path, &["recovered".into()], "test");
         assert_eq!(counts(&path).unwrap(), vec![("recovered".into(), 1)]);
+    }
+
+    #[test]
+    fn busy_record_hits_does_not_delete_existing_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hits.db");
+        record_hits(&path, &["seed".into()], "test");
+
+        let lock_conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        lock_conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        record_hits(&path, &["blocked".into()], "test");
+
+        lock_conn.execute_batch("COMMIT;").unwrap();
+        drop(lock_conn);
+
+        assert!(path.is_file());
+        let conn = Connection::open(&path).unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT entry_id FROM hits ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(ids, vec!["seed".to_string()]);
     }
 
     #[test]

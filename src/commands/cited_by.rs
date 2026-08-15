@@ -158,6 +158,9 @@ fn is_ranged_citation_for_file(citation_path: &str, file: &str) -> bool {
 
 fn render_rows<W: Write>(rows: &[CitedByRow], json: bool, writer: &mut W) -> anyhow::Result<()> {
     if rows.is_empty() {
+        if json {
+            writer.write_all(b"[]\n")?;
+        }
         return Ok(());
     }
 
@@ -377,6 +380,20 @@ mod tests {
         cmd.execute_with_conn(&conn, Some(dir.path()), &mut out)
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_cited_by_empty_json_result_is_array() {
+        let conn = open_db_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CitedBy {
+            file: "src/missing.rs".to_string(),
+            json: true,
+        };
+        let mut out = Vec::new();
+        cmd.execute_with_conn(&conn, Some(dir.path()), &mut out)
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "[]\n");
     }
 
     #[test]

@@ -17,8 +17,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
+use std::sync::Once;
 
 /// Maximum file size allowed for verification: 64 MiB.
 /// Files larger than this are rejected to prevent unbounded memory use.
@@ -258,7 +261,7 @@ fn hash_check_at_citation(
         Ok(m) => m,
         Err(_) => return HashCheck::Failed(UnverifiedReason::ReadError),
     };
-    if !opened_file_within_repo(&file, repo_root) {
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
         return HashCheck::Failed(UnverifiedReason::ReadError);
     }
 
@@ -297,17 +300,39 @@ fn hash_check_at_citation(
     }
 }
 
-fn opened_file_within_repo(file: &File, repo_root: &Path) -> bool {
+#[cfg(not(target_os = "linux"))]
+static DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE: Once = Once::new();
+
+fn opened_file_within_repo(file: &File, file_abs: &Path, repo_root: &Path) -> bool {
     let canonical_root = match repo_root.canonicalize() {
         Ok(root) => root,
         Err(_) => return false,
     };
-    let fd = file.as_raw_fd();
-    let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-    resolved.starts_with(&canonical_root)
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = file.as_raw_fd();
+        let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        return resolved.starts_with(&canonical_root);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE.call_once(|| {
+            eprintln!(
+                "verification: descriptor containment degraded on this platform; falling back to canonicalized path checks"
+            );
+        });
+        let resolved = match file_abs.canonicalize() {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        return resolved.starts_with(&canonical_root);
+    }
 }
 
 /// An excerpt is strong enough to relocate from only if it clears BOTH floors.
@@ -364,11 +389,22 @@ pub fn verify_evidence(
         return Ok(VerificationOutcome::unverified(decayed));
     }
 
+    if matches!(
+        decayed,
+        UnverifiedReason::PathEscape | UnverifiedReason::FileMissing
+    ) {
+        return Ok(VerificationOutcome::unverified(decayed));
+    }
+
     let excerpt = match &ev.citation_excerpt {
         Some(e) if excerpt_is_strong(e) => e.as_str(),
         _ => {
             return Ok(VerificationOutcome::unverified(
-                UnverifiedReason::ExcerptTooWeak,
+                if decayed == UnverifiedReason::HashMismatch {
+                    UnverifiedReason::ExcerptTooWeak
+                } else {
+                    decayed
+                },
             ))
         }
     };
@@ -574,7 +610,7 @@ fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> 
         Ok(m) if m.is_file() => m,
         _ => return FileScan::Skipped,
     };
-    if !opened_file_within_repo(&file, repo_root) {
+    if !opened_file_within_repo(&file, path, repo_root) {
         return FileScan::Skipped;
     }
     let size = meta.len();
@@ -1104,7 +1140,8 @@ mod tests {
 
         let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly).unwrap();
         assert_eq!(outcome.status, VerificationStatus::Unverified);
-        assert_eq!(outcome.reason, Some(UnverifiedReason::NoCandidate));
+        // PathEscape now propagates directly instead of falling through to excerpt search.
+        assert_eq!(outcome.reason, Some(UnverifiedReason::PathEscape));
         assert_eq!(outcome.relocated_to, None);
         assert!(!outcome.is_verified(), "sibling content must never verify");
     }
@@ -1126,8 +1163,8 @@ mod tests {
         let inside = std::fs::File::open(&repo_file).unwrap();
         let outside = std::fs::File::open(&sibling_file).unwrap();
 
-        assert!(opened_file_within_repo(&inside, &repo));
-        assert!(!opened_file_within_repo(&outside, &repo));
+        assert!(opened_file_within_repo(&inside, &repo_file, &repo));
+        assert!(!opened_file_within_repo(&outside, &sibling_file, &repo));
     }
 
     #[test]

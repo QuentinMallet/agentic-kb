@@ -203,10 +203,8 @@ fn test_parse_golden_jsonl() {
         "golden set with zero cases must be rejected"
     );
     let legacy = r#"{"query":"legacy","expected_ids":["e-auth"]}"#;
-    assert!(parse_golden_jsonl(legacy)
-        .unwrap_err()
-        .to_string()
-        .contains("invalid JSON"));
+    let parsed = parse_golden_jsonl(legacy).unwrap();
+    assert_eq!(parsed[0].split, Split::Dev);
 }
 
 #[test]

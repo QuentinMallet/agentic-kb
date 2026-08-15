@@ -23,11 +23,18 @@ pub enum Split {
     Sealed,
 }
 
+impl Default for Split {
+    fn default() -> Self {
+        Self::Dev
+    }
+}
+
 /// One golden case: a query and the entry ids a good retriever must return.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GoldenCase {
     pub query: String,
     pub expected_ids: Vec<String>,
+    #[serde(default)]
     pub split: Split,
 }
 

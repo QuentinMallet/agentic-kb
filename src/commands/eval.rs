@@ -10,6 +10,8 @@ use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 
+const EXIT_COMPARE_REGRESSION: i32 = 3;
+
 /// Evaluate retrieval quality against a golden set (recall@k, MRR)
 #[derive(Command, Debug, Parser)]
 pub struct Eval {
@@ -179,7 +181,19 @@ impl Eval {
                 comparison.discordant_pairs
             );
         }
+        if let Some(code) = compare_exit_code(comparison.verdict) {
+            std::process::exit(code);
+        }
         Ok(())
+    }
+}
+
+fn compare_exit_code(verdict: crate::components::retrieval_eval::Verdict) -> Option<i32> {
+    match verdict {
+        // `kb eval --compare` is a CI gate only for a demonstrated regression.
+        crate::components::retrieval_eval::Verdict::Regression => Some(EXIT_COMPARE_REGRESSION),
+        crate::components::retrieval_eval::Verdict::Significant
+        | crate::components::retrieval_eval::Verdict::Inconclusive => None,
     }
 }
 
@@ -253,5 +267,12 @@ mod tests {
         let err = eval_cmd(golden, Some(0.5)).execute_with(&paths, &NoopEmbedder);
         assert!(err.is_err(), "gate must fail when recall < min_recall");
         assert!(err.unwrap_err().to_string().contains("eval gate failed"));
+    }
+
+    #[test]
+    fn test_compare_exit_code_only_for_regressions() {
+        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Regression), Some(EXIT_COMPARE_REGRESSION));
+        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Significant), None);
+        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Inconclusive), None);
     }
 }
