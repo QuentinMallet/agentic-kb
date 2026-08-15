@@ -3151,6 +3151,55 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_audit_report_counts_match_distinct_sampled_entries_per_arm() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let (_dir, paths, emb) = setup();
+        let hot = add_live_entry(&paths, &emb, "p/exact-hot", None);
+        let warm = add_live_entry(&paths, &emb, "p/exact-warm", None);
+        let cold = add_live_entry(&paths, &emb, "p/exact-cold", None);
+        query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 200], "test");
+        query_hits::record_hits(&paths.query_hits, &[warm.clone(), cold.clone()], "test");
+
+        let run = handle_audit_run(&json!(null), &json!({"sample_size": 2, "mode": "traffic"}), &paths);
+        assert_eq!(run["type"], "ok");
+        let samples = run["samples"].as_array().unwrap();
+        assert!(samples.iter().any(|s| s["arm"] == "uniform"));
+        assert!(samples.iter().any(|s| s["arm"] == "traffic"));
+
+        let expected_counts: BTreeMap<String, usize> = samples.iter()
+            .fold(BTreeMap::<String, BTreeSet<String>>::new(), |mut acc, sample| {
+                let arm = sample["arm"].as_str().unwrap().to_string();
+                let id = sample["id"].as_str().unwrap().to_string();
+                acc.entry(arm).or_default().insert(id);
+                acc
+            })
+            .into_iter()
+            .map(|(arm, ids)| (arm, ids.len()))
+            .collect();
+
+        let verdicts: Vec<Value> = samples.iter().map(|sample| {
+            json!({"entry_id": sample["id"].as_str().unwrap(), "verdict": true})
+        }).collect();
+        let req = json!({"run_id": run["run_id"].as_str().unwrap(), "verdicts": verdicts});
+        assert_eq!(handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"], samples.len());
+
+        let report = handle_audit_report(&json!(null), &paths);
+        let actual_counts: BTreeMap<String, usize> = report["per_arm_precision"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["arm"].as_str().unwrap().to_string(),
+                    row["n"].as_i64().unwrap() as usize,
+                )
+            })
+            .collect();
+        assert_eq!(actual_counts, expected_counts);
+    }
+
+    #[test]
     fn test_handle_provenance_one_hop() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);

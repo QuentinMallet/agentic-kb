@@ -190,6 +190,46 @@ fn manifest_hash_is_stable_and_absent_id_is_detected() {
     assert!(err.to_string().contains("SEALED_MANIFEST_HASH_MISMATCH"));
 }
 
+#[test]
+fn sealed_manifest_rejects_split_membership_drift() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let events = [
+        make_entry("case-dev", "p/dev", "dev case", "alpha"),
+        make_entry("case-sealed", "p/sealed", "sealed case", "beta"),
+    ];
+    fs::write(
+        &path,
+        events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n",
+    ).unwrap();
+
+    let cases = vec![
+        GoldenCase { query: "dev".into(), expected_ids: vec!["case-dev".into()], split: Split::Sealed },
+        GoldenCase { query: "sealed".into(), expected_ids: vec!["case-sealed".into()], split: Split::Sealed },
+    ];
+    let manifest = SplitManifest {
+        corpus_hash: kb::components::retrieval_eval::ids_only_corpus_hash(
+            &kb::components::retrieval_eval::expected_ids(&cases),
+        ),
+        sealed_ids: vec!["case-sealed".into()],
+        dev_ids: vec!["case-dev".into()],
+        frozen_at: "now".into(),
+        corpus_hash_domain: "ids-only".into(),
+    };
+
+    let err = validate_sealed_manifest(&cases, &path, &manifest).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("SEALED_SPLIT_MANIFEST_MISMATCH"));
+    assert!(msg.contains("golden membership differs from frozen manifest"));
+}
+
 /// Test 5 (property): metrics bounded in [0,1] for arbitrary case mixes.
 mod prop {
     use super::*;

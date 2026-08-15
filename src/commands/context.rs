@@ -334,7 +334,10 @@ fn enumerate_working_set(root: &Path) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::{db, embedder::NoopEmbedder};
     use proptest::prelude::*;
+    use rusqlite::{params, Connection};
+    use serde_json::json;
     use std::collections::HashSet;
     use tempfile::tempdir;
 
@@ -360,6 +363,30 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    fn insert_entry(conn: &Connection, id: &str, path: &str, summary: &str, content: &str) {
+        let event = json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": id,
+            "path": path,
+            "summary": summary,
+            "content": content,
+            "tags": [],
+            "ts": "2024-01-01T00:00:00Z",
+        });
+        db::apply_event(conn, &NoopEmbedder, &event).unwrap();
+    }
+
+    fn insert_evidence(conn: &Connection, id: &str, entry_id: &str, citation_path: &str) {
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, 'sha256:test', '2024-01-01T00:00:00Z')",
+            params![id, entry_id, citation_path],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -413,6 +440,21 @@ mod tests {
         }
 
         #[test]
+        fn emitted_entry_ids_are_unique(
+            candidates in prop::collection::vec((1usize..100, 0f32..5.0, any::<bool>()), 0..30),
+            budget in 0usize..300,
+            floor in prop::option::of(0f32..5.0),
+        ) {
+            let input: Vec<_> = candidates.into_iter().enumerate().map(|(i, (bytes, score, signal))| {
+                candidate(&format!("{i:03}"), bytes, score, signal)
+            }).collect();
+            let (selected, _) = greedy_select(input, budget, floor);
+            let ids: Vec<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
+            let unique: HashSet<_> = ids.iter().copied().collect();
+            prop_assert_eq!(unique.len(), ids.len());
+        }
+
+        #[test]
         fn below_floor_is_silent(scores in prop::collection::vec(0f32..1.0, 0..30)) {
             let input = scores.into_iter().enumerate().map(|(i, score)| candidate(&i.to_string(), 4, score, true)).collect();
             let (selected, _) = greedy_select(input, 2, Some(2.0));
@@ -450,5 +492,66 @@ mod tests {
                 else { prop_assert!(spent_before.saturating_add(entry.tokens) > budget); }
             }
         }
+    }
+
+    #[test]
+    fn floor_filters_individually_in_mixed_candidates() {
+        let conn = db::open_db_memory().unwrap();
+        insert_entry(
+            &conn,
+            "010-low",
+            "docs/low.md",
+            "cold summary",
+            "No working-set evidence and no branch-token hit.",
+        );
+        insert_entry(
+            &conn,
+            "020-high",
+            "docs/high.md",
+            "working set summary",
+            "Has evidence on the active file.",
+        );
+        insert_entry(
+            &conn,
+            "030-top",
+            "docs/top.md",
+            "signal branch token summary",
+            "Has working-set evidence and an FTS branch-token hit.",
+        );
+        insert_evidence(&conn, "ev-020", "020-high", "src/hot.rs:0-10");
+        insert_evidence(&conn, "ev-030", "030-top", "src/hot.rs:11-20");
+
+        let working_set = BTreeSet::from([String::from("src/hot.rs")]);
+        let branch_tokens = vec![String::from("signal")];
+        let input = build_candidates(&conn, &NoopEmbedder, &working_set, &branch_tokens).unwrap();
+        let (selected, spent) = greedy_select(input, usize::MAX, None);
+        let ids: Vec<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["030-top", "020-high"]);
+        assert_eq!(spent, selected.entries.iter().map(|e| e.tokens).sum::<usize>());
+
+        let mut bytes = Vec::new();
+        render(&selected, false, &mut bytes).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("[kb#020-high]"));
+        assert!(rendered.contains("[kb#030-top]"));
+        assert!(!rendered.contains("[kb#010-low]"));
+    }
+
+    #[test]
+    fn tied_scores_render_byte_identically_with_id_ascending_tiebreak() {
+        let input = vec![
+            candidate("020-zeta", 4, 1.0, true),
+            candidate("010-alpha", 4, 1.0, true),
+            candidate("030-omega", 4, 1.0, true),
+        ];
+        let (first, _) = greedy_select(input.clone(), 3, None);
+        let (second, _) = greedy_select(input, 3, None);
+        let first_ids: Vec<_> = first.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(first_ids, ["010-alpha", "020-zeta", "030-omega"]);
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        render(&first, false, &mut a).unwrap();
+        render(&second, false, &mut b).unwrap();
+        assert_eq!(a, b);
     }
 }
