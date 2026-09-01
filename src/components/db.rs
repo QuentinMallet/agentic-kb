@@ -704,6 +704,7 @@ pub fn apply_event(
             let is_stale = event["is_stale"].as_bool().unwrap_or(false) as i32;
             // Legacy events without kind/evidence_status fields default to
             // 'belief' / 'n/a' — matching the column DEFAULT for pre-migration rows.
+            let has_explicit_kind = event.get("kind").is_some();
             let kind = event["kind"].as_str().unwrap_or("belief");
             let evidence_status = event["evidence_status"].as_str().unwrap_or("n/a");
             let session_id = event["session_id"].as_str();
@@ -747,6 +748,14 @@ pub fn apply_event(
                     )?;
                     conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
                     return Ok(false);
+                }
+
+                if has_explicit_kind {
+                    let derived_status = compute_evidence_status(conn, id)?;
+                    conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![derived_status, id],
+                    )?;
                 }
 
                 let rowid: i64 =
@@ -2460,6 +2469,24 @@ mod tests {
         .unwrap();
     }
 
+    fn entry_evidence_status(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT COALESCE(evidence_status, 'n/a') FROM entries WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn entry_evidence_row_count(conn: &Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM evidence WHERE entry_id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_db_ensure_schema_creates_tables() {
         let conn = open_db_memory().unwrap();
@@ -2806,6 +2833,169 @@ mod tests {
             is_stale, 0,
             "events without is_stale must default to active"
         );
+    }
+
+    #[test]
+    fn test_apply_event_upsert_derives_missing_without_evidence_rows() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let event = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "derived-missing",
+            "path": "src/lib.rs",
+            "summary": "entry without evidence",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &event).unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "derived-missing"), 0);
+        assert_eq!(entry_evidence_status(&conn, "derived-missing"), "missing");
+    }
+
+    #[test]
+    fn test_apply_event_upsert_derives_present_from_existing_evidence_rows() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let initial = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "derived-present",
+            "path": "src/lib.rs",
+            "summary": "entry with evidence",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &initial).unwrap();
+
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": "derived-present",
+            "evidence": {
+                "id": "ev-derived-present",
+                "entry_id": "derived-present",
+                "kind": "code",
+                "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null,
+                "citation_hash": "sha256:derived-present",
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &evidence_add).unwrap();
+
+        let replayed_upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "derived-present",
+            "path": "src/lib.rs",
+            "summary": "entry with evidence replayed",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-02T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &replayed_upsert).unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "derived-present"), 1);
+        assert_eq!(entry_evidence_status(&conn, "derived-present"), "present");
+    }
+
+    #[test]
+    fn test_apply_event_legacy_upsert_preserves_na_status() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let event = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "legacy-na",
+            "path": "src/lib.rs",
+            "summary": "legacy entry",
+            "content": "content",
+            "tags": [],
+            "ts": "2023-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &event).unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "legacy-na"), 0);
+        assert_eq!(entry_evidence_status(&conn, "legacy-na"), "n/a");
+    }
+
+    #[test]
+    fn test_apply_event_upsert_status_converges_to_local_rowset_across_reordered_compaction_repro() {
+        let embedder = NoopEmbedder;
+
+        let conn_full = open_db_memory().unwrap();
+        let conn_reordered = open_db_memory().unwrap();
+
+        let upsert_a = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "cmp-a",
+            "path": "src/lib.rs",
+            "summary": "cmp a",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": "cmp-a",
+            "evidence": {
+                "id": "ev-cmp-a",
+                "entry_id": "cmp-a",
+                "kind": "code",
+                "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null,
+                "citation_hash": "sha256:cmp-a",
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        let upsert_b = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "cmp-a",
+            "path": "src/lib.rs",
+            "summary": "cmp a replayed",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-02T00:00:00Z"
+        });
+
+        for event in [&upsert_a, &evidence_add, &upsert_b] {
+            apply_event(&conn_full, &embedder, event).unwrap();
+        }
+        for event in [&evidence_add, &upsert_b] {
+            apply_event(&conn_reordered, &embedder, event).unwrap();
+        }
+
+        assert_eq!(entry_evidence_row_count(&conn_full, "cmp-a"), 1);
+        assert_eq!(entry_evidence_status(&conn_full, "cmp-a"), "present");
+
+        assert_eq!(entry_evidence_row_count(&conn_reordered, "cmp-a"), 0);
+        assert_eq!(entry_evidence_status(&conn_reordered, "cmp-a"), "missing");
     }
 
     /// br-h9g (security I2): fetch_evidence_for_entries must cap rows at

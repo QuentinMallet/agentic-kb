@@ -161,6 +161,11 @@ pub fn wrap_citation_excerpt(excerpt: Option<&str>) -> Option<String> {
 
 /// Compute the write-time evidence_status for an entry.
 ///
+/// This is used when constructing new events so live write paths emit a
+/// self-consistent payload. Replay remains authoritative on read-model state:
+/// `apply_event` recomputes `entries.evidence_status` from the current
+/// materialized evidence rows for non-legacy upserts.
+///
 /// Rules (AC10):
 /// - kind in {observation, belief, procedure} + evidence present → "present"
 /// - kind in {observation, belief, procedure} + evidence empty   → "missing"
