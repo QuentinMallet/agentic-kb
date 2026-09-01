@@ -86,8 +86,9 @@
                            materializes identically to single replay.
    CompactionEquivalenceE  ADR-2 live-state equivalence: replaying the log —
                            including after `compact` has rewritten it — still
-                           yields the DB's live state.  THIS IS EXPECTED TO FAIL
-                           until epic tasks T1 and T2 land; see the Run section.
+                           yields the DB's live state.  This FAILED against the
+                           pre-T1/T2 CompactedLogE; it holds against the
+                           implemented one modelled below.
 
    Atomic write-through abstraction
    ---------------------------------
@@ -101,21 +102,21 @@
 
    Run
    ---
-   Four configurations, all from this directory:
+   Four configurations, all from this directory.  Since T1/T2 landed and the
+   legacy_add arm was amended (CE3), ALL FOUR MUST PASS; the CE harnesses are
+   kept as named regression gates for the two shapes they were built to expose.
 
      1. Regression — every invariant, compaction disabled.  MUST PASS.
         tlc AgentKbEvidence -config AgentKbEvidence_NoCompact.cfg -workers 4 -deadlock
 
-     2. Primary counterexample — the upsert-reordering evidence loss.
-        MUST FAIL with the 4-event trace add / evidence_add / add / compact.
+     2. Primary counterexample harness — the upsert-reordering evidence loss.
         tlc AgentKbEvidence -config AgentKbEvidence_CE1.cfg -workers 4 -deadlock
 
-     3. Secondary counterexample — the dropped evidence_expire resurrection.
-        MUST FAIL.  MaxLogLen raised to 5 for headroom.
+     3. Secondary counterexample harness — the dropped evidence_expire
+        resurrection.  MaxLogLen raised to 5 for headroom.
         tlc AgentKbEvidence -config AgentKbEvidence_CE2.cfg -workers 4 -deadlock
 
-     4. Full model — every action, every invariant.  EXPECTED TO FAIL on
-        CompactionEquivalenceE until T1/T2 land; MUST PASS afterwards.
+     4. Full model — every action, every invariant.
         tlc AgentKbEvidence -config AgentKbEvidence.cfg -workers 4 -deadlock
 *)
 
@@ -263,8 +264,13 @@ EmptyLegacy   == [id \in EntryIds |-> FALSE]
 \*   "legacy_add"      — install entry with kind="belief" (AC1 backfill default).
 \*                       ADR-1 applies here too — a legacy add is still an upsert,
 \*                       so evidence survives.  The AC2 grandfather
-\*                       (evidence_status="n_a") applies only when the entry has
-\*                       no evidence to derive a status from.
+\*                       (evidence_status="n_a") is an INITIALIZATION only: it
+\*                       lands on an absent entry, and an existing entry keeps
+\*                       the status the evidence lifecycle last derived.  A
+\*                       legacy upsert that RE-grandfathered an existing entry
+\*                       would be exactly the payload-style authority ADR-1
+\*                       abolishes, and it is order-sensitive under compaction —
+\*                       see CE3 in T0-counterexample.md.
 \*
 \*   "evidence_add"    — add an evidence row to evidence[id] IFF the entry is
 \*                       present.  Orphan EvidenceAdd (id absent) is FILTERED:
@@ -308,12 +314,26 @@ ApplyEventE(state, ev) ==
                 lgy2  == [lgy  EXCEPT ![ev.id] = FALSE]
             IN <<ents2, evs, sts2, lgy2>>
       [] ev.action = "legacy_add" ->
-            LET ents2  == [ents EXCEPT ![ev.id] = PresentEntry("belief")]
-                hasEv  == evs[ev.id] # {}
-                newSts == IF hasEv THEN StatusOf("belief", evs[ev.id]) ELSE "n_a"
-                sts2   == [sts EXCEPT ![ev.id] = newSts]
-                lgy2   == [lgy EXCEPT ![ev.id] = ~hasEv]
-            IN <<ents2, evs, sts2, lgy2>>
+            \* ADR-1 corollary (CE3): a legacy upsert may INITIALIZE a fresh
+            \* entry's grandfather but may never RE-GRANDFATHER an existing one.
+            \* `sts` is therefore left UNCHANGED: an absent entry already carries
+            \* "n_a" (AbsentEntriesClean), so the fresh-insert case initializes to
+            \* "n_a" for free, while an existing entry keeps whatever status the
+            \* evidence lifecycle last derived for it.
+            \*
+            \* is_legacy becomes a DERIVED predicate — "this entry's status is a
+            \* grandfather rather than a derivation" — rather than independent
+            \* state.  That is forced, not chosen: the arm overwrites kind with
+            \* the AC1 backfill default "belief", so an entry that carried "n_a"
+            \* legitimately under kind="convention" acquires a status the belief
+            \* rule would not derive, and only re-raising the grandfather keeps
+            \* StatusConsistent true.  On every entry whose kind was already
+            \* belief-like the predicate reproduces the preceding flag exactly,
+            \* which is the "preserves the current is_legacy flag" clause.
+            LET ents2 == [ents EXCEPT ![ev.id] = PresentEntry("belief")]
+                lgy2  == [lgy EXCEPT ![ev.id] =
+                             sts[ev.id] # StatusOf("belief", evs[ev.id])]
+            IN <<ents2, evs, sts, lgy2>>
       [] ev.action = "evidence_add" ->
             IF ents[ev.id].type = "absent"
                 THEN state  \* orphan tolerated (L4 + OrphanTolerated)
@@ -366,38 +386,50 @@ MaterializeE(events) == MatHelperE(events, Len(events))
    defect.  The real command does not synthesize events: it selects a subset of
    the ORIGINAL events by index and re-sorts that subset by index.
 
+   Revision 2 (this one) tracks the POST-T1/T2 implementation.  The retention
+   and emission rules below are what T1 and T2 landed; the pre-fix rules that
+   CE1 and CE2 exploit are recorded in T0-counterexample.md, not here.
+
    The algorithm, arm by arm:
 
+     * entry_first[id]  — index of the FIRST ("upsert","entries") event for id
+                          (compact.rs:123, an `or_insert`).  Both `add` and
+                          `legacy_add` model that event.
      * entry_last[id]   — index of the last ("upsert","entries") event for id
-                          (compact.rs:110-112).  Both `add` and `legacy_add`
-                          model that event.
+                          (compact.rs:124).
      * expire_last[id]  — index of the last ("expire","entries") event
-                          (compact.rs:113-115).
+                          (compact.rs:127).
      * an entry is LIVE iff expire_last[id] < entry_last[id]; live entries
                           contribute their entry_last index, dead ones are
-                          dropped entirely (compact.rs:139-143).  Orphan expire
+                          dropped entirely (compact.rs:157-161).  Orphan expire
                           events are never emitted.
-     * evidence_indices — every ("evidence_add"|"citation_healed","evidence")
-                          event (compact.rs:121-123).  NOTE the omission:
-                          "evidence_expire" is NOT matched, so compaction DROPS
-                          those events outright — the resurrection defect that
-                          CE2 exhibits.
-     * an evidence event is retained iff its parent entry is live
-                          (compact.rs:166-172).  Retention is by ORIGINAL index
-                          and unconditional on position, so an evidence event
-                          that precedes its parent's retained upsert stays
-                          before it — where replay into a fresh database orphans
-                          and silently discards it.
-     * retained_indices.sort_unstable() (compact.rs:174) — the retained subset
-                          is emitted in original-index order.
+     * evidence_indices — every ("evidence_add"|"citation_healed"|
+                          "evidence_expire","evidence") event
+                          (compact.rs:135-137).  T1 added the third arm; before
+                          it, dropping evidence_expire resurrected deleted rows
+                          (CE2).
+     * an evidence event is retained iff its parent is live AND its index is
+                          strictly greater than BOTH entry_first[parent] and
+                          expire_last[parent] (compact.rs:186-196).  The
+                          first-upsert bound drops events that were orphan
+                          no-ops on the original replay; the expire bound keeps
+                          pre-expire rows from reattaching to a later revive.
+     * emission          (compact.rs:199-214) — retained upserts are emitted in
+                          original-index order, and each live entry's retained
+                          evidence events are spliced in immediately AFTER that
+                          entry's retained upsert, in their original relative
+                          order.  This is what closes CE1: an evidence event can
+                          no longer replay before the upsert that parents it.
 *)
 
 EntryUpsertActions == {"add", "legacy_add"}
 
-\* Deliberately excludes "evidence_expire": compact.rs:121 does not match it.
-EvidenceRetainedActions == {"evidence_add", "citation_healed"}
+\* T1 added ("evidence_expire","evidence") to the match arm, so all three
+\* evidence-table variants are now retention candidates (compact.rs:135-137).
+EvidenceEventActions == {"evidence_add", "citation_healed", "evidence_expire"}
 
 MaxOfSet(S) == CHOOSE i \in S : \A j \in S : j <= i
+MinOfSet(S) == CHOOSE i \in S : \A j \in S : i <= j
 
 \* Index of the last event in `events` with an action in `acts` naming `id`.
 \* 0 when there is none — the "absent from the HashMap" case.
@@ -407,20 +439,35 @@ LastIdxOf(events, id, acts) ==
                  /\ events[i].id = id }
     IN IF S = {} THEN 0 ELSE MaxOfSet(S)
 
+\* Mirrors `entry_first` (compact.rs:123, an `or_insert` on first sight).
+FirstIdxOf(events, id, acts) ==
+    LET S == { i \in 1..Len(events) :
+                 /\ events[i].action \in acts
+                 /\ events[i].id = id }
+    IN IF S = {} THEN 0 ELSE MinOfSet(S)
+
 LiveIdsIn(events) ==
     { id \in EntryIds :
         LET u == LastIdxOf(events, id, EntryUpsertActions)
         IN /\ u > 0
            /\ LastIdxOf(events, id, {"expire"}) < u }
 
-RetainedIndices(events) ==
-    LET live == LiveIdsIn(events)
-    IN    { LastIdxOf(events, id, EntryUpsertActions) : id \in live }
-       \cup { i \in 1..Len(events) :
-                /\ events[i].action \in EvidenceRetainedActions
-                /\ events[i].id \in live }
+\* Retention (compact.rs:180-197).  An evidence event survives iff its parent
+\* entry is live AND the event sits strictly after that entry's FIRST upsert
+\* (before it, the event was an orphan no-op during the original replay, and
+\* re-emitting it after the retained upsert would make it effective) AND
+\* strictly after that entry's LAST expire (an entry expire is an evidence-GC
+\* boundary — ADR-2 — so pre-expire rows must not reattach to a later revive).
+RetainedEvidenceIdxs(events, id) ==
+    LET firstU == FirstIdxOf(events, id, EntryUpsertActions)
+        lastX  == LastIdxOf(events, id, {"expire"})
+    IN { i \in 1..Len(events) :
+           /\ events[i].action \in EvidenceEventActions
+           /\ events[i].id = id
+           /\ i > firstU
+           /\ i > lastX }
 
-\* Emit the retained subset in original-index order (the sort_unstable step).
+\* Emit the named indices in ascending original order.
 RECURSIVE FilterByIdx(_, _, _)
 FilterByIdx(events, idxs, i) ==
     IF i > Len(events)
@@ -429,7 +476,25 @@ FilterByIdx(events, idxs, i) ==
                 THEN <<events[i]>> \o FilterByIdx(events, idxs, i + 1)
                 ELSE FilterByIdx(events, idxs, i + 1)
 
-CompactedLogE(events) == FilterByIdx(events, RetainedIndices(events), 1)
+\* Emission (compact.rs:199-214).  Retained upserts are walked in original-index
+\* order, and each live entry's retained evidence events are spliced in
+\* IMMEDIATELY AFTER that entry's retained (last) upsert, keeping their relative
+\* order.  This is the T2 rule: an evidence event can no longer replay ahead of
+\* the upsert that gives it a parent, which is what CE1 exploited.
+RECURSIVE EmitFrom(_, _, _)
+EmitFrom(events, live, i) ==
+    IF i > Len(events)
+        THEN <<>>
+        ELSE IF /\ events[i].action \in EntryUpsertActions
+                /\ events[i].id \in live
+                /\ LastIdxOf(events, events[i].id, EntryUpsertActions) = i
+                THEN   <<events[i]>>
+                     \o FilterByIdx(events, RetainedEvidenceIdxs(events,
+                                                                 events[i].id), 1)
+                     \o EmitFrom(events, live, i + 1)
+                ELSE EmitFrom(events, live, i + 1)
+
+CompactedLogE(events) == EmitFrom(events, LiveIdsIn(events), 1)
 
 (* ──────────────────────────── Initial state ────────────────────────────── *)
 
