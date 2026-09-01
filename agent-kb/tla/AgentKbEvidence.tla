@@ -386,17 +386,16 @@ MaterializeE(events) == MatHelperE(events, Len(events))
    defect.  The real command does not synthesize events: it selects a subset of
    the ORIGINAL events by index and re-sorts that subset by index.
 
-   Revision 2 (this one) tracks the POST-T1/T2 implementation.  The retention
-   and emission rules below are what T1 and T2 landed; the pre-fix rules that
-   CE1 and CE2 exploit are recorded in T0-counterexample.md, not here.
+   Revision 2 (this one) tracks the POST-T1/T2 implementation, plus the one
+   TARGET rule that has not landed yet (the live-at-index retention bound, CE5).
+   The pre-fix rules that CE1 and CE2 exploit are recorded in
+   T0-counterexample.md, not here.
 
    The algorithm, arm by arm:
 
-     * entry_first[id]  — index of the FIRST ("upsert","entries") event for id
-                          (compact.rs:123, an `or_insert`).  Both `add` and
-                          `legacy_add` model that event.
      * entry_last[id]   — index of the last ("upsert","entries") event for id
-                          (compact.rs:124).
+                          (compact.rs:124).  Both `add` and `legacy_add` model
+                          that event.
      * expire_last[id]  — index of the last ("expire","entries") event
                           (compact.rs:127).
      * an entry is LIVE iff expire_last[id] < entry_last[id]; live entries
@@ -408,12 +407,16 @@ MaterializeE(events) == MatHelperE(events, Len(events))
                           (compact.rs:135-137).  T1 added the third arm; before
                           it, dropping evidence_expire resurrected deleted rows
                           (CE2).
-     * an evidence event is retained iff its parent is live AND its index is
-                          strictly greater than BOTH entry_first[parent] and
-                          expire_last[parent] (compact.rs:186-196).  The
-                          first-upsert bound drops events that were orphan
-                          no-ops on the original replay; the expire bound keeps
-                          pre-expire rows from reattaching to a later revive.
+     * an evidence event is retained iff its parent is live, its index is
+                          strictly greater than expire_last[parent], and its
+                          parent was live AT ITS OWN INDEX.  The expire bound
+                          keeps pre-expire rows from reattaching to a later
+                          revive; the live-at-index bound (CE5) drops events
+                          that were orphan no-ops on the original replay.  The
+                          latter is the target rule — the code currently uses a
+                          weaker first-upsert bound (compact.rs:186-196), which
+                          is self-consistent only while expire leaves an
+                          is_stale=1 row behind.  See RetainedEvidenceIdxs.
      * emission          (compact.rs:199-214) — retained upserts are emitted in
                           original-index order, and each live entry's retained
                           evidence events are spliced in immediately AFTER that
@@ -429,7 +432,6 @@ EntryUpsertActions == {"add", "legacy_add"}
 EvidenceEventActions == {"evidence_add", "citation_healed", "evidence_expire"}
 
 MaxOfSet(S) == CHOOSE i \in S : \A j \in S : j <= i
-MinOfSet(S) == CHOOSE i \in S : \A j \in S : i <= j
 
 \* Index of the last event in `events` with an action in `acts` naming `id`.
 \* 0 when there is none — the "absent from the HashMap" case.
@@ -439,12 +441,19 @@ LastIdxOf(events, id, acts) ==
                  /\ events[i].id = id }
     IN IF S = {} THEN 0 ELSE MaxOfSet(S)
 
-\* Mirrors `entry_first` (compact.rs:123, an `or_insert` on first sight).
-FirstIdxOf(events, id, acts) ==
-    LET S == { i \in 1..Len(events) :
-                 /\ events[i].action \in acts
-                 /\ events[i].id = id }
-    IN IF S = {} THEN 0 ELSE MinOfSet(S)
+\* Index of the last event with an action in `acts` naming `id` STRICTLY BEFORE
+\* position i.  0 when there is none.
+LastIdxBefore(events, id, acts, i) ==
+    LET S == { j \in 1..(i - 1) :
+                 /\ events[j].action \in acts
+                 /\ events[j].id = id }
+    IN IF S = {} THEN 0 ELSE MaxOfSet(S)
+
+\* Was `id` a present entry at the moment event i applied?  Exactly the
+\* condition ApplyEventE's orphan guard tests at that point in the replay.
+LiveAtIdx(events, id, i) ==
+      LastIdxBefore(events, id, EntryUpsertActions, i)
+    > LastIdxBefore(events, id, {"expire"}, i)
 
 LiveIdsIn(events) ==
     { id \in EntryIds :
@@ -452,20 +461,34 @@ LiveIdsIn(events) ==
         IN /\ u > 0
            /\ LastIdxOf(events, id, {"expire"}) < u }
 
-\* Retention (compact.rs:180-197).  An evidence event survives iff its parent
-\* entry is live AND the event sits strictly after that entry's FIRST upsert
-\* (before it, the event was an orphan no-op during the original replay, and
-\* re-emitting it after the retained upsert would make it effective) AND
-\* strictly after that entry's LAST expire (an entry expire is an evidence-GC
-\* boundary — ADR-2 — so pre-expire rows must not reattach to a later revive).
+\* Retention.  An evidence event survives iff
+\*
+\*   (1) its parent entry is live at the end of the log,
+\*   (2) it sits strictly after that entry's LAST expire — an entry expire is an
+\*       evidence-GC boundary (ADR-2), so pre-expire rows must not reattach to a
+\*       later revive, and
+\*   (3) its parent was LIVE AT ITS OWN INDEX.
+\*
+\* Bound (3) is the CE5 fix.  Without it, an evidence event landing in the gap
+\* between an expire and a later revive upsert is retained even though it was an
+\* orphan no-op during the original replay — and the emission rule then places it
+\* AFTER the revive, where it becomes effective and resurrects evidence that
+\* never applied.  It subsumes the implementation's current `entry_first` bound
+\* (live-at-i implies some upsert precedes i), which is therefore not restated.
+\*
+\* This models the TARGET algorithm, not the code as it stands.  Today the
+\* implementation is self-consistent without bound (3) because `expire` leaves an
+\* `is_stale=1` row behind and `evidence_add`'s orphan guard counts stale rows,
+\* so the gap event really does apply.  Bound (3) and the ADR-2 evidence GC must
+\* land together — see T0-counterexample.md CE5 and beads task
+\* bd-evidence-storage-integrity-w3xo.7.
 RetainedEvidenceIdxs(events, id) ==
-    LET firstU == FirstIdxOf(events, id, EntryUpsertActions)
-        lastX  == LastIdxOf(events, id, {"expire"})
+    LET lastX == LastIdxOf(events, id, {"expire"})
     IN { i \in 1..Len(events) :
            /\ events[i].action \in EvidenceEventActions
            /\ events[i].id = id
-           /\ i > firstU
-           /\ i > lastX }
+           /\ i > lastX
+           /\ LiveAtIdx(events, id, i) }
 
 \* Emit the named indices in ascending original order.
 RECURSIVE FilterByIdx(_, _, _)
@@ -525,8 +548,23 @@ DoAdd ==
     \E id \in EntryIds, k \in ModelKinds :
         WriteThrough(AddEvent(id, k, "present"))
 
+\* Writer-producible alphabet (CE4).  A `legacy_add` models an upsert event
+\* written by pre-Phase-0 code, and the only production writer of entry upserts
+\* — `kb_core::add` (src/components/kb_core.rs:244-258) — has emitted `kind`
+\* unconditionally since Phase 0.  A kindless upsert can therefore only come
+\* from a log segment that predates every explicit-kind upsert, so no real
+\* events.jsonl can contain a `legacy_add` for an id that already carries an
+\* `add`.  Compaction cannot manufacture the shape either: it only ever selects
+\* original events, and a kindless LAST upsert implies every upsert for that
+\* entry is kindless.
+\*
+\* The guard restricts the event alphabet to logs a writer can actually produce.
+\* It does NOT weaken CompactionEquivalenceE, and CE3 — whose trace is
+\* legacy-only — remains reachable, so the regression value is retained.
 DoLegacyAdd ==
-    \E id \in EntryIds : WriteThrough(LegacyAddEvent(id))
+    \E id \in EntryIds :
+        /\ ~\E i \in 1..Len(log) : log[i].action = "add" /\ log[i].id = id
+        /\ WriteThrough(LegacyAddEvent(id))
 
 DoEvidenceAdd ==
     \E id \in EntryIds, eid \in EvidenceIds, ek \in EvidenceKinds :
