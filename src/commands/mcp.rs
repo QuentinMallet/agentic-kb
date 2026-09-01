@@ -339,10 +339,9 @@ fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
                         let Some((file, suffix)) = path.rsplit_once(':') else {
                             return path.to_owned();
                         };
-                        if suffix
-                            .split('-')
-                            .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
-                        {
+                        if suffix.split('-').all(|part| {
+                            !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())
+                        }) {
                             file.to_owned()
                         } else {
                             path.to_owned()
@@ -808,10 +807,13 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
     use crate::commands::rebuild::Rebuild;
     match (Rebuild).execute_with(paths, emb) {
         Ok(()) => {
-            let rebuilt = events::read_events(&paths.events)
-                .map(|e| e.len())
-                .unwrap_or(0);
-            json!({"id": id, "type": "ok", "rebuilt": rebuilt})
+            let read = events::read_events(&paths.events).ok();
+            let rebuilt = read.as_ref().map(|r| r.events.len()).unwrap_or(0);
+            let truncated_tail = read.and_then(|r| {
+                r.torn_tail
+                    .map(|t| json!({"line": t.line, "bytes": t.bytes.len()}))
+            });
+            json!({"id": id, "type": "ok", "rebuilt": rebuilt, "truncated_tail": truncated_tail})
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }

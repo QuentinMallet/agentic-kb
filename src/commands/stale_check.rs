@@ -1257,11 +1257,19 @@ mod tests {
         assert!(report.relocation[1].healed, "remaining rows still heal");
 
         let lines = render_lines(&report);
-        assert!(lines.iter().any(|l| l.contains("seed.rs:10-20") && l.ends_with("(report-only)")));
-        assert!(lines.iter().any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("seed.rs:10-20") && l.ends_with("(report-only)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
 
         let events = events::read_events(&paths.events).unwrap();
-        assert_eq!(events.len(), 1, "only the surviving heal is appended");
+        assert_eq!(
+            events.events.len(),
+            1,
+            "only the surviving heal is appended"
+        );
 
         let healed_path: String = conn
             .query_row(
@@ -1330,7 +1338,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.stale.len(), 1, "fixture must surface entry in pass 1");
+        assert_eq!(
+            report.stale.len(),
+            1,
+            "fixture must surface entry in pass 1"
+        );
         assert_eq!(report.relocation.len(), 1, "malformed row must not vanish");
         let row = &report.relocation[0];
         assert_eq!(row.entry_id, "e1");

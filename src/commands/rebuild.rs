@@ -137,7 +137,17 @@ pub fn rebuild_if_schema_obsolete(
                 return Ok(false);
             }
         };
+        if let Some(torn_tail) = &evts.torn_tail {
+            eprintln!(
+                "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                 ignoring the truncated tail during schema upgrade checks",
+                paths.events.display(),
+                torn_tail.line,
+                torn_tail.bytes.len()
+            );
+        }
         let log_upsert_ids: std::collections::HashSet<String> = evts
+            .events
             .iter()
             .filter(|e| e["action"] == "upsert" && e["table"] == "entries")
             .filter_map(|e| e["id"].as_str().map(|s| s.to_string()))
@@ -259,7 +269,17 @@ impl Rebuild {
         // Phase 1: snapshot event count under a brief lock.
         let snapshot_len = {
             let _lock = acquire_lock(&paths.lock)?;
-            events::read_events(&paths.events)?.len()
+            let snapshot = events::read_events(&paths.events)?;
+            if let Some(torn_tail) = &snapshot.torn_tail {
+                eprintln!(
+                    "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                     rebuild snapshot will ignore it",
+                    paths.events.display(),
+                    torn_tail.line,
+                    torn_tail.bytes.len()
+                );
+            }
+            snapshot.events.len()
         };
 
         // Phase 2: replay snapshot into a tmp DB — no lock held.
@@ -305,8 +325,17 @@ impl Rebuild {
             // DELETE journal avoids WAL files on the tmp path, simplifying the
             // rename step (no companion files to move or orphan).
             conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-            eprintln!("replaying {} events...", evts.len());
-            for event in &evts {
+            if let Some(torn_tail) = &evts.torn_tail {
+                eprintln!(
+                    "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                     replaying only the complete prefix",
+                    paths.events.display(),
+                    torn_tail.line,
+                    torn_tail.bytes.len()
+                );
+            }
+            eprintln!("replaying {} events...", evts.events.len());
+            for event in &evts.events {
                 db::apply_event(&conn, embedder, event)
                     .with_context(|| format!("apply event: {}", event))?;
             }
@@ -317,7 +346,16 @@ impl Rebuild {
         #[cfg(test)]
         let phase3_lock_acquired = std::time::Instant::now();
         let all_evts = events::read_events(&paths.events)?;
-        let catchup = &all_evts[snapshot_len.min(all_evts.len())..];
+        if let Some(torn_tail) = &all_evts.torn_tail {
+            eprintln!(
+                "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                 catch-up will ignore it",
+                paths.events.display(),
+                torn_tail.line,
+                torn_tail.bytes.len()
+            );
+        }
+        let catchup = &all_evts.events[snapshot_len.min(all_evts.events.len())..];
         if !catchup.is_empty() {
             eprintln!("catching up {} new event(s)...", catchup.len());
             let conn = db::open_db(&tmp_db)?;
@@ -563,7 +601,7 @@ mod tests {
         // Verify DB == Materialize(all events in log).
         let all_events = events::read_events(&paths.events).unwrap();
         let ref_conn = db::open_db_memory().unwrap();
-        for ev in &all_events {
+        for ev in &all_events.events {
             db::apply_event(&ref_conn, &emb, ev).unwrap();
         }
 
@@ -658,7 +696,7 @@ mod tests {
         // All 30 events are now in the log.  A second rebuild converges the DB.
         Rebuild.execute_with(&paths, &emb).unwrap();
 
-        let log_len = events::read_events(&paths.events).unwrap().len() as i64;
+        let log_len = events::read_events(&paths.events).unwrap().events.len() as i64;
         assert_eq!(log_len, 30);
         assert_eq!(
             count_entries(&paths),
@@ -784,17 +822,26 @@ mod tests {
 
         let paths_rebuild = clone_paths(&paths);
         let emb_rebuild = Arc::clone(&emb);
-        let rebuild_handle = thread::spawn(move || {
-            Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref())
-        });
+        let rebuild_handle =
+            thread::spawn(move || Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref()));
         let writer_handles: Vec<_> = (0..WRITERS)
-            .map(|w| spawn_writer(clone_paths(&paths), Arc::clone(&emb), Arc::clone(&barrier), w))
+            .map(|w| {
+                spawn_writer(
+                    clone_paths(&paths),
+                    Arc::clone(&emb),
+                    Arc::clone(&barrier),
+                    w,
+                )
+            })
             .collect();
         let writer_intervals: Vec<_> = writer_handles
             .into_iter()
             .map(|h| h.join().unwrap())
             .collect();
-        rebuild_handle.join().unwrap().expect("rebuild must succeed");
+        rebuild_handle
+            .join()
+            .unwrap()
+            .expect("rebuild must succeed");
 
         let phase3 = phase3_timings.lock().unwrap().clone();
         assert_eq!(
@@ -839,9 +886,7 @@ mod tests {
         let has_overlap = overlaps.iter().any(|v| *v);
         let writer_stall_deltas_ms: Vec<f64> = writer_latencies
             .iter()
-            .map(|(control, contended)| {
-                (contended.as_secs_f64() - control.as_secs_f64()) * 1000.0
-            })
+            .map(|(control, contended)| (contended.as_secs_f64() - control.as_secs_f64()) * 1000.0)
             .collect();
         let has_positive_stall_delta = writer_stall_deltas_ms.iter().any(|delta| *delta > 0.0);
         let has_negative_stall_delta = writer_stall_deltas_ms.iter().any(|delta| *delta < 0.0);
@@ -924,14 +969,16 @@ mod tests {
         let artifact_path = std::env::var_os("KB_REBUILD_BENCH_ARTIFACT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::PathBuf::from(
-                    ".omc/benches/2026-08-15-rebuild-contention.json",
-                )
+                std::path::PathBuf::from(".omc/benches/2026-08-15-rebuild-contention.json")
             });
         if let Some(parent) = artifact_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(&artifact_path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
 
         assert!(
             has_overlap,
@@ -958,15 +1005,15 @@ mod tests {
         let all_events = events::read_events(&paths.events).unwrap();
         let expected_total = SEEDED + WRITERS * EVENTS_PER_WRITER as usize;
         assert_eq!(
-            all_events.len(),
+            all_events.events.len(),
             expected_total,
             "events log must contain {expected_total} events, got {}",
-            all_events.len()
+            all_events.events.len()
         );
 
         // AC1: DB == Materialize(events.jsonl).
         let ref_conn = db::open_db_memory().unwrap();
-        for ev in &all_events {
+        for ev in &all_events.events {
             db::apply_event(&ref_conn, emb.as_ref(), ev).unwrap();
         }
         let live_conn = db::open_db(&paths.db).unwrap();

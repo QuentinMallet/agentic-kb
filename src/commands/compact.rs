@@ -4,10 +4,12 @@ use crate::commands::add::acquire_lock;
 use crate::components::events;
 use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
+use anyhow::Context;
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Maximum number of `run_history` events to retain after compaction.
 /// Older records beyond this tail are purged.
@@ -84,8 +86,19 @@ impl Compact {
         vacuum_cfg: &VacuumConfig,
     ) -> anyhow::Result<(usize, usize)> {
         let _lock = acquire_lock(&paths.lock)?;
-        let evts = events::read_events(&paths.events)?;
-        let original_count = evts.len();
+        let read = events::read_events(&paths.events)?;
+        let original_count = read.events.len();
+        if let Some(torn_tail) = &read.torn_tail {
+            let sidecar = preserve_torn_tail(&paths.events, torn_tail)?;
+            eprintln!(
+                "compact: WARNING preserved torn final line {} ({} bytes) to {} before rewriting {}",
+                torn_tail.line,
+                torn_tail.bytes.len(),
+                sidecar.display(),
+                paths.events.display()
+            );
+        }
+        let evts = read.events;
 
         let mut entry_last: HashMap<String, usize> = HashMap::new();
         let mut test_last: HashMap<String, usize> = HashMap::new();
@@ -195,6 +208,27 @@ impl Compact {
     }
 }
 
+fn preserve_torn_tail(events_path: &Path, torn_tail: &events::TornTail) -> anyhow::Result<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let file_name = format!(
+        "{}.torn-{}",
+        events_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("events.jsonl"),
+        stamp
+    );
+    let sidecar = events_path.with_file_name(file_name);
+    fs::write(&sidecar, &torn_tail.bytes).with_context(|| {
+        format!(
+            "preserve torn tail from {} into {}",
+            events_path.display(),
+            sidecar.display()
+        )
+    })?;
+    Ok(sidecar)
+}
+
 /// Run VACUUM if both conditions hold:
 /// 1. `compacts_since_vacuum` has reached `vacuum_cfg.vacuum_after_compacts`.
 /// 2. SQLite `freelist_count` is at least `vacuum_cfg.vacuum_min_free_pages`.
@@ -272,14 +306,14 @@ mod tests {
         }
 
         let before = events::read_events(&paths.events).unwrap();
-        assert_eq!(before.len(), 3);
+        assert_eq!(before.events.len(), 3);
 
         let cmd = Compact;
         cmd.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0]["summary"], "v2");
+        assert_eq!(after.events.len(), 1);
+        assert_eq!(after.events[0]["summary"], "v2");
     }
 
     #[test]
@@ -310,7 +344,7 @@ mod tests {
 
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
-            after.len(),
+            after.events.len(),
             0,
             "force-expired entry must be purged from the log"
         );
@@ -356,17 +390,17 @@ mod tests {
 
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
-            after.len(),
+            after.events.len(),
             1,
             "compact must produce exactly one entry event"
         );
         // The compact must emit the LATEST upsert (v2) and must NOT mark stale.
         assert_eq!(
-            after[0]["summary"], "v2",
+            after.events[0]["summary"], "v2",
             "compact must keep the last upsert content"
         );
         assert!(
-            after[0]["is_stale"].is_null() || after[0]["is_stale"] == false,
+            after.events[0]["is_stale"].is_null() || after.events[0]["is_stale"] == false,
             "re-upsert after expire must NOT be marked stale (br-joj)"
         );
     }
@@ -391,8 +425,8 @@ mod tests {
         cmd.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1);
-        assert!(after[0]["is_stale"].is_null() || after[0]["is_stale"] == false);
+        assert_eq!(after.events.len(), 1);
+        assert!(after.events[0]["is_stale"].is_null() || after.events[0]["is_stale"] == false);
     }
 
     #[test]
@@ -426,8 +460,8 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
 
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 1, "only live entry must remain in log");
-        assert_eq!(after[0]["id"], "live");
+        assert_eq!(after.events.len(), 1, "only live entry must remain in log");
+        assert_eq!(after.events[0]["id"], "live");
     }
 
     #[test]
@@ -453,14 +487,17 @@ mod tests {
 
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
-            after.len(),
+            after.events.len(),
             RUN_HISTORY_CAP,
             "compact must retain at most RUN_HISTORY_CAP run_history events"
         );
         // Verify the LAST RUN_HISTORY_CAP records are kept (oldest 50 trimmed).
-        assert_eq!(after[0]["test_id"], "50", "first retained must be event 50");
         assert_eq!(
-            after[RUN_HISTORY_CAP - 1]["test_id"],
+            after.events[0]["test_id"], "50",
+            "first retained must be event 50"
+        );
+        assert_eq!(
+            after.events[RUN_HISTORY_CAP - 1]["test_id"],
             format!("{}", over - 1),
             "last retained must be the most recent event"
         );
@@ -488,13 +525,13 @@ mod tests {
 
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
-            after.len(),
+            after.events.len(),
             RUN_HISTORY_CAP,
             "exactly RUN_HISTORY_CAP events must not be trimmed"
         );
-        assert_eq!(after[0]["test_id"], "0");
+        assert_eq!(after.events[0]["test_id"], "0");
         assert_eq!(
-            after[RUN_HISTORY_CAP - 1]["test_id"],
+            after.events[RUN_HISTORY_CAP - 1]["test_id"],
             format!("{}", RUN_HISTORY_CAP - 1)
         );
     }
@@ -530,7 +567,11 @@ mod tests {
             derived_from: None,
             recorded_at: Some("2026-01-01T00:00:00Z".to_string()),
         };
-        append_event(&paths.events, &evidence_add_event("e1", &evidence, Some("deadbeef"))).unwrap();
+        append_event(
+            &paths.events,
+            &evidence_add_event("e1", &evidence, Some("deadbeef")),
+        )
+        .unwrap();
         append_event(
             &paths.events,
             &citation_healed_event(
@@ -548,14 +589,16 @@ mod tests {
 
         let replay = open_db_memory().unwrap();
         let embedder = NoopEmbedder;
-        for ev in events::read_events(&paths.events).unwrap() {
+        for ev in events::read_events(&paths.events).unwrap().events {
             apply_event(&replay, &embedder, &ev).unwrap();
         }
 
         let citation_path: String = replay
-            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(citation_path, "src/new.rs:11-77");
     }
@@ -584,7 +627,7 @@ mod tests {
         .unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         let after = events::read_events(&paths.events).unwrap();
-        assert_eq!(after.len(), 0, "pure orphan expire must be dropped");
+        assert_eq!(after.events.len(), 0, "pure orphan expire must be dropped");
 
         // Case (b): post-compact orphan — another expire after log is empty.
         append_event(
@@ -598,10 +641,46 @@ mod tests {
         Compact.execute_with_paths(&paths).unwrap();
         let after2 = events::read_events(&paths.events).unwrap();
         assert_eq!(
-            after2.len(),
+            after2.events.len(),
             0,
             "post-compact orphan expire must also be dropped"
         );
+    }
+
+    #[test]
+    fn test_cmd_compact_preserves_torn_tail_in_sidecar() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        fs::write(
+            &paths.events,
+            b"{\"action\":\"upsert\",\"table\":\"entries\",\"id\":\"live\",\"path\":\"src/live.rs\",\"summary\":\"live\",\"content\":\"c\",\"tags\":[],\"ts\":\"2024-01-01T00:00:00Z\"}\n{\"action\":",
+        )
+        .unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let after = events::read_events(&paths.events).unwrap();
+        assert_eq!(after.events.len(), 1);
+        assert!(after.torn_tail.is_none());
+        assert_eq!(after.events[0]["id"], "live");
+
+        let sidecars: Vec<_> = fs::read_dir(paths.events.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("agent-kb-events.jsonl.torn-"))
+            })
+            .collect();
+        assert_eq!(sidecars.len(), 1, "compact must preserve torn bytes");
+        assert_eq!(fs::read(&sidecars[0]).unwrap(), b"{\"action\":");
+        let compacted_bytes = fs::read(&paths.events).unwrap();
+        assert!(!compacted_bytes.ends_with(b"{\"action\":"));
     }
 
     // br-h7c: proptest target #4 — expire/compact state machine.
@@ -700,7 +779,7 @@ mod tests {
         let conn = db::open_db_memory().unwrap();
         let embedder = NoopEmbedder;
         let evts = events::read_events(&paths.events).unwrap();
-        for ev in &evts {
+        for ev in &evts.events {
             db::apply_event(&conn, &embedder, ev).unwrap();
         }
 

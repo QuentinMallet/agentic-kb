@@ -193,8 +193,16 @@ pub fn corpus_hash_from_event_log(
     expected_ids: &BTreeSet<String>,
 ) -> Result<(String, BTreeSet<String>)> {
     let events = crate::components::events::read_events(events_path)?;
+    if let Some(torn_tail) = &events.torn_tail {
+        eprintln!(
+            "retrieval-eval: WARNING event log at {} has a torn final line {} ({} bytes) — hashing only the complete prefix",
+            events_path.display(),
+            torn_tail.line,
+            torn_tail.bytes.len()
+        );
+    }
     let mut live: BTreeMap<String, String> = BTreeMap::new();
-    for event in events {
+    for event in events.events {
         if event.get("table").and_then(|v| v.as_str()) != Some("entries") {
             continue;
         }
