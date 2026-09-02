@@ -18,6 +18,24 @@ pub struct ReadEvents {
     pub torn_tail: Option<TornTail>,
 }
 
+enum EventLineParseError {
+    Utf8(std::str::Utf8Error),
+    Json(serde_json::Error),
+}
+
+fn parse_event_line(
+    bytes: &[u8],
+) -> std::result::Result<Option<serde_json::Value>, EventLineParseError> {
+    let text = std::str::from_utf8(bytes).map_err(EventLineParseError::Utf8)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .map_err(EventLineParseError::Json)
+}
+
 /// Build an `evidence_add` event payload.
 ///
 /// The caller is responsible for appending to the event log under the existing
@@ -155,6 +173,13 @@ pub(crate) fn preserve_torn_tail(
     Ok(sidecar)
 }
 
+/// Repair an unterminated final record while the caller holds the event-log flock.
+///
+/// Classification intentionally matches [`read_events_up_to`]: valid UTF-8 that
+/// parses as a complete JSON value (or a line the reader skips as blank) is
+/// reader-accepted, so only its missing newline is appended. Invalid UTF-8 or
+/// incomplete JSON is preserved in a sidecar and truncated. Append must never
+/// destroy an event that the reader would already have accepted.
 fn repair_torn_tail_before_append(events_path: &Path) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -193,6 +218,10 @@ fn repair_torn_tail_before_append(events_path: &Path) -> Result<()> {
     file.seek(SeekFrom::Start(tail_start))?;
     let mut bytes = Vec::with_capacity((len - tail_start) as usize);
     file.read_to_end(&mut bytes)?;
+    if parse_event_line(&bytes).is_ok() {
+        file.write_all(b"\n")?;
+        return Ok(());
+    }
     let sidecar = preserve_torn_tail(events_path, &bytes)?;
     file.set_len(tail_start)?;
     eprintln!(
@@ -254,31 +283,30 @@ pub fn read_events_up_to(events_path: &Path, max: usize) -> Result<ReadEvents> {
             line,
             bytes: chunk.to_vec(),
         };
-        let text = match std::str::from_utf8(chunk) {
-            Ok(text) => text,
-            Err(_) if !has_newline => {
+        let event = match parse_event_line(chunk) {
+            Ok(event) => event,
+            Err(EventLineParseError::Utf8(_)) if !has_newline => {
                 return Ok(ReadEvents {
                     events,
                     torn_tail: Some(torn_tail()),
                 });
             }
-            Err(e) => return Err(e).with_context(|| format!("decode events line {line}")),
+            Err(EventLineParseError::Utf8(e)) => {
+                return Err(e).with_context(|| format!("decode events line {line}"));
+            }
+            Err(EventLineParseError::Json(_)) if !has_newline => {
+                return Ok(ReadEvents {
+                    events,
+                    torn_tail: Some(torn_tail()),
+                });
+            }
+            Err(EventLineParseError::Json(e)) => {
+                return Err(e).with_context(|| format!("parse events line {line}"));
+            }
         };
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            continue;
+        if let Some(event) = event {
+            events.push(event);
         }
-        let v: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) if !has_newline => {
-                return Ok(ReadEvents {
-                    events,
-                    torn_tail: Some(torn_tail()),
-                });
-            }
-            Err(e) => return Err(e).with_context(|| format!("parse events line {line}")),
-        };
-        events.push(v);
     }
     Ok(ReadEvents {
         events,
@@ -291,6 +319,19 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn torn_sidecars(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
+            })
+            .collect()
+    }
 
     #[test]
     fn test_append_and_read_events_roundtrip() {
@@ -314,6 +355,43 @@ mod tests {
     }
 
     #[test]
+    fn test_append_event_preserves_complete_json_without_newline_in_log() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let prior = serde_json::json!({"action": "upsert", "id": "prior"});
+        let appended = serde_json::json!({"action": "upsert", "id": "appended"});
+        fs::write(&events_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+
+        append_event(&events_path, &appended).unwrap();
+
+        let result = read_events(&events_path).unwrap();
+        assert_eq!(result.events, vec![prior, appended]);
+        assert!(result.torn_tail.is_none());
+        assert!(torn_sidecars(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_append_events_batch_preserves_complete_json_without_newline_in_log() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let prior = serde_json::json!({"action": "upsert", "id": "prior"});
+        let appended = vec![
+            serde_json::json!({"action": "upsert", "id": "one"}),
+            serde_json::json!({"action": "upsert", "id": "two"}),
+        ];
+        fs::write(&events_path, serde_json::to_vec(&prior).unwrap()).unwrap();
+
+        append_events_batch(&events_path, &appended).unwrap();
+
+        let result = read_events(&events_path).unwrap();
+        let mut expected = vec![prior];
+        expected.extend(appended);
+        assert_eq!(result.events, expected);
+        assert!(result.torn_tail.is_none());
+        assert!(torn_sidecars(dir.path()).is_empty());
+    }
+
+    #[test]
     fn test_append_event_repairs_and_preserves_torn_tail() {
         let dir = tempdir().unwrap();
         let events_path = dir.path().join("events.jsonl");
@@ -333,18 +411,54 @@ mod tests {
         let result = read_events(&events_path).unwrap();
         assert_eq!(result.events, vec![first, second]);
         assert!(result.torn_tail.is_none());
-        let sidecars: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
-            })
-            .collect();
+        let sidecars = torn_sidecars(dir.path());
         assert_eq!(sidecars.len(), 1);
         assert_eq!(fs::read(&sidecars[0]).unwrap(), torn);
+    }
+
+    #[test]
+    fn test_append_event_preserves_split_utf8_tail_in_sidecar() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let first = serde_json::json!({"action": "upsert", "id": "first"});
+        let appended = serde_json::json!({"action": "upsert", "id": "appended"});
+        let mut contents = serde_json::to_vec(&first).unwrap();
+        contents.push(b'\n');
+        let torn = b"{\"msg\":\"\xE2\x82";
+        contents.extend_from_slice(torn);
+        fs::write(&events_path, contents).unwrap();
+
+        append_event(&events_path, &appended).unwrap();
+
+        let result = read_events(&events_path).unwrap();
+        assert_eq!(result.events, vec![first, appended]);
+        assert!(result.torn_tail.is_none());
+        let sidecars = torn_sidecars(dir.path());
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(fs::read(&sidecars[0]).unwrap(), torn);
+    }
+
+    #[test]
+    fn test_append_event_never_removes_reader_accepted_tail() {
+        let appended = serde_json::json!({"action": "upsert", "id": "appended"});
+        for tail in [
+            serde_json::to_vec(&serde_json::json!({"action": "upsert", "id": "accepted"}))
+                .unwrap(),
+            b"{\"action\":".to_vec(),
+        ] {
+            let dir = tempdir().unwrap();
+            let events_path = dir.path().join("events.jsonl");
+            fs::write(&events_path, &tail).unwrap();
+            let before = read_events(&events_path).unwrap();
+
+            append_event(&events_path, &appended).unwrap();
+
+            let after = read_events(&events_path).unwrap();
+            let mut expected = before.events;
+            expected.push(appended.clone());
+            assert_eq!(after.events, expected);
+            assert!(after.torn_tail.is_none());
+        }
     }
 
     #[test]
