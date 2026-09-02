@@ -104,7 +104,7 @@ defmodule AgenticKbMcp.McpServer do
                 },
                 "citation_path" => %{
                   "type" => "string",
-                  "description" => "File path and required byte range, e.g. src/foo.rs:42-58"
+                  "description" => "File path (whole-file citation) or path:start-end byte range"
                 },
                 "citation_sha" => %{
                   "type" => "string",
@@ -112,7 +112,7 @@ defmodule AgenticKbMcp.McpServer do
                 },
                 "citation_hash" => %{
                   "type" => "string",
-                  "description" => "sha256: hash of the cited byte range for inline verification"
+                  "description" => "sha256 of the whole file (bare form) or of the cited byte range"
                 },
                 "citation_excerpt" => %{
                   "type" => "string",
