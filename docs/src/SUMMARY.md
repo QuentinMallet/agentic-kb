@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](./introduction.md)
+- [Evidence Storage](./evidence-storage.md)
 - [Peer Graph (kb peers)](./peer-graph-cli.md)
 - [MCP Surfaces](./mcp.md)
 - [Search Tuning](./search-tuning.md)
