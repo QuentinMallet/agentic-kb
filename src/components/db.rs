@@ -918,19 +918,6 @@ pub fn apply_event(
                 .as_str()
                 .context("evidence_add: missing entry_id")?;
 
-            // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
-            let entry_exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE id=?1",
-                    params![entry_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
-            if !entry_exists {
-                return Ok(());
-            }
-
             let kind = ev["kind"]
                 .as_str()
                 .context("evidence_add: missing evidence.kind")?;
@@ -943,24 +930,46 @@ pub fn apply_event(
             let derived_from = ev["derived_from"].as_str();
             let recorded_at = ev["recorded_at"].as_str();
 
-            conn.execute(
-                "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
-            )?;
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<()> {
+                // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
+                let entry_exists: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE id=?1",
+                        params![entry_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !entry_exists {
+                    return Ok(());
+                }
 
-            // Recompute evidence_status unconditionally. The prior "preserve n/a for
-            // legacy entries" branch caused incremental-vs-replay divergence: a legacy
-            // upsert (no explicit kind/evidence_status) followed by evidence_add kept
-            // evidence_status='n/a' on the incremental path, while a full rebuild from
-            // the same events would converge to 'present' via compute_evidence_status.
-            // The fix is to always call the soft-mandate helper after an evidence row
-            // change so both paths agree (br-f7y).
-            let new_status = compute_evidence_status(conn, entry_id)?;
-            conn.execute(
-                "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                params![new_status, entry_id],
-            )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
+                )?;
+
+                // Recompute evidence_status unconditionally. The prior "preserve n/a for
+                // legacy entries" branch caused incremental-vs-replay divergence: a legacy
+                // upsert (no explicit kind/evidence_status) followed by evidence_add kept
+                // evidence_status='n/a' on the incremental path, while a full rebuild from
+                // the same events would converge to 'present' via compute_evidence_status.
+                // The fix is to always call the soft-mandate helper after an evidence row
+                // change so both paths agree (br-f7y).
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            conn.execute_batch("COMMIT")?;
         }
 
         ("citation_healed", "evidence") => {
@@ -994,27 +1003,36 @@ pub fn apply_event(
                 .as_str()
                 .context("evidence_expire: missing entry_id")?;
 
-            conn.execute(
-                "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
-                params![ev_id, entry_id],
-            )?;
-
-            // Recompute evidence_status if the parent entry exists.
-            let entry_exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE id=?1",
-                    params![entry_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
-            if entry_exists {
-                let new_status = compute_evidence_status(conn, entry_id)?;
+            conn.execute_batch("BEGIN")?;
+            let result = (|| -> Result<()> {
                 conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
+                    "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
+                    params![ev_id, entry_id],
                 )?;
+
+                // Recompute evidence_status if the parent entry exists.
+                let entry_exists: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE id=?1",
+                        params![entry_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if entry_exists {
+                    let new_status = compute_evidence_status(conn, entry_id)?;
+                    conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                        params![new_status, entry_id],
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
+            conn.execute_batch("COMMIT")?;
         }
 
         _ => {} // unknown event — skip silently
@@ -3042,6 +3060,89 @@ mod tests {
             .unwrap();
         assert_eq!(is_stale, 1);
         assert_eq!(evidence_status, "n/a");
+    }
+
+    #[test]
+    fn test_apply_event_evidence_add_rolls_back_on_status_update_failure() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "ev-add-tx",
+            "path": "src/lib.rs",
+            "summary": "entry",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER abort_evidence_add_status_update
+             BEFORE UPDATE OF evidence_status ON entries
+             BEGIN
+               SELECT RAISE(ABORT, 'boom evidence add');
+             END;",
+        )
+        .unwrap();
+
+        let err = apply_event(&conn, &embedder, &evidence_add_event("ev-add-tx")).unwrap_err();
+        assert!(err.to_string().contains("boom evidence add"));
+        assert_eq!(entry_evidence_row_count(&conn, "ev-add-tx"), 0);
+        assert_eq!(entry_evidence_status(&conn, "ev-add-tx"), "missing");
+
+        conn.execute_batch("DROP TRIGGER abort_evidence_add_status_update;")
+            .unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("ev-add-tx")).unwrap();
+        assert_eq!(entry_evidence_row_count(&conn, "ev-add-tx"), 1);
+        assert_eq!(entry_evidence_status(&conn, "ev-add-tx"), "present");
+    }
+
+    #[test]
+    fn test_apply_event_evidence_expire_rolls_back_on_status_update_failure() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "ev-expire-tx",
+            "path": "src/lib.rs",
+            "summary": "entry",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("ev-expire-tx")).unwrap();
+        assert_eq!(entry_evidence_row_count(&conn, "ev-expire-tx"), 1);
+
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER abort_evidence_expire_status_update
+             BEFORE UPDATE OF evidence_status ON entries
+             BEGIN
+               SELECT RAISE(ABORT, 'boom evidence expire');
+             END;",
+        )
+        .unwrap();
+
+        let err = apply_event(&conn, &embedder, &evidence_expire_event("ev-expire-tx"))
+            .unwrap_err();
+        assert!(err.to_string().contains("boom evidence expire"));
+        assert_eq!(entry_evidence_row_count(&conn, "ev-expire-tx"), 1);
+        assert_eq!(entry_evidence_status(&conn, "ev-expire-tx"), "present");
+
+        conn.execute_batch("DROP TRIGGER abort_evidence_expire_status_update;")
+            .unwrap();
+        apply_event(&conn, &embedder, &evidence_expire_event("ev-expire-tx")).unwrap();
+        assert_eq!(entry_evidence_row_count(&conn, "ev-expire-tx"), 0);
+        assert_eq!(entry_evidence_status(&conn, "ev-expire-tx"), "missing");
     }
 
     /// ADR-1 corollary (AgentKbEvidence.tla CE3): a legacy upsert may only
