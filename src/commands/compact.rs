@@ -100,6 +100,7 @@ impl Compact {
         }
         let evts = read.events;
 
+        let mut entry_first: HashMap<String, usize> = HashMap::new();
         let mut entry_last: HashMap<String, usize> = HashMap::new();
         let mut test_last: HashMap<String, usize> = HashMap::new();
         // Track index of the LAST expire per id (not just membership) so that
@@ -120,6 +121,7 @@ impl Compact {
             }
             match (action, table) {
                 ("upsert", "entries") => {
+                    entry_first.entry(id.clone()).or_insert(i);
                     entry_last.insert(id, i);
                 }
                 ("expire", "entries") => {
@@ -131,7 +133,9 @@ impl Compact {
                 ("insert", "run_history") => {
                     run_indices.push(i);
                 }
-                ("evidence_add", "evidence") | ("citation_healed", "evidence") => {
+                ("evidence_add", "evidence")
+                | ("citation_healed", "evidence")
+                | ("evidence_expire", "evidence") => {
                     evidence_indices.push(i);
                 }
                 _ => {}
@@ -171,24 +175,49 @@ impl Compact {
             retained_indices.push(i);
         }
 
-        // Evidence events are retained verbatim for live parent entries so a
-        // compacted log still rebuilds their evidence rows and healed paths.
-        // Compact still does not synthesize a minimal evidence history; it
-        // preserves the live-entry subset and leaves deeper evidence compaction
-        // work out of scope.
+        // Evidence events are retained verbatim for live parent entries, but an
+        // entry expire is an evidence-GC boundary: evidence from before the last
+        // expire must not be attached to a later re-upsert of the same entry.
+        // Also drop events before the first upsert: they were orphan no-ops during
+        // replay and emission after the retained upsert would make them effective.
+        // The first-upsert boundary is global, so evidence between an expire and a
+        // revive upsert remains eligible: the stale entry existed when it applied.
+        let mut evidence_by_entry: HashMap<String, Vec<usize>> = HashMap::new();
         for i in evidence_indices {
             let ev = &evts[i];
             let entry_id = ev["entry_id"].as_str().unwrap_or("");
-            if live_entry_ids.contains(entry_id) {
-                retained_indices.push(i);
+            if live_entry_ids.contains(entry_id)
+                && entry_first
+                    .get(entry_id)
+                    .is_some_and(|&first_upsert_i| i > first_upsert_i)
+                && expire_last
+                    .get(entry_id)
+                    .map_or(true, |&expire_i| i > expire_i)
+            {
+                evidence_by_entry
+                    .entry(entry_id.to_string())
+                    .or_default()
+                    .push(i);
             }
         }
 
         retained_indices.sort_unstable();
-        let compacted: Vec<serde_json::Value> = retained_indices
-            .into_iter()
-            .map(|i| evts[i].clone())
-            .collect();
+        let mut compacted: Vec<serde_json::Value> = Vec::new();
+        for i in retained_indices {
+            let ev = &evts[i];
+            compacted.push(ev.clone());
+            if ev["action"] == "upsert" && ev["table"] == "entries" {
+                if let Some(entry_id) = ev["id"].as_str() {
+                    if let Some(indices) = evidence_by_entry.remove(entry_id) {
+                        compacted.extend(
+                            indices
+                                .into_iter()
+                                .map(|evidence_i| evts[evidence_i].clone()),
+                        );
+                    }
+                }
+            }
+        }
 
         let tmp = paths.events.with_extension("jsonl.tmp");
         {
@@ -604,6 +633,228 @@ mod tests {
     }
 
     #[test]
+    fn test_cmd_compact_preserves_evidence_after_trailing_reupsert() {
+        use crate::components::db::{apply_event, open_db_memory};
+        use crate::components::embedder::NoopEmbedder;
+        use crate::components::events::evidence_add_event;
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "e1",
+            "path": "src/a.rs", "summary": "entry", "content": "c",
+            "tags": [], "kind": "observation", "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &upsert).unwrap();
+        let evidence = Evidence {
+            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
+            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
+            derived_from: None, recorded_at: Some("2024-01-01T00:00:01Z".to_string()),
+        };
+        append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
+        append_event(&paths.events, &upsert).unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let replay = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        for ev in events::read_events(&paths.events).unwrap().events {
+            apply_event(&replay, &embedder, &ev).unwrap();
+        }
+        let evidence_count: i64 = replay
+            .query_row("SELECT COUNT(*) FROM evidence WHERE entry_id='e1'", [], |row| row.get(0))
+            .unwrap();
+        let evidence_status: String = replay
+            .query_row("SELECT evidence_status FROM entries WHERE id='e1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(evidence_count, 1);
+        assert_eq!(evidence_status, "present");
+    }
+
+    #[test]
+    fn test_cmd_compact_drops_evidence_before_last_entry_expire() {
+        use crate::components::events::evidence_add_event;
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "e1", "path": "src/a.rs",
+            "summary": "entry", "content": "c", "tags": [], "kind": "observation",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &upsert).unwrap();
+        let evidence = Evidence {
+            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
+            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
+            derived_from: None, recorded_at: None,
+        };
+        append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
+        append_event(&paths.events, &serde_json::json!({
+            "action": "expire", "table": "entries", "id": "e1", "ts": "2024-01-01T00:00:02Z"
+        })).unwrap();
+        append_event(&paths.events, &upsert).unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+        let compacted = events::read_events(&paths.events).unwrap().events;
+        assert!(compacted.iter().all(|ev| ev["table"] != "evidence" || ev["entry_id"] != "e1"));
+    }
+
+    #[test]
+    fn test_cmd_compact_drops_evidence_expire_before_first_upsert() {
+        use crate::components::events::evidence_expire_event;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        append_event(
+            &paths.events,
+            &evidence_expire_event("d", "ev-d", "orphan regression"),
+        )
+        .unwrap();
+        for id in ["d", "a"] {
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "upsert", "table": "entries", "id": id,
+                    "path": format!("src/{id}.rs"), "summary": "legacy",
+                    "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+                }),
+            )
+            .unwrap();
+        }
+
+        let original = materialize(&paths);
+        assert_eq!(
+            original.iter().find(|(id, _, _)| id == "d").unwrap().1.as_str(),
+            "n/a"
+        );
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let compacted = events::read_events(&paths.events).unwrap().events;
+        assert!(compacted
+            .iter()
+            .all(|ev| ev["table"] != "evidence" || ev["entry_id"] != "d"));
+        let replayed = materialize(&paths);
+        assert_eq!(replayed, original);
+    }
+
+    #[test]
+    fn test_cmd_compact_drops_evidence_add_before_first_upsert() {
+        use crate::components::events::evidence_add_event;
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let evidence = Evidence {
+            id: "ev-d".to_string(), entry_id: "d".to_string(), kind: "code".to_string(),
+            citation_path: Some("src/d.rs:0-1".to_string()), citation_sha: None,
+            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
+            derived_from: None, recorded_at: None,
+        };
+        append_event(&paths.events, &evidence_add_event("d", &evidence, None)).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "d",
+                "path": "src/d.rs", "summary": "legacy", "content": "c",
+                "tags": [], "ts": "2024-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let compacted = events::read_events(&paths.events).unwrap().events;
+        assert!(compacted
+            .iter()
+            .all(|ev| ev["table"] != "evidence" || ev["entry_id"] != "d"));
+    }
+
+    #[test]
+    fn test_cmd_compact_retains_evidence_between_expire_and_revive() {
+        use crate::components::events::evidence_add_event;
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "d",
+            "path": "src/d.rs", "summary": "entry", "content": "c",
+            "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &upsert).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries", "id": "d",
+                "ts": "2024-01-01T00:00:01Z"
+            }),
+        )
+        .unwrap();
+        let evidence = Evidence {
+            id: "ev-d".to_string(), entry_id: "d".to_string(), kind: "code".to_string(),
+            citation_path: Some("src/d.rs:0-1".to_string()), citation_sha: None,
+            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
+            derived_from: None, recorded_at: None,
+        };
+        append_event(&paths.events, &evidence_add_event("d", &evidence, None)).unwrap();
+        append_event(&paths.events, &upsert).unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+
+        let compacted = events::read_events(&paths.events).unwrap().events;
+        assert!(compacted.iter().any(|ev| {
+            ev["action"] == "evidence_add"
+                && ev["table"] == "evidence"
+                && ev["entry_id"] == "d"
+        }));
+    }
+
+    #[test]
+    fn test_cmd_compact_evidence_fixpoint() {
+        use crate::components::events::{citation_healed_event, evidence_add_event};
+        use crate::models::Evidence;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        append_event(&paths.events, &serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "e1", "path": "src/a.rs",
+            "summary": "entry", "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        })).unwrap();
+        let evidence = Evidence {
+            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
+            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
+            derived_from: None, recorded_at: None,
+        };
+        append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
+        append_event(&paths.events, &citation_healed_event("e1", "ev-1", "src/a.rs:0-1", "src/a.rs:2-3", "sha256:abc", None)).unwrap();
+
+        Compact.execute_with_paths(&paths).unwrap();
+        let once = fs::read(&paths.events).unwrap();
+        Compact.execute_with_paths(&paths).unwrap();
+        assert_eq!(fs::read(&paths.events).unwrap(), once);
+    }
+
+    #[test]
     fn test_cmd_compact_orphan_expire_dropped() {
         // An expire event with no matching upsert in the log is an orphan. Compact
         // must drop it silently — absent == stale for all query paths. Two cases:
@@ -731,6 +982,27 @@ mod tests {
                         });
                         append_event(&paths.events, &ev).unwrap();
                     }
+                    CompactOp::EvidenceAdd(id) => {
+                        append_event(&paths.events, &serde_json::json!({
+                            "action": "evidence_add", "table": "evidence", "entry_id": id,
+                            "evidence": {"id": format!("ev-{id}"), "entry_id": id, "kind": "code",
+                                "citation_path": format!("src/{id}.rs:0-1"), "citation_sha": null,
+                                "citation_hash": "sha256:abc", "citation_excerpt": null,
+                                "derived_from": null, "recorded_at": null},
+                            "ts": "2024-01-01T02:00:00Z"
+                        })).unwrap();
+                    }
+                    CompactOp::EvidenceExpire(id) => {
+                        append_event(&paths.events, &crate::components::events::evidence_expire_event(
+                            id, &format!("ev-{id}"), "property test"
+                        )).unwrap();
+                    }
+                    CompactOp::CitationHealed(id) => {
+                        append_event(&paths.events, &crate::components::events::citation_healed_event(
+                            id, &format!("ev-{id}"), &format!("src/{id}.rs:0-1"),
+                            &format!("src/{id}.rs:2-3"), "sha256:abc", None
+                        )).unwrap();
+                    }
                     CompactOp::Compact => {
                         let before = materialize(&paths);
                         Compact.execute_with_paths(&paths).unwrap();
@@ -755,6 +1027,9 @@ mod tests {
     enum CompactOp {
         Upsert(String),
         Expire(String),
+        EvidenceAdd(String),
+        EvidenceExpire(String),
+        CitationHealed(String),
         Compact,
     }
 
@@ -764,16 +1039,17 @@ mod tests {
         let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
         prop_oneof![
             arb_id.clone().prop_map(CompactOp::Upsert),
-            arb_id.prop_map(CompactOp::Expire),
+            arb_id.clone().prop_map(CompactOp::Expire),
+            arb_id.clone().prop_map(CompactOp::EvidenceAdd),
+            arb_id.clone().prop_map(CompactOp::EvidenceExpire),
+            arb_id.prop_map(CompactOp::CitationHealed),
             Just(CompactOp::Compact),
         ]
     }
 
-    /// Replay the current event log into a fresh in-memory DB and return the
-    /// sorted set of live (non-stale) entry IDs — the materialized live state
-    /// under test. Stale entries are excluded because compact purges them from
-    /// the log entirely; their absence after rebuild is correct.
-    fn materialize(paths: &Paths) -> Vec<String> {
+    /// Replay the current event log into a fresh in-memory DB and return each
+    /// live entry's ID, derived evidence status, and sorted evidence rows.
+    fn materialize(paths: &Paths) -> Vec<(String, String, Vec<(String, String)>)> {
         use crate::components::{db, embedder::NoopEmbedder};
 
         let conn = db::open_db_memory().unwrap();
@@ -781,13 +1057,38 @@ mod tests {
         let evts = events::read_events(&paths.events).unwrap();
         for ev in &evts.events {
             db::apply_event(&conn, &embedder, ev).unwrap();
+            // ADR-2 is implemented by the following epic task. Model its
+            // ratified live-state semantics here so this compaction property
+            // already enforces the entry-expire evidence-GC boundary.
+            if ev["action"] == "expire" && ev["table"] == "entries" {
+                conn.execute("DELETE FROM evidence WHERE entry_id=?1", [ev["id"].as_str()])
+                    .unwrap();
+            }
         }
 
         let mut stmt = conn
-            .prepare("SELECT id FROM entries WHERE COALESCE(is_stale, 0) = 0 ORDER BY id")
+            .prepare("SELECT id, evidence_status FROM entries WHERE COALESCE(is_stale, 0) = 0 ORDER BY id")
             .unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        rows.collect::<Result<Vec<_>, _>>().unwrap()
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap();
+        rows.map(|row| {
+            let (id, status) = row.unwrap();
+            let evidence = {
+                let mut evidence_stmt = conn.prepare(
+                    "SELECT id, COALESCE(citation_path, '') FROM evidence WHERE entry_id=?1 ORDER BY id"
+                ).unwrap();
+                evidence_stmt
+                    .query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            (id, status, evidence)
+        })
+        .collect()
     }
 
     // ── VACUUM gate helpers ───────────────────────────────────────────────────

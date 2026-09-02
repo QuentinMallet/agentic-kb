@@ -210,7 +210,7 @@ pub struct Evidence {
     pub citation_hash: String,
     /// Short excerpt from the cited artifact
     pub citation_excerpt: Option<String>,
-    /// ID of the evidence this was derived from (for kind=derived)
+    /// ID of the parent entry this evidence was derived from (for kind=derived)
     pub derived_from: Option<String>,
     /// Timestamp when evidence was recorded
     pub recorded_at: Option<String>,

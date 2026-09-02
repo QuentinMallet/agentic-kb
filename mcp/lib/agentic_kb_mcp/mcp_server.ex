@@ -104,7 +104,7 @@ defmodule AgenticKbMcp.McpServer do
                 },
                 "citation_path" => %{
                   "type" => "string",
-                  "description" => "File path and optional line range, e.g. src/foo.rs:42-58"
+                  "description" => "File path and required byte range, e.g. src/foo.rs:42-58"
                 },
                 "citation_sha" => %{
                   "type" => "string",
@@ -122,7 +122,7 @@ defmodule AgenticKbMcp.McpServer do
                 "derived_from" => %{
                   "type" => "string",
                   "description" =>
-                    "ID of a parent evidence row this row is derived from (optional)"
+                    "ID of the parent entry this evidence row is derived from (optional)"
                 }
               },
               "required" => ["kind", "citation_path", "citation_sha", "citation_hash"]
