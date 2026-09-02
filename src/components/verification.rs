@@ -12,7 +12,7 @@
 //! recorded hash still describes it.
 
 use crate::models::{Evidence, VerificationStatus};
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
@@ -24,12 +24,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 
 /// Maximum file size allowed for verification: 64 MiB.
-/// Files larger than this are rejected to prevent unbounded memory use.
+/// Per D3 (2026-09-02), whole-file citations use this as their only size cap;
+/// explicit ranges remain separately capped by [`MAX_RANGE_BYTES`].
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum range size allowed for verification: 4 MiB.
-/// Citation ranges larger than this are rejected to prevent unbounded reads.
+/// Per D3 (2026-09-02), this applies only to explicit `file:start-end`
+/// citations; whole-file citations are bounded only by [`MAX_FILE_BYTES`].
 const MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Fixed buffer size for streaming citation bytes into the hasher.
+const HASH_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Hard per-relocation scan budget: 32 MiB of file content read across the
 /// whole search. Bounds the worst single unit of work handed to a verification
@@ -218,6 +223,140 @@ fn strip_hash_prefix(h: &str) -> &str {
     h.strip_prefix("sha256:").unwrap_or(h)
 }
 
+pub(crate) struct CitationHash {
+    pub(crate) sha256_hex: String,
+    pub(crate) file_size: u64,
+}
+
+/// The only place a citation_path string is constructed.
+///
+/// Before the optional-range parser lands, `range = None` must keep emitting
+/// the legacy whole-file workaround form `path:0-file_size`. After `.3` lands,
+/// the `None` arm becomes a one-line change to return `rel_path.to_string()`.
+pub fn format_citation_path(
+    rel_path: &str,
+    range: Option<(usize, usize)>,
+    file_size: u64,
+) -> String {
+    match range {
+        Some((start, end)) => format!("{rel_path}:{start}-{end}"),
+        None => format!("{rel_path}:0-{file_size}"),
+    }
+}
+
+pub fn compute_citation_hash(
+    repo_root: &Path,
+    rel_path: &str,
+    range: Option<(usize, usize)>,
+) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        compute_citation_hash_and_size(repo_root, rel_path, range)?.sha256_hex
+    ))
+}
+
+pub(crate) fn compute_citation_hash_and_size(
+    repo_root: &Path,
+    rel_path: &str,
+    range: Option<(usize, usize)>,
+) -> Result<CitationHash> {
+    hash_citation_bytes(repo_root, rel_path, range).map_err(|reason| {
+        let detail = match reason {
+            UnverifiedReason::FileTooLarge => format!(
+                "file exceeds MAX_FILE_BYTES ({} bytes)",
+                MAX_FILE_BYTES
+            ),
+            UnverifiedReason::RangeTooLarge => format!(
+                "range exceeds MAX_RANGE_BYTES ({} bytes)",
+                MAX_RANGE_BYTES
+            ),
+            _ => reason.as_str().to_string(),
+        };
+        anyhow!("compute citation hash for {rel_path:?}: {detail}")
+    })
+}
+
+fn hash_citation_bytes(
+    repo_root: &Path,
+    file_rel: &str,
+    range: Option<(usize, usize)>,
+) -> std::result::Result<CitationHash, UnverifiedReason> {
+    let file_abs = match safe_join(repo_root, file_rel) {
+        Some(p) => p,
+        None => {
+            return Err(if repo_root.join(file_rel).exists() {
+                UnverifiedReason::PathEscape
+            } else {
+                UnverifiedReason::FileMissing
+            })
+        }
+    };
+
+    let mut file = match File::open(&file_abs) {
+        Ok(f) => f,
+        Err(_) => return Err(UnverifiedReason::FileMissing),
+    };
+
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => return Err(UnverifiedReason::ReadError),
+    };
+    if !metadata.is_file() {
+        return Err(UnverifiedReason::FileMissing);
+    }
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        return Err(UnverifiedReason::ReadError);
+    }
+
+    let file_size = metadata.len();
+    if file_size > MAX_FILE_BYTES {
+        return Err(UnverifiedReason::FileTooLarge);
+    }
+
+    let (start, end) = match range {
+        Some((start, end)) => {
+            if end < start {
+                return Err(UnverifiedReason::RangeOutOfBounds);
+            }
+            if start as u64 > file_size || end as u64 > file_size {
+                return Err(UnverifiedReason::RangeOutOfBounds);
+            }
+            let range_size = (end - start) as u64;
+            if range_size > MAX_RANGE_BYTES {
+                return Err(UnverifiedReason::RangeTooLarge);
+            }
+            (start, end)
+        }
+        None => (0usize, file_size as usize),
+    };
+
+    if file.seek(SeekFrom::Start(start as u64)).is_err() {
+        return Err(UnverifiedReason::ReadError);
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; HASH_READ_BUFFER_BYTES];
+    let mut remaining = (end - start) as u64;
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(HASH_READ_BUFFER_BYTES as u64) as usize;
+        let read = match file.read(&mut buffer[..chunk_len]) {
+            Ok(read) => read,
+            Err(_) => return Err(UnverifiedReason::ReadError),
+        };
+        if read == 0 {
+            return Err(UnverifiedReason::ReadError);
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+
+    Ok(CitationHash {
+        sha256_hex: format!("{:x}", hasher.finalize()),
+        file_size,
+    })
+}
+
 /// Outcome of the direct hash check at the recorded citation path.
 enum HashCheck {
     /// sha256(bytes at citation_path) == citation_hash.
@@ -239,59 +378,10 @@ fn hash_check_at_citation(
     end: usize,
     expected: &str,
 ) -> HashCheck {
-    let file_abs = match safe_join(repo_root, file_rel) {
-        Some(p) => p,
-        // Path traversal or escape attempt, but also a plain missing file:
-        // `safe_join` canonicalizes, which fails on a nonexistent path.
-        None => {
-            return HashCheck::Failed(if repo_root.join(file_rel).exists() {
-                UnverifiedReason::PathEscape
-            } else {
-                UnverifiedReason::FileMissing
-            })
-        }
+    let computed = match hash_citation_bytes(repo_root, file_rel, Some((start, end))) {
+        Ok(computed) => computed.sha256_hex,
+        Err(reason) => return HashCheck::Failed(reason),
     };
-
-    let mut file = match File::open(&file_abs) {
-        Ok(f) => f,
-        Err(_) => return HashCheck::Failed(UnverifiedReason::FileMissing),
-    };
-
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(_) => return HashCheck::Failed(UnverifiedReason::ReadError),
-    };
-    if !opened_file_within_repo(&file, &file_abs, repo_root) {
-        return HashCheck::Failed(UnverifiedReason::ReadError);
-    }
-
-    let file_size = metadata.len();
-
-    if file_size > MAX_FILE_BYTES {
-        return HashCheck::Failed(UnverifiedReason::FileTooLarge);
-    }
-
-    if start as u64 > file_size || end as u64 > file_size {
-        return HashCheck::Failed(UnverifiedReason::RangeOutOfBounds);
-    }
-
-    let range_size = (end - start) as u64;
-    if range_size > MAX_RANGE_BYTES {
-        return HashCheck::Failed(UnverifiedReason::RangeTooLarge);
-    }
-
-    if file.seek(SeekFrom::Start(start as u64)).is_err() {
-        return HashCheck::Failed(UnverifiedReason::ReadError);
-    }
-
-    let mut buffer = vec![0u8; range_size as usize];
-    if file.read_exact(&mut buffer).is_err() {
-        return HashCheck::Failed(UnverifiedReason::ReadError);
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(&buffer);
-    let computed = format!("{:x}", hasher.finalize());
 
     if computed.eq_ignore_ascii_case(strip_hash_prefix(expected)) {
         HashCheck::Match
@@ -442,7 +532,11 @@ pub fn verify_evidence(
         ));
     }
 
-    let new_path = format!("{}:{}-{}", candidate.rel_path, new_start, new_end);
+    let new_path = format_citation_path(
+        &candidate.rel_path,
+        Some((new_start, new_end)),
+        candidate.file_size,
+    );
     if new_path == *raw_path {
         // The excerpt is still exactly where it was; the range's bytes changed
         // around it. That is decay, not a move.
@@ -878,6 +972,112 @@ mod tests {
                 .is_verified(),
             true
         );
+    }
+
+    #[test]
+    fn test_hash_check_at_citation_matches_expected_ranges() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content =
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--tail";
+        tmp.write_all(content).unwrap();
+        tmp.flush().unwrap();
+
+        let file_name = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dir = tmp.path().parent().unwrap();
+
+        for (start, end) in [
+            (0usize, 8usize),
+            (10usize, 36usize),
+            (content.len() - 6, content.len()),
+            (0usize, content.len()),
+        ] {
+            let expected_hash = hash_bytes(&content[start..end]);
+            assert!(matches!(
+                hash_check_at_citation(dir, &file_name, start, end, &expected_hash),
+                HashCheck::Match
+            ));
+        }
+    }
+
+    #[test]
+    fn test_hash_check_at_citation_matches_empty_file_range() {
+        let tmp = NamedTempFile::new().unwrap();
+        let file_name = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dir = tmp.path().parent().unwrap();
+        let expected_hash = hash_bytes(b"");
+
+        assert!(matches!(
+            hash_check_at_citation(dir, &file_name, 0, 0, &expected_hash),
+            HashCheck::Match
+        ));
+    }
+
+    #[test]
+    fn test_hash_check_at_citation_large_range_crosses_chunk_boundaries() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content: Vec<u8> = (0..(300 * 1024)).map(|i| (i % 251) as u8).collect();
+        tmp.write_all(&content).unwrap();
+        tmp.flush().unwrap();
+
+        let file_name = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dir = tmp.path().parent().unwrap();
+        let start = 17usize;
+        let end = start + (300 * 1024) - 123;
+        let expected_hash = hash_bytes(&content[start..end]);
+
+        assert!(matches!(
+            hash_check_at_citation(dir, &file_name, start, end, &expected_hash),
+            HashCheck::Match
+        ));
+    }
+
+    #[test]
+    fn test_hash_check_at_citation_shrinking_file_folds_to_read_error() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = vec![b'x'; 128 * 1024];
+        tmp.write_all(&content).unwrap();
+        tmp.flush().unwrap();
+
+        let file_name = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dir = tmp.path().parent().unwrap();
+        let expected_hash = hash_bytes(&content);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path())
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+
+        // Shrink happens before the read starts, so the metadata bounds check
+        // catches it as RangeOutOfBounds. A shrink mid-read (after bounds are
+        // checked but before all bytes are consumed) would instead surface as
+        // ReadError from the short read; that path isn't deterministically
+        // reachable here without fault injection.
+        assert!(matches!(
+            hash_check_at_citation(dir, &file_name, 0, content.len(), &expected_hash),
+            HashCheck::Failed(UnverifiedReason::RangeOutOfBounds)
+        ));
     }
 
     #[test]
