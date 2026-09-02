@@ -47,7 +47,8 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
 /// - `tags` must pass `validate_tags` (array of non-empty strings ≤ 50 chars).
 /// - Each evidence row must have `evidence.kind ∈ {"code","derived"}` (Phase 1 constraint).
 /// - For `evidence.kind = "derived"`, `derived_from` must not equal the entry's own id.
-/// - Each evidence row must have a non-empty `citation_hash`.
+/// - Each evidence row must have a non-empty `citation_path` or `citation_hash`.
+///   Path-only rows are resolved by `kb_core::add` before event construction.
 /// - `citation_excerpt` (if present) must be ≤ MAX_CITATION_EXCERPT_CHARS and
 ///   must not contain ASCII control characters other than `\n` and `\t`
 ///   (br-47d: prompt-injection containment).
@@ -90,12 +91,16 @@ pub fn validate_kb_add_inputs(
             }
         }
 
+        let path = ev
+            .get("citation_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let hash = ev
             .get("citation_hash")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if hash.is_empty() {
-            anyhow::bail!("evidence row missing required citation_hash");
+        if path.is_empty() && hash.is_empty() {
+            anyhow::bail!("evidence row missing required citation_path or citation_hash");
         }
 
         if let Some(excerpt) = ev.get("citation_excerpt").and_then(|v| v.as_str()) {
@@ -222,10 +227,16 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_citation_hash_rejected() {
+    fn test_neither_citation_path_nor_hash_rejected() {
         let ev = json!({"kind": "code", "citation_hash": ""});
         let err = validate_kb_add_inputs("", "belief", &json!([]), &[ev]).unwrap_err();
-        assert!(err.to_string().contains("citation_hash"));
+        assert!(err.to_string().contains("citation_path or citation_hash"));
+    }
+
+    #[test]
+    fn test_path_only_evidence_accepted_for_core_resolution() {
+        let ev = json!({"kind": "code", "citation_path": "src/lib.rs"});
+        assert!(validate_kb_add_inputs("", "belief", &json!([]), &[ev]).is_ok());
     }
 
     #[test]

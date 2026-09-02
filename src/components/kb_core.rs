@@ -36,6 +36,7 @@
 
 use crate::commands::add::acquire_lock;
 use crate::components::{db, embedder, events, redactor};
+use crate::components::verification::{compute_citation_hash, parse_citation_path};
 use crate::config;
 use crate::models::Evidence;
 use anyhow::Result;
@@ -117,6 +118,46 @@ pub fn add(
     embedder: &dyn embedder::Embedder,
     mut args: AddArgs,
 ) -> Result<AddOutcome> {
+    let repo_root = paths
+        .db
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("cannot determine repository root from KB database path"))?;
+
+    // Normalize path-only evidence before constructing any events. Explicit
+    // assertions are authoritative and are never replaced, even when wrong.
+    for evidence in &mut args.evidence_rows {
+        let hash_missing = evidence
+            .get("citation_hash")
+            .and_then(Value::as_str)
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if !hash_missing {
+            continue;
+        }
+        let citation_path = evidence
+            .get("citation_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("evidence row missing required citation_path or citation_hash")
+            })?;
+        let (file_rel, range) = parse_citation_path(citation_path)
+            .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
+        let citation_hash = compute_citation_hash(repo_root, file_rel, range)
+            .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
+        let object = evidence
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("evidence row must be a JSON object"))?;
+        object.insert("citation_hash".to_string(), Value::String(citation_hash));
+        if object.get("citation_sha").map_or(true, Value::is_null) {
+            if let Some(head) = config::git_head_sha() {
+                object.insert("citation_sha".to_string(), Value::String(head));
+            }
+        }
+    }
+
     // Resource caps for cue anchors (mirrors evidence-row caps): bounded count
     // and length keep the embed cost and cue-table growth per add bounded.
     const MAX_CUES: usize = 8;
@@ -336,6 +377,130 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(&root);
         (dir, paths)
+    }
+
+    fn evidence_args(evidence_rows: Vec<Value>) -> AddArgs {
+        AddArgs {
+            id: "evidence-test".to_string(),
+            path: "tests/evidence".to_string(),
+            summary: "evidence resolution".to_string(),
+            content: "body".to_string(),
+            tags: serde_json::json!([]),
+            version_ref: None,
+            permanent: false,
+            replace_path: false,
+            kind: "observation".to_string(),
+            evidence_status: "present".to_string(),
+            evidence_rows,
+            ts: "2026-09-02T00:00:00Z".to_string(),
+            session: "test".to_string(),
+            session_id: None,
+            expire_reason: String::new(),
+            dedup_cutoff: None,
+            cues: vec![],
+        }
+    }
+
+    fn load_test_evidence(conn: &Connection) -> Evidence {
+        conn.query_row(
+            "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                    citation_excerpt, derived_from, recorded_at
+             FROM evidence WHERE entry_id='evidence-test'",
+            [],
+            |row| {
+                Ok(Evidence {
+                    id: row.get(0)?,
+                    entry_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    citation_path: row.get(3)?,
+                    citation_sha: row.get(4)?,
+                    citation_hash: row.get(5)?,
+                    citation_excerpt: row.get(6)?,
+                    derived_from: row.get(7)?,
+                    recorded_at: row.get(8)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_kb_core_add_resolves_bare_citation_path() {
+        use crate::components::verification::{
+            compute_citation_hash, verify_evidence, RelocationPolicy,
+        };
+        use crate::models::VerificationStatus;
+
+        let (dir, paths) = setup();
+        fs::write(dir.path().join("cited.txt"), b"whole file\n").unwrap();
+        let expected_hash = compute_citation_hash(dir.path(), "cited.txt", None).unwrap();
+        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
+            "kind": "code", "citation_path": "cited.txt"
+        })])).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let evidence = load_test_evidence(&conn);
+        assert_eq!(evidence.citation_hash, expected_hash);
+        assert_eq!(evidence.citation_sha, config::git_head_sha());
+        let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
+        assert_eq!(result.status, VerificationStatus::Verified);
+
+        let event_log = fs::read_to_string(&paths.events).unwrap();
+        let evidence_event: Value = serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
+        assert_eq!(
+            evidence_event["evidence"]["citation_sha"],
+            config::git_head_sha().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_kb_core_add_resolves_ranged_citation_path() {
+        use crate::components::verification::{
+            compute_citation_hash, verify_evidence, RelocationPolicy,
+        };
+        use crate::models::VerificationStatus;
+
+        let (dir, paths) = setup();
+        fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
+        let expected_hash = compute_citation_hash(dir.path(), "cited.txt", Some((0, 3))).unwrap();
+        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
+            "kind": "code", "citation_path": "cited.txt:0-3"
+        })])).unwrap();
+        let conn = Connection::open(&paths.db).unwrap();
+        let evidence = load_test_evidence(&conn);
+        assert_eq!(evidence.citation_hash, expected_hash);
+        let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
+        assert_eq!(result.status, VerificationStatus::Verified);
+    }
+
+    #[test]
+    fn test_kb_core_add_preserves_explicit_citation_hash() {
+        use crate::components::verification::{verify_evidence, RelocationPolicy};
+        use crate::models::VerificationStatus;
+
+        let (dir, paths) = setup();
+        fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
+        let explicit = "sha256:not-the-file-hash";
+        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
+            "kind": "code", "citation_path": "cited.txt", "citation_hash": explicit
+        })])).unwrap();
+        let conn = Connection::open(&paths.db).unwrap();
+        let evidence = load_test_evidence(&conn);
+        assert_eq!(evidence.citation_hash, explicit);
+        let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
+        assert_eq!(result.status, VerificationStatus::Unverified);
+    }
+
+    #[test]
+    fn test_kb_core_add_missing_citation_file_does_not_append_event() {
+        let (_dir, paths) = setup();
+        let before = fs::read(&paths.events).unwrap_or_default();
+        let err = add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
+            "kind": "code", "citation_path": "missing.txt"
+        })])).unwrap_err();
+        assert!(err.to_string().contains("missing.txt"), "{err}");
+        assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
     }
 
     // -------------------------------------------------------------------------
