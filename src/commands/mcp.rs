@@ -9,6 +9,7 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
+use crate::commands::cite::compute_citation_fields;
 use crate::components::{db, embedder, events, kb_core, query_hits};
 use crate::config;
 use abscissa_core::{Application, Command, Runnable};
@@ -198,6 +199,7 @@ fn handle_request(
         "kb_peers_add" => handle_kb_peers_add(&id, &req, paths),
         "kb_peers_list" => handle_kb_peers_list(&id, &req, paths),
         "kb_peers_remove" => handle_kb_peers_remove(&id, &req, paths),
+        "cite" => handle_cite(&id, &req, paths),
         _ => json!({
             "id": id,
             "type": "error",
@@ -546,6 +548,57 @@ fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
             "message": format!("entry '{}' not found", entry_id)
         }),
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    }
+}
+
+fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    let path = match req.get("path").and_then(|v| v.as_str()) {
+        Some(path) => path,
+        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"}),
+    };
+
+    let start = match req.get("start") {
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n as usize),
+            None => {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"start must be a non-negative integer"});
+            }
+        },
+        None => None,
+    };
+    let end = match req.get("end") {
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n as usize),
+            None => {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"end must be a non-negative integer"});
+            }
+        },
+        None => None,
+    };
+    let range = match (start, end) {
+        (None, None) => None,
+        (Some(start), Some(end)) => {
+            if start > end {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"start must be <= end"});
+            }
+            Some((start, end))
+        }
+        _ => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"start and end must be provided together"});
+        }
+    };
+
+    let repo_root = root_from_db(&paths.db);
+    match compute_citation_fields(&repo_root, path, range) {
+        Ok(fields) => json!({
+            "id": id,
+            "type": "result",
+            "citation_path": fields.citation_path,
+            "citation_sha": fields.citation_sha,
+            "citation_hash": fields.citation_hash,
+            "file_size": fields.file_size,
+        }),
+        Err(e) => json!({"id":id,"type":"error","code":"cite_error","message":e.to_string()}),
     }
 }
 
@@ -3085,7 +3138,7 @@ mod tests {
                             "search" | "add" | "import" | "expire" | "stale_check" |
                             "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild" |
                             "audit_run" | "audit_record" | "audit_report" | "provenance" |
-                            "kb_get"
+                            "kb_get" | "cite"
                         );
                         if !known {
                             proptest::prop_assert_eq!(
@@ -3108,6 +3161,39 @@ mod tests {
             "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,datetime('now'))",
             rusqlite::params![run_id, entry_id],
         ).unwrap();
+    }
+
+    #[test]
+    fn test_handle_cite_returns_verified_fields() {
+        let (dir, paths, _emb) = setup();
+        fs::write(dir.path().join("src.rs"), b"fn main() {}\n").unwrap();
+
+        let id = json!("cite1");
+        let req = json!({"method":"cite","id":"cite1","path":"src.rs","start":0,"end":2});
+        let resp = handle_cite(&id, &req, &paths);
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["citation_path"], "src.rs:0-2");
+        assert_eq!(resp["file_size"], 13);
+        assert!(resp["citation_hash"].as_str().unwrap().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_handle_cite_rejects_partial_range() {
+        let (_dir, paths, _emb) = setup();
+
+        let id = json!("cite2");
+        let req = json!({"method":"cite","id":"cite2","path":"src.rs","start":0});
+        let resp = handle_cite(&id, &req, &paths);
+
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "parse_error");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap()
+                .contains("provided together")
+        );
     }
 
     fn add_live_entry(
