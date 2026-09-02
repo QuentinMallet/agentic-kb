@@ -14,6 +14,7 @@ pub mod hook;
 pub mod import_cmd;
 pub mod ingest;
 pub mod mcp;
+pub mod migrate_citations;
 pub mod older_than;
 pub mod peers;
 pub mod rebuild;
@@ -37,6 +38,8 @@ pub enum KbCmd {
     Search(search::Search),
     /// Run MCP port protocol server (line-delimited JSON over stdio)
     Mcp(mcp::Mcp),
+    /// Heal legacy whole-file workaround citations (`path:0-N`) to bare paths
+    MigrateCitations(migrate_citations::MigrateCitations),
     /// Check if kb entries for given files are stale
     StaleCheck(stale_check::StaleCheck),
     /// Replay all events and rebuild agent-kb.db from scratch

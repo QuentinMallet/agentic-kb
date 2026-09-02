@@ -251,8 +251,16 @@ impl Paths {
 
 /// Get the git HEAD SHA.
 pub fn git_head_sha() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| git_head_sha_at(&cwd))
+}
+
+/// Get the git HEAD SHA for a specific working directory.
+pub fn git_head_sha_at(dir: &Path) -> Option<String> {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
         .output()
         .ok()
         .filter(|o| o.status.success())
