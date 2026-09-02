@@ -139,6 +139,30 @@ defmodule AgenticKbMcp.McpServer do
       }
     },
     %{
+      "name" => "kb_cite",
+      "description" =>
+        "Compute ready-to-use citation fields ({citation_path, citation_sha, citation_hash, file_size}) for a file or byte range, using the verifier's own hashing code path — guarantees the emitted citation verifies. Prefer this over hand-computing sha256 for kb_add evidence.",
+      "inputSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "path" => %{
+            "type" => "string",
+            "description" => "Repo-relative file path"
+          },
+          "start" => %{
+            "type" => "integer",
+            "description" => "Byte offset inclusive"
+          },
+          "end" => %{
+            "type" => "integer",
+            "description" =>
+              "Byte offset exclusive-ish (matches the Rust handler semantics); both start and end must be given together"
+          }
+        },
+        "required" => ["path"]
+      }
+    },
+    %{
       "name" => "kb_import",
       "description" => "Bulk-import entries from a seed JSON file",
       "inputSchema" => %{
@@ -431,6 +455,16 @@ defmodule AgenticKbMcp.McpServer do
       |> put_if_present("kind", args["kind"])
       |> put_if_present("evidence", args["evidence"])
       |> put_if_present("cues", args["cues"])
+
+    port_call_to_content(req)
+  end
+
+  defp dispatch_tool("kb_cite", args, _state) do
+    req =
+      %{"method" => "cite", "id" => gen_id()}
+      |> put_if_present("path", args["path"])
+      |> put_if_present("start", args["start"])
+      |> put_if_present("end", args["end"])
 
     port_call_to_content(req)
   end
