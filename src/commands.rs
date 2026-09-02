@@ -3,6 +3,7 @@
 pub mod add;
 pub mod add_validation;
 pub mod cited_by;
+pub mod cite;
 pub mod compact;
 pub mod compress;
 pub mod context;
@@ -46,6 +47,8 @@ pub enum KbCmd {
     Compress(compress::Compress),
     /// List live KB entries that cite a file
     CitedBy(cited_by::CitedBy),
+    /// Emit citation fields for a file or byte range
+    Cite(cite::Cite),
     /// Select relevant KB context within an approximate token budget
     Context(context::Context),
     /// Evaluate retrieval quality against a golden set (recall@k, MRR)
