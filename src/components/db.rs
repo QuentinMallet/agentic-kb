@@ -763,6 +763,7 @@ pub fn apply_event(
                 // CueBatch.tla S2). Returns false: stale upserts don't count
                 // toward the FTS deprecation gate.
                 if is_stale == 1 {
+                    conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
                     // entries_fts may be gone after the deprecation gate fires; treat as no-op.
                     let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                     conn.execute(
@@ -843,9 +844,8 @@ pub fn apply_event(
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
             // Single transaction: spec-conformant expire reset + FTS/emb/cue GC.
-            // Resetting evidence_status to 'n/a' closes the TLC-CE-class order
-            // sensitivity repro [legacy_up, ev_expire, expire, legacy_up];
-            // evidence-row GC lands later with the ADR-2 task.
+            // Resetting evidence_status to 'n/a' and deleting evidence mirrors
+            // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
             // We can't use `Connection::transaction()` here because `apply_event`
             // takes `&Connection`, not `&mut Connection`. Manual BEGIN/COMMIT it is.
@@ -855,6 +855,10 @@ pub fn apply_event(
                     "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
                     params![id],
                 )?;
+                // ADR-2 intentionally does not cascade through derived_from:
+                // provenance edges on other entries may still name this stale
+                // entry, whose row remains available to provenance traversal.
+                conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
                 // Remove from FTS so expired entries don't appear in search.
                 // entries_fts may be gone after the deprecation gate fires; treat as no-op.
                 let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
@@ -932,10 +936,11 @@ pub fn apply_event(
 
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
-                // Orphan-tolerant: if the parent entry doesn't exist, skip silently.
+                // Orphan-tolerant: absent and stale parents are equivalent under
+                // ADR-2, so evidence targeting either is skipped silently.
                 let entry_exists: bool = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM entries WHERE id=?1",
+                        "SELECT COUNT(*) FROM entries WHERE id=?1 AND is_stale=0",
                         params![entry_id],
                         |r| r.get::<_, i64>(0),
                     )
@@ -1005,27 +1010,32 @@ pub fn apply_event(
 
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
-                conn.execute(
-                    "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
-                    params![ev_id, entry_id],
-                )?;
-
-                // Recompute evidence_status if the parent entry exists.
+                // Orphan-tolerant: absent and stale parents are equivalent under
+                // ADR-2, so evidence targeting either is skipped silently. This
+                // mirrors evidence_add. Skipping the delete is safe because
+                // entry-expire already GC'd the evidence rows for stale parents.
                 let entry_exists: bool = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM entries WHERE id=?1",
+                        "SELECT COUNT(*) FROM entries WHERE id=?1 AND is_stale=0",
                         params![entry_id],
                         |r| r.get::<_, i64>(0),
                     )
                     .unwrap_or(0)
                     > 0;
-                if entry_exists {
-                    let new_status = compute_evidence_status(conn, entry_id)?;
-                    conn.execute(
-                        "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                        params![new_status, entry_id],
-                    )?;
+                if !entry_exists {
+                    return Ok(());
                 }
+
+                conn.execute(
+                    "DELETE FROM evidence WHERE id=?1 AND entry_id=?2",
+                    params![ev_id, entry_id],
+                )?;
+
+                let new_status = compute_evidence_status(conn, entry_id)?;
+                conn.execute(
+                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
+                    params![new_status, entry_id],
+                )?;
                 Ok(())
             })();
             if let Err(e) = result {
@@ -1181,7 +1191,7 @@ pub fn fetch_entry_by_id(
                     permanent, created_at, updated_at, COALESCE(kind, 'belief'),
                     COALESCE(evidence_status, 'n/a')
              FROM entries
-             WHERE id = ?1",
+             WHERE id = ?1 AND is_stale = 0",
             params![entry_id],
             |r| {
                 Ok(FetchEntryByIdResult {
@@ -4246,6 +4256,177 @@ mod tests {
             after, 0,
             "is_stale=true upsert must delete entries_emb row (GC regression)"
         );
+    }
+
+    #[test]
+    fn test_expire_entry_gcs_evidence_rows() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("evidence-gc-expire")).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("evidence-gc-expire")).unwrap();
+
+        apply_event(
+            &conn,
+            &embedder,
+            &serde_json::json!({
+                "action": "expire", "table": "entries",
+                "id": "evidence-gc-expire", "ts": "2024-01-02T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='evidence-gc-expire'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "entry expire must GC its evidence rows");
+    }
+
+    #[test]
+    fn test_stale_upsert_gcs_evidence_rows() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("evidence-gc-stale")).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("evidence-gc-stale")).unwrap();
+
+        let mut stale = legacy_upsert_event("evidence-gc-stale");
+        stale["is_stale"] = serde_json::json!(true);
+        apply_event(&conn, &embedder, &stale).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='evidence-gc-stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale upsert must GC its evidence rows");
+    }
+
+    #[test]
+    fn test_evidence_add_onto_stale_entry_is_noop() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("stale-parent")).unwrap();
+        apply_event(
+            &conn,
+            &embedder,
+            &serde_json::json!({
+                "action": "expire", "table": "entries", "id": "stale-parent"
+            }),
+        )
+        .unwrap();
+
+        apply_event(&conn, &embedder, &evidence_add_event("stale-parent")).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='stale-parent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale parents are orphan-equivalent under ADR-2");
+    }
+
+    #[test]
+    fn test_evidence_expire_onto_stale_entry_is_full_noop() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("stale-expire-parent")).unwrap();
+        apply_event(
+            &conn,
+            &embedder,
+            &serde_json::json!({
+                "action": "expire", "table": "entries", "id": "stale-expire-parent"
+            }),
+        )
+        .unwrap();
+
+        apply_event(
+            &conn,
+            &embedder,
+            &evidence_expire_event("stale-expire-parent"),
+        )
+        .unwrap();
+
+        let (is_stale, evidence_status): (i64, String) = conn
+            .query_row(
+                "SELECT is_stale, COALESCE(evidence_status, 'n/a') FROM entries WHERE id='stale-expire-parent'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(is_stale, 1);
+        assert_eq!(
+            evidence_status, "n/a",
+            "stale-parent evidence_expire must be a full no-op"
+        );
+    }
+
+    #[test]
+    fn test_legacy_reupsert_after_stale_window_evidence_expire_matches_compacted_replay_status() {
+        let embedder = NoopEmbedder;
+
+        let conn_full = open_db_memory().unwrap();
+        for event in [
+            legacy_upsert_event("stale-window"),
+            serde_json::json!({
+                "action": "expire",
+                "table": "entries",
+                "id": "stale-window"
+            }),
+            evidence_expire_event("stale-window"),
+            legacy_upsert_event("stale-window"),
+        ] {
+            apply_event(&conn_full, &embedder, &event).unwrap();
+        }
+
+        let conn_compacted = open_db_memory().unwrap();
+        apply_event(&conn_compacted, &embedder, &legacy_upsert_event("stale-window")).unwrap();
+
+        let (full_stale, compacted_stale): (i64, i64) = (
+            conn_full
+                .query_row(
+                    "SELECT is_stale FROM entries WHERE id='stale-window'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            conn_compacted
+                .query_row(
+                    "SELECT is_stale FROM entries WHERE id='stale-window'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(full_stale, 0, "re-upsert must revive the expired entry");
+        assert_eq!(compacted_stale, 0, "compacted replay must keep the entry live");
+        assert_eq!(
+            entry_evidence_status(&conn_full, "stale-window"),
+            entry_evidence_status(&conn_compacted, "stale-window"),
+            "stale-window evidence_expire must not perturb compacted equivalence"
+        );
+        assert_eq!(entry_evidence_status(&conn_full, "stale-window"), "n/a");
+    }
+
+    #[test]
+    fn test_evidence_expire_on_live_entry_deletes_and_recomputes() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("live-expire")).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("live-expire")).unwrap();
+        assert_eq!(entry_evidence_row_count(&conn, "live-expire"), 1);
+        assert_eq!(entry_evidence_status(&conn, "live-expire"), "present");
+
+        apply_event(&conn, &embedder, &evidence_expire_event("live-expire")).unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "live-expire"), 0);
+        assert_eq!(entry_evidence_status(&conn, "live-expire"), "missing");
     }
 
     /// Steady-state invariant: after any sequence of upserts and expires,

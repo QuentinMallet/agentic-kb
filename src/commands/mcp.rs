@@ -2556,6 +2556,34 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_kb_get_does_not_return_stale_entry() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("get-stale");
+        let added = handle_add(
+            &id,
+            &json!({
+                "path":"test/get-stale","summary":"stale","content":"body",
+                "tags":[],"kind":"convention"
+            }),
+            &paths,
+            &emb,
+        );
+        let entry_id = added["entry_id"].as_str().unwrap().to_string();
+        let conn = db::open_db(&paths.db).unwrap();
+        db::apply_event(
+            &conn,
+            &emb,
+            &json!({"action":"expire","table":"entries","id":entry_id}),
+        )
+        .unwrap();
+        drop(conn);
+
+        let resp = handle_kb_get(&id, &json!({"entry_id":entry_id}), &paths);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "entry_not_found");
+    }
+
+    #[test]
     fn test_handle_add_permanent() {
         let (_dir, paths, emb) = setup();
         let id = json!("t2");
@@ -3638,6 +3666,44 @@ mod tests {
         assert_eq!(graph.len(), 1);
         assert_eq!(graph[0]["from"], b_id);
         assert_eq!(graph[0]["to"], a_id);
+    }
+
+    #[test]
+    fn test_handle_provenance_resolves_derived_edge_to_expired_entry() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let root = handle_add(
+            &id,
+            &json!({"path":"p/stale-root","summary":"root","content":"root","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
+        let root_id = root["entry_id"].as_str().unwrap().to_string();
+        let child = handle_add(
+            &id,
+            &json!({
+                "path":"p/live-child","summary":"child","content":"child","tags":[],
+                "kind":"observation",
+                "evidence":[{"kind":"derived","derived_from":root_id,"citation_hash":"sha256:derived"}]
+            }),
+            &paths,
+            &emb,
+        );
+        let child_id = child["entry_id"].as_str().unwrap().to_string();
+        let conn = db::open_db(&paths.db).unwrap();
+        db::apply_event(
+            &conn,
+            &emb,
+            &json!({"action":"expire","table":"entries","id":root_id}),
+        )
+        .unwrap();
+        drop(conn);
+
+        let resp = handle_provenance(&id, &json!({"entry_id":child_id}), &paths);
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["graph"][0]["from"], child_id);
+        assert_eq!(resp["graph"][0]["to"], root_id);
+        assert_eq!(resp["roots"], json!([root_id]));
     }
 
     #[test]

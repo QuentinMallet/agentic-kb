@@ -100,7 +100,6 @@ impl Compact {
         }
         let evts = read.events;
 
-        let mut entry_first: HashMap<String, usize> = HashMap::new();
         let mut entry_last: HashMap<String, usize> = HashMap::new();
         let mut test_last: HashMap<String, usize> = HashMap::new();
         // Track index of the LAST expire per id (not just membership) so that
@@ -109,6 +108,8 @@ impl Compact {
         let mut live_entry_ids: HashSet<String> = HashSet::new();
         let mut run_indices: Vec<usize> = Vec::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
+        let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
+        let mut live_at_cursor: HashSet<String> = HashSet::new();
 
         for (i, ev) in evts.iter().enumerate() {
             let action = ev["action"].as_str().unwrap_or("");
@@ -121,11 +122,12 @@ impl Compact {
             }
             match (action, table) {
                 ("upsert", "entries") => {
-                    entry_first.entry(id.clone()).or_insert(i);
-                    entry_last.insert(id, i);
+                    entry_last.insert(id.clone(), i);
+                    live_at_cursor.insert(id);
                 }
                 ("expire", "entries") => {
-                    expire_last.insert(id, i);
+                    expire_last.insert(id.clone(), i);
+                    live_at_cursor.remove(&id);
                 }
                 ("upsert", "test_cases") => {
                     test_last.insert(id, i);
@@ -137,6 +139,12 @@ impl Compact {
                 | ("citation_healed", "evidence")
                 | ("evidence_expire", "evidence") => {
                     evidence_indices.push(i);
+                    if ev["entry_id"]
+                        .as_str()
+                        .is_some_and(|entry_id| live_at_cursor.contains(entry_id))
+                    {
+                        evidence_live_at_index.insert(i);
+                    }
                 }
                 _ => {}
             }
@@ -178,18 +186,16 @@ impl Compact {
         // Evidence events are retained verbatim for live parent entries, but an
         // entry expire is an evidence-GC boundary: evidence from before the last
         // expire must not be attached to a later re-upsert of the same entry.
-        // Also drop events before the first upsert: they were orphan no-ops during
-        // replay and emission after the retained upsert would make them effective.
-        // The first-upsert boundary is global, so evidence between an expire and a
-        // revive upsert remains eligible: the stale entry existed when it applied.
+        // Require the parent to be live immediately before the evidence event,
+        // exactly LiveAtIdx in AgentKbEvidence.tla. This drops orphan events both
+        // before the first upsert and between expire and revival. The old explicit
+        // first-upsert bound is redundant because LiveAtIdx implies one precedes i.
         let mut evidence_by_entry: HashMap<String, Vec<usize>> = HashMap::new();
         for i in evidence_indices {
             let ev = &evts[i];
             let entry_id = ev["entry_id"].as_str().unwrap_or("");
             if live_entry_ids.contains(entry_id)
-                && entry_first
-                    .get(entry_id)
-                    .is_some_and(|&first_upsert_i| i > first_upsert_i)
+                && evidence_live_at_index.contains(&i)
                 && expire_last
                     .get(entry_id)
                     .map_or(true, |&expire_i| i > expire_i)
@@ -785,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_compact_retains_evidence_between_expire_and_revive() {
+    fn test_cmd_compact_ce5_stale_window_evidence_converges() {
         use crate::components::events::evidence_add_event;
         use crate::models::Evidence;
 
@@ -816,14 +822,16 @@ mod tests {
         append_event(&paths.events, &evidence_add_event("d", &evidence, None)).unwrap();
         append_event(&paths.events, &upsert).unwrap();
 
+        let original = materialize(&paths);
         Compact.execute_with_paths(&paths).unwrap();
 
         let compacted = events::read_events(&paths.events).unwrap().events;
-        assert!(compacted.iter().any(|ev| {
-            ev["action"] == "evidence_add"
-                && ev["table"] == "evidence"
-                && ev["entry_id"] == "d"
+        assert!(compacted.iter().all(|ev| {
+            ev["action"] != "evidence_add"
+                || ev["table"] != "evidence"
+                || ev["entry_id"] != "d"
         }));
+        assert_eq!(materialize(&paths), original);
     }
 
     #[test]
@@ -1057,13 +1065,6 @@ mod tests {
         let evts = events::read_events(&paths.events).unwrap();
         for ev in &evts.events {
             db::apply_event(&conn, &embedder, ev).unwrap();
-            // ADR-2 is implemented by the following epic task. Model its
-            // ratified live-state semantics here so this compaction property
-            // already enforces the entry-expire evidence-GC boundary.
-            if ev["action"] == "expire" && ev["table"] == "entries" {
-                conn.execute("DELETE FROM evidence WHERE entry_id=?1", [ev["id"].as_str()])
-                    .unwrap();
-            }
         }
 
         let mut stmt = conn

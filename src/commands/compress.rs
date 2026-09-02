@@ -432,4 +432,50 @@ mod tests {
             "expected decode failure, got: {err}"
         );
     }
+
+    #[test]
+    fn test_compress_strands_no_evidence_on_expired_entry_id() {
+        let dir = tempdir().unwrap();
+        let paths = make_paths(dir.path());
+        let conn = db::open_db(&paths.db).unwrap();
+        let emb = NoopEmbedder;
+        let content = "paragraph one\n\nparagraph two\n\nparagraph three".repeat(80);
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "compress-old",
+            "path": "docs/compress-gc", "summary": "entry", "content": content,
+            "tags": [], "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &upsert).unwrap();
+        let evidence = serde_json::json!({
+            "action": "evidence_add", "table": "evidence", "entry_id": "compress-old",
+            "evidence": {
+                "id": "compress-old-ev", "kind": "code",
+                "citation_path": "src/lib.rs:1-2", "citation_hash": "sha256:ok"
+            }
+        });
+        db::apply_event(&conn, &emb, &evidence).unwrap();
+        drop(conn);
+
+        run(
+            &Compress {
+                path: "docs/compress-gc".to_string(),
+                threshold_chars: Some(100),
+                dry_run: false,
+            },
+            &KbConfig::default(),
+            &paths,
+            &TestEmbedder,
+        )
+        .unwrap();
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let stranded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='compress-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stranded, 0);
+    }
 }
