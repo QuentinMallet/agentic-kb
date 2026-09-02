@@ -718,7 +718,16 @@ pub fn apply_event(
             // not `&mut Connection` (same pattern as the expire branch).
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<bool> {
-                conn.execute(
+                // A legacy upsert carries no kind, so its 'n/a' is the AC2
+                // grandfather rather than a derived value. The grandfather may
+                // INITIALIZE a fresh row, but re-applying it to an existing row
+                // would re-grandfather an entry the evidence lifecycle has
+                // already de-legacied — payload-style authority of exactly the
+                // kind ADR-1 abolishes, and order-sensitive under compact
+                // (agent-kb/tla/AgentKbEvidence.tla, CE3). So the ON CONFLICT
+                // path leaves evidence_status alone for legacy events; the
+                // explicit-kind path recomputes it below regardless.
+                let upsert_sql = if has_explicit_kind {
                     "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
                      ON CONFLICT(id) DO UPDATE SET
@@ -730,7 +739,22 @@ pub fn apply_event(
                        kind=excluded.kind,
                        evidence_status=excluded.evidence_status,
                        session_id=excluded.session_id,
-                       updated_at=excluded.updated_at",
+                       updated_at=excluded.updated_at"
+                } else {
+                    "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                     ON CONFLICT(id) DO UPDATE SET
+                       path=excluded.path, summary=excluded.summary,
+                       content=excluded.content, tags=excluded.tags,
+                       version_ref=excluded.version_ref,
+                       permanent=excluded.permanent,
+                       is_stale=excluded.is_stale,
+                       kind=excluded.kind,
+                       session_id=excluded.session_id,
+                       updated_at=excluded.updated_at"
+                };
+                conn.execute(
+                    upsert_sql,
                     params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
                 )?;
 
@@ -818,16 +842,17 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
-            // Single transaction: entries UPDATE + FTS DELETE + entries_emb DELETE.
-            // Prevents orphan embedding rows accumulating for stale entries
-            // (br-improvement-catalog-23b.6 GC).
+            // Single transaction: spec-conformant expire reset + FTS/emb/cue GC.
+            // Resetting evidence_status to 'n/a' closes the TLC-CE-class order
+            // sensitivity repro [legacy_up, ev_expire, expire, legacy_up];
+            // evidence-row GC lands later with the ADR-2 task.
             //
             // We can't use `Connection::transaction()` here because `apply_event`
             // takes `&Connection`, not `&mut Connection`. Manual BEGIN/COMMIT it is.
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
                 conn.execute(
-                    "UPDATE entries SET is_stale=1, updated_at=datetime('now') WHERE id=?1",
+                    "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
                     params![id],
                 )?;
                 // Remove from FTS so expired entries don't appear in search.
@@ -2933,6 +2958,246 @@ mod tests {
 
         assert_eq!(entry_evidence_row_count(&conn, "legacy-na"), 0);
         assert_eq!(entry_evidence_status(&conn, "legacy-na"), "n/a");
+    }
+
+    /// A legacy upsert event: no `kind`, no `evidence_status`. Replaying one is
+    /// the AC2 grandfather path.
+    fn legacy_upsert_event(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": id,
+            "path": "src/lib.rs",
+            "summary": format!("legacy {id}"),
+            "content": "content",
+            "tags": [],
+            "ts": "2023-01-01T00:00:00Z"
+        })
+    }
+
+    fn evidence_add_event(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": id,
+            "evidence": {
+                "id": format!("ev-{id}"),
+                "entry_id": id,
+                "kind": "code",
+                "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null,
+                "citation_hash": "sha256:abc",
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    fn evidence_expire_event(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "evidence_expire",
+            "table": "evidence",
+            "entry_id": id,
+            "evidence_id": format!("ev-{id}"),
+            "reason": "test",
+            "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    #[test]
+    fn test_apply_event_expire_resets_evidence_status_to_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "expire-reset",
+            "path": "src/lib.rs",
+            "summary": "entry without evidence",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        assert_eq!(entry_evidence_status(&conn, "expire-reset"), "missing");
+
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "expire-reset"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+
+        let (is_stale, evidence_status): (i64, String) = conn
+            .query_row(
+                "SELECT is_stale, COALESCE(evidence_status, 'n/a') FROM entries WHERE id='expire-reset'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(is_stale, 1);
+        assert_eq!(evidence_status, "n/a");
+    }
+
+    /// ADR-1 corollary (AgentKbEvidence.tla CE3): a legacy upsert may only
+    /// INITIALIZE the 'n/a' grandfather on a fresh row. Once an evidence event
+    /// has de-legacied the entry, a later legacy upsert must preserve the
+    /// derived status instead of re-grandfathering it.
+    #[test]
+    fn test_legacy_reupsert_does_not_regrandfather_delegacied_entry() {
+        let embedder = NoopEmbedder;
+
+        // De-legacied to 'missing' by an evidence_expire naming no live row.
+        let conn = open_db_memory().unwrap();
+        apply_event(&conn, &embedder, &legacy_upsert_event("c")).unwrap();
+        assert_eq!(entry_evidence_status(&conn, "c"), "n/a");
+        apply_event(&conn, &embedder, &evidence_expire_event("c")).unwrap();
+        assert_eq!(entry_evidence_status(&conn, "c"), "missing");
+        apply_event(&conn, &embedder, &legacy_upsert_event("c")).unwrap();
+        assert_eq!(
+            entry_evidence_status(&conn, "c"),
+            "missing",
+            "legacy re-upsert must not re-grandfather a de-legacied entry"
+        );
+
+        // De-legacied to 'present' by an evidence_add.
+        let conn = open_db_memory().unwrap();
+        apply_event(&conn, &embedder, &legacy_upsert_event("p")).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("p")).unwrap();
+        assert_eq!(entry_evidence_status(&conn, "p"), "present");
+        apply_event(&conn, &embedder, &legacy_upsert_event("p")).unwrap();
+        assert_eq!(
+            entry_evidence_status(&conn, "p"), "present",
+            "legacy re-upsert must not drop an entry with evidence back to n/a"
+        );
+        assert_eq!(entry_evidence_row_count(&conn, "p"), 1);
+    }
+
+    /// The other half of the corollary: preserving the current status on an
+    /// existing row keeps a STILL-legacy entry at 'n/a', and a fresh legacy
+    /// insert still initializes to 'n/a'.
+    #[test]
+    fn test_legacy_reupsert_of_still_legacy_entry_keeps_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        apply_event(&conn, &embedder, &legacy_upsert_event("l")).unwrap();
+        assert_eq!(
+            entry_evidence_status(&conn, "l"),
+            "n/a",
+            "fresh legacy insert initializes the grandfather"
+        );
+
+        apply_event(&conn, &embedder, &legacy_upsert_event("l")).unwrap();
+        assert_eq!(
+            entry_evidence_status(&conn, "l"),
+            "n/a",
+            "legacy re-upsert of a still-legacy entry keeps n/a"
+        );
+    }
+
+    /// Order insensitivity — the property CompactionEquivalenceE needs. Compact
+    /// keeps only the LAST upsert per entry, so replaying the trailing legacy
+    /// upsert with its preceding evidence event must land on the same status as
+    /// replaying the full log.
+    #[test]
+    fn test_legacy_reupsert_after_expire_matches_compacted_replay_status() {
+        let embedder = NoopEmbedder;
+
+        let conn_full = open_db_memory().unwrap();
+        for event in [
+            legacy_upsert_event("d"),
+            evidence_expire_event("d"),
+            serde_json::json!({
+                "action": "expire",
+                "table": "entries",
+                "id": "d"
+            }),
+            legacy_upsert_event("d"),
+        ] {
+            apply_event(&conn_full, &embedder, &event).unwrap();
+        }
+
+        let conn_compacted = open_db_memory().unwrap();
+        apply_event(&conn_compacted, &embedder, &legacy_upsert_event("d")).unwrap();
+
+        let (full_stale, compacted_stale): (i64, i64) = (
+            conn_full
+                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| r.get(0))
+                .unwrap(),
+            conn_compacted
+                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| r.get(0))
+                .unwrap(),
+        );
+        assert_eq!(full_stale, 0, "re-upsert must revive the expired entry");
+        assert_eq!(compacted_stale, 0, "compacted replay must keep the entry live");
+        assert_eq!(
+            entry_evidence_status(&conn_full, "d"),
+            entry_evidence_status(&conn_compacted, "d"),
+            "expire must reset status so replay order matches compacted replay"
+        );
+        assert_eq!(entry_evidence_status(&conn_full, "d"), "n/a");
+    }
+
+    #[test]
+    fn test_legacy_reupsert_status_is_compaction_order_insensitive() {
+        let embedder = NoopEmbedder;
+
+        let conn_full = open_db_memory().unwrap();
+        for event in [
+            legacy_upsert_event("c"),
+            evidence_expire_event("c"),
+            legacy_upsert_event("c"),
+        ] {
+            apply_event(&conn_full, &embedder, &event).unwrap();
+        }
+
+        let conn_compacted = open_db_memory().unwrap();
+        for event in [legacy_upsert_event("c"), evidence_expire_event("c")] {
+            apply_event(&conn_compacted, &embedder, &event).unwrap();
+        }
+
+        assert_eq!(
+            entry_evidence_status(&conn_full, "c"),
+            entry_evidence_status(&conn_compacted, "c"),
+            "trailing legacy re-upsert must not change the derived status"
+        );
+        assert_eq!(entry_evidence_status(&conn_full, "c"), "missing");
+    }
+
+    #[test]
+    fn test_apply_event_reupsert_after_expire_recomputes_missing_for_explicit_kind() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "revive-explicit-kind",
+            "path": "src/lib.rs",
+            "summary": "entry without evidence",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "revive-explicit-kind"
+        });
+
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        apply_event(&conn, &embedder, &expire).unwrap();
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        assert_eq!(entry_evidence_status(&conn, "revive-explicit-kind"), "missing");
     }
 
     #[test]
