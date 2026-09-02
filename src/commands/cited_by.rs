@@ -146,23 +146,20 @@ fn classify_evidence(ev: &Evidence, file: &str, repo_root: Option<&Path>) -> Cit
     let Some(root) = repo_root else {
         return CitedByStatus::Deferred;
     };
-    if ev.kind != "code" || !is_ranged_citation_for_file(citation_path, file) {
+    if ev.kind != "code" || !is_citation_for_file(citation_path, file) {
         return CitedByStatus::Deferred;
     }
 
-    match verify_evidence(ev, root, RelocationPolicy::FileOnly) {
-        Ok(outcome) => match outcome.status {
-            VerificationStatus::Verified => CitedByStatus::Verified,
-            VerificationStatus::Relocated => CitedByStatus::Relocated,
-            VerificationStatus::Unverified => CitedByStatus::Unverified,
-        },
-        Err(_) => CitedByStatus::Unverified,
+    match verify_evidence(ev, root, RelocationPolicy::FileOnly).status {
+        VerificationStatus::Verified => CitedByStatus::Verified,
+        VerificationStatus::Relocated => CitedByStatus::Relocated,
+        VerificationStatus::Unverified => CitedByStatus::Unverified,
     }
 }
 
-fn is_ranged_citation_for_file(citation_path: &str, file: &str) -> bool {
-    citation_path != file
-        && citation_path
+fn is_citation_for_file(citation_path: &str, file: &str) -> bool {
+    citation_path == file
+        || citation_path
             .strip_prefix(file)
             .is_some_and(|suffix| suffix.starts_with(':'))
 }
@@ -206,6 +203,13 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         format!("sha256:{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn test_is_citation_for_file_accepts_whole_file_equality() {
+        assert!(is_citation_for_file("src/foo.rs", "src/foo.rs"));
+        assert!(is_citation_for_file("src/foo.rs:0-4", "src/foo.rs"));
+        assert!(!is_citation_for_file("src/foo.rs.bak", "src/foo.rs"));
     }
 
     fn insert_entry(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
@@ -371,7 +375,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "GOVERNED DEFERRED [docs/deferred.md] Deferred summary id=deferred-entry",
+                "GOVERNED UNVERIFIED [docs/deferred.md] Deferred summary id=deferred-entry",
                 "GOVERNED RELOCATED [docs/relocated.md] Relocated summary id=relocated-entry",
                 "GOVERNED UNVERIFIED [docs/unverified.md] Unverified summary id=unverified-entry",
                 "GOVERNED VERIFIED [docs/verified.md] Verified summary id=verified-entry",
@@ -429,7 +433,7 @@ mod tests {
         assert_eq!(first["id"], "deferred-entry");
         assert_eq!(first["path"], "docs/deferred.md");
         assert_eq!(first["summary"], "Deferred summary");
-        assert_eq!(first["status"], "DEFERRED");
+        assert_eq!(first["status"], "UNVERIFIED");
         assert_eq!(first["citation_path"], "src/foo.rs");
     }
 }

@@ -2289,11 +2289,6 @@ pub fn search_entries(
                                 root,
                                 SEARCH_PATH_RELOCATION_POLICY,
                             )
-                            .unwrap_or(VerificationOutcome {
-                                status: VerificationStatus::Unverified,
-                                relocated_to: None,
-                                reason: None,
-                            })
                         } else {
                             VerificationOutcome {
                                 status: VerificationStatus::Unverified,

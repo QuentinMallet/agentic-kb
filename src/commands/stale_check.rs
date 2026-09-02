@@ -6,7 +6,7 @@
 //! invocation should be duplicated between the two call sites.
 
 use crate::components::db;
-use crate::components::verification::{verify_evidence, RelocationPolicy, VerificationOutcome};
+use crate::components::verification::{verify_evidence, RelocationPolicy};
 use crate::config;
 use crate::models::VerificationStatus;
 use abscissa_core::{Command, Runnable};
@@ -512,19 +512,7 @@ fn relocation_pass(
             None => continue,
         };
         for ev in rows {
-            let (outcome, malformed_citation) = match verify_evidence(ev, root, policy) {
-                Ok(o) => (o, false),
-                // A malformed citation_path is a data defect, not a reason to
-                // fail the whole stale check or disappear from the report.
-                Err(_) => (
-                    VerificationOutcome {
-                        status: VerificationStatus::Unverified,
-                        relocated_to: None,
-                        reason: None,
-                    },
-                    true,
-                ),
-            };
+            let outcome = verify_evidence(ev, root, policy);
             if outcome.status == VerificationStatus::Verified {
                 continue;
             }
@@ -534,15 +522,7 @@ fn relocation_pass(
                 status: outcome.status,
                 old_path: ev.citation_path.clone().unwrap_or_default(),
                 new_path: outcome.relocated_to,
-                reason: outcome
-                    .reason
-                    .as_ref()
-                    .map(|r| r.as_str())
-                    .or(if malformed_citation {
-                        Some("malformed_citation")
-                    } else {
-                        None
-                    }),
+                reason: outcome.reason.as_ref().map(|r| r.as_str()),
                 healed: false,
             });
         }

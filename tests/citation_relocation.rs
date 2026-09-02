@@ -107,7 +107,7 @@ fn excerpt_of_63_bytes_is_too_weak() {
 
     let mut ev = repo.ev.clone();
     ev.citation_excerpt = Some(short);
-    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Unverified);
     assert_eq!(out.reason, Some(UnverifiedReason::ExcerptTooWeak));
 }
@@ -134,7 +134,7 @@ fn excerpt_of_64_bytes_clears_the_byte_floor() {
         Some(&excerpt),
     );
 
-    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Relocated, "{out:?}");
     assert!(out.relocated_to.unwrap().starts_with("src/new.rs:"));
 }
@@ -148,7 +148,7 @@ fn single_line_excerpt_is_too_weak() {
 
     let mut ev = repo.ev.clone();
     ev.citation_excerpt = Some(one_line);
-    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.reason, Some(UnverifiedReason::ExcerptTooWeak));
 }
 
@@ -170,7 +170,7 @@ fn two_line_excerpt_clears_the_line_floor() {
         Some(&excerpt),
     );
 
-    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Relocated, "{out:?}");
 }
 
@@ -180,7 +180,7 @@ fn absent_excerpt_is_too_weak() {
     let repo = moved_repo("src/new.rs", &[]);
     let mut ev = repo.ev.clone();
     ev.citation_excerpt = None;
-    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.reason, Some(UnverifiedReason::ExcerptTooWeak));
 }
 
@@ -201,7 +201,7 @@ fn path_escape_skips_relocation_and_preserves_the_original_reason() {
     );
 
     for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
-        let out = verify_evidence(&ev, root, policy).unwrap();
+        let out = verify_evidence(&ev, root, policy);
         assert_eq!(out.status, VerificationStatus::Unverified);
         assert_eq!(out.reason, Some(UnverifiedReason::PathEscape));
         assert!(out.relocated_to.is_none());
@@ -224,7 +224,7 @@ fn file_missing_skips_relocation_and_preserves_the_original_reason() {
     );
 
     for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
-        let out = verify_evidence(&ev, root, policy).unwrap();
+        let out = verify_evidence(&ev, root, policy);
         assert_eq!(out.status, VerificationStatus::Unverified);
         assert_eq!(out.reason, Some(UnverifiedReason::FileMissing));
         assert!(out.relocated_to.is_none());
@@ -247,7 +247,7 @@ fn weak_excerpt_preserves_non_hash_failure_reasons() {
     ev.citation_excerpt = Some("x".to_string());
 
     for policy in [RelocationPolicy::FileOnly, RelocationPolicy::FileThenRepo] {
-        let out = verify_evidence(&ev, root, policy).unwrap();
+        let out = verify_evidence(&ev, root, policy);
         assert_eq!(out.status, VerificationStatus::Unverified);
         assert_eq!(out.reason, Some(UnverifiedReason::FileTooLarge));
         assert!(out.relocated_to.is_none());
@@ -263,7 +263,7 @@ fn weak_excerpt_preserves_non_hash_failure_reasons() {
 #[test]
 fn never_policy_reports_hash_mismatch_without_searching() {
     let repo = moved_repo("src/new.rs", &[]);
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::Never).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::Never);
     assert_eq!(out.status, VerificationStatus::Unverified);
     assert_eq!(out.reason, Some(UnverifiedReason::HashMismatch));
     assert!(out.relocated_to.is_none());
@@ -273,7 +273,7 @@ fn never_policy_reports_hash_mismatch_without_searching() {
 #[test]
 fn file_only_policy_does_not_walk_the_repo() {
     let repo = moved_repo("src/new.rs", &[]);
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileOnly).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileOnly);
     assert_eq!(out.status, VerificationStatus::Unverified);
     assert_eq!(out.reason, Some(UnverifiedReason::NoCandidate));
 }
@@ -293,7 +293,7 @@ fn file_only_policy_finds_an_in_file_move() {
         Some(STRONG_EXCERPT),
     );
 
-    let out = verify_evidence(&ev, root, RelocationPolicy::FileOnly).unwrap();
+    let out = verify_evidence(&ev, root, RelocationPolicy::FileOnly);
     assert_eq!(out.status, VerificationStatus::Relocated, "{out:?}");
     assert_eq!(
         out.relocated_to.unwrap(),
@@ -309,7 +309,7 @@ fn file_only_policy_finds_an_in_file_move() {
 #[test]
 fn unique_repo_candidate_relocates() {
     let repo = moved_repo("src/moved/new.rs", &[]);
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Relocated, "{out:?}");
     assert!(out
         .relocated_to
@@ -323,7 +323,7 @@ fn unique_repo_candidate_relocates() {
 #[test]
 fn multiple_candidates_report_multiplicity() {
     let repo = moved_repo("src/new.rs", &["src/copy.rs"]);
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Unverified);
     match out.reason {
         Some(UnverifiedReason::NonUnique { candidates }) => assert!(candidates >= 2),
@@ -344,7 +344,7 @@ fn zero_candidates_is_unverified() {
         STRONG_EXCERPT.as_bytes(),
         Some(STRONG_EXCERPT),
     );
-    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo);
     assert_eq!(out.reason, Some(UnverifiedReason::NoCandidate));
 }
 
@@ -355,7 +355,7 @@ fn excluded_directories_are_not_searched() {
     for excluded in [".git", "target", "node_modules"] {
         let repo = moved_repo(&format!("{excluded}/build/new.rs"), &[]);
         let out =
-            verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+            verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
         assert_eq!(
             out.reason,
             Some(UnverifiedReason::NoCandidate),
@@ -369,7 +369,7 @@ fn excluded_directories_are_not_searched() {
 fn gitignored_directory_is_not_searched() {
     let repo = moved_repo("vendor/new.rs", &[]);
     write_file(repo.dir.path(), ".gitignore", "vendor/\n*.tmp\n");
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.reason, Some(UnverifiedReason::NoCandidate));
 }
 
@@ -407,7 +407,7 @@ fn hash_match_verifies_without_searching() {
         RelocationPolicy::FileOnly,
         RelocationPolicy::FileThenRepo,
     ] {
-        let out = verify_evidence(&ev, root, policy).unwrap();
+        let out = verify_evidence(&ev, root, policy);
         assert_eq!(
             out.status,
             VerificationStatus::Verified,
@@ -427,7 +427,7 @@ fn hash_match_verifies_without_searching() {
 #[test]
 fn relocation_pass_never_promotes_to_verified() {
     let repo = moved_repo("src/new.rs", &[]);
-    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Relocated);
 
     // Simulate the heal: the citation now points at the new location.
@@ -440,7 +440,7 @@ fn relocation_pass_never_promotes_to_verified() {
     );
 
     // A fresh pass re-hashes; here the moved bytes are identical, so it verifies.
-    let second = verify_evidence(&healed, repo.dir.path(), RelocationPolicy::Never).unwrap();
+    let second = verify_evidence(&healed, repo.dir.path(), RelocationPolicy::Never);
     assert_eq!(second.status, VerificationStatus::Verified);
 }
 
@@ -466,12 +466,12 @@ fn heal_without_a_matching_rehash_does_not_verify() {
         Some(STRONG_EXCERPT),
     );
 
-    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo).unwrap();
+    let out = verify_evidence(&ev, root, RelocationPolicy::FileThenRepo);
     assert_eq!(out.status, VerificationStatus::Relocated);
 
     let mut healed = ev.clone();
     healed.citation_path = out.relocated_to.clone();
-    let second = verify_evidence(&healed, root, RelocationPolicy::Never).unwrap();
+    let second = verify_evidence(&healed, root, RelocationPolicy::Never);
     assert_eq!(
         second.status,
         VerificationStatus::Unverified,
@@ -605,7 +605,7 @@ mod props {
             }
             let ev = evidence("src/old.rs", 0, STRONG_EXCERPT.len(),
                               STRONG_EXCERPT.as_bytes(), Some(STRONG_EXCERPT));
-            let out = verify_evidence(&ev, root, policy).unwrap();
+            let out = verify_evidence(&ev, root, policy);
             prop_assert_eq!(out.status, VerificationStatus::Verified);
             prop_assert!(out.relocated_to.is_none());
         }
@@ -617,7 +617,7 @@ mod props {
             let refs: Vec<&str> = decoys.iter().map(String::as_str).collect();
             let repo = moved_repo("src/new.rs", &refs);
             let out = verify_evidence(&repo.ev, repo.dir.path(),
-                                      RelocationPolicy::FileThenRepo).unwrap();
+                                      RelocationPolicy::FileThenRepo);
             prop_assert_ne!(out.status, VerificationStatus::Relocated);
             let is_non_unique = matches!(out.reason, Some(UnverifiedReason::NonUnique { .. }));
             prop_assert!(is_non_unique, "expected NonUnique, got {:?}", out.reason);
@@ -639,7 +639,7 @@ mod props {
             let mut ev = repo.ev.clone();
             ev.citation_excerpt = Some(weak);
             let out = verify_evidence(&ev, repo.dir.path(),
-                                      RelocationPolicy::FileThenRepo).unwrap();
+                                      RelocationPolicy::FileThenRepo);
             prop_assert_ne!(out.status, VerificationStatus::Relocated);
             prop_assert_eq!(out.reason, Some(UnverifiedReason::ExcerptTooWeak));
         }
@@ -651,8 +651,8 @@ mod props {
             let names: Vec<String> = (0..decoys).map(|i| format!("src/copy{i}.rs")).collect();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             let repo = moved_repo("src/new.rs", &refs);
-            let first = verify_evidence(&repo.ev, repo.dir.path(), policy).unwrap();
-            let second = verify_evidence(&repo.ev, repo.dir.path(), policy).unwrap();
+            let first = verify_evidence(&repo.ev, repo.dir.path(), policy);
+            let second = verify_evidence(&repo.ev, repo.dir.path(), policy);
             prop_assert_eq!(&first, &second);
             prop_assert_eq!(first.status.rank(), second.status.rank());
         }

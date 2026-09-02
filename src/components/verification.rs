@@ -73,6 +73,8 @@ pub enum UnverifiedReason {
     NotCodeKind,
     /// Evidence row carries no `citation_path`.
     MissingCitationPath,
+    /// Stored `citation_path` does not satisfy the citation grammar.
+    MalformedCitationPath,
     /// `citation_path` escapes the repo root.
     PathEscape,
     /// No file at `citation_path`.
@@ -109,6 +111,7 @@ impl UnverifiedReason {
         match self {
             UnverifiedReason::NotCodeKind => "not_code_kind",
             UnverifiedReason::MissingCitationPath => "missing_citation_path",
+            UnverifiedReason::MalformedCitationPath => "malformed_citation",
             UnverifiedReason::PathEscape => "path_escape",
             UnverifiedReason::FileMissing => "file_missing",
             UnverifiedReason::RangeOutOfBounds => "range_out_of_bounds",
@@ -194,14 +197,19 @@ pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     Some(canon_cand)
 }
 
-/// Parse a citation_path of shape "src/foo.rs:42-58" into (path, start, end).
-/// Returns Err if format is invalid. Byte offsets, NOT line numbers.
-/// (Plan locks this: "byte range" semantics per spec AC15.)
-fn parse_citation_path(s: &str) -> Result<(&str, usize, usize)> {
-    let colon = s
-        .rfind(':')
-        .ok_or_else(|| anyhow::anyhow!("citation_path missing ':' separator: {s:?}"))?;
+/// Parse a whole-file `path` or ranged `path:start-end` citation.
+/// Explicit ranges use byte offsets, NOT line numbers.
+pub(crate) fn parse_citation_path(s: &str) -> Result<(&str, Option<(usize, usize)>)> {
+    if s.is_empty() {
+        bail!("citation_path file part must not be empty: {s:?}");
+    }
+    let Some(colon) = s.rfind(':') else {
+        return Ok((s, None));
+    };
     let file_part = &s[..colon];
+    if file_part.is_empty() {
+        bail!("citation_path file part must not be empty: {s:?}");
+    }
     let range_part = &s[colon + 1..];
     let dash = range_part
         .find('-')
@@ -212,10 +220,10 @@ fn parse_citation_path(s: &str) -> Result<(&str, usize, usize)> {
     let end: usize = range_part[dash + 1..]
         .parse()
         .map_err(|_| anyhow::anyhow!("citation_path end is not a number: {s:?}"))?;
-    if start > end {
-        bail!("citation_path start > end: {s:?}");
+    if start >= end {
+        bail!("citation_path start must be less than end: {s:?}");
     }
-    Ok((file_part, start, end))
+    Ok((file_part, Some((start, end))))
 }
 
 /// Strip a `"sha256:"` prefix if present, returning the bare hex string.
@@ -230,17 +238,16 @@ pub(crate) struct CitationHash {
 
 /// The only place a citation_path string is constructed.
 ///
-/// Before the optional-range parser lands, `range = None` must keep emitting
-/// the legacy whole-file workaround form `path:0-file_size`. After `.3` lands,
-/// the `None` arm becomes a one-line change to return `rel_path.to_string()`.
+/// `file_size` is retained for API compatibility with callers that compute it;
+/// whole-file citations deliberately carry no size anchor.
 pub fn format_citation_path(
     rel_path: &str,
     range: Option<(usize, usize)>,
-    file_size: u64,
+    _file_size: u64,
 ) -> String {
     match range {
         Some((start, end)) => format!("{rel_path}:{start}-{end}"),
-        None => format!("{rel_path}:0-{file_size}"),
+        None => rel_path.to_string(),
     }
 }
 
@@ -315,7 +322,7 @@ fn hash_citation_bytes(
 
     let (start, end) = match range {
         Some((start, end)) => {
-            if end < start {
+            if end <= start {
                 return Err(UnverifiedReason::RangeOutOfBounds);
             }
             if start as u64 > file_size || end as u64 > file_size {
@@ -374,11 +381,10 @@ enum HashCheck {
 fn hash_check_at_citation(
     repo_root: &Path,
     file_rel: &str,
-    start: usize,
-    end: usize,
+    range: Option<(usize, usize)>,
     expected: &str,
 ) -> HashCheck {
-    let computed = match hash_citation_bytes(repo_root, file_rel, Some((start, end))) {
+    let computed = match hash_citation_bytes(repo_root, file_rel, range) {
         Ok(computed) => computed.sha256_hex,
         Err(reason) => return HashCheck::Failed(reason),
     };
@@ -442,108 +448,94 @@ fn excerpt_is_strong(excerpt: &str) -> bool {
 ///
 /// `policy` is required and has no default — see [`RelocationPolicy`].
 ///
-/// Returns `Err` only for a malformed `citation_path` (a programming bug, not
-/// a runtime condition); every runtime failure folds into
+/// Every failure, including malformed stored citation data, folds into
 /// [`VerificationStatus::Unverified`] with a reason.
 pub fn verify_evidence(
     ev: &Evidence,
     repo_root: &Path,
     policy: RelocationPolicy,
-) -> Result<VerificationOutcome> {
+) -> VerificationOutcome {
     // Only "code" kind is verified in Phase 1. Other kinds deferred to Phase 2.
     // TODO(Phase 2): add test/command/user/derived verification paths.
     if ev.kind != "code" {
-        return Ok(VerificationOutcome::unverified(
-            UnverifiedReason::NotCodeKind,
-        ));
+        return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
     }
 
     let raw_path = match &ev.citation_path {
         Some(p) => p,
         None => {
-            return Ok(VerificationOutcome::unverified(
-                UnverifiedReason::MissingCitationPath,
-            ))
+            return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath)
         }
     };
 
-    let (file_rel, start, end) = parse_citation_path(raw_path)?;
+    let (file_rel, range) = match parse_citation_path(raw_path) {
+        Ok(parsed) => parsed,
+        Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
+    };
 
-    let decayed = match hash_check_at_citation(repo_root, file_rel, start, end, &ev.citation_hash) {
-        HashCheck::Match => return Ok(VerificationOutcome::verified()),
+    let decayed = match hash_check_at_citation(repo_root, file_rel, range, &ev.citation_hash) {
+        HashCheck::Match => return VerificationOutcome::verified(),
         HashCheck::Mismatch => UnverifiedReason::HashMismatch,
         HashCheck::Failed(reason) => reason,
     };
 
     if policy == RelocationPolicy::Never {
-        return Ok(VerificationOutcome::unverified(decayed));
+        return VerificationOutcome::unverified(decayed);
     }
 
     if matches!(
         decayed,
         UnverifiedReason::PathEscape | UnverifiedReason::FileMissing
     ) {
-        return Ok(VerificationOutcome::unverified(decayed));
+        return VerificationOutcome::unverified(decayed);
     }
 
     let excerpt = match &ev.citation_excerpt {
         Some(e) if excerpt_is_strong(e) => e.as_str(),
         _ => {
-            return Ok(VerificationOutcome::unverified(
+            return VerificationOutcome::unverified(
                 if decayed == UnverifiedReason::HashMismatch {
                     UnverifiedReason::ExcerptTooWeak
                 } else {
                     decayed
                 },
-            ))
+            )
         }
     };
 
     let candidate = match search_for_excerpt(repo_root, file_rel, excerpt, policy) {
         ExcerptSearch::Unique(c) => c,
         ExcerptSearch::NotFound => {
-            return Ok(VerificationOutcome::unverified(
-                UnverifiedReason::NoCandidate,
-            ))
+            return VerificationOutcome::unverified(UnverifiedReason::NoCandidate)
         }
         ExcerptSearch::NonUnique(candidates) => {
-            return Ok(VerificationOutcome::unverified(
-                UnverifiedReason::NonUnique { candidates },
-            ))
+            return VerificationOutcome::unverified(UnverifiedReason::NonUnique { candidates })
         }
         ExcerptSearch::CapExceeded => {
-            return Ok(VerificationOutcome::unverified(
-                UnverifiedReason::ScanCapExceeded,
-            ))
+            return VerificationOutcome::unverified(UnverifiedReason::ScanCapExceeded)
         }
     };
 
-    // Reconstruct the range by anchoring the ORIGINAL range length at the match
-    // offset. When the excerpt is the head of the cited range — the shape kb_add
-    // records — this reproduces the original range exactly, so a later pass can
-    // re-hash it against the unchanged stored hash. When it is not, the range is
-    // wrong and that pass simply will not verify: the excerpt match is never
-    // carried over as an assertion about the full range.
-    let new_start = candidate.offset;
-    let new_end = new_start + (end - start);
-    if new_end as u64 > candidate.file_size {
-        return Ok(VerificationOutcome::unverified(
-            UnverifiedReason::RangeOutOfBounds,
-        ));
+    // Explicit ranges retain their original length at the match offset. A
+    // whole-file citation has no length anchor and therefore relocates to the
+    // candidate's bare path. In both cases a later pass must re-hash against
+    // the unchanged stored hash before it can become Verified.
+    let new_range = range.map(|(start, end)| {
+        let new_start = candidate.offset;
+        (new_start, new_start + (end - start))
+    });
+    if new_range.is_some_and(|(_, new_end)| new_end as u64 > candidate.file_size) {
+        return VerificationOutcome::unverified(UnverifiedReason::RangeOutOfBounds);
     }
 
-    let new_path = format_citation_path(
-        &candidate.rel_path,
-        Some((new_start, new_end)),
-        candidate.file_size,
-    );
+    let new_path = format_citation_path(&candidate.rel_path, new_range, candidate.file_size);
     if new_path == *raw_path {
         // The excerpt is still exactly where it was; the range's bytes changed
         // around it. That is decay, not a move.
-        return Ok(VerificationOutcome::unverified(decayed));
+        return VerificationOutcome::unverified(decayed);
     }
 
-    Ok(VerificationOutcome::relocated(new_path))
+    VerificationOutcome::relocated(new_path)
 }
 
 /// A single location the excerpt was found at.
@@ -793,6 +785,7 @@ fn normalize_rel(rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use sha2::{Digest, Sha256};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -839,9 +832,7 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), expected_hash, "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             true
         );
     }
@@ -865,9 +856,7 @@ mod tests {
         // Wrong hash
         let ev = make_evidence(Some(citation_path), "sha256:deadbeef".to_string(), "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -881,9 +870,7 @@ mod tests {
         );
         // Must return false, not panic or Err
         assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -906,33 +893,29 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             false
         );
     }
 
     #[test]
     fn test_parse_citation_path_valid() {
-        let (path, start, end) = parse_citation_path("src/foo.rs:42-58").unwrap();
+        let (path, range) = parse_citation_path("src/foo.rs:42-58").unwrap();
         assert_eq!(path, "src/foo.rs");
-        assert_eq!(start, 42);
-        assert_eq!(end, 58);
+        assert_eq!(range, Some((42, 58)));
     }
 
     #[test]
     fn test_parse_citation_path_valid_nested() {
         // Path with colons in directory name (unusual but valid)
-        let (path, start, end) = parse_citation_path("a/b/c.rs:0-100").unwrap();
+        let (path, range) = parse_citation_path("a/b/c.rs:0-100").unwrap();
         assert_eq!(path, "a/b/c.rs");
-        assert_eq!(start, 0);
-        assert_eq!(end, 100);
+        assert_eq!(range, Some((0, 100)));
     }
 
     #[test]
-    fn test_parse_citation_path_malformed_no_colon() {
-        assert!(parse_citation_path("src/foo.rs").is_err());
+    fn test_parse_citation_path_whole_file() {
+        assert_eq!(parse_citation_path("src/foo.rs").unwrap(), ("src/foo.rs", None));
     }
 
     #[test]
@@ -943,6 +926,116 @@ mod tests {
     #[test]
     fn test_parse_citation_path_malformed_non_numeric() {
         assert!(parse_citation_path("src/foo.rs:abc-def").is_err());
+    }
+
+    #[test]
+    fn test_parse_citation_path_rejects_empty_file_and_empty_range() {
+        assert!(parse_citation_path("").is_err());
+        assert!(parse_citation_path(":0-4").is_err());
+        assert!(parse_citation_path("src/foo.rs:4-4").is_err());
+    }
+
+    #[test]
+    fn test_parse_citation_path_colon_edge_rules() {
+        assert!(parse_citation_path("a:b.rs").is_err());
+        assert_eq!(
+            parse_citation_path("weird:name.rs:0-42").unwrap(),
+            ("weird:name.rs", Some((0, 42)))
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_parse_citation_path_round_trips(
+            path in "[a-zA-Z0-9_./]{1,40}",
+            start in 0usize..10_000,
+            width in 1usize..10_000,
+        ) {
+            let end = start + width;
+            let ranged = format!("{path}:{start}-{end}");
+            prop_assert_eq!(
+                parse_citation_path(&ranged).unwrap(),
+                (path.as_str(), Some((start, end)))
+            );
+            prop_assert_eq!(parse_citation_path(&path).unwrap(), (path.as_str(), None));
+        }
+    }
+
+    #[test]
+    fn test_verify_evidence_whole_file_match_mismatch_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("full.rs"), b"whole file bytes\n").unwrap();
+        std::fs::write(dir.path().join("empty.rs"), b"").unwrap();
+
+        let matching = make_evidence(
+            Some("full.rs".to_string()),
+            hash_bytes(b"whole file bytes\n"),
+            "code",
+        );
+        assert!(verify_evidence(&matching, dir.path(), RelocationPolicy::Never).is_verified());
+
+        let mismatching = make_evidence(
+            Some("full.rs".to_string()),
+            hash_bytes(b"different"),
+            "code",
+        );
+        assert_eq!(
+            verify_evidence(&mismatching, dir.path(), RelocationPolicy::Never).reason,
+            Some(UnverifiedReason::HashMismatch)
+        );
+
+        let empty = make_evidence(
+            Some("empty.rs".to_string()),
+            hash_bytes(b""),
+            "code",
+        );
+        assert!(verify_evidence(&empty, dir.path(), RelocationPolicy::Never).is_verified());
+    }
+
+    #[test]
+    fn test_verify_evidence_whole_file_directory_is_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let ev = make_evidence(Some("src".to_string()), hash_bytes(b""), "code");
+        assert_eq!(
+            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).reason,
+            Some(UnverifiedReason::FileMissing)
+        );
+    }
+
+    #[test]
+    fn test_verify_evidence_malformed_path_folds_to_reason() {
+        let ev = make_evidence(
+            Some("src/foo.rs:not-a-range".to_string()),
+            hash_bytes(b""),
+            "code",
+        );
+        let outcome = verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never);
+        assert_eq!(outcome.reason, Some(UnverifiedReason::MalformedCitationPath));
+        assert_eq!(outcome.reason.unwrap().as_str(), "malformed_citation");
+    }
+
+    #[test]
+    fn test_verify_evidence_relocates_whole_file_to_bare_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "fn uniquely_relocated_whole_file() {\n",
+            "    let enough_bytes = \"make this excerpt strong and unique in the repository\";\n",
+            "    println!(\"{enough_bytes}\");\n",
+            "}\n"
+        );
+        std::fs::write(dir.path().join("old.rs"), b"changed bytes\n").unwrap();
+        std::fs::write(dir.path().join("new.rs"), excerpt).unwrap();
+        let mut ev = make_evidence(
+            Some("old.rs".to_string()),
+            hash_bytes(excerpt.as_bytes()),
+            "code",
+        );
+        ev.citation_excerpt = Some(excerpt.to_string());
+
+        let outcome = verify_evidence(&ev, dir.path(), RelocationPolicy::FileThenRepo);
+        assert_eq!(outcome.status, VerificationStatus::Relocated);
+        assert_eq!(outcome.relocated_to.as_deref(), Some("new.rs"));
     }
 
     #[test]
@@ -967,9 +1060,7 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), prefixed_hash, "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             true
         );
     }
@@ -998,14 +1089,14 @@ mod tests {
         ] {
             let expected_hash = hash_bytes(&content[start..end]);
             assert!(matches!(
-                hash_check_at_citation(dir, &file_name, start, end, &expected_hash),
+                hash_check_at_citation(dir, &file_name, Some((start, end)), &expected_hash),
                 HashCheck::Match
             ));
         }
     }
 
     #[test]
-    fn test_hash_check_at_citation_matches_empty_file_range() {
+    fn test_hash_check_at_citation_rejects_empty_explicit_range() {
         let tmp = NamedTempFile::new().unwrap();
         let file_name = tmp
             .path()
@@ -1017,8 +1108,8 @@ mod tests {
         let expected_hash = hash_bytes(b"");
 
         assert!(matches!(
-            hash_check_at_citation(dir, &file_name, 0, 0, &expected_hash),
-            HashCheck::Match
+            hash_check_at_citation(dir, &file_name, Some((0, 0)), &expected_hash),
+            HashCheck::Failed(UnverifiedReason::RangeOutOfBounds)
         ));
     }
 
@@ -1041,7 +1132,7 @@ mod tests {
         let expected_hash = hash_bytes(&content[start..end]);
 
         assert!(matches!(
-            hash_check_at_citation(dir, &file_name, start, end, &expected_hash),
+            hash_check_at_citation(dir, &file_name, Some((start, end)), &expected_hash),
             HashCheck::Match
         ));
     }
@@ -1075,7 +1166,7 @@ mod tests {
         // ReadError from the short read; that path isn't deterministically
         // reachable here without fault injection.
         assert!(matches!(
-            hash_check_at_citation(dir, &file_name, 0, content.len(), &expected_hash),
+            hash_check_at_citation(dir, &file_name, Some((0, content.len())), &expected_hash),
             HashCheck::Failed(UnverifiedReason::RangeOutOfBounds)
         ));
     }
@@ -1092,9 +1183,7 @@ mod tests {
         );
         // Must return Ok(false) — no panic, no Err, no read outside repo.
         assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             false
         );
         // Confirm we did not create any artifact inside the tempdir from this call.
@@ -1114,9 +1203,7 @@ mod tests {
             "code",
         );
         assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -1130,9 +1217,7 @@ mod tests {
             "code",
         );
         assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -1159,9 +1244,7 @@ mod tests {
             "test",
         );
         assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -1188,9 +1271,7 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -1215,9 +1296,7 @@ mod tests {
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
         assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
             false
         );
     }
@@ -1338,7 +1417,7 @@ mod tests {
             recorded_at: None,
         };
 
-        let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly).unwrap();
+        let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly);
         assert_eq!(outcome.status, VerificationStatus::Unverified);
         // PathEscape now propagates directly instead of falling through to excerpt search.
         assert_eq!(outcome.reason, Some(UnverifiedReason::PathEscape));
@@ -1406,9 +1485,7 @@ mod tests {
             "code",
         );
         assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never)
-                .unwrap()
-                .is_verified(),
+            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             false,
             "files larger than MAX_FILE_BYTES must return Ok(false)"
         );

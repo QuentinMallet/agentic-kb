@@ -61,7 +61,7 @@ pub fn compute_citation_fields(
     range: Option<(usize, usize)>,
 ) -> Result<CitationFields> {
     compute_citation_fields_with_verifier(repo_root, rel_path, range, |ev, root| {
-        verify_evidence(ev, root, RelocationPolicy::Never)
+        Ok(verify_evidence(ev, root, RelocationPolicy::Never))
     })
 }
 
@@ -205,7 +205,7 @@ mod tests {
                 derived_from: None,
                 recorded_at: None,
             };
-            let outcome = verify_evidence(&ev, dir.path(), RelocationPolicy::Never).unwrap();
+            let outcome = verify_evidence(&ev, dir.path(), RelocationPolicy::Never);
             prop_assert_eq!(outcome.status, VerificationStatus::Verified);
         }
     }
@@ -247,13 +247,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_citation_fields_whole_file_uses_legacy_path_form() {
+    fn test_compute_citation_fields_whole_file_uses_bare_path_form() {
+        // Post-.3: format_citation_path(None) emits the bare path, not the
+        // legacy path:0-file_size workaround form.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("sample.rs"), b"fn main() {}\n").unwrap();
 
         let fields = compute_citation_fields(dir.path(), "sample.rs", None).unwrap();
 
-        assert_eq!(fields.citation_path, "sample.rs:0-13");
+        assert_eq!(fields.citation_path, "sample.rs");
         assert_eq!(fields.file_size, 13);
     }
 
