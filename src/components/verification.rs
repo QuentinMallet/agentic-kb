@@ -291,11 +291,14 @@ fn hash_citation_bytes(
     let file_abs = match safe_join(repo_root, file_rel) {
         Some(p) => p,
         None => {
-            return Err(if repo_root.join(file_rel).exists() {
+            // Do not probe after containment rejection: the reason must not
+            // disclose whether an out-of-repository target exists. Descriptor-
+            // relative open hardening is tracked separately in bd-eho3.
+            return Err(if syntactically_escapes_root(file_rel) {
                 UnverifiedReason::PathEscape
             } else {
                 UnverifiedReason::FileMissing
-            })
+            });
         }
     };
 
@@ -362,6 +365,24 @@ fn hash_citation_bytes(
         sha256_hex: format!("{:x}", hasher.finalize()),
         file_size,
     })
+}
+
+fn syntactically_escapes_root(rel: &str) -> bool {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return true;
+    }
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth == 0 => return true,
+            Component::ParentDir => depth -= 1,
+            Component::RootDir | Component::Prefix(_) => return true,
+            Component::CurDir => {}
+        }
+    }
+    false
 }
 
 /// Outcome of the direct hash check at the recorded citation path.
@@ -1004,6 +1025,51 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_evidence_escape_reason_does_not_disclose_existence() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(parent.path().join("outside-existing-file"), b"secret").unwrap();
+
+        for path in ["../outside-existing-file", "../outside-nonexistent-file"] {
+            let ev = make_evidence(Some(path.to_string()), hash_bytes(b"secret"), "code");
+            assert_eq!(
+                verify_evidence(&ev, &repo, RelocationPolicy::Never).reason,
+                Some(UnverifiedReason::PathEscape),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_evidence_rejects_absolute_path_as_escape() {
+        let repo = tempfile::tempdir().unwrap();
+        let ev = make_evidence(
+            Some(repo.path().join("missing.rs").to_string_lossy().into_owned()),
+            hash_bytes(b""),
+            "code",
+        );
+        assert_eq!(
+            verify_evidence(&ev, repo.path(), RelocationPolicy::Never).reason,
+            Some(UnverifiedReason::PathEscape)
+        );
+    }
+
+    #[test]
+    fn test_verify_evidence_normal_missing_file_is_file_missing() {
+        let repo = tempfile::tempdir().unwrap();
+        let ev = make_evidence(
+            Some("src/missing.rs".to_string()),
+            hash_bytes(b""),
+            "code",
+        );
+        assert_eq!(
+            verify_evidence(&ev, repo.path(), RelocationPolicy::Never).reason,
+            Some(UnverifiedReason::FileMissing)
+        );
+    }
+
+    #[test]
     fn test_verify_evidence_malformed_path_folds_to_reason() {
         let ev = make_evidence(
             Some("src/foo.rs:not-a-range".to_string()),
@@ -1419,8 +1485,12 @@ mod tests {
 
         let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly);
         assert_eq!(outcome.status, VerificationStatus::Unverified);
-        // PathEscape now propagates directly instead of falling through to excerpt search.
-        assert_eq!(outcome.reason, Some(UnverifiedReason::PathEscape));
+        // Non-disclosure rule (bd-eho3): a resolution-level escape (symlink,
+        // no ".." in the syntactic path) is not distinguishable from a plain
+        // missing file without probing outside containment, so it folds to
+        // FileMissing rather than PathEscape. Only syntactic escapes ("..",
+        // absolute paths) report PathEscape now.
+        assert_eq!(outcome.reason, Some(UnverifiedReason::FileMissing));
         assert_eq!(outcome.relocated_to, None);
         assert!(!outcome.is_verified(), "sibling content must never verify");
     }

@@ -14,12 +14,13 @@ use abscissa_core::{Command, Runnable};
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 const SELF_REFERENTIAL_LOG_REASON: &str =
     "self-referential log citation — re-cite or expire manually";
 const SKIP_ALREADY_BARE_REASON: &str = "already bare whole-file citation";
 const SKIP_NON_LEGACY_REASON: &str = "not a legacy whole-file workaround citation";
+const SKIP_PARENT_STALE_REASON: &str = "parent went stale";
 
 #[derive(Command, Debug, Parser)]
 pub struct MigrateCitations {
@@ -80,7 +81,7 @@ impl MigrateCitations {
     pub fn execute_with_paths(&self, paths: &config::Paths) -> Result<MigrationReport> {
         let conn = db::open_db(&paths.db)?;
         let repo_root = repo_root_from_paths(paths)?;
-        let mut report = plan_migration(&conn, repo_root.as_path())?;
+        let mut report = plan_migration(&conn, repo_root.as_path(), &paths.events)?;
         if !self.dry_run {
             apply_heals(paths, &conn, repo_root.as_path(), &mut report)?;
         }
@@ -99,7 +100,11 @@ fn repo_root_from_paths(paths: &config::Paths) -> Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow!("could not derive repo root from {}", paths.db.display()))
 }
 
-fn plan_migration(conn: &Connection, repo_root: &Path) -> Result<MigrationReport> {
+fn plan_migration(
+    conn: &Connection,
+    repo_root: &Path,
+    events_path: &Path,
+) -> Result<MigrationReport> {
     let mut stmt = conn.prepare(
         "SELECT ev.entry_id, ev.id, ev.citation_path, ev.citation_hash
          FROM evidence ev
@@ -128,7 +133,7 @@ fn plan_migration(conn: &Connection, repo_root: &Path) -> Result<MigrationReport
             new_path: None,
             reason: None,
         };
-        match classify_row(&row, repo_root) {
+        match classify_row(&row, repo_root, events_path) {
             PlannedAction::WouldHeal { new_path } => report.would_heal.push(MigrationRow {
                 new_path: Some(new_path),
                 ..view
@@ -147,7 +152,11 @@ fn plan_migration(conn: &Connection, repo_root: &Path) -> Result<MigrationReport
     Ok(report)
 }
 
-fn classify_row(row: &EvidenceCitationRow, repo_root: &Path) -> PlannedAction {
+fn classify_row(
+    row: &EvidenceCitationRow,
+    repo_root: &Path,
+    events_path: &Path,
+) -> PlannedAction {
     let (file_rel, range) = match parse_citation_path(&row.citation_path) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -167,7 +176,7 @@ fn classify_row(row: &EvidenceCitationRow, repo_root: &Path) -> PlannedAction {
             reason: SKIP_NON_LEGACY_REASON,
         };
     }
-    if file_rel.ends_with("agent-kb-events.jsonl") {
+    if citation_targets_events_log(file_rel, repo_root, events_path) {
         return PlannedAction::Fail {
             reason: SELF_REFERENTIAL_LOG_REASON.to_string(),
         };
@@ -202,6 +211,36 @@ fn classify_row(row: &EvidenceCitationRow, repo_root: &Path) -> PlannedAction {
     }
 }
 
+fn normalize_repo_relative(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn citation_targets_events_log(file_rel: &str, repo_root: &Path, events_path: &Path) -> bool {
+    let Some(citation_rel) = normalize_repo_relative(Path::new(file_rel)) else {
+        return false;
+    };
+    let Ok(configured_rel) = events_path.strip_prefix(repo_root) else {
+        return false;
+    };
+    normalize_repo_relative(configured_rel).as_ref() == Some(&citation_rel)
+}
+
 fn apply_heals(
     paths: &config::Paths,
     conn: &Connection,
@@ -215,14 +254,26 @@ fn apply_heals(
     for row in planned {
         let Some((current_path, citation_hash)) = conn
             .query_row(
-                "SELECT citation_path, citation_hash FROM evidence WHERE id=?1 AND entry_id=?2",
+                "SELECT ev.citation_path, ev.citation_hash
+                 FROM evidence ev
+                 JOIN entries e ON e.id = ev.entry_id
+                 WHERE ev.id=?1 AND ev.entry_id=?2 AND e.is_stale=0",
                 params![&row.evidence_id, &row.entry_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?
         else {
+            let evidence_still_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evidence WHERE id=?1 AND entry_id=?2)",
+                params![&row.evidence_id, &row.entry_id],
+                |r| r.get::<_, bool>(0),
+            )?;
             report.skipped.push(MigrationRow {
-                reason: Some("evidence row disappeared before apply".to_string()),
+                reason: Some(if evidence_still_exists {
+                    SKIP_PARENT_STALE_REASON.to_string()
+                } else {
+                    "evidence row disappeared before apply".to_string()
+                }),
                 ..row
             });
             continue;
@@ -242,7 +293,7 @@ fn apply_heals(
             reason: None,
         };
 
-        match classify_row(&verify_row, repo_root) {
+        match classify_row(&verify_row, repo_root, &paths.events) {
             PlannedAction::WouldHeal { new_path } => {
                 let event = events::citation_healed_event(
                     &row.entry_id,
@@ -253,6 +304,9 @@ fn apply_heals(
                     version_ref.as_deref(),
                 );
                 events::append_event(&paths.events, &event)?;
+                // If append succeeds but apply fails, a rerun may append a
+                // second citation_healed event. Applying the same target is a
+                // state-idempotent no-op; deterministic op IDs are deferred.
                 db::apply_event(conn, &NoopEmbedder, &event)?;
                 report.emitted_events += 1;
                 report.would_heal.push(MigrationRow {
@@ -631,5 +685,96 @@ mod tests {
             report.failed[0].reason.as_deref(),
             Some(SELF_REFERENTIAL_LOG_REASON)
         );
+    }
+
+    #[test]
+    fn test_migrate_citations_heals_subdir_file_named_like_events_log() {
+        let (_dir, paths, conn) = setup_repo();
+        let root = repo_root_from_paths(&paths).unwrap();
+        fs::create_dir_all(root.join("fixtures")).unwrap();
+        fs::write(
+            root.join("fixtures/agent-kb-events.jsonl"),
+            "fixture\n",
+        )
+        .unwrap();
+        let end = fs::metadata(root.join("fixtures/agent-kb-events.jsonl"))
+            .unwrap()
+            .len() as usize;
+        let hash = crate::components::verification::compute_citation_hash(
+            &root,
+            "fixtures/agent-kb-events.jsonl",
+            None,
+        )
+        .unwrap();
+        seed_live_entry(&paths, &conn, "entry-1");
+        seed_evidence(
+            &paths,
+            &conn,
+            "entry-1",
+            "ev-1",
+            &format!("fixtures/agent-kb-events.jsonl:0-{end}"),
+            &hash,
+        );
+
+        let report = MigrateCitations { dry_run: false }
+            .execute_with_paths(&paths)
+            .unwrap();
+
+        assert_eq!(report.emitted_events, 1);
+        assert_eq!(
+            report.would_heal[0].new_path.as_deref(),
+            Some("fixtures/agent-kb-events.jsonl")
+        );
+    }
+
+    #[test]
+    fn test_migrate_citations_skips_when_parent_goes_stale_between_plan_and_apply() {
+        let (_dir, paths, conn) = setup_repo();
+        let root = repo_root_from_paths(&paths).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let end = fs::metadata(root.join("src/lib.rs")).unwrap().len() as usize;
+        let hash = crate::components::verification::compute_citation_hash(
+            &root,
+            "src/lib.rs",
+            None,
+        )
+        .unwrap();
+        seed_live_entry(&paths, &conn, "entry-1");
+        seed_evidence(
+            &paths,
+            &conn,
+            "entry-1",
+            "ev-1",
+            &format!("src/lib.rs:0-{end}"),
+            &hash,
+        );
+        let mut report = plan_migration(&conn, &root, &paths.events).unwrap();
+
+        let expire = serde_json::json!({
+            "action": "expire",
+            "table": "entries",
+            "id": "entry-1",
+            "reason": "test race",
+            "ts": "2026-09-02T00:00:01Z"
+        });
+        events::append_event(&paths.events, &expire).unwrap();
+        apply_event(&conn, &NoopEmbedder, &expire).unwrap();
+        let before = read_events(&paths.events).unwrap().events.len();
+
+        apply_heals(&paths, &conn, &root, &mut report).unwrap();
+
+        assert_eq!(report.emitted_events, 0);
+        assert!(report.would_heal.is_empty());
+        // Under ADR-2, expiring the parent entry GCs its evidence rows, so the
+        // requery finds the row gone entirely — the SKIP_PARENT_STALE_REASON
+        // branch (live parent, stale evidence) is unreachable for
+        // expire-driven staleness. The skip itself (the actual requirement)
+        // still happens.
+        assert_eq!(
+            report.skipped[0].reason.as_deref(),
+            Some("evidence row disappeared before apply")
+        );
+        assert_eq!(read_events(&paths.events).unwrap().events.len(), before);
     }
 }
