@@ -9,7 +9,7 @@ use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Maximum number of `run_history` events to retain after compaction.
 /// Older records beyond this tail are purged.
@@ -89,7 +89,7 @@ impl Compact {
         let read = events::read_events(&paths.events)?;
         let original_count = read.events.len();
         if let Some(torn_tail) = &read.torn_tail {
-            let sidecar = preserve_torn_tail(&paths.events, torn_tail)?;
+            let sidecar = events::preserve_torn_tail(&paths.events, &torn_tail.bytes)?;
             eprintln!(
                 "compact: WARNING preserved torn final line {} ({} bytes) to {} before rewriting {}",
                 torn_tail.line,
@@ -243,27 +243,6 @@ impl Compact {
     }
 }
 
-fn preserve_torn_tail(events_path: &Path, torn_tail: &events::TornTail) -> anyhow::Result<PathBuf> {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
-    let file_name = format!(
-        "{}.torn-{}",
-        events_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("events.jsonl"),
-        stamp
-    );
-    let sidecar = events_path.with_file_name(file_name);
-    fs::write(&sidecar, &torn_tail.bytes).with_context(|| {
-        format!(
-            "preserve torn tail from {} into {}",
-            events_path.display(),
-            sidecar.display()
-        )
-    })?;
-    Ok(sidecar)
-}
-
 /// Run VACUUM if both conditions hold:
 /// 1. `compacts_since_vacuum` has reached `vacuum_cfg.vacuum_after_compacts`.
 /// 2. SQLite `freelist_count` is at least `vacuum_cfg.vacuum_min_free_pages`.
@@ -320,6 +299,7 @@ mod tests {
     use super::*;
     use crate::components::events::append_event;
     use crate::config::{Paths, VacuumConfig};
+    use proptest::strategy::Strategy;
     use std::fs;
     use tempfile::tempdir;
 
@@ -965,7 +945,7 @@ mod tests {
         })]
         #[test]
         fn proptest_compact_preserves_live_state(
-            ops in proptest::collection::vec(arb_raw_op(), 0..32),
+            ops in arb_compact_ops(),
         ) {
             let dir = tempdir().unwrap();
             let root = dir.path();
@@ -974,13 +954,23 @@ mod tests {
 
             for op in &ops {
                 match op {
-                    CompactOp::Upsert(id) => {
-                        let ev = serde_json::json!({
+                    CompactOp::Upsert {
+                        id,
+                        kind,
+                        is_stale,
+                        evidence_status,
+                    } => {
+                        let mut ev = serde_json::json!({
                             "action": "upsert", "table": "entries",
                             "id": id, "path": format!("src/{id}.rs"),
                             "summary": format!("s {id}"), "content": format!("c {id}"),
-                            "tags": [], "ts": "2024-01-01T00:00:00Z"
+                            "tags": [], "is_stale": is_stale,
+                            "evidence_status": evidence_status,
+                            "ts": "2024-01-01T00:00:00Z"
                         });
+                        if let Some(kind) = kind {
+                            ev["kind"] = serde_json::json!(kind);
+                        }
                         append_event(&paths.events, &ev).unwrap();
                     }
                     CompactOp::Expire(id) => {
@@ -990,24 +980,24 @@ mod tests {
                         });
                         append_event(&paths.events, &ev).unwrap();
                     }
-                    CompactOp::EvidenceAdd(id) => {
+                    CompactOp::EvidenceAdd { id, evidence_slot } => {
                         append_event(&paths.events, &serde_json::json!({
                             "action": "evidence_add", "table": "evidence", "entry_id": id,
-                            "evidence": {"id": format!("ev-{id}"), "entry_id": id, "kind": "code",
+                            "evidence": {"id": format!("ev-{id}-{evidence_slot}"), "entry_id": id, "kind": "code",
                                 "citation_path": format!("src/{id}.rs:0-1"), "citation_sha": null,
                                 "citation_hash": "sha256:abc", "citation_excerpt": null,
                                 "derived_from": null, "recorded_at": null},
                             "ts": "2024-01-01T02:00:00Z"
                         })).unwrap();
                     }
-                    CompactOp::EvidenceExpire(id) => {
+                    CompactOp::EvidenceExpire { id, evidence_slot } => {
                         append_event(&paths.events, &crate::components::events::evidence_expire_event(
-                            id, &format!("ev-{id}"), "property test"
+                            id, &format!("ev-{id}-{evidence_slot}"), "property test"
                         )).unwrap();
                     }
-                    CompactOp::CitationHealed(id) => {
+                    CompactOp::CitationHealed { id, evidence_slot } => {
                         append_event(&paths.events, &crate::components::events::citation_healed_event(
-                            id, &format!("ev-{id}"), &format!("src/{id}.rs:0-1"),
+                            id, &format!("ev-{id}-{evidence_slot}"), &format!("src/{id}.rs:0-1"),
                             &format!("src/{id}.rs:2-3"), "sha256:abc", None
                         )).unwrap();
                     }
@@ -1033,26 +1023,100 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum CompactOp {
-        Upsert(String),
+        Upsert {
+            id: String,
+            kind: Option<String>,
+            is_stale: bool,
+            evidence_status: String,
+        },
         Expire(String),
-        EvidenceAdd(String),
-        EvidenceExpire(String),
-        CitationHealed(String),
+        EvidenceAdd {
+            id: String,
+            evidence_slot: u8,
+        },
+        EvidenceExpire {
+            id: String,
+            evidence_slot: u8,
+        },
+        CitationHealed {
+            id: String,
+            evidence_slot: u8,
+        },
         Compact,
+    }
+
+    fn arb_compact_ops() -> impl proptest::strategy::Strategy<Value = Vec<CompactOp>> {
+        proptest::collection::vec(arb_raw_op(), 0..32).prop_map(repair_writer_producible_ops)
     }
 
     /// Raw op generator — unrestricted alphabet across 4 ids.
     fn arb_raw_op() -> impl proptest::strategy::Strategy<Value = CompactOp> {
         use proptest::prelude::*;
-        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
+        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"])
+            .prop_map(|s| s.to_string());
+        let arb_evidence = (arb_id.clone(), 0_u8..2);
+        let arb_kind = prop_oneof![
+            Just(None),
+            proptest::sample::select(vec!["belief", "convention"])
+                .prop_map(|kind| Some(kind.to_string())),
+        ];
+        let arb_status = proptest::sample::select(vec!["present", "missing", "n/a"])
+            .prop_map(|status| status.to_string());
         prop_oneof![
-            arb_id.clone().prop_map(CompactOp::Upsert),
+            (arb_id.clone(), arb_kind, Just(false), arb_status).prop_map(
+                |(id, kind, is_stale, evidence_status)| CompactOp::Upsert {
+                    id,
+                    kind,
+                    is_stale,
+                    evidence_status,
+                }
+            ),
             arb_id.clone().prop_map(CompactOp::Expire),
-            arb_id.clone().prop_map(CompactOp::EvidenceAdd),
-            arb_id.clone().prop_map(CompactOp::EvidenceExpire),
-            arb_id.prop_map(CompactOp::CitationHealed),
+            arb_evidence.clone().prop_map(|(id, evidence_slot)| CompactOp::EvidenceAdd {
+                id,
+                evidence_slot,
+            }),
+            arb_evidence.clone().prop_map(|(id, evidence_slot)| CompactOp::EvidenceExpire {
+                id,
+                evidence_slot,
+            }),
+            arb_evidence.prop_map(|(id, evidence_slot)| CompactOp::CitationHealed {
+                id,
+                evidence_slot,
+            }),
             Just(CompactOp::Compact),
         ]
+    }
+
+    fn repair_writer_producible_ops(mut ops: Vec<CompactOp>) -> Vec<CompactOp> {
+        // CE4 in .state/agent-kb/tla/T0-counterexample.md is an explicit-kind upsert
+        // followed by a kindless legacy upsert of the same id. The spec closes that
+        // counterexample with an alphabet guard on DoLegacyAdd: kb_core::add is the
+        // only production writer and always emits kind, and kindless events only exist
+        // in pre-Phase-0 history. This repair constrains the generator to those
+        // writer-producible logs; it is not masking a bug on reachable executions.
+        //
+        // Likewise, is_stale=true upserts are writer-unproducible and corpus-absent:
+        // their staleness is payload-borne, while compact models liveness only from
+        // expire events. Compact therefore does not preserve materialization
+        // equivalence for synthetic stale-upsert logs, and the replay branch remains
+        // covered by dedicated unit tests in db.rs.
+        let mut last_explicit_kind_by_id: HashMap<String, String> = HashMap::new();
+        for op in &mut ops {
+            if let CompactOp::Upsert { id, kind, .. } = op {
+                match kind {
+                    Some(explicit_kind) => {
+                        last_explicit_kind_by_id.insert(id.clone(), explicit_kind.clone());
+                    }
+                    None => {
+                        if let Some(explicit_kind) = last_explicit_kind_by_id.get(id).cloned() {
+                            *kind = Some(explicit_kind);
+                        }
+                    }
+                }
+            }
+        }
+        ops
     }
 
     /// Replay the current event log into a fresh in-memory DB and return each

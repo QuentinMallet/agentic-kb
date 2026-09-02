@@ -718,45 +718,70 @@ pub fn apply_event(
             // not `&mut Connection` (same pattern as the expire branch).
             conn.execute_batch("BEGIN")?;
             let result = (|| -> Result<bool> {
-                // A legacy upsert carries no kind, so its 'n/a' is the AC2
-                // grandfather rather than a derived value. The grandfather may
-                // INITIALIZE a fresh row, but re-applying it to an existing row
-                // would re-grandfather an entry the evidence lifecycle has
-                // already de-legacied — payload-style authority of exactly the
-                // kind ADR-1 abolishes, and order-sensitive under compact
-                // (agent-kb/tla/AgentKbEvidence.tla, CE3). So the ON CONFLICT
-                // path leaves evidence_status alone for legacy events; the
-                // explicit-kind path recomputes it below regardless.
-                let upsert_sql = if has_explicit_kind {
-                    "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-                     ON CONFLICT(id) DO UPDATE SET
-                       path=excluded.path, summary=excluded.summary,
-                       content=excluded.content, tags=excluded.tags,
-                       version_ref=excluded.version_ref,
-                       permanent=excluded.permanent,
-                       is_stale=excluded.is_stale,
-                       kind=excluded.kind,
-                       evidence_status=excluded.evidence_status,
-                       session_id=excluded.session_id,
-                       updated_at=excluded.updated_at"
+                // payload evidence_status is authoritative NOWHERE. For
+                // kindless legacy events, a fresh insert pins 'n/a' as the AC2
+                // grandfather, and the ON CONFLICT path preserves the current
+                // row value so a later legacy upsert cannot re-grandfather a
+                // de-legacied entry (AgentKbEvidence.tla CE3). For explicit-
+                // kind events, the row is recomputed below regardless of any
+                // payload value, so the insert payload is only transient.
+                if has_explicit_kind {
+                    conn.execute(
+                        "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                         ON CONFLICT(id) DO UPDATE SET
+                           path=excluded.path, summary=excluded.summary,
+                           content=excluded.content, tags=excluded.tags,
+                           version_ref=excluded.version_ref,
+                           permanent=excluded.permanent,
+                           is_stale=excluded.is_stale,
+                           kind=excluded.kind,
+                           evidence_status=excluded.evidence_status,
+                           session_id=excluded.session_id,
+                           updated_at=excluded.updated_at",
+                        params![
+                            id,
+                            path,
+                            summary,
+                            content,
+                            tags,
+                            version_ref,
+                            permanent,
+                            is_stale,
+                            kind,
+                            evidence_status,
+                            session_id,
+                            ts
+                        ],
+                    )?;
                 } else {
-                    "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
-                     ON CONFLICT(id) DO UPDATE SET
-                       path=excluded.path, summary=excluded.summary,
-                       content=excluded.content, tags=excluded.tags,
-                       version_ref=excluded.version_ref,
-                       permanent=excluded.permanent,
-                       is_stale=excluded.is_stale,
-                       kind=excluded.kind,
-                       session_id=excluded.session_id,
-                       updated_at=excluded.updated_at"
-                };
-                conn.execute(
-                    upsert_sql,
-                    params![id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, ts],
-                )?;
+                    conn.execute(
+                        "INSERT INTO entries(id, path, summary, content, tags, version_ref, permanent, is_stale, kind, evidence_status, session_id, created_at, updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'n/a',?10,?11,?11)
+                         ON CONFLICT(id) DO UPDATE SET
+                           path=excluded.path, summary=excluded.summary,
+                           content=excluded.content, tags=excluded.tags,
+                           version_ref=excluded.version_ref,
+                           permanent=excluded.permanent,
+                           is_stale=excluded.is_stale,
+                           kind=excluded.kind,
+                           session_id=excluded.session_id,
+                           updated_at=excluded.updated_at",
+                        params![
+                            id,
+                            path,
+                            summary,
+                            content,
+                            tags,
+                            version_ref,
+                            permanent,
+                            is_stale,
+                            kind,
+                            session_id,
+                            ts
+                        ],
+                    )?;
+                }
 
                 // Stale entries: clean up FTS/embeddings/cues so they don't
                 // appear in search (br-improvement-catalog-23b.6 GC,
@@ -764,6 +789,10 @@ pub fn apply_event(
                 // toward the FTS deprecation gate.
                 if is_stale == 1 {
                     conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
+                    conn.execute(
+                        "UPDATE entries SET evidence_status='n/a' WHERE id=?1",
+                        params![id],
+                    )?;
                     // entries_fts may be gone after the deprecation gate fires; treat as no-op.
                     let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
                     conn.execute(
@@ -3003,6 +3032,20 @@ mod tests {
         })
     }
 
+    fn legacy_upsert_event_with_payload_status(id: &str, evidence_status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": id,
+            "path": "src/lib.rs",
+            "summary": format!("legacy {id}"),
+            "content": "content",
+            "tags": [],
+            "evidence_status": evidence_status,
+            "ts": "2023-01-01T00:00:00Z"
+        })
+    }
+
     fn evidence_add_event(id: &str) -> serde_json::Value {
         serde_json::json!({
             "action": "evidence_add",
@@ -3212,6 +3255,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_kindless_fresh_upsert_ignores_payload_evidence_status_and_pins_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        apply_event(
+            &conn,
+            &embedder,
+            &legacy_upsert_event_with_payload_status("legacy-payload-na", "present"),
+        )
+        .unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "legacy-payload-na"), 0);
+        assert_eq!(entry_evidence_status(&conn, "legacy-payload-na"), "n/a");
+    }
+
+    #[test]
+    fn test_kindless_payload_status_replay_matches_compacted_last_upsert() {
+        let embedder = NoopEmbedder;
+
+        let conn_full = open_db_memory().unwrap();
+        for event in [
+            legacy_upsert_event_with_payload_status("legacy-compact-payload", "present"),
+            legacy_upsert_event_with_payload_status("legacy-compact-payload", "missing"),
+        ] {
+            apply_event(&conn_full, &embedder, &event).unwrap();
+        }
+
+        let conn_compacted = open_db_memory().unwrap();
+        apply_event(
+            &conn_compacted,
+            &embedder,
+            &legacy_upsert_event_with_payload_status("legacy-compact-payload", "missing"),
+        )
+        .unwrap();
+
+        assert_eq!(entry_evidence_status(&conn_full, "legacy-compact-payload"), "n/a");
+        assert_eq!(
+            entry_evidence_status(&conn_full, "legacy-compact-payload"),
+            entry_evidence_status(&conn_compacted, "legacy-compact-payload")
+        );
+    }
+
     /// Order insensitivity — the property CompactionEquivalenceE needs. Compact
     /// keeps only the LAST upsert per entry, so replaying the trailing legacy
     /// upsert with its preceding evidence event must land on the same status as
@@ -3309,6 +3395,29 @@ mod tests {
         apply_event(&conn, &embedder, &upsert).unwrap();
 
         assert_eq!(entry_evidence_status(&conn, "revive-explicit-kind"), "missing");
+    }
+
+    #[test]
+    fn test_explicit_kind_fresh_upsert_recomputes_status_ignoring_payload() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "explicit-kind-fresh",
+            "path": "src/lib.rs",
+            "summary": "entry without evidence",
+            "content": "content",
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        assert_eq!(entry_evidence_row_count(&conn, "explicit-kind-fresh"), 0);
+        assert_eq!(entry_evidence_status(&conn, "explicit-kind-fresh"), "missing");
     }
 
     #[test]
@@ -4255,6 +4364,51 @@ mod tests {
         assert_eq!(
             after, 0,
             "is_stale=true upsert must delete entries_emb row (GC regression)"
+        );
+    }
+
+    #[test]
+    fn test_explicit_kind_stale_upsert_forces_evidence_status_na() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let stale_upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "stale-status",
+            "path": "src/stale.rs", "summary": "stale", "content": "content",
+            "tags": [], "kind": "belief", "evidence_status": "present",
+            "is_stale": true, "ts": "2024-01-01T00:00:00Z"
+        });
+
+        apply_event(&conn, &embedder, &stale_upsert).unwrap();
+
+        assert_eq!(entry_evidence_status(&conn, "stale-status"), "n/a");
+    }
+
+    #[test]
+    fn test_stale_upsert_status_matches_live_upsert_then_expire() {
+        let embedder = NoopEmbedder;
+        let live_then_expire = open_db_memory().unwrap();
+        let stale_upsert_only = open_db_memory().unwrap();
+        let live = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "status-order",
+            "path": "src/status.rs", "summary": "status", "content": "content",
+            "tags": [], "kind": "belief", "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "status-order",
+            "ts": "2024-01-02T00:00:00Z"
+        });
+        let mut stale = live.clone();
+        stale["is_stale"] = serde_json::json!(true);
+
+        apply_event(&live_then_expire, &embedder, &live).unwrap();
+        apply_event(&live_then_expire, &embedder, &expire).unwrap();
+        apply_event(&stale_upsert_only, &embedder, &stale).unwrap();
+
+        assert_eq!(entry_evidence_status(&live_then_expire, "status-order"), "n/a");
+        assert_eq!(
+            entry_evidence_status(&stale_upsert_only, "status-order"),
+            entry_evidence_status(&live_then_expire, "status-order")
         );
     }
 

@@ -7,3 +7,5 @@
 cc 4a5000cb4a76aa8bab916632d2c6962d5df562fc75cdaaf24f7aaa3a98df09f3 # shrinks to ops = [Expire("b"), Upsert("b")]
 cc 4b6b0d967c82e7051f25e60ee573bfcb001c3e7c47c9ba0911ca5d7e7d493fbc # shrinks to ops = [EvidenceExpire("d"), Upsert("d"), Upsert("a")]
 cc a4de3f113228baef094f34451c000b66f82eb64d49df0960ed74cf977d7f46f0 # shrinks to ops = [Upsert("d"), EvidenceExpire("d"), Expire("d"), Upsert("d"), CitationHealed("a")]
+cc 31b3e6fa1a209a6f0350c0968b792966aa9731c23324508d4e7eca3a0602a1df # shrinks to ops = [Upsert("b"), Expire("b"), EvidenceExpire("b"), Upsert("b")]
+cc 131e1fb0b04ba947af50546047bdcf59d21abec972bff8adc2596d9a840394a9 # shrinks to ops = [Upsert { id: "c", kind: None, is_stale: true, evidence_status: "present" }, EvidenceAdd { id: "c", evidence_slot: 0 }, Upsert { id: "c", kind: None, is_stale: false, evidence_status: "present" }]

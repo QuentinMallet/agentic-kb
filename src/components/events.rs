@@ -3,8 +3,8 @@
 use crate::models::Evidence;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TornTail {
@@ -103,6 +103,7 @@ pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> 
     if let Some(p) = events_path.parent() {
         fs::create_dir_all(p)?;
     }
+    repair_torn_tail_before_append(events_path)?;
     let mut f = OpenOptions::new()
         .append(true)
         .create(true)
@@ -119,12 +120,87 @@ pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()>
     if let Some(p) = events_path.parent() {
         fs::create_dir_all(p)?;
     }
+    repair_torn_tail_before_append(events_path)?;
     let mut f = OpenOptions::new()
         .append(true)
         .create(true)
         .open(events_path)
         .with_context(|| format!("open events {}", events_path.display()))?;
     writeln!(f, "{}", serde_json::to_string(event)?)?;
+    Ok(())
+}
+
+/// Preserve a torn final record using the event-log sidecar naming convention.
+pub(crate) fn preserve_torn_tail(
+    events_path: &Path,
+    torn_tail: &[u8],
+) -> Result<PathBuf> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let file_name = format!(
+        "{}.torn-{}",
+        events_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("events.jsonl"),
+        stamp
+    );
+    let sidecar = events_path.with_file_name(file_name);
+    fs::write(&sidecar, torn_tail).with_context(|| {
+        format!(
+            "preserve torn tail from {} into {}",
+            events_path.display(),
+            sidecar.display()
+        )
+    })?;
+    Ok(sidecar)
+}
+
+fn repair_torn_tail_before_append(events_path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(events_path)
+        .with_context(|| format!("open events {} for tail repair", events_path.display()))?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    const SCAN_CHUNK: u64 = 8192;
+    let mut cursor = len;
+    let mut tail_start = 0_u64;
+    let mut scan = vec![0_u8; SCAN_CHUNK as usize];
+    while cursor > 0 {
+        let start = cursor.saturating_sub(SCAN_CHUNK);
+        let count = (cursor - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut scan[..count])?;
+        if let Some(offset) = scan[..count].iter().rposition(|byte| *byte == b'\n') {
+            tail_start = start + offset as u64 + 1;
+            break;
+        }
+        cursor = start;
+    }
+
+    file.seek(SeekFrom::Start(tail_start))?;
+    let mut bytes = Vec::with_capacity((len - tail_start) as usize);
+    file.read_to_end(&mut bytes)?;
+    let sidecar = preserve_torn_tail(events_path, &bytes)?;
+    file.set_len(tail_start)?;
+    eprintln!(
+        "events: WARNING preserved torn final record ({} bytes) to {} and truncated {} before append",
+        bytes.len(),
+        sidecar.display(),
+        events_path.display()
+    );
     Ok(())
 }
 
@@ -235,6 +311,94 @@ mod tests {
         assert_eq!(result.events[0]["id"], "1");
         assert_eq!(result.events[1]["id"], "2");
         assert_eq!(result.events[2]["test_id"], "t1");
+    }
+
+    #[test]
+    fn test_append_event_repairs_and_preserves_torn_tail() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let first = serde_json::json!({"action": "upsert", "table": "entries", "id": "1"});
+        let second = serde_json::json!({"action": "upsert", "table": "entries", "id": "2"});
+        let torn = b"{\"action\":";
+        fs::write(
+            &events_path,
+            format!("{}\n", serde_json::to_string(&first).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        let mut file = OpenOptions::new().append(true).open(&events_path).unwrap();
+        file.write_all(torn).unwrap();
+
+        append_event(&events_path, &second).unwrap();
+
+        let result = read_events(&events_path).unwrap();
+        assert_eq!(result.events, vec![first, second]);
+        assert!(result.torn_tail.is_none());
+        let sidecars: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
+            })
+            .collect();
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(fs::read(&sidecars[0]).unwrap(), torn);
+    }
+
+    #[test]
+    fn test_append_events_batch_repairs_torn_tail() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        fs::write(&events_path, b"{\"torn\":").unwrap();
+        let events = vec![
+            serde_json::json!({"action": "upsert", "id": "1"}),
+            serde_json::json!({"action": "upsert", "id": "2"}),
+        ];
+
+        append_events_batch(&events_path, &events).unwrap();
+
+        assert_eq!(read_events(&events_path).unwrap().events, events);
+        let sidecar = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
+            })
+            .expect("torn-tail sidecar");
+        assert_eq!(fs::read(sidecar).unwrap(), b"{\"torn\":");
+    }
+
+    #[test]
+    fn test_append_event_to_clean_file_creates_no_sidecar() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let events = vec![
+            serde_json::json!({"action": "upsert", "id": "1"}),
+            serde_json::json!({"action": "upsert", "id": "2"}),
+        ];
+        append_event(&events_path, &events[0]).unwrap();
+        append_event(&events_path, &events[1]).unwrap();
+
+        assert_eq!(read_events(&events_path).unwrap().events, events);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn test_append_event_to_empty_file() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        fs::write(&events_path, b"").unwrap();
+        let event = serde_json::json!({"action": "upsert", "id": "1"});
+
+        append_event(&events_path, &event).unwrap();
+
+        assert_eq!(read_events(&events_path).unwrap().events, vec![event]);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
