@@ -92,6 +92,7 @@ pub struct SimilarEntry {
 }
 
 /// Result returned by `kb_core::add`.
+#[derive(Debug)]
 pub struct AddOutcome {
     /// The entry ID (same as `AddArgs::id`).
     pub entry_id: String,
@@ -215,10 +216,9 @@ pub fn add(
     let existing_ids: Vec<String> = if args.replace_path {
         let mut stmt =
             conn.prepare("SELECT id FROM entries WHERE path=?1 AND is_stale=0")?;
-        let ids: Vec<String> = stmt
+        let ids = stmt
             .query_map(params![args.path], |r| r.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<String>>>()?;
         ids
     } else {
         vec![]
@@ -658,5 +658,48 @@ mod tests {
             serde_json::from_str(lines[before_lines + 1]).unwrap();
         assert_eq!(expire_ev["action"], "expire", "expire must come first");
         assert_eq!(upsert_ev["action"], "upsert");
+    }
+
+    #[test]
+    fn test_kb_core_add_replace_path_propagates_existing_id_decode_failure() {
+        let (_dir, paths) = setup();
+        let emb = NoopEmbedder;
+        let conn = db::open_db(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO entries(
+                id, path, summary, content, tags, version_ref, permanent, is_stale,
+                kind, evidence_status, session_id, created_at, updated_at
+             ) VALUES(CAST(X'00' AS BLOB), ?1, 'old', 'old', '[]', NULL, 0, 0, 'belief', 'n/a', NULL, ?2, ?2)",
+            rusqlite::params!["docs/corrupt", "2024-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let args = AddArgs {
+            id: "new-corrupt".to_string(),
+            path: "docs/corrupt".to_string(),
+            summary: "new".to_string(),
+            content: "new".to_string(),
+            tags: serde_json::json!([]),
+            version_ref: None,
+            permanent: false,
+            replace_path: true,
+            kind: "belief".to_string(),
+            evidence_status: "n/a".to_string(),
+            evidence_rows: vec![],
+            ts: "2024-01-01T00:00:00Z".to_string(),
+            session: "test".to_string(),
+            session_id: None,
+            expire_reason: "replace".to_string(),
+            dedup_cutoff: None,
+            cues: vec![],
+        };
+
+        let err = add(&paths, &emb, args).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid column type")
+                || err.to_string().contains("invalid column type"),
+            "expected decode failure, got: {err}"
+        );
     }
 }

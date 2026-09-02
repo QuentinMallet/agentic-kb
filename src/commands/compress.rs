@@ -175,7 +175,7 @@ pub fn run(
             "SELECT kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from
              FROM evidence WHERE entry_id = ?1 ORDER BY rowid",
         )?;
-        let rows: Vec<serde_json::Value> = stmt
+        let rows = stmt
             .query_map(params![entry_id], |r| {
                 Ok(serde_json::json!({
                     "kind":             r.get::<_, String>(0)?,
@@ -186,8 +186,7 @@ pub fn run(
                     "derived_from":     r.get::<_, Option<String>>(5)?,
                 }))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<serde_json::Value>>>()?;
         rows
     };
     drop(conn2);
@@ -246,10 +245,20 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::commands::add::Add;
+    use crate::components::db;
+    use crate::components::embedder::Embedder;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::{KbConfig, Paths};
     use std::fs;
     use tempfile::tempdir;
+
+    struct TestEmbedder;
+
+    impl Embedder for TestEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![text.len() as f32, 1.0])
+        }
+    }
 
     fn make_paths(root: &std::path::Path) -> Paths {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
@@ -360,5 +369,67 @@ mod tests {
     #[test]
     fn test_cosine_similarity_empty() {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn test_compress_propagates_evidence_row_decode_failure() {
+        let dir = tempdir().unwrap();
+        let paths = make_paths(dir.path());
+        let conn = db::open_db(&paths.db).unwrap();
+        let emb = NoopEmbedder;
+        let content = "paragraph one\n\nparagraph two\n\nparagraph three".repeat(80);
+        let upsert = serde_json::json!({
+            "action": "upsert",
+            "table": "entries",
+            "id": "compress-corrupt",
+            "path": "docs/compress-corrupt",
+            "summary": "entry",
+            "content": content,
+            "tags": [],
+            "kind": "belief",
+            "evidence_status": "missing",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &upsert).unwrap();
+        let evidence = serde_json::json!({
+            "action": "evidence_add",
+            "table": "evidence",
+            "entry_id": "compress-corrupt",
+            "evidence": {
+                "id": "compress-ev",
+                "entry_id": "compress-corrupt",
+                "kind": "code",
+                "citation_path": "src/lib.rs:1-2",
+                "citation_sha": null,
+                "citation_hash": "sha256:ok",
+                "citation_excerpt": null,
+                "derived_from": null,
+                "recorded_at": "2024-01-01T00:00:00Z"
+            },
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &evidence).unwrap();
+        conn.execute(
+            "UPDATE evidence SET citation_hash = CAST(X'00' AS BLOB) WHERE id = ?1",
+            rusqlite::params!["compress-ev"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = KbConfig {
+            compress_threshold: 100,
+            ..KbConfig::default()
+        };
+        let cmd = Compress {
+            path: "docs/compress-corrupt".to_string(),
+            threshold_chars: Some(100),
+            dry_run: false,
+        };
+        let err = run(&cmd, &config, &paths, &TestEmbedder).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid column type")
+                || err.to_string().contains("invalid column type"),
+            "expected decode failure, got: {err}"
+        );
     }
 }

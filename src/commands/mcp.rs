@@ -1731,7 +1731,12 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                 };
 
                 let parents: Vec<String> = match stmt.query_map(params![node_id], |r| r.get(0)) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Ok(rows) => match rows.collect::<rusqlite::Result<Vec<String>>>() {
+                        Ok(parents) => parents,
+                        Err(e) => {
+                            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                        }
+                    },
                     Err(e) => {
                         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
                     }
@@ -2125,6 +2130,39 @@ mod tests {
         let telemetry = query_hits::injection_telemetry(&paths.query_hits).unwrap();
         assert_eq!(telemetry.total_injections, 0);
         assert_eq!(telemetry.unknown_surface_rate, 0.0);
+    }
+
+    #[test]
+    fn test_handle_provenance_returns_db_error_on_parent_decode_failure() {
+        let (_dir, paths, emb) = setup();
+        let conn = db::open_db(&paths.db).unwrap();
+        let upsert = json!({
+            "action": "upsert", "table": "entries", "id": "prov-child",
+            "path": "prov/child", "summary": "child", "content": "body", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        db::apply_event(&conn, &emb, &upsert).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_hash, derived_from, recorded_at
+             ) VALUES(?1, ?2, 'derived', ?3, CAST(X'00' AS BLOB), ?4)",
+            rusqlite::params!["prov-ev", "prov-child", "sha256:test", "2024-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let resp = handle_provenance(
+            &json!("prov-1"),
+            &json!({"entry_id": "prov-child", "max_depth": 4}),
+            &paths,
+        );
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "db_error");
+        assert!(
+            resp["message"].as_str().unwrap().contains("column"),
+            "expected decode failure message, got: {}",
+            resp["message"]
+        );
     }
 
     #[test]
