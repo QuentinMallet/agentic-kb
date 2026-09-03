@@ -673,7 +673,41 @@ pub fn entry_embed_text(
     }
 }
 
-/// Apply a single event to the database.
+fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("SAVEPOINT apply_evt")?;
+    match f() {
+        Ok(value) => {
+            if let Err(error) = conn.execute_batch("RELEASE SAVEPOINT apply_evt") {
+                let _ = conn
+                    .execute_batch("ROLLBACK TO SAVEPOINT apply_evt; RELEASE SAVEPOINT apply_evt");
+                return Err(error.into());
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO SAVEPOINT apply_evt; RELEASE SAVEPOINT apply_evt");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+static CROSS_ENTRY_EVIDENCE_WARNINGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn warn_cross_entry_evidence_id(ev_id: &str, owner_entry_id: &str, attempted_entry_id: &str) {
+    eprintln!(
+        "apply_event: WARNING evidence id {ev_id} already belongs to entry {owner_entry_id}; ignoring duplicate for entry {attempted_entry_id}"
+    );
+    #[cfg(test)]
+    CROSS_ENTRY_EVIDENCE_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Apply a single event atomically.
+///
+/// The operation uses a savepoint and therefore composes inside a caller-owned
+/// transaction while retaining the same atomic behavior when called standalone.
 pub fn apply_event(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -714,10 +748,7 @@ pub fn apply_event(
             // CueBatch.tla's ApplyNext — a reader can never observe the entry
             // with a stale cue set or missing embedding mid-apply.
             //
-            // Manual BEGIN/COMMIT because `apply_event` takes `&Connection`,
-            // not `&mut Connection` (same pattern as the expire branch).
-            conn.execute_batch("BEGIN")?;
-            let result = (|| -> Result<bool> {
+            let counts_toward_gate = with_apply_event_savepoint(conn, || -> Result<bool> {
                 // payload evidence_status is authoritative NOWHERE. For
                 // kindless legacy events, a fresh insert pins 'n/a' as the AC2
                 // grandfather, and the ON CONFLICT path preserves the current
@@ -856,15 +887,7 @@ pub fn apply_event(
                     }
                 }
                 Ok(true)
-            })();
-            let counts_toward_gate = match result {
-                Ok(counts) => counts,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            };
-            conn.execute_batch("COMMIT")?;
+            })?;
             if counts_toward_gate {
                 increment_post_cutover_writes(conn);
             }
@@ -876,10 +899,7 @@ pub fn apply_event(
             // Resetting evidence_status to 'n/a' and deleting evidence mirrors
             // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
-            // We can't use `Connection::transaction()` here because `apply_event`
-            // takes `&Connection`, not `&mut Connection`. Manual BEGIN/COMMIT it is.
-            conn.execute_batch("BEGIN")?;
-            let result = (|| -> Result<()> {
+            with_apply_event_savepoint(conn, || -> Result<()> {
                 conn.execute(
                     "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
                     params![id],
@@ -900,12 +920,7 @@ pub fn apply_event(
                 // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
                 conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
                 Ok(())
-            })();
-            if let Err(e) = result {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            conn.execute_batch("COMMIT")?;
+            })?;
             increment_post_cutover_writes(conn);
         }
 
@@ -963,8 +978,25 @@ pub fn apply_event(
             let derived_from = ev["derived_from"].as_str();
             let recorded_at = ev["recorded_at"].as_str();
 
-            conn.execute_batch("BEGIN")?;
-            let result = (|| -> Result<()> {
+            with_apply_event_savepoint(conn, || -> Result<()> {
+                let existing_owner = conn
+                    .query_row(
+                        "SELECT entry_id FROM evidence WHERE id=?1",
+                        params![ev_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let cross_entry_duplicate = existing_owner
+                    .as_deref()
+                    .is_some_and(|owner_entry_id| owner_entry_id != entry_id);
+                if cross_entry_duplicate {
+                    warn_cross_entry_evidence_id(
+                        ev_id,
+                        existing_owner.as_deref().unwrap_or(""),
+                        entry_id,
+                    );
+                }
+
                 // Orphan-tolerant: absent and stale parents are equivalent under
                 // ADR-2, so evidence targeting either is skipped silently.
                 let entry_exists: bool = conn
@@ -979,11 +1011,13 @@ pub fn apply_event(
                     return Ok(());
                 }
 
-                conn.execute(
-                    "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
-                )?;
+                if !cross_entry_duplicate {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO evidence(id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                        params![ev_id, entry_id, kind, citation_path, citation_sha, citation_hash, citation_excerpt, derived_from, recorded_at],
+                    )?;
+                }
 
                 // Recompute evidence_status unconditionally. The prior "preserve n/a for
                 // legacy entries" branch caused incremental-vs-replay divergence: a legacy
@@ -998,12 +1032,7 @@ pub fn apply_event(
                     params![new_status, entry_id],
                 )?;
                 Ok(())
-            })();
-            if let Err(e) = result {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            conn.execute_batch("COMMIT")?;
+            })?;
         }
 
         ("citation_healed", "evidence") => {
@@ -1037,8 +1066,7 @@ pub fn apply_event(
                 .as_str()
                 .context("evidence_expire: missing entry_id")?;
 
-            conn.execute_batch("BEGIN")?;
-            let result = (|| -> Result<()> {
+            with_apply_event_savepoint(conn, || -> Result<()> {
                 // Orphan-tolerant: absent and stale parents are equivalent under
                 // ADR-2, so evidence targeting either is skipped silently. This
                 // mirrors evidence_add. Skipping the delete is safe because
@@ -1066,12 +1094,7 @@ pub fn apply_event(
                     params![new_status, entry_id],
                 )?;
                 Ok(())
-            })();
-            if let Err(e) = result {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            conn.execute_batch("COMMIT")?;
+            })?;
         }
 
         _ => {} // unknown event — skip silently
@@ -2421,7 +2444,10 @@ mod tests {
         let embedder = SearchTestEmbedder;
         for (id, summary) in [
             ("rank-a", "sealedwaiver sealedwaiver rank-a"),
-            ("rank-b", "sealedwaiver rank-b with deliberately longer filler text"),
+            (
+                "rank-b",
+                "sealedwaiver rank-b with deliberately longer filler text",
+            ),
             ("rank-c", "semantic-only rank-c"),
         ] {
             let event = serde_json::json!({
@@ -3027,7 +3053,10 @@ mod tests {
         })
     }
 
-    fn legacy_upsert_event_with_payload_status(id: &str, evidence_status: &str) -> serde_json::Value {
+    fn legacy_upsert_event_with_payload_status(
+        id: &str,
+        evidence_status: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "action": "upsert",
             "table": "entries",
@@ -3151,6 +3180,64 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_event_warns_and_keeps_first_cross_entry_evidence_owner() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        apply_event(&conn, &embedder, &legacy_upsert_event("owner-a")).unwrap();
+        apply_event(&conn, &embedder, &legacy_upsert_event("owner-b")).unwrap();
+
+        let mut first = evidence_add_event("owner-a");
+        first["evidence"]["id"] = serde_json::json!("shared-evidence-id");
+        let mut duplicate = evidence_add_event("owner-b");
+        duplicate["evidence"]["id"] = serde_json::json!("shared-evidence-id");
+        apply_event(&conn, &embedder, &first).unwrap();
+
+        let warnings_before =
+            CROSS_ENTRY_EVIDENCE_WARNINGS.load(std::sync::atomic::Ordering::Relaxed);
+        apply_event(&conn, &embedder, &duplicate).unwrap();
+        assert_eq!(
+            CROSS_ENTRY_EVIDENCE_WARNINGS.load(std::sync::atomic::Ordering::Relaxed),
+            warnings_before + 1,
+            "cross-entry duplicate must emit the loud warning path"
+        );
+        let owner: String = conn
+            .query_row(
+                "SELECT entry_id FROM evidence WHERE id='shared-evidence-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "owner-a");
+        assert_eq!(entry_evidence_row_count(&conn, "owner-b"), 0);
+    }
+
+    #[test]
+    fn test_apply_event_atomic_arms_compose_inside_caller_transaction() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        conn.execute_batch("BEGIN").unwrap();
+
+        apply_event(&conn, &embedder, &legacy_upsert_event("nested")).unwrap();
+        apply_event(&conn, &embedder, &evidence_add_event("nested")).unwrap();
+        apply_event(&conn, &embedder, &evidence_expire_event("nested")).unwrap();
+        apply_event(
+            &conn,
+            &embedder,
+            &serde_json::json!({"action": "expire", "table": "entries", "id": "nested"}),
+        )
+        .unwrap();
+
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "caller rollback must still own and undo the outer transaction"
+        );
+    }
+
+    #[test]
     fn test_apply_event_evidence_expire_rolls_back_on_status_update_failure() {
         let conn = open_db_memory().unwrap();
         let embedder = NoopEmbedder;
@@ -3180,8 +3267,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = apply_event(&conn, &embedder, &evidence_expire_event("ev-expire-tx"))
-            .unwrap_err();
+        let err =
+            apply_event(&conn, &embedder, &evidence_expire_event("ev-expire-tx")).unwrap_err();
         assert!(err.to_string().contains("boom evidence expire"));
         assert_eq!(entry_evidence_row_count(&conn, "ev-expire-tx"), 1);
         assert_eq!(entry_evidence_status(&conn, "ev-expire-tx"), "present");
@@ -3221,7 +3308,8 @@ mod tests {
         assert_eq!(entry_evidence_status(&conn, "p"), "present");
         apply_event(&conn, &embedder, &legacy_upsert_event("p")).unwrap();
         assert_eq!(
-            entry_evidence_status(&conn, "p"), "present",
+            entry_evidence_status(&conn, "p"),
+            "present",
             "legacy re-upsert must not drop an entry with evidence back to n/a"
         );
         assert_eq!(entry_evidence_row_count(&conn, "p"), 1);
@@ -3286,7 +3374,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(entry_evidence_status(&conn_full, "legacy-compact-payload"), "n/a");
+        assert_eq!(
+            entry_evidence_status(&conn_full, "legacy-compact-payload"),
+            "n/a"
+        );
         assert_eq!(
             entry_evidence_status(&conn_full, "legacy-compact-payload"),
             entry_evidence_status(&conn_compacted, "legacy-compact-payload")
@@ -3320,14 +3411,21 @@ mod tests {
 
         let (full_stale, compacted_stale): (i64, i64) = (
             conn_full
-                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| r.get(0))
+                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| {
+                    r.get(0)
+                })
                 .unwrap(),
             conn_compacted
-                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| r.get(0))
+                .query_row("SELECT is_stale FROM entries WHERE id='d'", [], |r| {
+                    r.get(0)
+                })
                 .unwrap(),
         );
         assert_eq!(full_stale, 0, "re-upsert must revive the expired entry");
-        assert_eq!(compacted_stale, 0, "compacted replay must keep the entry live");
+        assert_eq!(
+            compacted_stale, 0,
+            "compacted replay must keep the entry live"
+        );
         assert_eq!(
             entry_evidence_status(&conn_full, "d"),
             entry_evidence_status(&conn_compacted, "d"),
@@ -3389,7 +3487,10 @@ mod tests {
         apply_event(&conn, &embedder, &expire).unwrap();
         apply_event(&conn, &embedder, &upsert).unwrap();
 
-        assert_eq!(entry_evidence_status(&conn, "revive-explicit-kind"), "missing");
+        assert_eq!(
+            entry_evidence_status(&conn, "revive-explicit-kind"),
+            "missing"
+        );
     }
 
     #[test]
@@ -3412,11 +3513,15 @@ mod tests {
         apply_event(&conn, &embedder, &upsert).unwrap();
 
         assert_eq!(entry_evidence_row_count(&conn, "explicit-kind-fresh"), 0);
-        assert_eq!(entry_evidence_status(&conn, "explicit-kind-fresh"), "missing");
+        assert_eq!(
+            entry_evidence_status(&conn, "explicit-kind-fresh"),
+            "missing"
+        );
     }
 
     #[test]
-    fn test_apply_event_upsert_status_converges_to_local_rowset_across_reordered_compaction_repro() {
+    fn test_apply_event_upsert_status_converges_to_local_rowset_across_reordered_compaction_repro()
+    {
         let embedder = NoopEmbedder;
 
         let conn_full = open_db_memory().unwrap();
@@ -4400,7 +4505,10 @@ mod tests {
         apply_event(&live_then_expire, &embedder, &expire).unwrap();
         apply_event(&stale_upsert_only, &embedder, &stale).unwrap();
 
-        assert_eq!(entry_evidence_status(&live_then_expire, "status-order"), "n/a");
+        assert_eq!(
+            entry_evidence_status(&live_then_expire, "status-order"),
+            "n/a"
+        );
         assert_eq!(
             entry_evidence_status(&stale_upsert_only, "status-order"),
             entry_evidence_status(&live_then_expire, "status-order")
@@ -4485,7 +4593,12 @@ mod tests {
     fn test_evidence_expire_onto_stale_entry_is_full_noop() {
         let conn = open_db_memory().unwrap();
         let embedder = NoopEmbedder;
-        apply_event(&conn, &embedder, &legacy_upsert_event("stale-expire-parent")).unwrap();
+        apply_event(
+            &conn,
+            &embedder,
+            &legacy_upsert_event("stale-expire-parent"),
+        )
+        .unwrap();
         apply_event(
             &conn,
             &embedder,
@@ -4535,7 +4648,12 @@ mod tests {
         }
 
         let conn_compacted = open_db_memory().unwrap();
-        apply_event(&conn_compacted, &embedder, &legacy_upsert_event("stale-window")).unwrap();
+        apply_event(
+            &conn_compacted,
+            &embedder,
+            &legacy_upsert_event("stale-window"),
+        )
+        .unwrap();
 
         let (full_stale, compacted_stale): (i64, i64) = (
             conn_full
@@ -4554,7 +4672,10 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(full_stale, 0, "re-upsert must revive the expired entry");
-        assert_eq!(compacted_stale, 0, "compacted replay must keep the entry live");
+        assert_eq!(
+            compacted_stale, 0,
+            "compacted replay must keep the entry live"
+        );
         assert_eq!(
             entry_evidence_status(&conn_full, "stale-window"),
             entry_evidence_status(&conn_compacted, "stale-window"),
