@@ -3,6 +3,8 @@
 use anyhow::Result;
 use serde_json::Value;
 
+pub use crate::components::db::MAX_EVIDENCE_ROWS_PER_ENTRY;
+
 /// Valid entry kind values.
 const VALID_KINDS: &[&str] = &["observation", "belief", "procedure", "convention", "memory"];
 
@@ -68,6 +70,14 @@ pub fn validate_kb_add_inputs(
     }
 
     validate_tags(tags)?;
+
+    if evidence.len() > MAX_EVIDENCE_ROWS_PER_ENTRY {
+        anyhow::bail!(
+            "too many evidence rows: {} (max {})",
+            evidence.len(),
+            MAX_EVIDENCE_ROWS_PER_ENTRY
+        );
+    }
 
     for ev in evidence {
         let ev_kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -243,6 +253,27 @@ mod tests {
     fn test_path_only_evidence_accepted_for_core_resolution() {
         let ev = json!({"kind": "code", "citation_path": "src/lib.rs"});
         assert!(validate_kb_add_inputs("", "belief", &json!([]), &[ev]).is_ok());
+    }
+
+    #[test]
+    fn test_evidence_rows_over_write_cap_rejected() {
+        let evidence: Vec<Value> = (0..=MAX_EVIDENCE_ROWS_PER_ENTRY)
+            .map(|_| json!({"kind": "code", "citation_path": "src/lib.rs"}))
+            .collect();
+        let err = validate_kb_add_inputs("", "belief", &json!([]), &evidence).unwrap_err();
+        assert!(err.to_string().contains(&format!(
+            "too many evidence rows: {} (max {})",
+            evidence.len(),
+            MAX_EVIDENCE_ROWS_PER_ENTRY
+        )));
+    }
+
+    #[test]
+    fn test_evidence_rows_at_write_cap_accepted() {
+        let evidence: Vec<Value> = (0..MAX_EVIDENCE_ROWS_PER_ENTRY)
+            .map(|_| json!({"kind": "code", "citation_path": "src/lib.rs"}))
+            .collect();
+        assert!(validate_kb_add_inputs("", "belief", &json!([]), &evidence).is_ok());
     }
 
     #[test]

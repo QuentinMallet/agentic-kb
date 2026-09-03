@@ -94,13 +94,13 @@ defmodule AgenticKbMcp.McpServer do
           "evidence" => %{
             "type" => "array",
             "description" =>
-              "Evidence citations (default: []). Phase 1 accepts kind=\"code\" only; other kinds are rejected with an error naming Phase 2. Each item: {kind, citation_path, citation_sha, citation_hash, citation_excerpt?, derived_from?}.",
+              "Evidence citations (default: []). Phase 1 accepts kind=\"code\" | \"derived\" only; other kinds are rejected with an error naming Phase 2. Derived rows set `derived_from` to the supporting entry's id. Each item: {kind, citation_path, citation_sha, citation_hash, citation_excerpt?, derived_from?}.",
             "items" => %{
               "type" => "object",
               "properties" => %{
                 "kind" => %{
                   "type" => "string",
-                  "description" => "Evidence kind. Phase 1: must be \"code\"."
+                  "description" => "Evidence kind. Phase 1: must be \"code\" or \"derived\"; derived rows set `derived_from` to the supporting entry's id."
                 },
                 "citation_path" => %{
                   "type" => "string",

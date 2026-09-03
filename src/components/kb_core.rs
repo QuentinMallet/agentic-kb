@@ -42,6 +42,24 @@ use crate::models::Evidence;
 use anyhow::Result;
 use rusqlite::params;
 use serde_json::Value;
+use std::collections::HashMap;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static CITATION_HASH_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn resolve_citation_hash(
+    repo_root: &std::path::Path,
+    file_rel: &str,
+    range: Option<(usize, usize)>,
+) -> Result<String> {
+    #[cfg(test)]
+    CITATION_HASH_RESOLUTION_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    compute_citation_hash(repo_root, file_rel, range)
+}
 
 /// Input arguments for `kb_core::add`.
 ///
@@ -127,6 +145,7 @@ pub fn add(
 
     // Normalize path-only evidence before constructing any events. Explicit
     // assertions are authoritative and are never replaced, even when wrong.
+    let mut resolved_hashes_by_path: HashMap<String, String> = HashMap::new();
     for evidence in &mut args.evidence_rows {
         let hash_missing = evidence
             .get("citation_hash")
@@ -145,8 +164,15 @@ pub fn add(
             })?;
         let (file_rel, range) = parse_citation_path(citation_path)
             .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
-        let citation_hash = compute_citation_hash(repo_root, file_rel, range)
-            .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
+        let citation_hash = if let Some(existing) = resolved_hashes_by_path.get(citation_path) {
+            existing.clone()
+        } else {
+            let resolved = resolve_citation_hash(repo_root, file_rel, range).map_err(|error| {
+                anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
+            })?;
+            resolved_hashes_by_path.insert(citation_path.to_string(), resolved.clone());
+            resolved
+        };
         let object = evidence
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("evidence row must be a JSON object"))?;
@@ -432,6 +458,32 @@ mod tests {
         .unwrap()
     }
 
+    fn load_all_test_evidence(conn: &Connection) -> Vec<Evidence> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entry_id, kind, citation_path, citation_sha, citation_hash,
+                        citation_excerpt, derived_from, recorded_at
+                 FROM evidence WHERE entry_id='evidence-test' ORDER BY rowid",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(Evidence {
+                id: row.get(0)?,
+                entry_id: row.get(1)?,
+                kind: row.get(2)?,
+                citation_path: row.get(3)?,
+                citation_sha: row.get(4)?,
+                citation_hash: row.get(5)?,
+                citation_excerpt: row.get(6)?,
+                derived_from: row.get(7)?,
+                recorded_at: row.get(8)?,
+            })
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+    }
+
     #[test]
     fn test_kb_core_add_resolves_bare_citation_path() {
         use crate::components::verification::{
@@ -499,6 +551,38 @@ mod tests {
         assert_eq!(evidence.citation_hash, expected_hash);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
+    }
+
+    #[test]
+    fn test_kb_core_add_memoizes_duplicate_path_only_hash_resolution() {
+        use crate::components::verification::compute_citation_hash;
+
+        CITATION_HASH_RESOLUTION_CALLS.store(0, Ordering::SeqCst);
+
+        let (dir, paths) = setup();
+        fs::write(dir.path().join("cited.txt"), b"whole file\n").unwrap();
+        let expected_hash = compute_citation_hash(dir.path(), "cited.txt", None).unwrap();
+        add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![
+                serde_json::json!({"kind": "code", "citation_path": "cited.txt"}),
+                serde_json::json!({"kind": "code", "citation_path": "cited.txt"}),
+                serde_json::json!({"kind": "code", "citation_path": "cited.txt"}),
+            ]),
+        )
+        .unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let evidence_rows = load_all_test_evidence(&conn);
+        assert_eq!(evidence_rows.len(), 3);
+        assert!(evidence_rows
+            .iter()
+            .all(|row| row.citation_hash == expected_hash));
+        assert!(evidence_rows
+            .iter()
+            .all(|row| row.citation_sha == config::git_head_sha()));
+        assert_eq!(CITATION_HASH_RESOLUTION_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
