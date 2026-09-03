@@ -35,8 +35,8 @@
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
 use crate::commands::add::acquire_lock;
-use crate::components::{db, embedder, events, redactor};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
+use crate::components::{db, embedder, events, redactor};
 use crate::config;
 use crate::models::Evidence;
 use anyhow::Result;
@@ -255,8 +255,7 @@ pub fn add(
 
     // Collect existing IDs to expire when replace_path is requested.
     let existing_ids: Vec<String> = if args.replace_path {
-        let mut stmt =
-            conn.prepare("SELECT id FROM entries WHERE path=?1 AND is_stale=0")?;
+        let mut stmt = conn.prepare("SELECT id FROM entries WHERE path=?1 AND is_stale=0")?;
         let ids = stmt
             .query_map(params![args.path], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -355,6 +354,15 @@ pub fn add(
         db::apply_event(&conn, embedder, ev)?;
     }
 
+    if args.evidence_status == "missing"
+        && matches!(args.kind.as_str(), "observation" | "belief" | "procedure")
+    {
+        eprintln!(
+            "kb: warning: kind='{}' entry stored with evidence_status=missing — attach evidence via citation_path (server resolves sha/hash) or kb cite",
+            args.kind
+        );
+    }
+
     Ok(AddOutcome {
         entry_id: args.id,
         similar_existing,
@@ -434,19 +442,33 @@ mod tests {
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"whole file\n").unwrap();
         let expected_hash = compute_citation_hash(dir.path(), "cited.txt", None).unwrap();
-        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
-            "kind": "code", "citation_path": "cited.txt"
-        })])).unwrap();
+        add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "cited.txt"
+            })]),
+        )
+        .unwrap();
 
         let conn = Connection::open(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
+        let evidence_status: String = conn
+            .query_row(
+                "SELECT evidence_status FROM entries WHERE id='evidence-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_status, "present");
         assert_eq!(evidence.citation_hash, expected_hash);
         assert_eq!(evidence.citation_sha, config::git_head_sha());
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
 
         let event_log = fs::read_to_string(&paths.events).unwrap();
-        let evidence_event: Value = serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
+        let evidence_event: Value =
+            serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
         assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
         assert_eq!(
             evidence_event["evidence"]["citation_sha"],
@@ -464,9 +486,14 @@ mod tests {
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
         let expected_hash = compute_citation_hash(dir.path(), "cited.txt", Some((0, 3))).unwrap();
-        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
-            "kind": "code", "citation_path": "cited.txt:0-3"
-        })])).unwrap();
+        add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "cited.txt:0-3"
+            })]),
+        )
+        .unwrap();
         let conn = Connection::open(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, expected_hash);
@@ -482,9 +509,14 @@ mod tests {
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
         let explicit = "sha256:not-the-file-hash";
-        add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
-            "kind": "code", "citation_path": "cited.txt", "citation_hash": explicit
-        })])).unwrap();
+        add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "cited.txt", "citation_hash": explicit
+            })]),
+        )
+        .unwrap();
         let conn = Connection::open(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, explicit);
@@ -496,9 +528,14 @@ mod tests {
     fn test_kb_core_add_missing_citation_file_does_not_append_event() {
         let (_dir, paths) = setup();
         let before = fs::read(&paths.events).unwrap_or_default();
-        let err = add(&paths, &NoopEmbedder, evidence_args(vec![serde_json::json!({
-            "kind": "code", "citation_path": "missing.txt"
-        })])).unwrap_err();
+        let err = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "missing.txt"
+            })]),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("missing.txt"), "{err}");
         assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
     }
@@ -547,10 +584,7 @@ mod tests {
         }
 
         // Count lines before.
-        let before_lines = fs::read_to_string(&paths.events)
-            .unwrap()
-            .lines()
-            .count();
+        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
         assert_eq!(before_lines, 2, "seeded 2 events");
 
         let args = AddArgs {
@@ -608,11 +642,9 @@ mod tests {
             assert_eq!(stale, 1, "seed {seed_id} must be stale");
         }
         let new_stale: i64 = conn
-            .query_row(
-                "SELECT is_stale FROM entries WHERE id='new-1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT is_stale FROM entries WHERE id='new-1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(new_stale, 0, "new entry must be active");
     }
@@ -767,10 +799,8 @@ mod tests {
             lines.len()
         );
         // The expire must appear BEFORE the upsert.
-        let expire_ev: Value =
-            serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value =
-            serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
+        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
         assert_eq!(expire_ev["action"], "expire");
         assert_eq!(upsert_ev["action"], "upsert");
         assert_eq!(upsert_ev["id"], "conv-new-1");
@@ -817,10 +847,8 @@ mod tests {
             before_lines + 2,
             lines.len()
         );
-        let expire_ev: Value =
-            serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value =
-            serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
+        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
         assert_eq!(expire_ev["action"], "expire", "expire must come first");
         assert_eq!(upsert_ev["action"], "upsert");
     }

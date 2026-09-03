@@ -620,34 +620,49 @@ mod tests {
     }
 
     #[test]
-    fn test_kb_add_hard_mandate_rejects_missing_evidence() {
+    fn test_kb_add_soft_mandate_stores_evidence_less_entries_with_derived_status() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         let embedder = NoopEmbedder;
 
-        // observation with no evidence → hard error, entry must not be written
-        let cmd = Add {
-            path: "src/lib.rs".to_string(),
-            summary: "test".to_string(),
-            content: "content".to_string(),
-            tags: "test".to_string(),
-            version_ref: Some("abc".to_string()),
-            id: Some("hard-mandate-1".to_string()),
-            permanent: false,
-            replace_path: false,
-            kind: "observation".to_string(),
-            evidence: vec![],
-            evidence_file: None,
-            cues: vec![],
-        };
-        let err = cmd.execute_with(&paths, &embedder).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("evidence required for kind='observation'"),
-            "unexpected error: {err}"
-        );
+        // bd-r05y.3: mandated kinds are accepted with "missing"; the other
+        // kinds retain their "n/a" status when no evidence is supplied.
+        for (kind, expected_status) in [
+            ("observation", "missing"),
+            ("belief", "missing"),
+            ("procedure", "missing"),
+            ("convention", "n/a"),
+            ("memory", "n/a"),
+        ] {
+            let id = format!("soft-mandate-{kind}");
+            let cmd = Add {
+                path: format!("test/{kind}"),
+                summary: "test".to_string(),
+                content: "content".to_string(),
+                tags: "test".to_string(),
+                version_ref: Some("abc".to_string()),
+                id: Some(id.clone()),
+                permanent: false,
+                replace_path: false,
+                kind: kind.to_string(),
+                evidence: vec![],
+                evidence_file: None,
+                cues: vec![],
+            };
+            cmd.execute_with(&paths, &embedder).unwrap();
+
+            let conn = crate::components::db::open_db(&paths.db).unwrap();
+            let stored_status: String = conn
+                .query_row(
+                    "SELECT evidence_status FROM entries WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored_status, expected_status, "kind={kind}");
+        }
     }
 
     #[test]

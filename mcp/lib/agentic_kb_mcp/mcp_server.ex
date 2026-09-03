@@ -62,7 +62,7 @@ defmodule AgenticKbMcp.McpServer do
     %{
       "name" => "kb_add",
       "description" =>
-        "Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are tagged `evidence_status=\"missing\"` and a warning is emitted to stderr. Supply 2-3 `cues` per entry so vague future queries can still reach it. The response may include `similar_existing` (entries with embedding cosine above the dedup cutoff) — when present, consider updating/expiring the listed entry instead of keeping both.",
+        "Call this after completing any task when you have just learned something that would have saved you time at the start of the task. Supply 2-3 `cues` per entry so vague future queries can still reach it. Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are stored with `evidence_status=\"missing\"` and a warning is emitted to stderr; attach evidence via `citation_path` (the server resolves sha/hash) or `kb cite` when available. The response may include `similar_existing` (entries with embedding cosine above the dedup cutoff) — when present, consider updating/expiring the listed entry instead of keeping both.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{

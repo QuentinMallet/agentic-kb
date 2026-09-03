@@ -553,7 +553,9 @@ fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let path = match req.get("path").and_then(|v| v.as_str()) {
         Some(path) => path,
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"}),
+        None => {
+            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
+        }
     };
 
     let start = match req.get("start") {
@@ -2199,7 +2201,12 @@ mod tests {
             "INSERT INTO evidence(
                 id, entry_id, kind, citation_hash, derived_from, recorded_at
              ) VALUES(?1, ?2, 'derived', ?3, CAST(X'00' AS BLOB), ?4)",
-            rusqlite::params!["prov-ev", "prov-child", "sha256:test", "2024-01-01T00:00:00Z"],
+            rusqlite::params![
+                "prov-ev",
+                "prov-child",
+                "sha256:test",
+                "2024-01-01T00:00:00Z"
+            ],
         )
         .unwrap();
         drop(conn);
@@ -2287,8 +2294,9 @@ mod tests {
         run_id: &str,
     ) -> (String, String) {
         // Entries need evidence to be included in audit_run samples; we don't use
-        // audit_run here — we seed candidates directly — but evidence is still required
-        // for the entry to be valid.  add_live_entry already adds evidence.
+        // audit_run here — we seed candidates directly — but keep evidence so the
+        // seeded entries remain representative of auditable candidates. Under the
+        // bd-r05y.3 soft mandate, the write itself would also be valid without it.
         // Override kind: add_live_entry hard-codes kind="observation"; we patch via
         // the low-level event path so the kind column is correct for bucket matching.
         let id_val = json!(null);
@@ -3243,7 +3251,10 @@ mod tests {
         assert_eq!(resp["type"], "result");
         assert_eq!(resp["citation_path"], "src.rs:0-2");
         assert_eq!(resp["file_size"], 13);
-        assert!(resp["citation_hash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(resp["citation_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
     }
 
     #[test]
@@ -3256,12 +3267,10 @@ mod tests {
 
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "parse_error");
-        assert!(
-            resp["message"]
-                .as_str()
-                .unwrap()
-                .contains("provided together")
-        );
+        assert!(resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("provided together"));
     }
 
     fn add_live_entry(

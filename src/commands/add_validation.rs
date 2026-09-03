@@ -45,6 +45,9 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
 ///
 /// - `kind` must be one of the five valid values.
 /// - `tags` must pass `validate_tags` (array of non-empty strings ≤ 50 chars).
+/// - Evidence-less writes are accepted for every kind. Observation, belief,
+///   and procedure entries receive `evidence_status="missing"` from
+///   `compute_evidence_status_write` (bd-r05y.3 soft mandate).
 /// - Each evidence row must have `evidence.kind ∈ {"code","derived"}` (Phase 1 constraint).
 /// - For `evidence.kind = "derived"`, `derived_from` must not equal the entry's own id.
 /// - Each evidence row must have a non-empty `citation_path` or `citation_hash`.
@@ -65,12 +68,6 @@ pub fn validate_kb_add_inputs(
     }
 
     validate_tags(tags)?;
-
-    if EVIDENCE_MANDATED_KINDS.contains(&kind) && evidence.is_empty() {
-        anyhow::bail!(
-            "evidence required for kind='{kind}'; provide at least one evidence row with evidence.kind=code or evidence.kind=derived"
-        );
-    }
 
     for ev in evidence {
         let ev_kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -174,8 +171,6 @@ pub fn wrap_citation_excerpt(excerpt: Option<&str>) -> Option<String> {
 /// Rules (AC10):
 /// - kind in {observation, belief, procedure} + evidence present → "present"
 /// - kind in {observation, belief, procedure} + evidence empty   → "missing"
-///   (only reachable via legacy event replay; live write paths are gated by
-///    `validate_kb_add_inputs` which hard-rejects empty evidence for these kinds)
 /// - otherwise                                                    → "n/a"
 pub fn compute_evidence_status_write(kind: &str, evidence: &[Value]) -> &'static str {
     if EVIDENCE_MANDATED_KINDS.contains(&kind) {
@@ -214,6 +209,17 @@ mod tests {
     fn test_invalid_kind_rejected() {
         let err = validate_kb_add_inputs("", "fact", &json!([]), &[]).unwrap_err();
         assert!(err.to_string().contains("invalid kind 'fact'"));
+    }
+
+    #[test]
+    fn test_evidence_less_entries_are_accepted_for_all_valid_kinds() {
+        // bd-r05y.3: evidence for observation/belief/procedure is a soft mandate.
+        for kind in VALID_KINDS {
+            assert!(
+                validate_kb_add_inputs("", kind, &json!([]), &[]).is_ok(),
+                "kind={kind} should accept an evidence-less write"
+            );
+        }
     }
 
     #[test]
