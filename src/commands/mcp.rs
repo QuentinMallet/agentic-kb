@@ -43,9 +43,8 @@ impl Runnable for Mcp {
 
 /// Derive the repo root from the db path.
 ///
-/// Supports both supported layouts:
-/// - `<root>/agent-kb/agent-kb.db`
-/// - `<root>/.state/agent-kb/agent-kb.db`
+/// The fleet-ratified canonical form is `<root>/.state/agent-kb/agent-kb.db`.
+/// `<root>/agent-kb/agent-kb.db` remains tolerated as a legacy read path.
 fn root_from_db(db: &Path) -> PathBuf {
     let Some(db_dir) = db.parent() else {
         return Path::new(".").to_path_buf();

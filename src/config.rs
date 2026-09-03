@@ -202,22 +202,24 @@ impl Paths {
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut dir: &Path = &cwd;
+        let mut warned_about_inner_state = false;
         loop {
             if dir.join(".state").is_dir() {
-                return Ok(Paths {
-                    lock: dir.join(".state").join(".lock"),
-                    events: dir
-                        .join(".state")
-                        .join("agent-kb")
-                        .join("agent-kb-events.jsonl"),
-                    db: dir.join(".state").join("agent-kb").join("agent-kb.db"),
-                    fastembed_cache: model_cache_dir(),
-                    compact_state: dir
-                        .join(".state")
-                        .join("agent-kb")
-                        .join("compact-state.json"),
-                    query_hits: dir.join(".state").join("agent-kb").join("query-hits.db"),
-                });
+                if path_contains_state_component(dir) {
+                    if !warned_about_inner_state {
+                        eprintln!(
+                            "WARNING: ignored inner .state root candidate {}; continuing to the outer repo root",
+                            dir.display()
+                        );
+                        warned_about_inner_state = true;
+                    }
+                } else {
+                    let paths = Paths::from_root(dir);
+                    if let Some(warning) = divergence_warning(dir, &paths) {
+                        eprintln!("{warning}");
+                    }
+                    return Ok(paths);
+                }
             }
             match dir.parent() {
                 Some(p) => dir = p,
@@ -247,6 +249,46 @@ impl Paths {
             query_hits: root.join(".state").join("agent-kb").join("query-hits.db"),
         }
     }
+}
+
+fn path_contains_state_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".state")
+}
+
+/// Report stores at known non-canonical sibling paths without selecting or modifying them.
+fn divergence_warning(root: &Path, canonical: &Paths) -> Option<String> {
+    let candidates = [
+        (
+            root.join("agent-kb").join("agent-kb.db"),
+            canonical.db.as_path(),
+        ),
+        (
+            root.join(".state")
+                .join(".state")
+                .join("agent-kb")
+                .join("agent-kb-events.jsonl"),
+            canonical.events.as_path(),
+        ),
+    ];
+    let divergences: Vec<String> = candidates
+        .into_iter()
+        .filter(|(noncanonical, _)| noncanonical.exists())
+        .map(|(noncanonical, canonical)| {
+            format!(
+                "non-canonical {} diverges from canonical {}",
+                noncanonical.display(),
+                canonical.display()
+            )
+        })
+        .collect();
+
+    (!divergences.is_empty()).then(|| {
+        format!(
+            "WARNING: KB STORE DIVERGENCE: {}; reconcile per bd-xw99",
+            divergences.join("; ")
+        )
+    })
 }
 
 /// Get the git HEAD SHA.
@@ -390,6 +432,58 @@ mod tests {
             state_agent_kb_pos.map(|p| p + "/.state".len()),
             "'/agent-kb/' in db path must be preceded by '.state', got: {db_str}"
         );
+    }
+
+    #[test]
+    fn test_discover_inside_state_returns_outer_repo_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let inner = root.join(".state").join("worktrees").join("feature");
+        fs::create_dir_all(inner.join(".state")).unwrap();
+
+        let _guard = CwdGuard::set(&inner);
+        let discovered = Paths::discover().expect("discover should find the outer repo root");
+        drop(_guard);
+
+        assert_eq!(discovered.db, root.join(".state/agent-kb/agent-kb.db"));
+    }
+
+    #[test]
+    fn test_discover_never_constructs_doubled_state_events_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let inner = root.join(".state").join("nested");
+        fs::create_dir_all(inner.join(".state")).unwrap();
+
+        let _guard = CwdGuard::set(&inner);
+        let discovered = Paths::discover().expect("discover should find the outer repo root");
+        drop(_guard);
+
+        assert!(
+            !discovered
+                .events
+                .components()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|parts| parts[0].as_os_str() == ".state" && parts[1].as_os_str() == ".state"),
+            "events path must not contain adjacent .state components: {}",
+            discovered.events.display()
+        );
+    }
+
+    #[test]
+    fn test_divergence_warning_detects_bare_legacy_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let paths = Paths::from_root(root);
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        fs::write(&legacy_db, b"").unwrap();
+
+        let warning = divergence_warning(root, &paths).expect("legacy DB must trigger warning");
+        assert!(warning.contains(&paths.db.display().to_string()));
+        assert!(warning.contains(&legacy_db.display().to_string()));
+        assert!(warning.contains("bd-xw99"));
     }
 
     #[test]
