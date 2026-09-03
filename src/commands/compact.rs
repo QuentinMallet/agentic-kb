@@ -109,6 +109,8 @@ impl Compact {
         let mut run_indices: Vec<usize> = Vec::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
         let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
+        let mut effective_evidence_add_indices: HashSet<usize> = HashSet::new();
+        let mut evidence_owner_by_id: HashMap<String, String> = HashMap::new();
         let mut live_at_cursor: HashSet<String> = HashSet::new();
 
         for (i, ev) in evts.iter().enumerate() {
@@ -123,11 +125,17 @@ impl Compact {
             match (action, table) {
                 ("upsert", "entries") => {
                     entry_last.insert(id.clone(), i);
-                    live_at_cursor.insert(id);
+                    if ev["is_stale"].as_bool().unwrap_or(false) {
+                        live_at_cursor.remove(&id);
+                        evidence_owner_by_id.retain(|_, owner| owner != &id);
+                    } else {
+                        live_at_cursor.insert(id);
+                    }
                 }
                 ("expire", "entries") => {
                     expire_last.insert(id.clone(), i);
                     live_at_cursor.remove(&id);
+                    evidence_owner_by_id.retain(|_, owner| owner != &id);
                 }
                 ("upsert", "test_cases") => {
                     test_last.insert(id, i);
@@ -139,11 +147,37 @@ impl Compact {
                 | ("citation_healed", "evidence")
                 | ("evidence_expire", "evidence") => {
                     evidence_indices.push(i);
-                    if ev["entry_id"]
+                    let live_parent = ev["entry_id"]
                         .as_str()
-                        .is_some_and(|entry_id| live_at_cursor.contains(entry_id))
-                    {
+                        .filter(|entry_id| live_at_cursor.contains(*entry_id));
+                    if live_parent.is_some() {
                         evidence_live_at_index.insert(i);
+                    }
+                    match action {
+                        "evidence_add" => {
+                            if let (Some(entry_id), Some(evidence_id)) =
+                                (live_parent, ev["evidence"]["id"].as_str())
+                            {
+                                if !evidence_owner_by_id.contains_key(evidence_id) {
+                                    evidence_owner_by_id
+                                        .insert(evidence_id.to_string(), entry_id.to_string());
+                                    effective_evidence_add_indices.insert(i);
+                                }
+                            }
+                        }
+                        "evidence_expire" => {
+                            if let (Some(entry_id), Some(evidence_id)) =
+                                (live_parent, ev["evidence_id"].as_str())
+                            {
+                                if evidence_owner_by_id
+                                    .get(evidence_id)
+                                    .is_some_and(|owner| owner == entry_id)
+                                {
+                                    evidence_owner_by_id.remove(evidence_id);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -153,7 +187,8 @@ impl Compact {
         let mut retained_indices: Vec<usize> = Vec::new();
 
         // Entry upserts ordered by original position. Drop entries whose last
-        // expire comes after their last upsert (absent == stale for all query paths).
+        // expire comes after their last upsert, or whose last upsert is itself stale
+        // (absent == stale for all query paths).
         // Orphan expire events (expire with no matching upsert in this log) are
         // implicitly dropped — they never appear in entry_pairs, so they are never
         // emitted. This is safe: absent == stale, so rebuild from the compacted log
@@ -162,7 +197,9 @@ impl Compact {
             entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
-            if expire_last.get(id).is_some_and(|&e| e > i) {
+            if evts[i]["is_stale"].as_bool().unwrap_or(false)
+                || expire_last.get(id).is_some_and(|&e| e > i)
+            {
                 continue;
             }
             live_entry_ids.insert(id.to_string());
@@ -194,8 +231,14 @@ impl Compact {
         for i in evidence_indices {
             let ev = &evts[i];
             let entry_id = ev["entry_id"].as_str().unwrap_or("");
+            // Evidence ids have current-state ownership during replay. Only adds
+            // that claimed an unowned id while their parent was live are effective;
+            // evidence/entry expiry can free an id for a later effective add.
+            let is_effective_add =
+                ev["action"] != "evidence_add" || effective_evidence_add_indices.contains(&i);
             if live_entry_ids.contains(entry_id)
                 && evidence_live_at_index.contains(&i)
+                && is_effective_add
                 && expire_last
                     .get(entry_id)
                     .map_or(true, |&expire_i| i > expire_i)
@@ -637,10 +680,15 @@ mod tests {
         });
         append_event(&paths.events, &upsert).unwrap();
         let evidence = Evidence {
-            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
-            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
-            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
-            derived_from: None, recorded_at: Some("2024-01-01T00:00:01Z".to_string()),
+            id: "ev-1".to_string(),
+            entry_id: "e1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: Some("2024-01-01T00:00:01Z".to_string()),
         };
         append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
         append_event(&paths.events, &upsert).unwrap();
@@ -653,10 +701,18 @@ mod tests {
             apply_event(&replay, &embedder, &ev).unwrap();
         }
         let evidence_count: i64 = replay
-            .query_row("SELECT COUNT(*) FROM evidence WHERE entry_id='e1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM evidence WHERE entry_id='e1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let evidence_status: String = replay
-            .query_row("SELECT evidence_status FROM entries WHERE id='e1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT evidence_status FROM entries WHERE id='e1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(evidence_count, 1);
         assert_eq!(evidence_status, "present");
@@ -678,20 +734,31 @@ mod tests {
         });
         append_event(&paths.events, &upsert).unwrap();
         let evidence = Evidence {
-            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
-            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
-            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
-            derived_from: None, recorded_at: None,
+            id: "ev-1".to_string(),
+            entry_id: "e1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: None,
         };
         append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
-        append_event(&paths.events, &serde_json::json!({
-            "action": "expire", "table": "entries", "id": "e1", "ts": "2024-01-01T00:00:02Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries", "id": "e1", "ts": "2024-01-01T00:00:02Z"
+            }),
+        )
+        .unwrap();
         append_event(&paths.events, &upsert).unwrap();
 
         Compact.execute_with_paths(&paths).unwrap();
         let compacted = events::read_events(&paths.events).unwrap().events;
-        assert!(compacted.iter().all(|ev| ev["table"] != "evidence" || ev["entry_id"] != "e1"));
+        assert!(compacted
+            .iter()
+            .all(|ev| ev["table"] != "evidence" || ev["entry_id"] != "e1"));
     }
 
     #[test]
@@ -722,7 +789,12 @@ mod tests {
 
         let original = materialize(&paths);
         assert_eq!(
-            original.iter().find(|(id, _, _)| id == "d").unwrap().1.as_str(),
+            original
+                .iter()
+                .find(|(id, _, _)| id == "d")
+                .unwrap()
+                .1
+                .as_str(),
             "n/a"
         );
 
@@ -746,10 +818,15 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         let evidence = Evidence {
-            id: "ev-d".to_string(), entry_id: "d".to_string(), kind: "code".to_string(),
-            citation_path: Some("src/d.rs:0-1".to_string()), citation_sha: None,
-            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
-            derived_from: None, recorded_at: None,
+            id: "ev-d".to_string(),
+            entry_id: "d".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/d.rs:0-1".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: None,
         };
         append_event(&paths.events, &evidence_add_event("d", &evidence, None)).unwrap();
         append_event(
@@ -794,10 +871,15 @@ mod tests {
         )
         .unwrap();
         let evidence = Evidence {
-            id: "ev-d".to_string(), entry_id: "d".to_string(), kind: "code".to_string(),
-            citation_path: Some("src/d.rs:0-1".to_string()), citation_sha: None,
-            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
-            derived_from: None, recorded_at: None,
+            id: "ev-d".to_string(),
+            entry_id: "d".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/d.rs:0-1".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: None,
         };
         append_event(&paths.events, &evidence_add_event("d", &evidence, None)).unwrap();
         append_event(&paths.events, &upsert).unwrap();
@@ -807,9 +889,7 @@ mod tests {
 
         let compacted = events::read_events(&paths.events).unwrap().events;
         assert!(compacted.iter().all(|ev| {
-            ev["action"] != "evidence_add"
-                || ev["table"] != "evidence"
-                || ev["entry_id"] != "d"
+            ev["action"] != "evidence_add" || ev["table"] != "evidence" || ev["entry_id"] != "d"
         }));
         assert_eq!(materialize(&paths), original);
     }
@@ -823,23 +903,209 @@ mod tests {
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
-        append_event(&paths.events, &serde_json::json!({
-            "action": "upsert", "table": "entries", "id": "e1", "path": "src/a.rs",
-            "summary": "entry", "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
-        })).unwrap();
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "e1", "path": "src/a.rs",
+                "summary": "entry", "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
         let evidence = Evidence {
-            id: "ev-1".to_string(), entry_id: "e1".to_string(), kind: "code".to_string(),
-            citation_path: Some("src/a.rs:0-1".to_string()), citation_sha: None,
-            citation_hash: "sha256:abc".to_string(), citation_excerpt: None,
-            derived_from: None, recorded_at: None,
+            id: "ev-1".to_string(),
+            entry_id: "e1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/a.rs:0-1".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:abc".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: None,
         };
         append_event(&paths.events, &evidence_add_event("e1", &evidence, None)).unwrap();
-        append_event(&paths.events, &citation_healed_event("e1", "ev-1", "src/a.rs:0-1", "src/a.rs:2-3", "sha256:abc", None)).unwrap();
+        append_event(
+            &paths.events,
+            &citation_healed_event(
+                "e1",
+                "ev-1",
+                "src/a.rs:0-1",
+                "src/a.rs:2-3",
+                "sha256:abc",
+                None,
+            ),
+        )
+        .unwrap();
 
         Compact.execute_with_paths(&paths).unwrap();
         let once = fs::read(&paths.events).unwrap();
         Compact.execute_with_paths(&paths).unwrap();
         assert_eq!(fs::read(&paths.events).unwrap(), once);
+    }
+
+    #[test]
+    fn test_cmd_compact_does_not_transfer_cross_parent_evidence_id_ownership() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        for id in ["owner-a", "owner-b"] {
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "upsert", "table": "entries", "id": id,
+                    "path": format!("src/{id}.rs"), "summary": id, "content": "c",
+                    "tags": [], "kind": "belief", "evidence_status": "missing",
+                    "ts": "2024-01-01T00:00:00Z"
+                }),
+            )
+            .unwrap();
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "evidence_add", "table": "evidence", "entry_id": id,
+                    "evidence": {
+                        "id": "shared-evidence-id", "entry_id": id, "kind": "code",
+                        "citation_path": format!("src/{id}.rs:1-1"), "citation_sha": null,
+                        "citation_hash": "sha256:abc", "citation_excerpt": null,
+                        "derived_from": null, "recorded_at": null
+                    },
+                    "ts": "2024-01-01T01:00:00Z"
+                }),
+            )
+            .unwrap();
+        }
+        append_event(
+            &paths.events,
+            &serde_json::json!({
+                "action": "expire", "table": "entries", "id": "owner-a",
+                "ts": "2024-01-02T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        let before = materialize(&paths);
+        Compact.execute_with_paths(&paths).unwrap();
+        let after = materialize(&paths);
+        assert_eq!(before, after);
+        let owner_b = after.iter().find(|(id, _, _)| id == "owner-b").unwrap();
+        assert!(owner_b.2.is_empty());
+        assert!(events::read_events(&paths.events)
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| {
+                event["action"] != "evidence_add" || event["evidence"]["id"] != "shared-evidence-id"
+            }));
+    }
+
+    #[test]
+    fn test_cmd_compact_retains_readded_evidence_after_evidence_expire() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        for id in ["a", "d"] {
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "upsert", "table": "entries", "id": id,
+                    "path": format!("src/{id}.rs"), "summary": id, "content": "c",
+                    "tags": [], "kind": "belief", "evidence_status": "missing"
+                }),
+            )
+            .unwrap();
+        }
+        for id in ["a", "d"] {
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "evidence_add", "table": "evidence", "entry_id": id,
+                    "evidence": {"id": "ev-shared-0", "entry_id": id, "kind": "code",
+                        "citation_path": format!("src/{id}.rs:0-1"),
+                        "citation_hash": "sha256:shared"}
+                }),
+            )
+            .unwrap();
+        }
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add", "table": "evidence", "entry_id": "d",
+            "evidence": {"id": "ev-d-1", "entry_id": "d", "kind": "code",
+                "citation_path": "src/d.rs:0-1", "citation_hash": "sha256:d"}
+        });
+        append_event(&paths.events, &evidence_add).unwrap();
+        append_event(
+            &paths.events,
+            &crate::components::events::evidence_expire_event("d", "ev-d-1", "replace"),
+        )
+        .unwrap();
+        append_event(&paths.events, &evidence_add).unwrap();
+        append_event(
+            &paths.events,
+            &crate::components::events::citation_healed_event(
+                "a",
+                "ev-shared-0",
+                "src/a.rs:0-1",
+                "src/a.rs:2-3",
+                "sha256:shared",
+                None,
+            ),
+        )
+        .unwrap();
+
+        let before = materialize(&paths);
+        Compact.execute_with_paths(&paths).unwrap();
+        let after = materialize(&paths);
+
+        assert_eq!(after, before);
+        let d = after.iter().find(|(id, _, _)| id == "d").unwrap();
+        assert!(d.2.iter().any(|(id, _)| id == "ev-d-1"));
+    }
+
+    #[test]
+    fn test_cmd_compact_allows_cross_parent_reclaim_after_owner_entry_expire() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        for id in ["owner-a", "owner-b"] {
+            append_event(
+                &paths.events,
+                &serde_json::json!({
+                    "action": "upsert", "table": "entries", "id": id,
+                    "path": format!("src/{id}.rs"), "summary": id, "content": "c",
+                    "tags": [], "kind": "belief", "evidence_status": "missing"
+                }),
+            )
+            .unwrap();
+        }
+        for (action, entry_id) in [
+            ("evidence_add", "owner-a"),
+            ("expire", "owner-a"),
+            ("evidence_add", "owner-b"),
+        ] {
+            let event = if action == "expire" {
+                serde_json::json!({"action": "expire", "table": "entries", "id": entry_id})
+            } else {
+                serde_json::json!({
+                    "action": "evidence_add", "table": "evidence", "entry_id": entry_id,
+                    "evidence": {"id": "shared-evidence-id", "entry_id": entry_id,
+                        "kind": "code", "citation_path": format!("src/{entry_id}.rs:0-1"),
+                        "citation_hash": "sha256:shared"}
+                })
+            };
+            append_event(&paths.events, &event).unwrap();
+        }
+
+        let before = materialize(&paths);
+        Compact.execute_with_paths(&paths).unwrap();
+        let after = materialize(&paths);
+
+        assert_eq!(after, before);
+        let owner_b = after.iter().find(|(id, _, _)| id == "owner-b").unwrap();
+        assert!(owner_b.2.iter().any(|(id, _)| id == "shared-evidence-id"));
     }
 
     #[test]
@@ -990,6 +1256,30 @@ mod tests {
                             "ts": "2024-01-01T02:00:00Z"
                         })).unwrap();
                     }
+                    CompactOp::CrossParentEvidenceCollision {
+                        first_id,
+                        second_id,
+                        evidence_slot,
+                    } => {
+                        for id in [first_id, second_id] {
+                            append_event(&paths.events, &serde_json::json!({
+                                "action": "upsert", "table": "entries", "id": id,
+                                "path": format!("src/{id}.rs"), "summary": format!("s {id}"),
+                                "content": format!("c {id}"), "tags": [], "kind": "belief",
+                                "evidence_status": "missing", "ts": "2024-01-01T01:59:59Z"
+                            })).unwrap();
+                        }
+                        for id in [first_id, second_id] {
+                            append_event(&paths.events, &serde_json::json!({
+                                "action": "evidence_add", "table": "evidence", "entry_id": id,
+                                "evidence": {"id": format!("ev-shared-{evidence_slot}"), "entry_id": id, "kind": "code",
+                                    "citation_path": format!("src/{id}.rs:0-1"), "citation_sha": null,
+                                    "citation_hash": "sha256:abc", "citation_excerpt": null,
+                                    "derived_from": null, "recorded_at": null},
+                                "ts": "2024-01-01T02:00:00Z"
+                            })).unwrap();
+                        }
+                    }
                     CompactOp::EvidenceExpire { id, evidence_slot } => {
                         append_event(&paths.events, &crate::components::events::evidence_expire_event(
                             id, &format!("ev-{id}-{evidence_slot}"), "property test"
@@ -1034,6 +1324,11 @@ mod tests {
             id: String,
             evidence_slot: u8,
         },
+        CrossParentEvidenceCollision {
+            first_id: String,
+            second_id: String,
+            evidence_slot: u8,
+        },
         EvidenceExpire {
             id: String,
             evidence_slot: u8,
@@ -1052,9 +1347,12 @@ mod tests {
     /// Raw op generator — unrestricted alphabet across 4 ids.
     fn arb_raw_op() -> impl proptest::strategy::Strategy<Value = CompactOp> {
         use proptest::prelude::*;
-        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"])
-            .prop_map(|s| s.to_string());
+        let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
         let arb_evidence = (arb_id.clone(), 0_u8..2);
+        let arb_cross_parent_collision = (arb_id.clone(), arb_id.clone(), 0_u8..2)
+            .prop_filter("collision parents must differ", |(first, second, _)| {
+                first != second
+            });
         let arb_kind = prop_oneof![
             Just(None),
             proptest::sample::select(vec!["belief", "convention"])
@@ -1072,18 +1370,21 @@ mod tests {
                 }
             ),
             arb_id.clone().prop_map(CompactOp::Expire),
-            arb_evidence.clone().prop_map(|(id, evidence_slot)| CompactOp::EvidenceAdd {
-                id,
-                evidence_slot,
+            arb_evidence
+                .clone()
+                .prop_map(|(id, evidence_slot)| CompactOp::EvidenceAdd { id, evidence_slot }),
+            arb_cross_parent_collision.prop_map(|(first_id, second_id, evidence_slot)| {
+                CompactOp::CrossParentEvidenceCollision {
+                    first_id,
+                    second_id,
+                    evidence_slot,
+                }
             }),
-            arb_evidence.clone().prop_map(|(id, evidence_slot)| CompactOp::EvidenceExpire {
-                id,
-                evidence_slot,
-            }),
-            arb_evidence.prop_map(|(id, evidence_slot)| CompactOp::CitationHealed {
-                id,
-                evidence_slot,
-            }),
+            arb_evidence
+                .clone()
+                .prop_map(|(id, evidence_slot)| CompactOp::EvidenceExpire { id, evidence_slot }),
+            arb_evidence
+                .prop_map(|(id, evidence_slot)| CompactOp::CitationHealed { id, evidence_slot }),
             Just(CompactOp::Compact),
         ]
     }
@@ -1102,7 +1403,26 @@ mod tests {
         // equivalence for synthetic stale-upsert logs, and the replay branch remains
         // covered by dedicated unit tests in db.rs.
         let mut last_explicit_kind_by_id: HashMap<String, String> = HashMap::new();
+        let mut collision_slot = 0_u8;
         for op in &mut ops {
+            if let CompactOp::CrossParentEvidenceCollision {
+                first_id,
+                second_id,
+                evidence_slot,
+            } = op
+            {
+                // Collision events are deliberately writer-unproducible, but each
+                // generated pair gets its own global id so the only duplication is
+                // the intended two-parent collision within that operation.
+                *evidence_slot = collision_slot;
+                collision_slot = collision_slot.saturating_add(1);
+                // This op carries implicit explicit-kind upserts for both parents
+                // (the emitter always writes "kind": "belief" for first_id and
+                // second_id) — register them so a later kindless Upsert of either
+                // id gets repaired instead of recreating the CE4 shape.
+                last_explicit_kind_by_id.insert(first_id.clone(), "belief".to_string());
+                last_explicit_kind_by_id.insert(second_id.clone(), "belief".to_string());
+            }
             if let CompactOp::Upsert { id, kind, .. } = op {
                 match kind {
                     Some(explicit_kind) => {
@@ -1135,9 +1455,7 @@ mod tests {
             .prepare("SELECT id, evidence_status FROM entries WHERE COALESCE(is_stale, 0) = 0 ORDER BY id")
             .unwrap();
         let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .unwrap();
         rows.map(|row| {
             let (id, status) = row.unwrap();
