@@ -45,10 +45,17 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
+// Thread-local, not a global static: memoization happens per-add on one
+// thread, and cargo runs tests in parallel threads, so a global counter
+// picks up concurrent tests' resolutions inside this test's window
+// (cross-test race, found when the storage-reliability tests shifted
+// scheduling). A thread-local counter measures only this test's own calls.
 #[cfg(test)]
-static CITATION_HASH_RESOLUTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static CITATION_HASH_RESOLUTION_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 fn resolve_citation_hash(
     repo_root: &std::path::Path,
@@ -56,7 +63,7 @@ fn resolve_citation_hash(
     range: Option<(usize, usize)>,
 ) -> Result<String> {
     #[cfg(test)]
-    CITATION_HASH_RESOLUTION_CALLS.fetch_add(1, Ordering::SeqCst);
+    CITATION_HASH_RESOLUTION_CALLS.with(|c| c.set(c.get() + 1));
 
     compute_citation_hash(repo_root, file_rel, range)
 }
@@ -557,7 +564,7 @@ mod tests {
     fn test_kb_core_add_memoizes_duplicate_path_only_hash_resolution() {
         use crate::components::verification::compute_citation_hash;
 
-        CITATION_HASH_RESOLUTION_CALLS.store(0, Ordering::SeqCst);
+        CITATION_HASH_RESOLUTION_CALLS.with(|c| c.set(0));
 
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"whole file\n").unwrap();
@@ -582,7 +589,7 @@ mod tests {
         assert!(evidence_rows
             .iter()
             .all(|row| row.citation_sha == config::git_head_sha()));
-        assert_eq!(CITATION_HASH_RESOLUTION_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CITATION_HASH_RESOLUTION_CALLS.with(|c| c.get()), 1);
     }
 
     #[test]
