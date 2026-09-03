@@ -7,7 +7,9 @@ use crate::config;
 use abscissa_core::{Command, Runnable};
 use anyhow::Context;
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Test-only hook: when set, `execute_with` waits on this barrier at the
 /// START of Phase 2 (after Phase 1 releases the lock, before replay begins).
@@ -17,35 +19,73 @@ static PHASE2_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Phase2TestHoo
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static PHASE2_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 struct Phase2TestHook {
+    events_path: Option<PathBuf>,
     barrier: std::sync::Arc<std::sync::Barrier>,
+    mutation_done: Option<std::sync::Arc<std::sync::Barrier>>,
     phase3_timings: Option<std::sync::Arc<std::sync::Mutex<Vec<Phase3Timing>>>>,
+    attempts: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[cfg(test)]
 pub(crate) fn set_phase2_barrier(b: std::sync::Arc<std::sync::Barrier>) {
     let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
     *m.lock().unwrap() = Some(Phase2TestHook {
+        events_path: None,
         barrier: b,
+        mutation_done: None,
         phase3_timings: None,
+        attempts: None,
     });
 }
 
 #[cfg(test)]
 fn set_rebuild_measurement(
+    events_path: PathBuf,
     barrier: std::sync::Arc<std::sync::Barrier>,
     phase3_timings: std::sync::Arc<std::sync::Mutex<Vec<Phase3Timing>>>,
 ) {
     let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
     *m.lock().unwrap() = Some(Phase2TestHook {
+        events_path: Some(events_path),
         barrier,
+        mutation_done: None,
         phase3_timings: Some(phase3_timings),
+        attempts: None,
     });
 }
 
 #[cfg(test)]
-fn take_phase2_barrier() -> Option<Phase2TestHook> {
-    PHASE2_BARRIER.get()?.lock().ok()?.take()
+fn set_rebuild_attempt_counter(
+    events_path: PathBuf,
+    barrier: std::sync::Arc<std::sync::Barrier>,
+    mutation_done: std::sync::Arc<std::sync::Barrier>,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
+    *m.lock().unwrap() = Some(Phase2TestHook {
+        events_path: Some(events_path),
+        barrier,
+        mutation_done: Some(mutation_done),
+        phase3_timings: None,
+        attempts: Some(attempts),
+    });
+}
+
+#[cfg(test)]
+fn take_phase2_barrier(events_path: &Path) -> Option<Phase2TestHook> {
+    let mut hook = PHASE2_BARRIER.get()?.lock().ok()?;
+    if hook
+        .as_ref()
+        .and_then(|hook| hook.events_path.as_deref())
+        .is_some_and(|target| target != events_path)
+    {
+        return None;
+    }
+    hook.take()
 }
 
 #[cfg(test)]
@@ -256,156 +296,258 @@ impl Rebuild {
     /// Three-phase algorithm so concurrent writes are never blocked for more
     /// than a brief lock-acquisition at either end:
     ///
-    /// 1. Snapshot (brief lock): record event count N, release lock.
-    /// 2. Replay (no lock): replay events 1..N into `agent-kb.db.tmp`.
+    /// 1. Snapshot (brief lock): record a complete-prefix byte identity.
+    /// 2. Replay (no lock): replay that prefix into `agent-kb.db.tmp`.
     ///    MCP writes continue normally against the live DB during this phase.
-    /// 3. Catch-up + swap (brief lock): apply events N+1..M written during
-    ///    phase 2, then atomically rename tmp into place.
+    /// 3. Catch-up + swap (brief lock): verify the prefix identity, apply bytes
+    ///    appended after it, then atomically rename tmp into place. A rewritten
+    ///    prefix restarts the algorithm instead of using an invalid cursor.
     pub fn execute_with(
         &self,
         paths: &config::Paths,
         embedder: &dyn Embedder,
     ) -> anyhow::Result<()> {
-        // Phase 1: snapshot event count under a brief lock.
-        let snapshot_len = {
-            let _lock = acquire_lock(&paths.lock)?;
-            let snapshot = events::read_events(&paths.events)?;
-            if let Some(torn_tail) = &snapshot.torn_tail {
-                eprintln!(
-                    "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
-                     rebuild snapshot will ignore it",
-                    paths.events.display(),
-                    torn_tail.line,
-                    torn_tail.bytes.len()
-                );
-            }
-            snapshot.events.len()
-        };
-
-        // Phase 2: replay snapshot into a tmp DB — no lock held.
+        const MAX_ATTEMPTS: usize = 3;
         #[cfg(test)]
-        let phase3_timing_sink = if let Some(hook) = take_phase2_barrier() {
-            hook.barrier.wait(); // synchronise with concurrent writers in tests
-            hook.phase3_timings
-        } else {
-            None
-        };
+        let hook = take_phase2_barrier(&paths.events);
 
-        // Per-process tmp path: concurrent rebuilds (manual + auto-upgrade,
-        // or two sessions) must never share/delete each other's tmp DB
-        // (codex review finding). Orphans from CRASHED rebuilds are swept —
-        // a file is an orphan only when its embedded pid is no longer alive
-        // (/proc/<pid> absent); a live pid means a rebuild in flight, leave it.
-        let tmp_db = paths
-            .db
-            .with_extension(format!("db.tmp.{}", std::process::id()));
-        if let (Some(dir), Some(stem)) = (paths.db.parent(), paths.db.file_name()) {
-            let prefix = format!("{}.tmp.", stem.to_string_lossy());
-            if let Ok(rd) = fs::read_dir(dir) {
-                for e in rd.filter_map(|e| e.ok()) {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let Some(pid_str) = name.strip_prefix(&prefix) else {
-                        continue;
-                    };
-                    let alive = pid_str
-                        .parse::<u32>()
-                        .is_ok_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
-                    if e.path() != tmp_db && !alive {
-                        let _ = fs::remove_file(e.path());
+        for attempt in 1..=MAX_ATTEMPTS {
+            #[cfg(test)]
+            if let Some(counter) = hook.as_ref().and_then(|h| h.attempts.as_ref()) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            // Sweep before creating this attempt's tmp. A SIGKILL cannot run
+            // Drop, so the next rebuild is the backstop for abandoned files.
+            let tmp_db = paths
+                .db
+                .with_extension(format!("db.tmp.{}", std::process::id()));
+            sweep_dead_tmp_files(&paths.db, &tmp_db);
+            let mut tmp = TmpDbGuard::new(tmp_db);
+
+            // Phase 1: snapshot a byte identity under a brief lock. Hashing the
+            // complete prefix is intentionally simple and robust: it detects
+            // compaction, reordering, truncation, and same-size rewrites.
+            let (snapshot_len, snapshot_byte_len, snapshot_hash) = {
+                let _lock = acquire_lock(&paths.lock)?;
+                let snapshot = events::read_events(&paths.events)?;
+                if let Some(torn_tail) = &snapshot.torn_tail {
+                    eprintln!(
+                        "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                         rebuild snapshot will ignore it",
+                        paths.events.display(),
+                        torn_tail.line,
+                        torn_tail.bytes.len()
+                    );
+                }
+                let bytes = match fs::read(&paths.events) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) => return Err(error.into()),
+                };
+                let complete_len = snapshot.torn_tail.as_ref().map_or(bytes.len(), |tail| {
+                    bytes.len().saturating_sub(tail.bytes.len())
+                });
+                (
+                    snapshot.events.len(),
+                    complete_len as u64,
+                    Sha256::digest(&bytes[..complete_len]).to_vec(),
+                )
+            };
+
+            // Phase 2: replay snapshot into a tmp DB — no lock held.
+            #[cfg(test)]
+            let phase3_timing_sink = if attempt == 1 {
+                if let Some(hook) = hook.as_ref() {
+                    hook.barrier.wait();
+                    if let Some(done) = &hook.mutation_done {
+                        done.wait();
                     }
+                    hook.phase3_timings.clone()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            {
+                // Stop at snapshot_len so we never encounter a partial tail line
+                // that a concurrent writer may be mid-writing after Phase 1.
+                let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
+                let conn = db::open_db(tmp.path())?;
+                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
+                if let Some(torn_tail) = &evts.torn_tail {
+                    eprintln!(
+                        "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
+                         replaying only the complete prefix",
+                        paths.events.display(),
+                        torn_tail.line,
+                        torn_tail.bytes.len()
+                    );
+                }
+                eprintln!("replaying {} events...", evts.events.len());
+                for event in &evts.events {
+                    db::apply_event(&conn, embedder, event)
+                        .with_context(|| format!("apply event: {}", event))?;
                 }
             }
-        }
-        let _ = fs::remove_file(&tmp_db);
-        {
-            // Stop at snapshot_len so we never encounter a partial tail line
-            // that a concurrent writer may be mid-writing after Phase 1 released the lock.
-            let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
-            let conn = db::open_db(&tmp_db)?;
-            // DELETE journal avoids WAL files on the tmp path, simplifying the
-            // rename step (no companion files to move or orphan).
-            conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-            if let Some(torn_tail) = &evts.torn_tail {
+
+            // Phase 3: catch-up and atomic swap under lock.
+            let _lock = acquire_lock(&paths.lock)?;
+            #[cfg(test)]
+            let phase3_lock_acquired = std::time::Instant::now();
+            if !prefix_matches(&paths.events, snapshot_byte_len, &snapshot_hash)? {
+                drop(_lock);
+                eprintln!(
+                    "kb: event log changed identity during rebuild attempt {attempt}/{MAX_ATTEMPTS}; restarting"
+                );
+                if attempt == MAX_ATTEMPTS {
+                    anyhow::bail!(
+                        "event log was rewritten during all {MAX_ATTEMPTS} rebuild attempts; refusing an unsafe positional catch-up"
+                    );
+                }
+                continue;
+            }
+            let catchup = events::read_events_from_offset(&paths.events, snapshot_byte_len)?;
+            if let Some(torn_tail) = &catchup.torn_tail {
                 eprintln!(
                     "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
-                     replaying only the complete prefix",
+                     catch-up will ignore it",
                     paths.events.display(),
                     torn_tail.line,
                     torn_tail.bytes.len()
                 );
             }
-            eprintln!("replaying {} events...", evts.events.len());
-            for event in &evts.events {
-                db::apply_event(&conn, embedder, event)
-                    .with_context(|| format!("apply event: {}", event))?;
+            if !catchup.events.is_empty() {
+                eprintln!("catching up {} new event(s)...", catchup.events.len());
+                let conn = db::open_db(tmp.path())?;
+                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
+                for event in &catchup.events {
+                    db::apply_event(&conn, embedder, event)
+                        .with_context(|| format!("apply event (catch-up): {}", event))?;
+                }
             }
-        }
+            #[cfg(test)]
+            let phase3_catchup_finished = std::time::Instant::now();
 
-        // Phase 3: catch-up and atomic swap under lock.
-        let _lock = acquire_lock(&paths.lock)?;
-        #[cfg(test)]
-        let phase3_lock_acquired = std::time::Instant::now();
-        let all_evts = events::read_events(&paths.events)?;
-        if let Some(torn_tail) = &all_evts.torn_tail {
-            eprintln!(
-                "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
-                 catch-up will ignore it",
-                paths.events.display(),
-                torn_tail.line,
-                torn_tail.bytes.len()
-            );
-        }
-        let catchup = &all_evts.events[snapshot_len.min(all_evts.events.len())..];
-        if !catchup.is_empty() {
-            eprintln!("catching up {} new event(s)...", catchup.len());
-            let conn = db::open_db(&tmp_db)?;
-            conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-            for event in catchup {
-                db::apply_event(&conn, embedder, event)
-                    .with_context(|| format!("apply event (catch-up): {}", event))?;
+            // Remove old WAL/SHM before rename. This is required: the tmp DB uses
+            // journal_mode=DELETE (no WAL), so if the old WAL files remain after
+            // the rename, new SQLite connections would attempt WAL recovery against
+            // the rebuilt DB, producing corruption or an error.
+            // Safety (Linux): the per-request connection model means no MCP handler
+            // holds a connection across the lock boundary, so no reader has the WAL
+            // open when we unlink it. On Linux, any FD open at unlink time remains
+            // valid (the inode persists until the last close), so this is safe even
+            // if a reader opened just before the lock was acquired. fs::rename then
+            // atomically replaces the DB file in one syscall.
+            let db_str = paths.db.to_string_lossy();
+            let _ = fs::remove_file(format!("{}-wal", db_str));
+            let _ = fs::remove_file(format!("{}-shm", db_str));
+            #[cfg(test)]
+            let phase3_unlink_finished = std::time::Instant::now();
+            fs::rename(tmp.path(), &paths.db).with_context(|| "rename rebuilt DB into place")?;
+            tmp.disarm();
+
+            #[cfg(test)]
+            {
+                let phase3_rename_finished = std::time::Instant::now();
+                // The measured swap window is the complete Phase-3 flock lifetime,
+                // so release the guard before taking its final timestamp.
+                drop(_lock);
+                let phase3_lock_released = std::time::Instant::now();
+                if let Some(sink) = phase3_timing_sink {
+                    sink.lock().unwrap().push(Phase3Timing {
+                        lock_acquired: phase3_lock_acquired,
+                        catchup_finished: phase3_catchup_finished,
+                        unlink_finished: phase3_unlink_finished,
+                        rename_finished: phase3_rename_finished,
+                        lock_released: phase3_lock_released,
+                    });
+                }
             }
+
+            eprintln!("rebuild complete");
+            return Ok(());
         }
-        #[cfg(test)]
-        let phase3_catchup_finished = std::time::Instant::now();
-
-        // Remove old WAL/SHM before rename. This is required: the tmp DB uses
-        // journal_mode=DELETE (no WAL), so if the old WAL files remain after
-        // the rename, new SQLite connections would attempt WAL recovery against
-        // the rebuilt DB, producing corruption or an error.
-        // Safety (Linux): the per-request connection model means no MCP handler
-        // holds a connection across the lock boundary, so no reader has the WAL
-        // open when we unlink it. On Linux, any FD open at unlink time remains
-        // valid (the inode persists until the last close), so this is safe even
-        // if a reader opened just before the lock was acquired. fs::rename then
-        // atomically replaces the DB file in one syscall.
-        let db_str = paths.db.to_string_lossy();
-        let _ = fs::remove_file(format!("{}-wal", db_str));
-        let _ = fs::remove_file(format!("{}-shm", db_str));
-        #[cfg(test)]
-        let phase3_unlink_finished = std::time::Instant::now();
-        fs::rename(&tmp_db, &paths.db).with_context(|| "rename rebuilt DB into place")?;
-
-        #[cfg(test)]
-        {
-            let phase3_rename_finished = std::time::Instant::now();
-            // The measured swap window is the complete Phase-3 flock lifetime,
-            // so release the guard before taking its final timestamp.
-            drop(_lock);
-            let phase3_lock_released = std::time::Instant::now();
-            if let Some(sink) = phase3_timing_sink {
-                sink.lock().unwrap().push(Phase3Timing {
-                    lock_acquired: phase3_lock_acquired,
-                    catchup_finished: phase3_catchup_finished,
-                    unlink_finished: phase3_unlink_finished,
-                    rename_finished: phase3_rename_finished,
-                    lock_released: phase3_lock_released,
-                });
-            }
-        }
-
-        eprintln!("rebuild complete");
-        Ok(())
+        unreachable!()
     }
+}
+
+struct TmpDbGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpDbGuard {
+    fn new(path: PathBuf) -> Self {
+        remove_tmp_shape(&path);
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpDbGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_tmp_shape(&self.path);
+        }
+    }
+}
+
+fn remove_tmp_shape(path: &Path) {
+    let raw = path.to_string_lossy();
+    let _ = fs::remove_file(path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{raw}{suffix}"));
+    }
+}
+
+fn sweep_dead_tmp_files(db_path: &Path, own_tmp: &Path) {
+    let (Some(dir), Some(stem)) = (db_path.parent(), db_path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.tmp.", stem.to_string_lossy());
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let pid_text = rest
+            .strip_suffix("-journal")
+            .or_else(|| rest.strip_suffix("-wal"))
+            .or_else(|| rest.strip_suffix("-shm"))
+            .unwrap_or(rest);
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        let alive = Path::new(&format!("/proc/{pid}")).exists();
+        if entry.path() != own_tmp && !alive {
+            let base = db_path.with_extension(format!("db.tmp.{pid}"));
+            remove_tmp_shape(&base);
+        }
+    }
+}
+
+fn prefix_matches(events_path: &Path, byte_len: u64, expected: &[u8]) -> anyhow::Result<bool> {
+    use std::io::Read;
+    let Ok(file) = fs::File::open(events_path) else {
+        return Ok(byte_len == 0 && expected == Sha256::digest([]).as_slice());
+    };
+    if file.metadata()?.len() < byte_len {
+        return Ok(false);
+    }
+    let mut bytes = Vec::with_capacity(byte_len as usize);
+    file.take(byte_len).read_to_end(&mut bytes)?;
+    Ok(bytes.len() as u64 == byte_len && Sha256::digest(&bytes).as_slice() == expected)
 }
 
 #[cfg(test)]
@@ -515,6 +657,125 @@ mod tests {
 
         Rebuild.execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 10, "rebuild must restore all events");
+    }
+
+    fn entry_content(paths: &Paths, id: &str) -> Option<String> {
+        Connection::open(&paths.db)
+            .unwrap()
+            .query_row(
+                "SELECT content FROM entries WHERE id=?1 AND is_stale=0",
+                [id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    fn run_with_phase2_mutation<F>(paths: &Paths, mutation: F) -> usize
+    where
+        F: FnOnce() + Send,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let _serial = PHASE2_TEST_SERIAL.lock().unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        set_rebuild_attempt_counter(
+            paths.events.clone(),
+            Arc::clone(&started),
+            Arc::clone(&done),
+            Arc::clone(&attempts),
+        );
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| Rebuild.execute_with(paths, &NoopEmbedder));
+            started.wait();
+            mutation();
+            done.wait();
+            handle.join().unwrap().unwrap();
+        });
+        attempts.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_rebuild_compact_during_phase2_preserves_post_compact_append() {
+        let (_dir, paths) = setup_repo();
+        for i in 0..8 {
+            events::append_event(&paths.events, &upsert(&format!("old-{i}"), i)).unwrap();
+        }
+        let retained = upsert("retained", 90);
+        events::append_event(&paths.events, &retained).unwrap();
+
+        let events_path = paths.events.clone();
+        let appended = upsert("post-compact", 91);
+        let attempts = run_with_phase2_mutation(&paths, move || {
+            fs::write(
+                &events_path,
+                format!("{}\n", serde_json::to_string(&retained).unwrap()),
+            )
+            .unwrap();
+            events::append_event(&events_path, &appended).unwrap();
+        });
+
+        assert_eq!(attempts, 2, "compaction must force a clean retry");
+        assert!(entry_content(&paths, "post-compact").is_some());
+    }
+
+    #[test]
+    fn test_rebuild_append_only_phase2_uses_byte_offset_fast_path() {
+        let (_dir, paths) = setup_repo();
+        events::append_event(&paths.events, &upsert("base", 1)).unwrap();
+        let events_path = paths.events.clone();
+        let appended = upsert("appended", 2);
+
+        let attempts = run_with_phase2_mutation(&paths, move || {
+            events::append_event(&events_path, &appended).unwrap();
+        });
+
+        assert_eq!(attempts, 1, "append-only catch-up must not restart");
+        assert!(entry_content(&paths, "appended").is_some());
+    }
+
+    #[test]
+    fn test_rebuild_same_size_reorder_restarts_and_materializes_current_log() {
+        let (_dir, paths) = setup_repo();
+        let mut first = upsert("same", 1);
+        first["content"] = serde_json::json!("first!");
+        let mut second = upsert("same", 2);
+        second["content"] = serde_json::json!("second");
+        events::append_event(&paths.events, &first).unwrap();
+        events::append_event(&paths.events, &second).unwrap();
+        let original_len = fs::metadata(&paths.events).unwrap().len();
+
+        let events_path = paths.events.clone();
+        let attempts = run_with_phase2_mutation(&paths, move || {
+            let rewritten = format!(
+                "{}\n{}\n",
+                serde_json::to_string(&second).unwrap(),
+                serde_json::to_string(&first).unwrap()
+            );
+            fs::write(&events_path, rewritten).unwrap();
+            assert_eq!(fs::metadata(&events_path).unwrap().len(), original_len);
+        });
+
+        assert_eq!(attempts, 2, "same-length rewrite must force a retry");
+        assert_eq!(entry_content(&paths, "same").as_deref(), Some("first!"));
+    }
+
+    #[test]
+    fn test_rebuild_sweeps_dead_pid_tmp_and_journal_companions() {
+        let (_dir, paths) = setup_repo();
+        events::append_event(&paths.events, &upsert("base", 1)).unwrap();
+        let dead_pid = u32::MAX;
+        let abandoned = paths.db.with_extension(format!("db.tmp.{dead_pid}"));
+        let journal = PathBuf::from(format!("{}-journal", abandoned.to_string_lossy()));
+        fs::write(&abandoned, b"abandoned").unwrap();
+        fs::write(&journal, b"journal").unwrap();
+
+        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+
+        assert!(!abandoned.exists());
+        assert!(!journal.exists());
     }
 
     // -----------------------------------------------------------------------
@@ -729,6 +990,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
         use std::time::{Duration, Instant};
 
+        let _serial = PHASE2_TEST_SERIAL.lock().unwrap();
         const WRITERS: usize = 4;
         const EVENTS_PER_WRITER: u32 = 50;
         const SEEDED: usize = 20;
@@ -818,7 +1080,11 @@ mod tests {
         let origin = Instant::now();
         let barrier = Arc::new(Barrier::new(5));
         let phase3_timings = Arc::new(std::sync::Mutex::new(Vec::new()));
-        set_rebuild_measurement(Arc::clone(&barrier), Arc::clone(&phase3_timings));
+        set_rebuild_measurement(
+            paths.events.clone(),
+            Arc::clone(&barrier),
+            Arc::clone(&phase3_timings),
+        );
 
         let paths_rebuild = clone_paths(&paths);
         let emb_rebuild = Arc::clone(&emb);

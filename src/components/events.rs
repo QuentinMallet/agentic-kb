@@ -149,10 +149,7 @@ pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()>
 }
 
 /// Preserve a torn final record using the event-log sidecar naming convention.
-pub(crate) fn preserve_torn_tail(
-    events_path: &Path,
-    torn_tail: &[u8],
-) -> Result<PathBuf> {
+pub(crate) fn preserve_torn_tail(events_path: &Path, torn_tail: &[u8]) -> Result<PathBuf> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
     let file_name = format!(
         "{}.torn-{}",
@@ -238,6 +235,22 @@ pub fn read_events(events_path: &Path) -> Result<ReadEvents> {
     read_events_up_to(events_path, usize::MAX)
 }
 
+/// Read complete events beginning at a known JSONL record boundary.
+///
+/// Rebuild records this byte offset while holding the event-log flock and
+/// verifies the bytes before it have not changed before using this reader.
+pub fn read_events_from_offset(events_path: &Path, offset: u64) -> Result<ReadEvents> {
+    if !events_path.exists() {
+        return Ok(ReadEvents {
+            events: vec![],
+            torn_tail: None,
+        });
+    }
+    let mut f = File::open(events_path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    read_events_from_reader(BufReader::new(f))
+}
+
 /// Read at most `max` complete events from a JSONL file.
 ///
 /// This function stops only when `max` events have been collected or EOF is
@@ -267,6 +280,58 @@ pub fn read_events_up_to(events_path: &Path, max: usize) -> Result<ReadEvents> {
         if events.len() >= max {
             break;
         }
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        line += 1;
+        let has_newline = buf.ends_with(b"\n");
+        let chunk = if has_newline {
+            &buf[..buf.len() - 1]
+        } else {
+            buf.as_slice()
+        };
+        let torn_tail = || TornTail {
+            line,
+            bytes: chunk.to_vec(),
+        };
+        let event = match parse_event_line(chunk) {
+            Ok(event) => event,
+            Err(EventLineParseError::Utf8(_)) if !has_newline => {
+                return Ok(ReadEvents {
+                    events,
+                    torn_tail: Some(torn_tail()),
+                });
+            }
+            Err(EventLineParseError::Utf8(e)) => {
+                return Err(e).with_context(|| format!("decode events line {line}"));
+            }
+            Err(EventLineParseError::Json(_)) if !has_newline => {
+                return Ok(ReadEvents {
+                    events,
+                    torn_tail: Some(torn_tail()),
+                });
+            }
+            Err(EventLineParseError::Json(e)) => {
+                return Err(e).with_context(|| format!("parse events line {line}"));
+            }
+        };
+        if let Some(event) = event {
+            events.push(event);
+        }
+    }
+    Ok(ReadEvents {
+        events,
+        torn_tail: None,
+    })
+}
+
+fn read_events_from_reader<R: BufRead>(mut reader: R) -> Result<ReadEvents> {
+    let mut events = Vec::new();
+    let mut buf = Vec::new();
+    let mut line = 0usize;
+    loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
         if n == 0 {
@@ -442,8 +507,7 @@ mod tests {
     fn test_append_event_never_removes_reader_accepted_tail() {
         let appended = serde_json::json!({"action": "upsert", "id": "appended"});
         for tail in [
-            serde_json::to_vec(&serde_json::json!({"action": "upsert", "id": "accepted"}))
-                .unwrap(),
+            serde_json::to_vec(&serde_json::json!({"action": "upsert", "id": "accepted"})).unwrap(),
             b"{\"action\":".to_vec(),
         ] {
             let dir = tempdir().unwrap();
