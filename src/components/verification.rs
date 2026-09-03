@@ -19,6 +19,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_os = "linux"))]
 use std::sync::Once;
@@ -269,14 +271,12 @@ pub(crate) fn compute_citation_hash_and_size(
 ) -> Result<CitationHash> {
     hash_citation_bytes(repo_root, rel_path, range).map_err(|reason| {
         let detail = match reason {
-            UnverifiedReason::FileTooLarge => format!(
-                "file exceeds MAX_FILE_BYTES ({} bytes)",
-                MAX_FILE_BYTES
-            ),
-            UnverifiedReason::RangeTooLarge => format!(
-                "range exceeds MAX_RANGE_BYTES ({} bytes)",
-                MAX_RANGE_BYTES
-            ),
+            UnverifiedReason::FileTooLarge => {
+                format!("file exceeds MAX_FILE_BYTES ({} bytes)", MAX_FILE_BYTES)
+            }
+            UnverifiedReason::RangeTooLarge => {
+                format!("range exceeds MAX_RANGE_BYTES ({} bytes)", MAX_RANGE_BYTES)
+            }
             _ => reason.as_str().to_string(),
         };
         anyhow!("compute citation hash for {rel_path:?}: {detail}")
@@ -288,34 +288,24 @@ fn hash_citation_bytes(
     file_rel: &str,
     range: Option<(usize, usize)>,
 ) -> std::result::Result<CitationHash, UnverifiedReason> {
-    let file_abs = match safe_join(repo_root, file_rel) {
-        Some(p) => p,
-        None => {
-            // Do not probe after containment rejection: the reason must not
-            // disclose whether an out-of-repository target exists. Descriptor-
-            // relative open hardening is tracked separately in bd-eho3.
-            return Err(if syntactically_escapes_root(file_rel) {
-                UnverifiedReason::PathEscape
-            } else {
-                UnverifiedReason::FileMissing
-            });
-        }
-    };
-
-    let mut file = match File::open(&file_abs) {
+    if syntactically_escapes_root(file_rel) {
+        return Err(UnverifiedReason::PathEscape);
+    }
+    let file_abs = repo_root.join(file_rel);
+    let mut file = match open_citation_file(repo_root, Path::new(file_rel)) {
         Ok(f) => f,
         Err(_) => return Err(UnverifiedReason::FileMissing),
     };
 
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        return Err(UnverifiedReason::ReadError);
+    }
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(_) => return Err(UnverifiedReason::ReadError),
     };
     if !metadata.is_file() {
         return Err(UnverifiedReason::FileMissing);
-    }
-    if !opened_file_within_repo(&file, &file_abs, repo_root) {
-        return Err(UnverifiedReason::ReadError);
     }
 
     let file_size = metadata.len();
@@ -365,6 +355,79 @@ fn hash_citation_bytes(
         sha256_hex: format!("{:x}", hasher.finalize()),
         file_size,
     })
+}
+
+/// Open a citation relative to an already-open repository directory.
+///
+/// Linux resolves the complete path atomically with `openat2`. Older kernels
+/// and other Unix targets use a deliberately stricter component walk which
+/// rejects symlinks at every level with `O_NOFOLLOW`.
+#[cfg(unix)]
+fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
+
+        let root = open(
+            repo_root,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        match openat2(
+            &root,
+            rel_path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => return Ok(File::from(fd)),
+            Err(rustix::io::Errno::NOSYS) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    open_citation_file_fallback(repo_root, rel_path)
+}
+
+#[cfg(not(unix))]
+fn open_citation_file(_repo_root: &Path, _rel_path: &Path) -> std::io::Result<File> {
+    // The supported deployment targets are Unix. Fail closed rather than
+    // reintroducing a pathname-first open on targets without openat.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative citation opens require openat",
+    ))
+}
+
+#[cfg(unix)]
+fn open_citation_file_fallback(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<File> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+
+    let mut current: OwnedFd = open(
+        repo_root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut components = rel_path.components().peekable();
+    if components.peek().is_none() {
+        return Err(rustix::io::Errno::NOENT);
+    }
+
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::CurDir => continue,
+            _ => return Err(rustix::io::Errno::XDEV),
+        };
+        let is_last = components.peek().is_none();
+        let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        if !is_last {
+            flags |= OFlags::DIRECTORY;
+        }
+        current = openat(&current, name, flags, Mode::empty())?;
+    }
+
+    Ok(File::from(current))
 }
 
 fn syntactically_escapes_root(rel: &str) -> bool {
@@ -484,9 +547,7 @@ pub fn verify_evidence(
 
     let raw_path = match &ev.citation_path {
         Some(p) => p,
-        None => {
-            return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath)
-        }
+        None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
     };
 
     let (file_rel, range) = match parse_citation_path(raw_path) {
@@ -514,13 +575,11 @@ pub fn verify_evidence(
     let excerpt = match &ev.citation_excerpt {
         Some(e) if excerpt_is_strong(e) => e.as_str(),
         _ => {
-            return VerificationOutcome::unverified(
-                if decayed == UnverifiedReason::HashMismatch {
-                    UnverifiedReason::ExcerptTooWeak
-                } else {
-                    decayed
-                },
-            )
+            return VerificationOutcome::unverified(if decayed == UnverifiedReason::HashMismatch {
+                UnverifiedReason::ExcerptTooWeak
+            } else {
+                decayed
+            })
         }
     };
 
@@ -936,7 +995,10 @@ mod tests {
 
     #[test]
     fn test_parse_citation_path_whole_file() {
-        assert_eq!(parse_citation_path("src/foo.rs").unwrap(), ("src/foo.rs", None));
+        assert_eq!(
+            parse_citation_path("src/foo.rs").unwrap(),
+            ("src/foo.rs", None)
+        );
     }
 
     #[test]
@@ -1005,11 +1067,7 @@ mod tests {
             Some(UnverifiedReason::HashMismatch)
         );
 
-        let empty = make_evidence(
-            Some("empty.rs".to_string()),
-            hash_bytes(b""),
-            "code",
-        );
+        let empty = make_evidence(Some("empty.rs".to_string()), hash_bytes(b""), "code");
         assert!(verify_evidence(&empty, dir.path(), RelocationPolicy::Never).is_verified());
     }
 
@@ -1045,7 +1103,12 @@ mod tests {
     fn test_verify_evidence_rejects_absolute_path_as_escape() {
         let repo = tempfile::tempdir().unwrap();
         let ev = make_evidence(
-            Some(repo.path().join("missing.rs").to_string_lossy().into_owned()),
+            Some(
+                repo.path()
+                    .join("missing.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             hash_bytes(b""),
             "code",
         );
@@ -1058,11 +1121,7 @@ mod tests {
     #[test]
     fn test_verify_evidence_normal_missing_file_is_file_missing() {
         let repo = tempfile::tempdir().unwrap();
-        let ev = make_evidence(
-            Some("src/missing.rs".to_string()),
-            hash_bytes(b""),
-            "code",
-        );
+        let ev = make_evidence(Some("src/missing.rs".to_string()), hash_bytes(b""), "code");
         assert_eq!(
             verify_evidence(&ev, repo.path(), RelocationPolicy::Never).reason,
             Some(UnverifiedReason::FileMissing)
@@ -1077,7 +1136,10 @@ mod tests {
             "code",
         );
         let outcome = verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never);
-        assert_eq!(outcome.reason, Some(UnverifiedReason::MalformedCitationPath));
+        assert_eq!(
+            outcome.reason,
+            Some(UnverifiedReason::MalformedCitationPath)
+        );
         assert_eq!(outcome.reason.unwrap().as_str(), "malformed_citation");
     }
 
@@ -1134,8 +1196,7 @@ mod tests {
     #[test]
     fn test_hash_check_at_citation_matches_expected_ranges() {
         let mut tmp = NamedTempFile::new().unwrap();
-        let content =
-            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--tail";
+        let content = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--tail";
         tmp.write_all(content).unwrap();
         tmp.flush().unwrap();
 
@@ -1159,6 +1220,55 @@ mod tests {
                 HashCheck::Match
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_check_rejects_symlink_to_outside_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let secret = b"outside bytes must never be hashed";
+        let outside = parent.path().join("outside.txt");
+        std::fs::write(&outside, secret).unwrap();
+        symlink(&outside, repo.join("citation.txt")).unwrap();
+
+        assert!(matches!(
+            hash_check_at_citation(&repo, "citation.txt", None, &hash_bytes(secret)),
+            HashCheck::Failed(UnverifiedReason::FileMissing)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_descriptor_walk_fallback_rejects_mid_path_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("citation.txt"), b"secret").unwrap();
+        symlink(&outside, repo.join("linked-dir")).unwrap();
+
+        assert!(open_citation_file_fallback(&repo, Path::new("linked-dir/citation.txt")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_descriptor_walk_fallback_reads_normal_file() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/citation.txt"), b"inside").unwrap();
+
+        let mut file =
+            open_citation_file_fallback(repo.path(), Path::new("src/citation.txt")).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"inside");
     }
 
     #[test]
