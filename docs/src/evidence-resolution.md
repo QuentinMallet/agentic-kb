@@ -51,7 +51,7 @@ The entry-point call `kb_add` now succeeds or fails on its own, without requirin
 
 ### Evidence Status and the Soft Mandate
 
-The soft mandate still applies: entries of kind observation, belief, or procedure must carry at least one evidence row at write time. The difference is that the row need only include `citation_path`; the server fills in the hash and SHA.
+The soft mandate on evidence (for observation, belief, and procedure kinds) does not block writes. Entries of these kinds are accepted with zero evidence rows, stored with `evidence_status="missing"`, and trigger a write-time warning to stderr. When evidence rows are provided, they need only include `citation_path`; the server resolves it to `citation_hash` and `citation_sha`. Evidence rows are capped at `MAX_EVIDENCE_ROWS_PER_ENTRY` (200), a limit enforced at both write and retrieval time.
 
 Entries of kind convention or memory are not subject to the soft mandate and may carry zero evidence rows.
 
