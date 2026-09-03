@@ -2,7 +2,8 @@ defmodule AgenticKbMcp.DbDiscovery do
   @moduledoc """
   Walk up from cwd looking first for the fleet-ratified canonical
   .state/agent-kb/agent-kb.db, then for the legacy agent-kb/agent-kb.db fallback.
-  Roots inside a .state tree are skipped, mirroring Rust Paths.discover().
+  Roots inside a managed .state git worktree are skipped, mirroring Rust
+  Paths.discover().
   """
 
   @spec discover(String.t()) :: {:ok, String.t()} | {:error, :not_found}
@@ -12,7 +13,7 @@ defmodule AgenticKbMcp.DbDiscovery do
 
   defp do_discover(dir) do
     candidates =
-      if ".state" in Path.split(dir) do
+      if inside_managed_state_worktree?(dir) do
         []
       else
         [
@@ -26,5 +27,31 @@ defmodule AgenticKbMcp.DbDiscovery do
       nil -> do_discover(Path.dirname(dir))
       path -> {:ok, path}
     end
+  end
+
+  defp inside_managed_state_worktree?(candidate) do
+    candidate
+    |> ancestors()
+    |> Enum.any?(fn ancestor ->
+      state_dir = Path.join(ancestor, ".state")
+      gitlink = Path.join([ancestor, ".state", ".git"])
+
+      inside?(candidate, state_dir) and File.regular?(gitlink) and
+        case File.read(gitlink) do
+          {:ok, "gitdir:" <> _} -> true
+          _ -> false
+        end
+    end)
+  end
+
+  defp ancestors(path) do
+    case Path.dirname(path) do
+      ^path -> [path]
+      parent -> [path | ancestors(parent)]
+    end
+  end
+
+  defp inside?(candidate, directory) do
+    candidate == directory or String.starts_with?(candidate, directory <> "/")
   end
 end

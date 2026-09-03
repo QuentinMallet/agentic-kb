@@ -205,10 +205,10 @@ impl Paths {
         let mut warned_about_inner_state = false;
         loop {
             if dir.join(".state").is_dir() {
-                if path_contains_state_component(dir) {
+                if is_inside_managed_state_worktree(dir) {
                     if !warned_about_inner_state {
                         eprintln!(
-                            "WARNING: ignored inner .state root candidate {}; continuing to the outer repo root",
+                            "WARNING: ignored root candidate {} inside a managed .state git worktree; continuing to the outer repo root",
                             dir.display()
                         );
                         warned_about_inner_state = true;
@@ -251,9 +251,21 @@ impl Paths {
     }
 }
 
-fn path_contains_state_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == ".state")
+fn is_inside_managed_state_worktree(candidate: &Path) -> bool {
+    candidate.ancestors().any(|ancestor| {
+        let state_dir = ancestor.join(".state");
+        if !candidate.starts_with(&state_dir) {
+            return false;
+        }
+
+        let gitlink = state_dir.join(".git");
+        std::fs::metadata(&gitlink)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+            && std::fs::read(&gitlink)
+                .map(|contents| contents.starts_with(b"gitdir:"))
+                .unwrap_or(false)
+    })
 }
 
 /// Report stores at known non-canonical sibling paths without selecting or modifying them.
@@ -273,7 +285,16 @@ fn divergence_warning(root: &Path, canonical: &Paths) -> Option<String> {
     ];
     let divergences: Vec<String> = candidates
         .into_iter()
-        .filter(|(noncanonical, _)| noncanonical.exists())
+        .filter(|(noncanonical, canonical)| {
+            std::fs::symlink_metadata(noncanonical).is_ok()
+                && match (
+                    std::fs::canonicalize(noncanonical),
+                    std::fs::canonicalize(canonical),
+                ) {
+                    (Ok(noncanonical), Ok(canonical)) => noncanonical != canonical,
+                    _ => true,
+                }
+        })
         .map(|(noncanonical, canonical)| {
             format!(
                 "non-canonical {} diverges from canonical {}",
@@ -435,11 +456,17 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_inside_state_returns_outer_repo_root() {
+    fn test_discover_inside_managed_state_worktree_returns_outer_repo_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        let inner = root.join(".state").join("worktrees").join("feature");
+        let inner = root.join(".state").join("somewhere");
         fs::create_dir_all(inner.join(".state")).unwrap();
+        fs::create_dir_all(root.join(".git/worktrees")).unwrap();
+        fs::write(
+            root.join(".state/.git"),
+            format!("gitdir: {}\n", root.join(".git/worktrees/state").display()),
+        )
+        .unwrap();
 
         let _guard = CwdGuard::set(&inner);
         let discovered = Paths::discover().expect("discover should find the outer repo root");
@@ -449,11 +476,26 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_standalone_repo_under_plain_state_named_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let container = tmp.path().join("x");
+        let project = container.join(".state/project");
+        fs::create_dir_all(project.join(".state/agent-kb")).unwrap();
+
+        let _guard = CwdGuard::set(&project);
+        let discovered = Paths::discover().expect("discover should find the standalone repo");
+        drop(_guard);
+
+        assert_eq!(discovered.db, project.join(".state/agent-kb/agent-kb.db"));
+    }
+
+    #[test]
     fn test_discover_never_constructs_doubled_state_events_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         let inner = root.join(".state").join("nested");
         fs::create_dir_all(inner.join(".state")).unwrap();
+        fs::write(root.join(".state/.git"), b"gitdir: /external/gitdir\n").unwrap();
 
         let _guard = CwdGuard::set(&inner);
         let discovered = Paths::discover().expect("discover should find the outer repo root");
@@ -477,13 +519,33 @@ mod tests {
         let root = tmp.path();
         let paths = Paths::from_root(root);
         let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+        fs::write(&paths.db, b"canonical").unwrap();
         fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
-        fs::write(&legacy_db, b"").unwrap();
+        fs::write(&legacy_db, b"distinct legacy").unwrap();
 
         let warning = divergence_warning(root, &paths).expect("legacy DB must trigger warning");
         assert!(warning.contains(&paths.db.display().to_string()));
         assert!(warning.contains(&legacy_db.display().to_string()));
         assert!(warning.contains("bd-xw99"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_divergence_warning_ignores_symlink_to_canonical_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let paths = Paths::from_root(root);
+        fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+        fs::write(&paths.db, b"").unwrap();
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&paths.db, &legacy_db).unwrap();
+
+        assert!(
+            divergence_warning(root, &paths).is_none(),
+            "a legacy symlink resolving to the canonical DB must not warn"
+        );
     }
 
     #[test]
