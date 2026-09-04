@@ -87,3 +87,19 @@ other bookkeeping around those two steps.
 
 `cargo nextest run` (fast tier, default `PROPTEST_CASES` unset →16 heavy-test
 case count): **547 tests run: 547 passed (2 slow), 0 skipped** in 120.18s.
+
+## Post-T2b measurement
+
+To be filled by the caller after building on the host (the task sandbox cannot
+link binaries). Run these exact commands from the repository root:
+
+```bash
+BENCH_LANES=write bash scripts/bench-interactive.sh cold
+KB_NO_EMBED=1 cargo bench --bench write_path
+```
+
+- Commit/date/machine: TODO
+- `kb add` p50: TODO (baseline 57.0 ms)
+- `kb add` p95: TODO (baseline 90.5 ms; acceptance gate: no more than 95.5 ms)
+- `append_events_batch_only`: TODO (baseline 4.7891–5.2578 ms)
+- Full Criterion output/artifact: TODO

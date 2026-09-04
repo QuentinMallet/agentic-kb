@@ -421,6 +421,7 @@ pub fn add_locked(
     batch.extend(evidence_events);
     events::append_events_batch(&paths.events, &batch)?;
     kill_point(KillPoint::AfterLogBatch);
+    kill_point(KillPoint::BeforeApply);
 
     for ev in &batch {
         db::apply_event(&conn, embedder, ev)?;
@@ -562,20 +563,20 @@ mod tests {
     }
 
     #[test]
-    fn test_add_crash_after_log_batch_leaves_db_behind_log() {
-        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-log-batch") {
+    fn test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-sync") {
             run_crash_gap_child();
         }
 
         let (dir, paths) = setup();
         let entry_id = "crash-gap-entry";
         let status = Command::new(std::env::current_exe().unwrap())
-            .arg("test_add_crash_after_log_batch_leaves_db_behind_log")
+            .arg("test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched")
             .arg("--nocapture")
             .current_dir(dir.path())
-            .env("KB_CRASH_TEST_CASE", "after-log-batch")
+            .env("KB_CRASH_TEST_CASE", "after-sync")
             .env("KB_CRASH_TEST_ROOT", dir.path())
-            .env("KB_CRASH_AFTER", KillPoint::AfterLogBatch.to_string())
+            .env("KB_CRASH_AFTER", KillPoint::AfterSync.to_string())
             .status()
             .unwrap();
 
@@ -590,18 +591,23 @@ mod tests {
             events.contains(entry_id),
             "event log should contain the appended entry after the simulated crash"
         );
+        let read = ev_mod::read_events(&paths.events).unwrap();
+        assert!(
+            read.events.iter().any(|event| event["id"] == entry_id),
+            "the synced span must be reader-accepted and committed"
+        );
+        assert_eq!(read.committed_len, fs::metadata(&paths.events).unwrap().len());
 
-        if paths.db.exists() {
-            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
-            let rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE id=?1",
-                    [entry_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(rows, 0, "DB must not contain the entry after the crash");
-        }
+        assert!(paths.db.exists(), "add opens the DB before appending");
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id=?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "DB must not contain the entry after the crash");
     }
 
     #[test]
