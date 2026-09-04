@@ -259,6 +259,31 @@ pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
     Connection::open(db_path)
 }
 
+/// D4 swap step 1's opener: a raw connection against the *live* DB path, with
+/// none of `open_db`/`open_rw`'s side effects. `ensure_schema`'s ALTERs and
+/// `sweep_expired_peers`' DELETE would each write fresh frames into the very
+/// WAL this connection exists to drain via `wal_checkpoint(TRUNCATE)` — this
+/// opener is the only place in the crate the checkpoint may start from. The
+/// deliberate inverse of `open_auxiliary` and `open_scratch`, which both
+/// refuse the live path; this one refuses everything else.
+///
+/// TOCTOU, not reachable in practice: this inherits `Connection::open`'s
+/// default `SQLITE_OPEN_CREATE`, so between `rebuild.rs`'s `!db_path.exists()`
+/// guard and this call, a file created at `db_path` in that window would be
+/// opened (not created) here, and a path that still doesn't exist would be
+/// created empty. Both are unreachable because the caller holds the rebuild
+/// flock (`paths.lock`) across this entire step, and every writer that could
+/// create the live DB file — `open_rw`, `open_or_init` — takes that same lock
+/// first.
+pub(crate) fn open_live_for_checkpoint(db_path: &Path) -> rusqlite::Result<Connection> {
+    debug_assert!(
+        is_live_db_path(db_path),
+        "open_live_for_checkpoint is the live-path opener; use open_scratch or \
+         open_auxiliary for anything else"
+    );
+    Connection::open(db_path)
+}
+
 /// Raw file opener for tests that intentionally bypass production policy to
 /// inspect or manufacture database states.
 #[cfg(test)]
