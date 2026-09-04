@@ -52,7 +52,16 @@ pub const MIN_EXCERPT_BYTES: usize = 64;
 pub const MIN_EXCERPT_LINES: usize = 2;
 
 /// Directory names never descended into during a repo-wide relocation search.
-const EXCLUDED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+///
+/// `.state` holds the KB's own managed files (`agent-kb.db`,
+/// `agent-kb-events.jsonl`, ...) on the canonical layout; `agent-kb` holds
+/// the same files directly at the repository root on the tolerated legacy
+/// layout (`<root>/agent-kb/agent-kb.db`, no `.state` wrapper). Both store
+/// every recorded `citation_excerpt` verbatim as row/event data. Without
+/// these exclusions a repo-wide scan matches its own database as a second
+/// "candidate" location for any excerpt the KB has ever recorded, turning a
+/// legitimate unique relocation into a false `NonUnique`.
+const EXCLUDED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".state", "agent-kb"];
 
 /// How hard to look for a citation whose hash no longer matches.
 ///
@@ -850,7 +859,8 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
                 if !meta.is_file() {
                     continue;
                 }
-                if cited_identity.is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
+                if cited_identity
+                    .is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
                 {
                     continue;
                 }
@@ -896,7 +906,9 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
 
         let (file_rel, range) = match parse_citation_path(raw_path) {
             Ok(parsed) => parsed,
-            Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
+            Err(_) => {
+                return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath)
+            }
         };
 
         let decayed = match self.hash_check_at_citation(file_rel, range, &ev.citation_hash) {
@@ -919,11 +931,13 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
         let excerpt = match &ev.citation_excerpt {
             Some(e) if excerpt_is_strong(e) => e.as_str(),
             _ => {
-                return VerificationOutcome::unverified(if decayed == UnverifiedReason::HashMismatch {
-                    UnverifiedReason::ExcerptTooWeak
-                } else {
-                    decayed
-                })
+                return VerificationOutcome::unverified(
+                    if decayed == UnverifiedReason::HashMismatch {
+                        UnverifiedReason::ExcerptTooWeak
+                    } else {
+                        decayed
+                    },
+                )
             }
         };
 
@@ -1277,8 +1291,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
 
     struct RecordingCapabilityReporter {
@@ -1742,9 +1756,7 @@ mod tests {
         );
         std::fs::write(dir.path().join("a-cited.rs"), excerpt).unwrap();
         let oversized = File::create(dir.path().join("z-oversized.rs")).unwrap();
-        oversized
-            .set_len(MAX_RELOCATION_SCAN_BYTES)
-            .unwrap();
+        oversized.set_len(MAX_RELOCATION_SCAN_BYTES).unwrap();
 
         assert!(matches!(
             search_for_excerpt(
@@ -1755,6 +1767,42 @@ mod tests {
             ),
             ExcerptSearch::CapExceeded
         ));
+    }
+
+    /// br-<store-exclusion>: pins the `EXCLUDED_DIRS` contract by name for
+    /// both supported layouts. The KB's own store (wherever it lives)
+    /// stores every recorded `citation_excerpt` verbatim, so a file placed
+    /// there containing the same excerpt as a real source file must never
+    /// count as a second relocation candidate — on the canonical layout
+    /// (`.state/agent-kb/...`) or the tolerated legacy layout
+    /// (`agent-kb/...`).
+    #[test]
+    fn search_never_treats_the_kb_store_as_a_relocation_candidate() {
+        for store_rel in [".state/agent-kb", "agent-kb"] {
+            let dir = tempfile::tempdir().unwrap();
+            let excerpt = concat!(
+                "fn store_exclusion_contract() {\n",
+                "    let marker = \"the kb's own store is never a relocation candidate\";\n",
+                "}\n"
+            );
+            std::fs::write(dir.path().join("real.rs"), excerpt).unwrap();
+            let store_dir = dir.path().join(store_rel);
+            std::fs::create_dir_all(&store_dir).unwrap();
+            // Stands in for the evidence row that recorded this excerpt
+            // verbatim — a real agent-kb.db would contain the same bytes.
+            std::fs::write(store_dir.join("agent-kb.db"), excerpt).unwrap();
+
+            let result = search_for_excerpt(
+                dir.path(),
+                "real.rs",
+                excerpt,
+                RelocationPolicy::FileThenRepo,
+            );
+            assert!(
+                matches!(&result, ExcerptSearch::Unique(c) if c.rel_path == "real.rs"),
+                "store dir {store_rel:?} must not be a relocation candidate"
+            );
+        }
     }
 
     proptest! {
