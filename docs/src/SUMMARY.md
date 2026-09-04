@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](./introduction.md)
+- [Event Log Format](./event-log-format.md)
 - [Evidence Storage](./evidence-storage.md)
 - [Citation Semantics](./citation-semantics.md)
 - [Evidence Resolution](./evidence-resolution.md)
