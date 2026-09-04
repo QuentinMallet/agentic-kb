@@ -455,4 +455,110 @@ defmodule AgenticKbMcpTest do
       assert extracted_id == "ent-roundtrip-42"
     end
   end
+
+  # ── B1 (ADR-4): reject unknown arguments at the outermost layer ────────────
+  #
+  # Every request field the DEPLOYED machines_conf pin sends is enumerated in
+  # docs/decisions/b1-request-contract.md. The pin is agentic-kb rev
+  # 058f82bdb650a1de44de167adea0672c54f1f2c1 (machines_conf flake.lock) whose
+  # `dispatch_tool/3` clauses are byte-identical to this branch's.
+  @deployed_pin_args %{
+    "kb_search" => [
+      "query",
+      "limit",
+      "mode",
+      "path_prefix",
+      "tag",
+      "inline_verify_k",
+      "expand_ids"
+    ],
+    "kb_add" => [
+      "path",
+      "summary",
+      "content",
+      "tags",
+      "permanent",
+      "replace_path",
+      "kind",
+      "evidence",
+      "cues"
+    ],
+    "kb_cite" => ["path", "start", "end"],
+    "kb_import" => ["path", "upsert"],
+    "kb_stale_check" => ["files", "commits", "blame"],
+    "kb_expire" => ["entry_id", "reason", "force"],
+    "kb_run" => ["test_id", "result", "adapter", "detail"],
+    "kb_test_add" => ["app", "name", "protocol", "config", "test_id"],
+    "kb_tests" => ["app"],
+    "kb_reembed" => ["dry_run", "max_chars"],
+    "kb_compact" => [],
+    "kb_rebuild" => [],
+    "kb_get" => ["entry_id"]
+  }
+
+  describe "tool schema closure (B1)" do
+    test "every tool schema sets additionalProperties: false" do
+      for tool <- McpServer.tools() do
+        assert tool["inputSchema"]["additionalProperties"] == false,
+               "#{tool["name"]} inputSchema must set additionalProperties: false"
+      end
+    end
+
+    test "every tool in the registry has a validated argument allow-list" do
+      registered = McpServer.tools() |> Enum.map(& &1["name"]) |> Enum.sort()
+      assert registered == Enum.sort(Map.keys(@deployed_pin_args))
+    end
+  end
+
+  describe "validate_tool_args/2 (B1)" do
+    test "an unknown argument is rejected, not silently dropped by put_if_present" do
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_add", %{
+                 "path" => "a/b",
+                 "summary" => "s",
+                 "content" => "c",
+                 "confidence" => 0.9
+               })
+
+      assert message =~ "confidence"
+      assert message =~ "unknown argument"
+    end
+
+    test "the rejection names every unknown key, sorted" do
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_search", %{
+                 "query" => "q",
+                 "zeta" => 1,
+                 "alpha" => 2
+               })
+
+      assert message =~ "alpha"
+      assert message =~ "zeta"
+      assert String.contains?(message, "alpha, zeta")
+    end
+
+    test "a tool with no arguments rejects any argument" do
+      assert {:error, message} = McpServer.validate_tool_args("kb_compact", %{"vacuum" => true})
+      assert message =~ "vacuum"
+    end
+
+    test "every field the deployed machines_conf pin sends is accepted" do
+      for {tool, fields} <- @deployed_pin_args do
+        args = Map.new(fields, fn field -> {field, nil} end)
+
+        assert :ok == McpServer.validate_tool_args(tool, args),
+               "#{tool} must accept the deployed pin field set #{inspect(fields)}"
+      end
+    end
+
+    test "an unknown tool is not reported as an argument error" do
+      assert :ok == McpServer.validate_tool_args("kb_nonexistent", %{"whatever" => 1})
+    end
+
+    test "empty arguments are accepted for every tool" do
+      for tool <- McpServer.tools() do
+        assert :ok == McpServer.validate_tool_args(tool["name"], %{})
+      end
+    end
+  end
 end
