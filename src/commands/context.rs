@@ -43,10 +43,15 @@ struct Candidate {
     path: String,
     summary: String,
     rendered: String,
-    tokens: usize,
     score: f32,
     has_signal: bool,
     cited_file: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputMode {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,7 +59,7 @@ struct JsonRow<'a> {
     id: &'a str,
     path: &'a str,
     summary: &'a str,
-    tokens: usize,
+    approx_tokens: usize,
     score: f32,
 }
 
@@ -111,8 +116,13 @@ impl Context {
         // This command deliberately uses search_entries' FTS-only lane; a
         // no-op embedder keeps selection read-only and avoids model setup.
         let emb = crate::components::embedder::NoopEmbedder;
-        let candidates = build_candidates(&conn, &emb, &working_set, &branch_tokens)?;
-        let (selected, spent) = greedy_select(candidates, self.budget, self.floor);
+        let output_mode = if self.json {
+            OutputMode::Json
+        } else {
+            OutputMode::Text
+        };
+        let candidates = build_candidates(&conn, &emb, &working_set, &branch_tokens, output_mode)?;
+        let (selected, spent) = greedy_select(candidates, self.budget, self.floor, output_mode);
 
         render(&selected, self.json, writer)?;
         if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
@@ -126,7 +136,7 @@ impl Context {
             query_hits::record_injection(&paths.query_hits, &session_id, &injected, &surface);
         }
         eprintln!(
-            "context: entries considered/selected: {}/{}; tokens emitted/budget: {}/{}",
+            "context: entries considered/selected: {}/{}; approx. tokens/budget: {}/{}",
             selected.considered,
             selected.entries.len(),
             spent,
@@ -161,6 +171,36 @@ fn entry_text(id: &str, summary: &str, content: &str) -> String {
     }
 }
 
+fn json_row_string(
+    id: &str,
+    path: &str,
+    summary: &str,
+    score: f32,
+) -> anyhow::Result<(String, usize)> {
+    // The row embeds its own approx_tokens estimate, so the field's decimal
+    // width feeds back into the byte length it is estimating. `approx` only
+    // grows (adding a digit can only lengthen the rendered row), and usize
+    // has at most 20 decimal digits, so this fixed-point search converges in
+    // a handful of iterations; the explicit cap just guards against a future
+    // change breaking that monotonicity invariant.
+    let mut approx = 0usize;
+    for _ in 0..32 {
+        let rendered = serde_json::to_string(&JsonRow {
+            id,
+            path,
+            summary,
+            approx_tokens: approx,
+            score,
+        })?;
+        let next = approx_tokens(&rendered);
+        if next == approx {
+            return Ok((rendered, approx));
+        }
+        approx = next;
+    }
+    anyhow::bail!("json_row_string: approx_tokens estimate did not converge for entry {id}")
+}
+
 fn citation_file(path: &str) -> &str {
     let Some((file, range)) = path.rsplit_once(':') else {
         return path;
@@ -182,6 +222,7 @@ fn build_candidates(
     embedder: &dyn Embedder,
     working_set: &BTreeSet<String>,
     branch_tokens: &[String],
+    output_mode: OutputMode,
 ) -> anyhow::Result<Vec<Candidate>> {
     let query = branch_tokens.join(" ");
     let fts_rank: HashMap<String, usize> = if query.is_empty() {
@@ -245,12 +286,15 @@ fn build_candidates(
         let fts = fts_rank
             .get(&id)
             .map_or(0.0, |rank| 1.0 / (RRF_K + *rank as f32));
-        let rendered = entry_text(&id, &summary, &content);
+        let text_rendered = entry_text(&id, &summary, &content);
+        let rendered = match output_mode {
+            OutputMode::Text => text_rendered,
+            OutputMode::Json => json_row_string(&id, &path, &summary, overlap + fts)?.0,
+        };
         out.push(Candidate {
             id,
             path,
             summary,
-            tokens: approx_tokens(&rendered),
             rendered,
             score: overlap + fts,
             has_signal: overlap > 0.0 || fts > 0.0,
@@ -264,18 +308,25 @@ fn greedy_select(
     mut candidates: Vec<Candidate>,
     budget: usize,
     floor: Option<f32>,
+    output_mode: OutputMode,
 ) -> (Selection, usize) {
     let considered = candidates.len();
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-    let mut spent = 0usize;
+    let mut spent_bytes = 0usize;
     let mut entries = Vec::new();
     for candidate in candidates {
         let clears_floor = floor.map_or(candidate.has_signal, |f| candidate.score >= f);
-        if clears_floor && spent.saturating_add(candidate.tokens) <= budget {
-            spent += candidate.tokens;
+        let candidate_bytes = candidate.rendered.len();
+        let next_bytes = projected_bytes(spent_bytes, entries.len(), candidate_bytes, output_mode);
+        if clears_floor && approx_tokens_from_bytes(next_bytes) <= budget {
+            spent_bytes = next_bytes;
             entries.push(candidate);
         }
     }
+    let spent = match output_mode {
+        OutputMode::Json if entries.is_empty() => approx_tokens("[]\n"),
+        _ => approx_tokens_from_bytes(spent_bytes),
+    };
     (
         Selection {
             considered,
@@ -283,6 +334,27 @@ fn greedy_select(
         },
         spent,
     )
+}
+
+fn approx_tokens_from_bytes(bytes: usize) -> usize {
+    bytes.saturating_add(3) / 4
+}
+
+fn projected_bytes(
+    spent_bytes: usize,
+    selected_entries: usize,
+    candidate_bytes: usize,
+    output_mode: OutputMode,
+) -> usize {
+    match output_mode {
+        OutputMode::Text => spent_bytes.saturating_add(candidate_bytes),
+        OutputMode::Json if selected_entries == 0 => 1usize
+            .saturating_add(candidate_bytes)
+            .saturating_add(2),
+        OutputMode::Json => spent_bytes
+            .saturating_add(1)
+            .saturating_add(candidate_bytes),
+    }
 }
 
 /// Narrow benchmark API for the allocation/sort/greedy-pack portion of context.
@@ -297,14 +369,13 @@ pub fn benchmark_greedy_select(
             id: id.clone(),
             path: id.clone(),
             summary: id.clone(),
-            rendered: id.clone(),
-            tokens: *tokens,
+            rendered: "x".repeat(tokens.saturating_mul(4)),
             score: *score,
             has_signal: *has_signal,
             cited_file: None,
         })
         .collect();
-    let (selection, spent) = greedy_select(candidates, budget, None);
+    let (selection, spent) = greedy_select(candidates, budget, None, OutputMode::Text);
     (selection.entries.len(), spent)
 }
 
@@ -317,8 +388,8 @@ pub fn benchmark_db_selection(
     budget: usize,
 ) -> anyhow::Result<(usize, usize)> {
     let embedder = crate::components::embedder::NoopEmbedder;
-    let candidates = build_candidates(conn, &embedder, working_set, branch_tokens)?;
-    let (selection, spent) = greedy_select(candidates, budget, None);
+    let candidates = build_candidates(conn, &embedder, working_set, branch_tokens, OutputMode::Text)?;
+    let (selection, spent) = greedy_select(candidates, budget, None, OutputMode::Text);
     Ok((selection.entries.len(), spent))
 }
 
@@ -344,19 +415,14 @@ fn render<W: Write>(selection: &Selection, json: bool, writer: &mut W) -> anyhow
         return Ok(());
     }
     if json {
-        let rows: Vec<_> = selection
-            .entries
-            .iter()
-            .map(|e| JsonRow {
-                id: &e.id,
-                path: &e.path,
-                summary: &e.summary,
-                tokens: e.tokens,
-                score: e.score,
-            })
-            .collect();
-        serde_json::to_writer(&mut *writer, &rows)?;
-        writeln!(writer)?;
+        writer.write_all(b"[")?;
+        for (idx, entry) in selection.entries.iter().enumerate() {
+            if idx > 0 {
+                writer.write_all(b",")?;
+            }
+            writer.write_all(entry.rendered.as_bytes())?;
+        }
+        writer.write_all(b"]\n")?;
     } else {
         for entry in &selection.entries {
             writer.write_all(entry.rendered.as_bytes())?;
@@ -447,7 +513,6 @@ mod tests {
             id: id.into(),
             path: id.into(),
             summary: id.into(),
-            tokens: approx_tokens(&rendered),
             rendered,
             score,
             has_signal: signal,
@@ -539,7 +604,7 @@ mod tests {
             candidate("b", 100, 2.0, true),
             candidate("c", 8, 1.0, true),
         ];
-        let (selected, spent) = greedy_select(input, 4, None);
+        let (selected, spent) = greedy_select(input, 4, None, OutputMode::Text);
         assert_eq!(
             selected
                 .entries
@@ -566,7 +631,7 @@ mod tests {
         #[test]
         fn budget_never_exceeded(costs in prop::collection::vec(1usize..100, 0..30), budget in 0usize..300) {
             let input = costs.into_iter().enumerate().map(|(i, n)| candidate(&format!("{i:03}"), n * 4, 1.0, true)).collect();
-            let (_, spent) = greedy_select(input, budget, None);
+            let (_, spent) = greedy_select(input, budget, None, OutputMode::Text);
             prop_assert!(spent <= budget);
         }
 
@@ -579,7 +644,7 @@ mod tests {
             let input: Vec<_> = candidates.into_iter().enumerate().map(|(i, (bytes, score, signal))| {
                 candidate(&format!("{i:03}"), bytes, score, signal)
             }).collect();
-            let (selected, _) = greedy_select(input, budget, floor);
+            let (selected, _) = greedy_select(input, budget, floor, OutputMode::Text);
             let ids: Vec<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
             let unique: HashSet<_> = ids.iter().copied().collect();
             prop_assert_eq!(unique.len(), ids.len());
@@ -588,7 +653,7 @@ mod tests {
         #[test]
         fn below_floor_is_silent(scores in prop::collection::vec(0f32..1.0, 0..30)) {
             let input = scores.into_iter().enumerate().map(|(i, score)| candidate(&i.to_string(), 4, score, true)).collect();
-            let (selected, _) = greedy_select(input, 2, Some(2.0));
+            let (selected, _) = greedy_select(input, 2, Some(2.0), OutputMode::Text);
             let mut bytes = Vec::new(); render(&selected, false, &mut bytes).unwrap();
             prop_assert!(bytes.is_empty());
         }
@@ -596,8 +661,8 @@ mod tests {
         #[test]
         fn selection_is_byte_deterministic(costs in prop::collection::vec(1usize..30, 0..20), budget in 0usize..100) {
             let input: Vec<_> = costs.into_iter().enumerate().map(|(i, n)| candidate(&format!("{i:03}"), n, (i % 3) as f32, true)).collect();
-            let (a, _) = greedy_select(input.clone(), budget, None);
-            let (b, _) = greedy_select(input, budget, None);
+            let (a, _) = greedy_select(input.clone(), budget, None, OutputMode::Text);
+            let (b, _) = greedy_select(input, budget, None, OutputMode::Text);
             let (mut x, mut y) = (Vec::new(), Vec::new()); render(&a, false, &mut x).unwrap(); render(&b, false, &mut y).unwrap();
             prop_assert_eq!(x, y);
         }
@@ -606,8 +671,8 @@ mod tests {
         fn emitted_multibyte_chunks_are_utf8_valid(chars in prop::collection::vec(prop_oneof![Just('é'), Just('界'), Just('🦀')], 1..30)) {
             let content: String = chars.into_iter().collect();
             let rendered = entry_text("utf8", "résumé", &content);
-            let input = vec![Candidate { id: "utf8".into(), path: "p".into(), summary: "résumé".into(), tokens: approx_tokens(&rendered), rendered, score: 1.0, has_signal: true, cited_file: None }];
-            let (selected, _) = greedy_select(input, usize::MAX, None);
+            let input = vec![Candidate { id: "utf8".into(), path: "p".into(), summary: "résumé".into(), rendered, score: 1.0, has_signal: true, cited_file: None }];
+            let (selected, _) = greedy_select(input, usize::MAX, None, OutputMode::Text);
             for entry in selected.entries { prop_assert!(String::from_utf8(entry.rendered.into_bytes()).is_ok()); }
         }
 
@@ -615,12 +680,20 @@ mod tests {
         fn every_skipped_relevant_entry_was_unaffordable_at_its_rank(costs in prop::collection::vec(1usize..60, 0..25), budget in 0usize..100) {
             let mut ranked: Vec<_> = costs.into_iter().enumerate().map(|(i, n)| candidate(&format!("{i:03}"), n * 4, (100-i) as f32, true)).collect();
             ranked.sort_by(|a,b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-            let (selected, _) = greedy_select(ranked.clone(), budget, None);
+            let (selected, _) = greedy_select(ranked.clone(), budget, None, OutputMode::Text);
             let ids: HashSet<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
-            let mut spent_before = 0;
+            let mut spent_bytes = 0;
+            let mut selected_entries = 0usize;
             for entry in ranked {
-                if ids.contains(entry.id.as_str()) { spent_before += entry.tokens; }
-                else { prop_assert!(spent_before.saturating_add(entry.tokens) > budget); }
+                let candidate_bytes = entry.rendered.len();
+                let next_bytes =
+                    projected_bytes(spent_bytes, selected_entries, candidate_bytes, OutputMode::Text);
+                if ids.contains(entry.id.as_str()) {
+                    spent_bytes = next_bytes;
+                    selected_entries += 1;
+                } else {
+                    prop_assert!(approx_tokens_from_bytes(next_bytes) > budget);
+                }
             }
         }
     }
@@ -654,13 +727,20 @@ mod tests {
 
         let working_set = BTreeSet::from([String::from("src/hot.rs")]);
         let branch_tokens = vec![String::from("signal")];
-        let input = build_candidates(&conn, &NoopEmbedder, &working_set, &branch_tokens).unwrap();
-        let (selected, spent) = greedy_select(input, usize::MAX, None);
+        let input =
+            build_candidates(&conn, &NoopEmbedder, &working_set, &branch_tokens, OutputMode::Text)
+                .unwrap();
+        let (selected, spent) = greedy_select(input, usize::MAX, None, OutputMode::Text);
         let ids: Vec<_> = selected.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["030-top", "020-high"]);
         assert_eq!(
             spent,
-            selected.entries.iter().map(|e| e.tokens).sum::<usize>()
+            approx_tokens(&String::from_utf8({
+                let mut out = Vec::new();
+                render(&selected, false, &mut out).unwrap();
+                out
+            })
+            .unwrap())
         );
 
         let mut bytes = Vec::new();
@@ -678,8 +758,8 @@ mod tests {
             candidate("010-alpha", 4, 1.0, true),
             candidate("030-omega", 4, 1.0, true),
         ];
-        let (first, _) = greedy_select(input.clone(), 3, None);
-        let (second, _) = greedy_select(input, 3, None);
+        let (first, _) = greedy_select(input.clone(), 3, None, OutputMode::Text);
+        let (second, _) = greedy_select(input, 3, None, OutputMode::Text);
         let first_ids: Vec<_> = first.entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(first_ids, ["010-alpha", "020-zeta", "030-omega"]);
 
@@ -687,5 +767,75 @@ mod tests {
         render(&first, false, &mut a).unwrap();
         render(&second, false, &mut b).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn json_mode_selection_budget_matches_emitted_output() {
+        let summary = "quoted \"path\" and slash \\ and café";
+        let content = "line1\n\"quoted\"\npath\\\\segment\nsnowman ☃ and crab 🦀";
+        let text_rendered = entry_text("json-1", summary, content);
+        let text_budget = approx_tokens(&text_rendered);
+
+        let json_candidate = Candidate {
+            id: "json-1".into(),
+            path: "docs/json.md".into(),
+            summary: summary.into(),
+            rendered: json_row_string("json-1", "docs/json.md", summary, 1.0)
+                .unwrap()
+                .0,
+            score: 1.0,
+            has_signal: true,
+            cited_file: None,
+        };
+        let (json_selected, json_spent) =
+            greedy_select(vec![json_candidate], text_budget, None, OutputMode::Json);
+        assert!(json_selected.entries.is_empty());
+        assert_eq!(json_spent, approx_tokens("[]\n"));
+
+        let (json_rendered, json_row_tokens) =
+            json_row_string("json-1", "docs/json.md", summary, 1.0).unwrap();
+        let json_budget = approx_tokens(&format!("[{json_rendered}]\n"));
+        let json_candidate = Candidate {
+            id: "json-1".into(),
+            path: "docs/json.md".into(),
+            summary: summary.into(),
+            rendered: json_rendered,
+            score: 1.0,
+            has_signal: true,
+            cited_file: None,
+        };
+        assert!(json_row_tokens <= json_budget);
+        let (json_selected, json_spent) =
+            greedy_select(vec![json_candidate], json_budget, None, OutputMode::Json);
+        let mut out = Vec::new();
+        render(&json_selected, true, &mut out).unwrap();
+        let emitted = String::from_utf8(out).unwrap();
+        assert_eq!(json_spent, approx_tokens(&emitted));
+        assert!(json_spent <= json_budget);
+    }
+
+    #[test]
+    fn text_mode_selection_budget_matches_emitted_output() {
+        let rendered = entry_text(
+            "text-1",
+            "summary",
+            "first paragraph\nwith more text\n\nsecond paragraph",
+        );
+        let budget = approx_tokens(&rendered);
+        let input = vec![Candidate {
+            id: "text-1".into(),
+            path: "docs/text.md".into(),
+            summary: "summary".into(),
+            rendered,
+            score: 1.0,
+            has_signal: true,
+            cited_file: None,
+        }];
+        let (selected, spent) = greedy_select(input, budget, None, OutputMode::Text);
+        let mut out = Vec::new();
+        render(&selected, false, &mut out).unwrap();
+        let emitted = String::from_utf8(out).unwrap();
+        assert_eq!(spent, approx_tokens(&emitted));
+        assert!(spent <= budget);
     }
 }
