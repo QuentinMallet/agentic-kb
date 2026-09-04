@@ -17,5 +17,6 @@ pub mod bench_fixture;
 pub mod commands;
 pub mod components;
 pub mod config;
+pub mod crash_sim;
 pub mod models;
 pub mod prelude;
