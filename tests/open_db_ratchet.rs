@@ -7,7 +7,11 @@ use std::path::Path;
 /// added 5 unmigrated `db::open_db(&paths.db)` call sites in
 /// `src/commands/mcp.rs` test helpers, ahead of L1a's own migration work.
 /// Not new legacy debt introduced by L1a itself.
-const OPEN_DB_CALLSITE_RATCHET: usize = 87;
+///
+/// Lowered 87 -> 72 by L1b: peers.rs and mcp.rs's kb_peers_* handlers moved
+/// their remaining production `open_db` call sites to `open_ro`/`open_rw`
+/// (peer TTL read-time filter + locked sweep).
+const OPEN_DB_CALLSITE_RATCHET: usize = 72;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();

@@ -311,10 +311,20 @@ fn query_direct_peers(conn: &rusqlite::Connection, slug_filter: Option<&str>) ->
     match slug_filter {
         Some(slug) => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE epic_slug = ?1",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE {} AND p.epic_slug = ?1",
+                db::live_peer_predicate("p"),
+            ),
             &[&slug],
         ),
-        None => query_target_repos(conn, "SELECT DISTINCT target_repo FROM peers", &[]),
+        None => query_target_repos(
+            conn,
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE {}",
+                db::live_peer_predicate("p"),
+            ),
+            &[],
+        ),
     }
 }
 
@@ -357,12 +367,18 @@ fn query_neighbors(
     match slug_filter {
         Some(slug) => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1 AND epic_slug = ?2",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE p.source_repo = ?1 AND {} AND p.epic_slug = ?2",
+                db::live_peer_predicate("p"),
+            ),
             &[&source_repo, &slug],
         ),
         None => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE p.source_repo = ?1 AND {}",
+                db::live_peer_predicate("p"),
+            ),
             &[&source_repo],
         ),
     }
@@ -386,6 +402,37 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    fn insert_peer_edge(
+        conn: &rusqlite::Connection,
+        source_repo: &str,
+        target_repo: &str,
+        expires_at: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES(?1, 'dep', ?2, '2024-01-01T00:00:00Z', ?3)",
+            rusqlite::params![
+                format!("graph-{source_repo}-{target_repo}"),
+                source_repo,
+                expires_at
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES(?1, ?2, ?3, ?4, 'dep', '2024-01-01T00:00:00Z', ?5)",
+            rusqlite::params![
+                format!("peer-{source_repo}-{target_repo}"),
+                format!("graph-{source_repo}-{target_repo}"),
+                source_repo,
+                target_repo,
+                expires_at
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -535,6 +582,43 @@ mod tests {
             slug: None,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
+    }
+
+    #[test]
+    fn test_collect_peer_paths_filters_expired_rows_without_deleting_them() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        db::open_or_init(&paths).unwrap();
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+
+        insert_peer_edge(&conn, "repo-a", "repo-expired", Some("2000-01-01 00:00:00"));
+        insert_peer_edge(&conn, "repo-a", "repo-live", None);
+
+        // `reachable_from=None` queries direct peers with no source_repo scope
+        // (used when there is no single starting repo), so this second hop is
+        // seeded only after the direct-peers assertion below to keep that
+        // assertion scoped to repo-a's own edges.
+        let direct = collect_peer_paths(&conn, None, 1, None);
+        assert_eq!(direct, vec!["repo-live".to_string()]);
+
+        insert_peer_edge(&conn, "repo-live", "repo-live-2", None);
+
+        let bfs = collect_peer_paths(&conn, Some("repo-a"), 2, None);
+        assert_eq!(
+            bfs,
+            vec!["repo-live".to_string(), "repo-live-2".to_string()],
+            "expired edges must be invisible to traversal and to federated peer collection"
+        );
+
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 3,
+            "the expired peer row must still be physically present before any locked sweep runs"
+        );
     }
 
     #[test]

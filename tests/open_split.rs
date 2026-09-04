@@ -36,6 +36,25 @@ fn shm_path(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-shm", db_path.display()))
 }
 
+fn insert_expired_peer(conn: &Connection, source_repo: &str, target_repo: &str) {
+    conn.execute(
+        "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+         VALUES('graph-expired', 'epic', ?1, '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
+        [source_repo],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO peers(
+            id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+         ) VALUES(
+            'peer-expired', 'graph-expired', ?1, ?2, 'member', '2024-01-01T00:00:00Z',
+            '2000-01-01 00:00:00'
+         )",
+        [source_repo, target_repo],
+    )
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // open_ro
 // ---------------------------------------------------------------------------
@@ -150,6 +169,33 @@ fn open_ro_recovers_a_hot_wal_left_by_a_crashed_writer() {
         })
         .expect("open_ro must read data committed before the crash");
     assert_eq!(summary, "summary");
+}
+
+#[test]
+fn open_or_init_does_not_sweep_expired_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = repo(dir.path());
+    db::open_or_init(&paths).unwrap();
+
+    {
+        let conn = Connection::open(&paths.db).unwrap();
+        insert_expired_peer(&conn, "repo-a", "repo-b");
+    }
+
+    db::open_or_init(&paths).unwrap();
+
+    let conn = Connection::open(&paths.db).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM peers WHERE id='peer-expired'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "open_or_init must keep expired peers physically present; L1b moves deletion to locked writers"
+    );
 }
 
 // ---------------------------------------------------------------------------

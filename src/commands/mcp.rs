@@ -1036,7 +1036,13 @@ fn handle_test_add(
 }
 
 fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"lock_error","message":e.to_string()})
+        }
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1096,7 +1102,13 @@ fn handle_reembed(
                        "message":"KB_NO_EMBED is set — no embedder available"});
     }
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"lock_error","message":e.to_string()})
+        }
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1208,7 +1220,13 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         return json!({"id":id,"type":"error","code":"parse_error","message":"provide files or commits"});
     }
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"lock_error","message":e.to_string()})
+        }
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1930,7 +1948,13 @@ fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value 
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"lock_error","message":e.to_string()})
+        }
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1994,6 +2018,9 @@ fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value 
     ) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
+    if let Err(e) = db::sweep_expired_peers(&conn) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
 
     json!({"id": id, "type": "ok", "peer_id": peer_id})
 }
@@ -2004,16 +2031,19 @@ fn handle_kb_peers_list(id: &Value, req: &Value, paths: &config::Paths) -> Value
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let sql = "SELECT p.id, p.source_repo, p.target_repo, g.graph_type, p.epic_slug, p.expires_at \
-               FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
-               WHERE (?1 IS NULL OR g.graph_type = ?1)";
+    let sql = format!(
+        "SELECT p.id, p.source_repo, p.target_repo, g.graph_type, p.epic_slug, p.expires_at \
+         FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+         WHERE {} AND (?1 IS NULL OR g.graph_type = ?1)",
+        db::live_peer_predicate("p"),
+    );
 
-    let mut stmt = match conn.prepare(sql) {
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2055,7 +2085,13 @@ fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Val
         }
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => {
+            return json!({"id":id,"type":"error","code":"lock_error","message":e.to_string()})
+        }
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2069,6 +2105,9 @@ fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Val
         "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
         [],
     ) {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    if let Err(e) = db::sweep_expired_peers(&conn) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -2278,6 +2317,43 @@ mod tests {
         let telemetry = query_hits::injection_telemetry(&paths.query_hits).unwrap();
         assert_eq!(telemetry.total_injections, 0);
         assert_eq!(telemetry.unknown_surface_rate, 0.0);
+    }
+
+    #[test]
+    fn test_handle_kb_peers_list_filters_expired_rows_without_deleting_them() {
+        let (_dir, paths, _emb) = setup();
+        db::open_or_init(&paths).unwrap();
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES('mcp-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES
+             ('mcp-expired', 'mcp-graph', 'repo-a', 'repo-expired', 'member', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00'),
+             ('mcp-live', 'mcp-graph', 'repo-a', 'repo-live', 'member', '2024-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let response = handle_kb_peers_list(&json!("req-1"), &json!({}), &paths);
+        let rows = response["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "MCP kb_peers_list must hide expired peers");
+        assert_eq!(rows[0]["target_repo"], "repo-live");
+
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 2,
+            "MCP filtering must not delete the expired row on read"
+        );
     }
 
     #[test]
