@@ -588,6 +588,40 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
     .is_ok()
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    Ok(found)
+}
+
+/// Idempotent migration: ensure `source_weights.updated_at` exists (D6 R2).
+///
+/// A no-op on a fresh DB, whose `CREATE TABLE IF NOT EXISTS source_weights`
+/// already declares the column. On a pre-existing DB missing it, adds a
+/// plain nullable column (no non-constant `DEFAULT`, which SQLite rejects
+/// via `ADD COLUMN` once the table has rows) and backfills existing rows in
+/// a separate `UPDATE`. Unexpected errors propagate rather than being
+/// swallowed, so a schema divergence is loud instead of silent.
+fn migrate_source_weights_updated_at(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "source_weights") {
+        return Ok(());
+    }
+    if column_exists(conn, "source_weights", "updated_at")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE source_weights ADD COLUMN updated_at TEXT;")
+        .context("migrating source_weights: add updated_at column")?;
+    conn.execute(
+        "UPDATE source_weights SET updated_at = datetime('now') WHERE updated_at IS NULL",
+        [],
+    )
+    .context("migrating source_weights: backfill updated_at")?;
+    Ok(())
+}
+
 /// Open an in-memory database with the full schema.
 pub fn open_db_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -731,10 +765,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
-    // Migration: add updated_at to source_weights for Phase 5 weight tracking.
-    let _ = conn.execute_batch(
-        "ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));",
-    );
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -779,6 +809,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Migration: add updated_at to source_weights for Phase 5 weight tracking
+    // (D6 R2). Guarded by PRAGMA table_info instead of a blind
+    // `let _ = ALTER ... DEFAULT (datetime('now'))`: SQLite rejects a
+    // non-constant default on ADD COLUMN once the table already holds rows,
+    // so the old migration silently never ran against an upgraded DB while
+    // still swallowing the error. Fresh DBs already have the column from the
+    // CREATE TABLE above; this only fires for a pre-existing table missing it.
+    migrate_source_weights_updated_at(conn)?;
     // AC-P6: peer graph tables (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -3078,6 +3116,99 @@ mod tests {
         assert!(cols.contains(&"session_id".to_string()));
         assert!(cols.contains(&"successes".to_string()));
         assert!(cols.contains(&"failures".to_string()));
+    }
+
+    #[test]
+    fn test_source_weights_migration_matches_fresh_schema_on_upgraded_db() {
+        // D6 R2 (failing-test-first regression): simulate a pre-migration
+        // DB where `source_weights` exists WITH ROWS but lacks
+        // `updated_at` (the column was added after the table's original
+        // release). SQLite rejects `ALTER TABLE ... ADD COLUMN ... DEFAULT
+        // (datetime('now'))` once a table has existing rows (non-constant
+        // default), so the prior `let _ =`-swallowed migration silently
+        // never added the column here — an upgraded DB's schema diverged
+        // from a fresh DB's while the swallow hid the failure.
+        let legacy = rusqlite::Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE source_weights (
+                    kind        TEXT NOT NULL,
+                    session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                    successes   INTEGER NOT NULL DEFAULT 0,
+                    failures    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, session_id)
+                );
+                INSERT INTO source_weights(kind, successes, failures) VALUES ('code', 3, 1);",
+            )
+            .unwrap();
+
+        ensure_schema(&legacy).unwrap();
+
+        let fresh = open_db_memory().unwrap();
+        let table_info = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("PRAGMA table_info(source_weights)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            table_info(&legacy),
+            table_info(&fresh),
+            "an upgraded DB must expose identical PRAGMA table_info for source_weights as a fresh DB"
+        );
+
+        let updated_at: Option<String> = legacy
+            .query_row(
+                "SELECT updated_at FROM source_weights WHERE kind='code'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            updated_at.is_some(),
+            "existing rows must be backfilled with a non-null updated_at"
+        );
+    }
+
+    #[test]
+    fn test_source_weights_migration_is_noop_when_column_already_present() {
+        // Idempotency: running the migration twice (e.g. two `open_db` calls
+        // against the same file) must not error or clobber the column.
+        let conn = open_db_memory().unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_source_weights_migration_propagates_unexpected_errors() {
+        // D6 R2 acceptance: an unexpected migration error propagates rather
+        // than being swallowed. Force the backfill UPDATE to fail via a
+        // trigger and confirm the caller observes an Err, not a silent Ok.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_weights (
+                kind        TEXT NOT NULL,
+                session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                successes   INTEGER NOT NULL DEFAULT 0,
+                failures    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (kind, session_id)
+            );
+            INSERT INTO source_weights(kind) VALUES ('code');
+            CREATE TRIGGER source_weights_reject_backfill
+            BEFORE UPDATE ON source_weights
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated backfill failure');
+            END;",
+        )
+        .unwrap();
+
+        let result = migrate_source_weights_updated_at(&conn);
+        assert!(
+            result.is_err(),
+            "an unexpected migration error must propagate, not be swallowed"
+        );
     }
 
     #[test]
