@@ -104,8 +104,7 @@ impl CandleEmbedder {
         let weights_path = Self::download_hf_file(model_id, "model.safetensors", cache_dir)?;
 
         let config_data = std::fs::read_to_string(&config_path)?;
-        let config: candle_transformers::models::bert::Config =
-            serde_json::from_str(&config_data)?;
+        let config: candle_transformers::models::bert::Config = serde_json::from_str(&config_data)?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
@@ -117,11 +116,7 @@ impl CandleEmbedder {
         // writes to the cache after download_hf_file returns.
         #[allow(unsafe_code)]
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[weights_path],
-                candle_core::DType::F32,
-                &device,
-            )?
+            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)?
         };
         let model = candle_transformers::models::bert::BertModel::load(vb, &config)?;
 
@@ -133,7 +128,10 @@ impl Embedder for CandleEmbedder {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         use candle_core::{Device, Tensor};
 
-        let mut guard = self.inner.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         if guard.is_none() {
             *guard = Some(Self::load_model(&self.cache_dir)?);
         }

@@ -76,7 +76,12 @@ fn count_cues(conn: &rusqlite::Connection, entry_id: &str) -> i64 {
 fn test_upsert_with_cues_creates_embedded_rows() {
     let conn = open_db_memory().unwrap();
     let emb = KeywordEmbedder;
-    apply_event(&conn, &emb, &entry_event("c1", json!(["cuetok anchor", "other anchor"]))).unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry_event("c1", json!(["cuetok anchor", "other anchor"])),
+    )
+    .unwrap();
 
     assert_eq!(count_cues(&conn, "c1"), 2);
     let with_emb: i64 = conn
@@ -94,7 +99,12 @@ fn test_upsert_with_cues_creates_embedded_rows() {
 fn test_reupsert_replaces_cue_rows() {
     let conn = open_db_memory().unwrap();
     let emb = KeywordEmbedder;
-    apply_event(&conn, &emb, &entry_event("c2", json!(["old anchor one", "old anchor two"]))).unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry_event("c2", json!(["old anchor one", "old anchor two"])),
+    )
+    .unwrap();
     apply_event(&conn, &emb, &entry_event("c2", json!(["new anchor"]))).unwrap();
 
     assert_eq!(count_cues(&conn, "c2"), 1, "old cue rows must be replaced");
@@ -119,7 +129,11 @@ fn test_expire_removes_cue_rows() {
                 "reason": "test", "ts": "2024-01-02T00:00:00Z"}),
     )
     .unwrap();
-    assert_eq!(count_cues(&conn, "c3"), 0, "expire must remove cue rows (no orphans)");
+    assert_eq!(
+        count_cues(&conn, "c3"),
+        0,
+        "expire must remove cue rows (no orphans)"
+    );
 }
 
 /// Invariant 4: the cue lane alone can surface an entry in hybrid search.
@@ -151,7 +165,10 @@ fn test_cue_lane_reaches_entry_hybrid() {
     let results = search_entries(&conn, &emb, "cuetok probe", &opts).unwrap();
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&"c4"), "cue lane must surface c4, got {ids:?}");
-    assert_eq!(ids[0], "c4", "cue-matched entry must rank first, got {ids:?}");
+    assert_eq!(
+        ids[0], "c4",
+        "cue-matched entry must rank first, got {ids:?}"
+    );
 }
 
 /// Invariant 5: legacy events without cues field — no rows, no errors.
@@ -200,7 +217,12 @@ fn test_rebuild_replays_cue_rows() {
 
     // History: r1 gets cues then a replacing cue set; r2 gets cues then expires.
     add(&paths, &emb, mk("r1", vec!["old anchor".into()])).unwrap();
-    add(&paths, &emb, mk("r1", vec!["cuetok kept".into(), "second kept".into()])).unwrap();
+    add(
+        &paths,
+        &emb,
+        mk("r1", vec!["cuetok kept".into(), "second kept".into()]),
+    )
+    .unwrap();
     add(&paths, &emb, mk("r2", vec!["doomed anchor".into()])).unwrap();
     {
         let conn = kb::components::db::open_db(&paths.db).unwrap();
@@ -293,7 +315,11 @@ fn test_kb_core_add_propagates_cues() {
     // DB has the cue row.
     let conn = rusqlite::Connection::open(&paths.db).unwrap();
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM cues WHERE entry_id='cue-add-1'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM cues WHERE entry_id='cue-add-1'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1);
 }

@@ -2,10 +2,9 @@
 
 use crate::{commands::EntryPoint, config::KbConfig};
 use abscissa_core::{
-    Application, FrameworkError, StandardPaths,
     application::{self, AppCell},
     config::{self, CfgCell},
-    trace,
+    trace, Application, FrameworkError, StandardPaths,
 };
 
 /// Application state

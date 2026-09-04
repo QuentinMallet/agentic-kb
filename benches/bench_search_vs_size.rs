@@ -227,7 +227,9 @@ fn bench_search_vs_size_xlarge(c: &mut Criterion) {
     // 1M-entry bench only runs when BENCH_LARGE_SIZE=1.
     // Without this env var the group is registered but immediately finished
     // (zero measurements). This prevents ~1.8 GB memory pressure in CI.
-    let enabled = std::env::var("BENCH_LARGE_SIZE").map(|v| v == "1").unwrap_or(false);
+    let enabled = std::env::var("BENCH_LARGE_SIZE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     let mut group = c.benchmark_group("search_vs_size_1m");
     group.sampling_mode(SamplingMode::Flat);
@@ -247,16 +249,7 @@ fn bench_search_vs_size_xlarge(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches_small,
-    bench_search_vs_size_small
-);
-criterion_group!(
-    benches_large,
-    bench_search_vs_size_large
-);
-criterion_group!(
-    benches_xlarge,
-    bench_search_vs_size_xlarge
-);
+criterion_group!(benches_small, bench_search_vs_size_small);
+criterion_group!(benches_large, bench_search_vs_size_large);
+criterion_group!(benches_xlarge, bench_search_vs_size_xlarge);
 criterion_main!(benches_small, benches_large, benches_xlarge);

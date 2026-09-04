@@ -63,13 +63,23 @@ fn setup_db_with_dated_entries() -> rusqlite::Connection {
     apply_event(
         &conn,
         &emb,
-        &make_entry("old-entry", "bench/old", "recencytest old observation", &["recencytest"]),
+        &make_entry(
+            "old-entry",
+            "bench/old",
+            "recencytest old observation",
+            &["recencytest"],
+        ),
     )
     .unwrap();
     apply_event(
         &conn,
         &emb,
-        &make_entry("new-entry", "bench/new", "recencytest new observation", &["recencytest"]),
+        &make_entry(
+            "new-entry",
+            "bench/new",
+            "recencytest new observation",
+            &["recencytest"],
+        ),
     )
     .unwrap();
 
@@ -118,7 +128,10 @@ fn test_lambda_zero_stable_ordering() {
     assert!(!results_a.is_empty(), "must return results");
     let ids_a: Vec<&str> = results_a.iter().map(|r| r.id.as_str()).collect();
     let ids_b: Vec<&str> = results_b.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(ids_a, ids_b, "λ=0.0 must produce identical ordering across calls");
+    assert_eq!(
+        ids_a, ids_b,
+        "λ=0.0 must produce identical ordering across calls"
+    );
 }
 
 /// Test 2: λ>0 causes the newer entry to rank above the identical-RRF older entry.
@@ -138,7 +151,8 @@ fn test_lambda_positive_newer_ranks_higher() {
 
     assert!(results.len() >= 2, "must return at least 2 entries");
     assert_eq!(
-        results[0].id, "new-entry",
+        results[0].id,
+        "new-entry",
         "with λ=0.1 the newer entry (1 day old) must outrank the older entry (200 days old); \
          order was: {:?}",
         results.iter().map(|r| &r.id).collect::<Vec<_>>()

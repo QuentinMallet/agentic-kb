@@ -68,13 +68,48 @@ fn evidence(entry_id: &str, ev_id: &str, file: &str) -> serde_json::Value {
 fn setup() -> rusqlite::Connection {
     let conn = open_db_memory().unwrap();
     let emb = NoopEmbedder;
-    apply_event(&conn, &emb, &entry("seed", "arch/search/rrf", json!(["fusion"]))).unwrap();
-    apply_event(&conn, &emb, &entry("sib", "arch/search/fts", json!(["lane"]))).unwrap();
-    apply_event(&conn, &emb, &entry("tagmate", "ops/deploy", json!(["fusion"]))).unwrap();
-    apply_event(&conn, &emb, &entry("evmate", "notes/db", json!(["storage"]))).unwrap();
-    apply_event(&conn, &emb, &entry("multi", "arch/search/mmr", json!(["fusion"]))).unwrap();
-    apply_event(&conn, &emb, &entry("far", "misc/other", json!(["unrelated"]))).unwrap();
-    apply_event(&conn, &emb, &entry("stale_sib", "arch/search/old", json!(["fusion"]))).unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("seed", "arch/search/rrf", json!(["fusion"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("sib", "arch/search/fts", json!(["lane"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("tagmate", "ops/deploy", json!(["fusion"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("evmate", "notes/db", json!(["storage"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("multi", "arch/search/mmr", json!(["fusion"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("far", "misc/other", json!(["unrelated"])),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &entry("stale_sib", "arch/search/old", json!(["fusion"])),
+    )
+    .unwrap();
     apply_event(&conn, &emb, &evidence("seed", "ev-1", "src/db.rs")).unwrap();
     apply_event(&conn, &emb, &evidence("evmate", "ev-2", "src/db.rs")).unwrap();
     apply_event(
@@ -94,10 +129,22 @@ fn test_expand_finds_all_facet_neighbors() {
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
 
     assert!(ids.contains(&"sib"), "path sibling must be found: {ids:?}");
-    assert!(ids.contains(&"tagmate"), "shared-tag neighbor must be found: {ids:?}");
-    assert!(ids.contains(&"evmate"), "shared-evidence neighbor must be found: {ids:?}");
-    assert!(ids.contains(&"multi"), "multi-facet neighbor must be found: {ids:?}");
-    assert!(!ids.contains(&"far"), "unrelated entry must not appear: {ids:?}");
+    assert!(
+        ids.contains(&"tagmate"),
+        "shared-tag neighbor must be found: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"evmate"),
+        "shared-evidence neighbor must be found: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"multi"),
+        "multi-facet neighbor must be found: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"far"),
+        "unrelated entry must not appear: {ids:?}"
+    );
 }
 
 #[test]
@@ -106,7 +153,10 @@ fn test_expand_excludes_seed_and_stale() {
     let results = expand_entries(&conn, &["seed".to_string()], 10).unwrap();
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
     assert!(!ids.contains(&"seed"), "seed must not be returned: {ids:?}");
-    assert!(!ids.contains(&"stale_sib"), "stale entries must not be returned: {ids:?}");
+    assert!(
+        !ids.contains(&"stale_sib"),
+        "stale entries must not be returned: {ids:?}"
+    );
 }
 
 #[test]
@@ -115,7 +165,8 @@ fn test_expand_multi_facet_ranks_first() {
     let results = expand_entries(&conn, &["seed".to_string()], 10).unwrap();
     assert!(!results.is_empty());
     assert_eq!(
-        results[0].id, "multi",
+        results[0].id,
+        "multi",
         "two-facet neighbor (sibling + shared tag) must outrank single-facet ones: {:?}",
         results.iter().map(|r| (&r.id, r.score)).collect::<Vec<_>>()
     );
@@ -149,7 +200,10 @@ fn test_expand_seed_count_capped() {
     let mut ids2: Vec<String> = vec!["seed".to_string()]; // inside the cap
     ids2.extend((0..40).map(|i| format!("junk-{i}")));
     let results2 = expand_entries(&conn, &ids2, 10).unwrap();
-    assert!(!results2.is_empty(), "seed inside the cap must still expand");
+    assert!(
+        !results2.is_empty(),
+        "seed inside the cap must still expand"
+    );
 }
 
 #[test]

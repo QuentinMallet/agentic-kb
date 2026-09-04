@@ -190,7 +190,8 @@ fn aws_access_key_idempotent() {
 #[test]
 fn jwt_positive() {
     // Minimal valid-looking JWT (3 base64url segments)
-    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    let jwt =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     assert_redacted(jwt);
 }
 
@@ -202,7 +203,8 @@ fn jwt_negative() {
 
 #[test]
 fn jwt_idempotent() {
-    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    let jwt =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     let once = redact_str(jwt).into_owned();
     let twice = redact_str(&once).into_owned();
     assert_eq!(once, twice, "idempotence violated for jwt");
@@ -274,7 +276,11 @@ fn redact_in_place_array_with_secret() {
     redact_in_place(&mut val);
 
     let arr = val.as_array().unwrap();
-    assert_eq!(arr[0].as_str().unwrap(), "clean text", "clean element unchanged");
+    assert_eq!(
+        arr[0].as_str().unwrap(),
+        "clean text",
+        "clean element unchanged"
+    );
     assert!(
         arr[1].as_str().unwrap().contains("<REDACTED>"),
         "secret element must be redacted"

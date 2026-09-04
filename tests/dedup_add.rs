@@ -78,18 +78,50 @@ fn test_similar_existing_reports_near_duplicate() {
     let (_dir, paths) = setup();
     let emb = ClusterEmbedder;
 
-    add(&paths, &emb, args("dup-a", "notes/a", "alpha fact one", None)).unwrap();
-    add(&paths, &emb, args("far-b", "notes/b", "beta unrelated", None)).unwrap();
+    add(
+        &paths,
+        &emb,
+        args("dup-a", "notes/a", "alpha fact one", None),
+    )
+    .unwrap();
+    add(
+        &paths,
+        &emb,
+        args("far-b", "notes/b", "beta unrelated", None),
+    )
+    .unwrap();
 
-    let out = add(&paths, &emb, args("dup-c", "notes/c", "alpha fact restated", Some(0.85))).unwrap();
+    let out = add(
+        &paths,
+        &emb,
+        args("dup-c", "notes/c", "alpha fact restated", Some(0.85)),
+    )
+    .unwrap();
 
     let ids: Vec<&str> = out.similar_existing.iter().map(|s| s.id.as_str()).collect();
-    assert!(ids.contains(&"dup-a"), "same-cluster entry must be reported, got {ids:?}");
-    assert!(!ids.contains(&"far-b"), "orthogonal entry must not be reported, got {ids:?}");
-    assert!(!ids.contains(&"dup-c"), "the new entry must never self-match, got {ids:?}");
+    assert!(
+        ids.contains(&"dup-a"),
+        "same-cluster entry must be reported, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"far-b"),
+        "orthogonal entry must not be reported, got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"dup-c"),
+        "the new entry must never self-match, got {ids:?}"
+    );
 
-    let hit = out.similar_existing.iter().find(|s| s.id == "dup-a").unwrap();
-    assert!(hit.score >= 0.85, "reported score must be >= cutoff, got {}", hit.score);
+    let hit = out
+        .similar_existing
+        .iter()
+        .find(|s| s.id == "dup-a")
+        .unwrap();
+    assert!(
+        hit.score >= 0.85,
+        "reported score must be >= cutoff, got {}",
+        hit.score
+    );
     assert_eq!(hit.path, "notes/a");
     assert_eq!(hit.summary, "alpha fact one");
 }
@@ -102,7 +134,10 @@ fn test_dedup_disabled_when_cutoff_none() {
 
     add(&paths, &emb, args("d1", "notes/1", "alpha original", None)).unwrap();
     let out = add(&paths, &emb, args("d2", "notes/2", "alpha again", None)).unwrap();
-    assert!(out.similar_existing.is_empty(), "probe must be off when cutoff is None");
+    assert!(
+        out.similar_existing.is_empty(),
+        "probe must be off when cutoff is None"
+    );
 }
 
 /// Invariant 5: replace_path expires same-path entries — they are not dupes.
@@ -117,9 +152,14 @@ fn test_replace_path_same_path_not_reported() {
     a.replace_path = true;
     let out = add(&paths, &emb, a).unwrap();
     assert!(
-        out.similar_existing.iter().all(|s| s.path != "notes/replaced"),
+        out.similar_existing
+            .iter()
+            .all(|s| s.path != "notes/replaced"),
         "entries being replaced at the same path must not be reported: {:?}",
-        out.similar_existing.iter().map(|s| &s.id).collect::<Vec<_>>()
+        out.similar_existing
+            .iter()
+            .map(|s| &s.id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -147,6 +187,11 @@ fn test_noop_embedder_probe_disabled() {
     let (_dir, paths) = setup();
 
     add(&paths, &NoopEmbedder, args("n1", "notes/n1", "alpha", None)).unwrap();
-    let out = add(&paths, &NoopEmbedder, args("n2", "notes/n2", "alpha", Some(0.85))).unwrap();
+    let out = add(
+        &paths,
+        &NoopEmbedder,
+        args("n2", "notes/n2", "alpha", Some(0.85)),
+    )
+    .unwrap();
     assert!(out.similar_existing.is_empty());
 }

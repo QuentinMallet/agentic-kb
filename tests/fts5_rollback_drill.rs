@@ -18,7 +18,7 @@
 ///   # No rebuild required; dual-write kept both tables in sync
 ///   # To confirm: run this test against the production DB
 use kb::components::db::{
-    apply_event, fts_query_contentless, fts_query_content_entries, open_db_memory, SearchOptions,
+    apply_event, fts_query_content_entries, fts_query_contentless, open_db_memory, SearchOptions,
 };
 use rusqlite::Connection;
 
@@ -72,7 +72,11 @@ fn apply_post_cutover_writes(conn: &Connection, count: usize) {
 /// Build a reference result set using the contentless table directly.
 /// This is the "direct event replay" reference: we query entries_fts (v1)
 /// which was populated by the same apply_event calls that populated entries_fts_v2.
-fn reference_ids(conn: &Connection, safe_q: &str, opts: &SearchOptions) -> std::collections::BTreeSet<String> {
+fn reference_ids(
+    conn: &Connection,
+    safe_q: &str,
+    opts: &SearchOptions,
+) -> std::collections::BTreeSet<String> {
     fts_query_contentless(conn, safe_q, opts)
         .unwrap_or_default()
         .into_iter()
@@ -122,18 +126,20 @@ fn test_rollback_after_1000_post_cutover_writes() {
             .join(" ");
 
         // Step 4: query contentless (rollback) path
-        let rollback_ids: std::collections::BTreeSet<String> = fts_query_contentless(&conn, &safe_q, &opts)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect();
+        let rollback_ids: std::collections::BTreeSet<String> =
+            fts_query_contentless(&conn, &safe_q, &opts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect();
 
         // Step 5: compare against reference (content_entries path, which was the primary)
-        let primary_ids: std::collections::BTreeSet<String> = fts_query_content_entries(&conn, &safe_q, &opts)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect();
+        let primary_ids: std::collections::BTreeSet<String> =
+            fts_query_content_entries(&conn, &safe_q, &opts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect();
 
         if rollback_ids != primary_ids {
             divergent.push(format!(
@@ -144,7 +150,10 @@ fn test_rollback_after_1000_post_cutover_writes() {
 
         // Also verify against direct replay reference (same table, sanity check)
         let ref_ids = reference_ids(&conn, &safe_q, &opts);
-        assert_eq!(rollback_ids, ref_ids, "rollback must match direct replay for query={raw_query:?}");
+        assert_eq!(
+            rollback_ids, ref_ids,
+            "rollback must match direct replay for query={raw_query:?}"
+        );
     }
 
     assert!(

@@ -38,11 +38,17 @@ fn test_abstraction_mode_excludes_content_includes_tags() {
         "handles JWT tokens",
         r#"["auth","security"]"#,
     );
-    assert!(!text.contains("JWT"), "content must not leak into abstraction embedding: {text}");
+    assert!(
+        !text.contains("JWT"),
+        "content must not leak into abstraction embedding: {text}"
+    );
     assert!(text.contains("src/auth.rs"));
     assert!(text.contains("authentication module"));
     assert!(text.contains("auth") && text.contains("security"));
-    assert!(!text.contains('[') && !text.contains('"'), "tags must be flattened, got: {text}");
+    assert!(
+        !text.contains('[') && !text.contains('"'),
+        "tags must be flattened, got: {text}"
+    );
 }
 
 #[test]
@@ -53,7 +59,10 @@ fn test_non_json_tags_pass_through() {
 
 #[test]
 fn test_mode_parsing() {
-    assert_eq!(EmbedTextMode::parse(Some("abstraction")), EmbedTextMode::Abstraction);
+    assert_eq!(
+        EmbedTextMode::parse(Some("abstraction")),
+        EmbedTextMode::Abstraction
+    );
     assert_eq!(EmbedTextMode::parse(Some("full")), EmbedTextMode::Full);
     assert_eq!(EmbedTextMode::parse(Some("garbage")), EmbedTextMode::Full);
     assert_eq!(EmbedTextMode::parse(None), EmbedTextMode::Full);
@@ -84,14 +93,22 @@ fn test_embed_mode_vintage_stamp() {
 
     check_embed_mode_vintage(&conn, EmbedTextMode::Full);
     let stored: String = conn
-        .query_row("SELECT value FROM kb_meta WHERE key='embed_text_mode'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='embed_text_mode'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(stored, "full", "first write must stamp the active mode");
 
     // Different mode: stamp must NOT be overwritten (warning path).
     check_embed_mode_vintage(&conn, EmbedTextMode::Abstraction);
     let stored: String = conn
-        .query_row("SELECT value FROM kb_meta WHERE key='embed_text_mode'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key='embed_text_mode'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(stored, "full", "mismatched mode must not re-stamp");
 }
@@ -101,7 +118,9 @@ fn test_embed_mode_vintage_stamp() {
 #[test]
 fn test_apply_event_uses_full_text_by_default() {
     let conn = open_db_memory().unwrap();
-    let emb = CapturingEmbedder { seen: Mutex::new(vec![]) };
+    let emb = CapturingEmbedder {
+        seen: Mutex::new(vec![]),
+    };
     apply_event(
         &conn,
         &emb,

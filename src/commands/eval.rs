@@ -280,8 +280,17 @@ mod tests {
 
     #[test]
     fn test_compare_exit_code_only_for_regressions() {
-        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Regression), Some(EXIT_COMPARE_REGRESSION));
-        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Significant), None);
-        assert_eq!(compare_exit_code(crate::components::retrieval_eval::Verdict::Inconclusive), None);
+        assert_eq!(
+            compare_exit_code(crate::components::retrieval_eval::Verdict::Regression),
+            Some(EXIT_COMPARE_REGRESSION)
+        );
+        assert_eq!(
+            compare_exit_code(crate::components::retrieval_eval::Verdict::Significant),
+            None
+        );
+        assert_eq!(
+            compare_exit_code(crate::components::retrieval_eval::Verdict::Inconclusive),
+            None
+        );
     }
 }

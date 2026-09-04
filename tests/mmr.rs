@@ -64,9 +64,24 @@ fn make_entry(id: &str, path: &str, summary: &str) -> serde_json::Value {
 fn setup() -> rusqlite::Connection {
     let conn = open_db_memory().unwrap();
     let emb = ClusterEmbedder;
-    apply_event(&conn, &emb, &make_entry("a1", "n/a1", "shared alnote topic one")).unwrap();
-    apply_event(&conn, &emb, &make_entry("a2", "n/a2", "shared alnote topic two")).unwrap();
-    apply_event(&conn, &emb, &make_entry("b1", "n/b1", "shared other subject")).unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &make_entry("a1", "n/a1", "shared alnote topic one"),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &make_entry("a2", "n/a2", "shared alnote topic two"),
+    )
+    .unwrap();
+    apply_event(
+        &conn,
+        &emb,
+        &make_entry("b1", "n/b1", "shared other subject"),
+    )
+    .unwrap();
     conn
 }
 
@@ -89,10 +104,19 @@ fn opts(limit: usize, mmr_lambda: f32) -> SearchOptions {
 #[test]
 fn test_mmr_off_keeps_rrf_order() {
     let conn = setup();
-    let results = search_entries(&conn, &ClusterEmbedder, "shared alnote topic", &opts(3, 0.0)).unwrap();
+    let results = search_entries(
+        &conn,
+        &ClusterEmbedder,
+        "shared alnote topic",
+        &opts(3, 0.0),
+    )
+    .unwrap();
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids.len(), 3);
-    assert_eq!(ids[2], "b1", "without MMR the diverse entry stays last: {ids:?}");
+    assert_eq!(
+        ids[2], "b1",
+        "without MMR the diverse entry stays last: {ids:?}"
+    );
 }
 
 /// Invariant 2+3: λ=0.5, limit=2 → top RRF entry kept, redundant twin
@@ -101,7 +125,13 @@ fn test_mmr_off_keeps_rrf_order() {
 fn test_mmr_swaps_redundant_twin_for_diverse_entry() {
     let conn = setup();
 
-    let baseline = search_entries(&conn, &ClusterEmbedder, "shared alnote topic", &opts(2, 0.0)).unwrap();
+    let baseline = search_entries(
+        &conn,
+        &ClusterEmbedder,
+        "shared alnote topic",
+        &opts(2, 0.0),
+    )
+    .unwrap();
     let base_ids: Vec<&str> = baseline.iter().map(|r| r.id.as_str()).collect();
     assert!(
         base_ids == ["a1", "a2"] || base_ids == ["a2", "a1"],
@@ -109,18 +139,33 @@ fn test_mmr_swaps_redundant_twin_for_diverse_entry() {
     );
     let top1 = base_ids[0].to_string();
 
-    let diversified = search_entries(&conn, &ClusterEmbedder, "shared alnote topic", &opts(2, 0.5)).unwrap();
+    let diversified = search_entries(
+        &conn,
+        &ClusterEmbedder,
+        "shared alnote topic",
+        &opts(2, 0.5),
+    )
+    .unwrap();
     let ids: Vec<&str> = diversified.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids.len(), 2);
     assert_eq!(ids[0], top1, "MMR must never displace the top-1 result");
-    assert_eq!(ids[1], "b1", "redundant twin must be swapped for the diverse entry, got {ids:?}");
+    assert_eq!(
+        ids[1], "b1",
+        "redundant twin must be swapped for the diverse entry, got {ids:?}"
+    );
 }
 
 /// Invariant 4: score_kind survives the MMR pass.
 #[test]
 fn test_mmr_score_kind_stays_rrf() {
     let conn = setup();
-    let results = search_entries(&conn, &ClusterEmbedder, "shared alnote topic", &opts(2, 0.5)).unwrap();
+    let results = search_entries(
+        &conn,
+        &ClusterEmbedder,
+        "shared alnote topic",
+        &opts(2, 0.5),
+    )
+    .unwrap();
     for r in &results {
         assert_eq!(r.score_kind, "rrf");
     }

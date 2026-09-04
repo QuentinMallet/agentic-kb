@@ -10,19 +10,57 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_SEED: u64 = 42;
 pub const EMBED_DIM: usize = 384;
 const POOL_SIZE: usize = 512;
-const CATEGORIES: &[&str] = &["architecture", "gotchas", "debugging", "conventions", "runbooks", "antipatterns", "packages", "e2e", "security", "performance"];
-const LOREM_WORDS: &[&str] = &["system", "module", "function", "trait", "struct", "impl", "async", "database", "index", "query", "cache", "latency", "throughput", "batch", "migration", "schema", "vector", "embedding", "similarity", "rank"];
+const CATEGORIES: &[&str] = &[
+    "architecture",
+    "gotchas",
+    "debugging",
+    "conventions",
+    "runbooks",
+    "antipatterns",
+    "packages",
+    "e2e",
+    "security",
+    "performance",
+];
+const LOREM_WORDS: &[&str] = &[
+    "system",
+    "module",
+    "function",
+    "trait",
+    "struct",
+    "impl",
+    "async",
+    "database",
+    "index",
+    "query",
+    "cache",
+    "latency",
+    "throughput",
+    "batch",
+    "migration",
+    "schema",
+    "vector",
+    "embedding",
+    "similarity",
+    "rank",
+];
 
-pub struct BenchEmbedder { pool: Vec<Vec<f32>> }
+pub struct BenchEmbedder {
+    pool: Vec<Vec<f32>>,
+}
 
 impl BenchEmbedder {
     pub fn new(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let pool = (0..POOL_SIZE).map(|_| {
-            let raw: Vec<f32> = (0..EMBED_DIM).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
-            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
-            raw.into_iter().map(|x| x / norm).collect()
-        }).collect();
+        let pool = (0..POOL_SIZE)
+            .map(|_| {
+                let raw: Vec<f32> = (0..EMBED_DIM)
+                    .map(|_| rng.gen::<f32>() * 2.0 - 1.0)
+                    .collect();
+                let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+                raw.into_iter().map(|x| x / norm).collect()
+            })
+            .collect();
         Self { pool }
     }
 }
@@ -30,10 +68,15 @@ impl BenchEmbedder {
 impl Embedder for BenchEmbedder {
     fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         let mut h = 0xcbf29ce484222325_u64;
-        for byte in text.bytes() { h ^= u64::from(byte); h = h.wrapping_mul(0x100000003b4c61); }
+        for byte in text.bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(0x100000003b4c61);
+        }
         Ok(self.pool[h as usize % self.pool.len()].clone())
     }
-    fn is_noop(&self) -> bool { false }
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// Populate entries, embeddings, cue anchors, and evidence through the runtime upsert path.
@@ -44,7 +87,11 @@ pub fn seed_db(conn: &Connection, emb: &BenchEmbedder, n: usize, seed: u64) -> a
         let word = LOREM_WORDS[i % LOREM_WORDS.len()];
         let word2 = LOREM_WORDS[(i + 3) % LOREM_WORDS.len()];
         let hot = i % 100 == 0;
-        let citation_path = if hot { "src/hot.rs:1-3" } else { "src/support.rs:1-3" };
+        let citation_path = if hot {
+            "src/hot.rs:1-3"
+        } else {
+            "src/support.rs:1-3"
+        };
         let event = json!({
             "action":"upsert", "table":"entries", "id":format!("bench-size-{i:07}"),
             "path":format!("bench/{cat}/entry-{i}"), "summary":format!("bench entry topic-{i} {cat}"),
@@ -80,8 +127,10 @@ mod tests {
     #[test]
     fn fixture_is_deterministic_for_same_seed() {
         let emb = BenchEmbedder::new(DEFAULT_SEED);
-        let a = db::open_db_memory().unwrap(); let b = db::open_db_memory().unwrap();
-        seed_db(&a, &emb, 32, DEFAULT_SEED).unwrap(); seed_db(&b, &emb, 32, DEFAULT_SEED).unwrap();
+        let a = db::open_db_memory().unwrap();
+        let b = db::open_db_memory().unwrap();
+        seed_db(&a, &emb, 32, DEFAULT_SEED).unwrap();
+        seed_db(&b, &emb, 32, DEFAULT_SEED).unwrap();
         assert_eq!(logical_checksum(&a).unwrap(), logical_checksum(&b).unwrap());
     }
 }

@@ -44,10 +44,7 @@ impl TranscriptState {
     /// Returns 0 if not previously tracked.
     pub fn offset(&self, transcript: &Path) -> Result<u64> {
         let (_lock, map) = self.read_locked()?;
-        Ok(*map
-            .offsets
-            .get(&path_key(transcript))
-            .unwrap_or(&0))
+        Ok(*map.offsets.get(&path_key(transcript)).unwrap_or(&0))
     }
 
     /// Atomically advance the offset for a transcript file.
@@ -60,9 +57,7 @@ impl TranscriptState {
         let key = path_key(transcript);
         let current = *map.offsets.get(&key).unwrap_or(&0);
         if new_offset <= current {
-            bail!(
-                "offset must advance: got {new_offset}, current is {current}"
-            );
+            bail!("offset must advance: got {new_offset}, current is {current}");
         }
         map.offsets.insert(key, new_offset);
         // Write to a tmpfile in the same directory (same FS), then rename.
@@ -72,10 +67,7 @@ impl TranscriptState {
             .context("state_path has no parent")?;
         // Use a unique suffix per call so concurrent callers (each holding
         // the flock in sequence) do not race on the same tmpfile path.
-        let tmp_name = format!(
-            "transcripts.json.{}.tmp",
-            uuid::Uuid::new_v4().simple()
-        );
+        let tmp_name = format!("transcripts.json.{}.tmp", uuid::Uuid::new_v4().simple());
         let tmp_path = dir.join(tmp_name);
         {
             let mut tmp = OpenOptions::new()
@@ -235,7 +227,10 @@ mod tests {
     /// the target values always advances.
     #[test]
     fn test_concurrent_advance_serializes() {
-        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
         use std::thread;
 
         let dir = tempdir().unwrap();

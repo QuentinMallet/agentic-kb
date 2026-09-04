@@ -152,11 +152,7 @@ fn plan_migration(
     Ok(report)
 }
 
-fn classify_row(
-    row: &EvidenceCitationRow,
-    repo_root: &Path,
-    events_path: &Path,
-) -> PlannedAction {
+fn classify_row(row: &EvidenceCitationRow, repo_root: &Path, events_path: &Path) -> PlannedAction {
     let (file_rel, range) = match parse_citation_path(&row.citation_path) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -483,10 +479,18 @@ mod tests {
         assert_eq!(report.would_heal.len(), 1);
 
         let citation_path: String = conn
-            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let citation_hash: String = conn
-            .query_row("SELECT citation_hash FROM evidence WHERE id='ev-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT citation_hash FROM evidence WHERE id='ev-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(citation_path, "src/lib.rs");
         assert_eq!(citation_hash, hash);
@@ -654,7 +658,11 @@ mod tests {
         assert_eq!(report.would_heal.len(), 1);
         assert_eq!(read_events(&paths.events).unwrap().events.len(), 2);
         let citation_path: String = conn
-            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(citation_path, format!("src/lib.rs:0-{end}"));
     }
@@ -692,11 +700,7 @@ mod tests {
         let (_dir, paths, conn) = setup_repo();
         let root = repo_root_from_paths(&paths).unwrap();
         fs::create_dir_all(root.join("fixtures")).unwrap();
-        fs::write(
-            root.join("fixtures/agent-kb-events.jsonl"),
-            "fixture\n",
-        )
-        .unwrap();
+        fs::write(root.join("fixtures/agent-kb-events.jsonl"), "fixture\n").unwrap();
         let end = fs::metadata(root.join("fixtures/agent-kb-events.jsonl"))
             .unwrap()
             .len() as usize;
@@ -734,12 +738,9 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::metadata(root.join("src/lib.rs")).unwrap().len() as usize;
-        let hash = crate::components::verification::compute_citation_hash(
-            &root,
-            "src/lib.rs",
-            None,
-        )
-        .unwrap();
+        let hash =
+            crate::components::verification::compute_citation_hash(&root, "src/lib.rs", None)
+                .unwrap();
         seed_live_entry(&paths, &conn, "entry-1");
         seed_evidence(
             &paths,

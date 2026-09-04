@@ -189,7 +189,11 @@ fn absent_excerpt_is_too_weak() {
 fn path_escape_skips_relocation_and_preserves_the_original_reason() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write_file(root, "src/new.rs", &format!("// preamble\n{STRONG_EXCERPT}\n"));
+    write_file(
+        root,
+        "src/new.rs",
+        &format!("// preamble\n{STRONG_EXCERPT}\n"),
+    );
     write_file(root, "../outside.rs", &format!("{STRONG_EXCERPT}\n"));
 
     let ev = evidence(
@@ -213,7 +217,11 @@ fn path_escape_skips_relocation_and_preserves_the_original_reason() {
 fn file_missing_skips_relocation_and_preserves_the_original_reason() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write_file(root, "src/new.rs", &format!("// preamble\n{STRONG_EXCERPT}\n"));
+    write_file(
+        root,
+        "src/new.rs",
+        &format!("// preamble\n{STRONG_EXCERPT}\n"),
+    );
 
     let ev = evidence(
         "src/missing.rs",
@@ -354,8 +362,7 @@ fn zero_candidates_is_unverified() {
 fn excluded_directories_are_not_searched() {
     for excluded in [".git", "target", "node_modules"] {
         let repo = moved_repo(&format!("{excluded}/build/new.rs"), &[]);
-        let out =
-            verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
+        let out = verify_evidence(&repo.ev, repo.dir.path(), RelocationPolicy::FileThenRepo);
         assert_eq!(
             out.reason,
             Some(UnverifiedReason::NoCandidate),

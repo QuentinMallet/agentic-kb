@@ -118,13 +118,19 @@ fn test_kb_core_add_rejects_oversized() {
     a.content = "x".repeat(10_001);
     let err = add(&paths, &NoopEmbedder, a);
     assert!(err.is_err());
-    assert!(err.err().unwrap().to_string().contains("content exceeds"), "clear error required");
+    assert!(
+        err.err().unwrap().to_string().contains("content exceeds"),
+        "clear error required"
+    );
 
     let mut a = base_args("too-big-summary");
     a.summary = "s".repeat(201);
     let err = add(&paths, &NoopEmbedder, a);
     assert!(err.is_err());
-    assert!(err.err().unwrap().to_string().contains("summary exceeds"), "clear error required");
+    assert!(
+        err.err().unwrap().to_string().contains("summary exceeds"),
+        "clear error required"
+    );
 }
 
 /// Invariant 5: fresh DBs are stamped current at creation.
@@ -132,7 +138,10 @@ fn test_kb_core_add_rejects_oversized() {
 fn test_fresh_db_is_current() {
     let dir = tempfile::tempdir().unwrap();
     let conn = open_db(&dir.path().join("fresh.db")).unwrap();
-    assert!(schema_is_current(&conn), "fresh DB must carry the current schema_version stamp");
+    assert!(
+        schema_is_current(&conn),
+        "fresh DB must carry the current schema_version stamp"
+    );
 }
 
 /// Invariants 6+7: legacy DB detected + force-rebuilt exactly once.
@@ -149,8 +158,12 @@ fn test_obsolete_schema_forces_one_rebuild() {
     // Simulate a legacy DB: strip the stamp (pre-stamp binaries never wrote one).
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
-        assert!(!schema_is_current(&conn), "stripped DB must read as obsolete");
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
+        assert!(
+            !schema_is_current(&conn),
+            "stripped DB must read as obsolete"
+        );
     }
 
     // A Noop embedder must DEFER (rebuilding would wipe entries_emb) and
@@ -167,9 +180,14 @@ fn test_obsolete_schema_forces_one_rebuild() {
     assert!(rebuilt, "obsolete schema must trigger a rebuild");
     {
         let conn = open_db(&paths.db).unwrap();
-        assert!(schema_is_current(&conn), "rebuilt DB must be stamped current");
+        assert!(
+            schema_is_current(&conn),
+            "rebuilt DB must be stamped current"
+        );
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 2, "rebuild must preserve entries");
         let emb: i64 = conn
@@ -195,7 +213,8 @@ fn test_missing_log_does_not_disarm_upgrade() {
     add(&paths, &NoopEmbedder, base_args("orphaned")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
     // Simulate a layout mismatch: the log is unreachable at paths.events.
     fs::remove_file(&paths.events).unwrap();
@@ -216,12 +235,16 @@ fn test_missing_log_does_not_disarm_upgrade() {
     let paths2 = Paths::from_root(dir2.path());
     {
         let conn = open_db(&paths2.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
     let rebuilt2 = rebuild_if_schema_obsolete(&paths2, &FixedEmbedder).unwrap();
     assert!(!rebuilt2);
     let conn = open_db(&paths2.db).unwrap();
-    assert!(schema_is_current(&conn), "empty DB with no log may stamp without rebuild");
+    assert!(
+        schema_is_current(&conn),
+        "empty DB with no log may stamp without rebuild"
+    );
 }
 
 /// Coverage guard (codex round-4 finding): an obsolete DB whose log does NOT
@@ -238,7 +261,8 @@ fn test_partial_log_refuses_auto_rebuild() {
     add(&paths, &NoopEmbedder, base_args("legacy-b")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
     // Simulate the partial-log hazard: the original log is gone; one later
     // write created a fresh log containing only a NEW entry.
@@ -251,7 +275,9 @@ fn test_partial_log_refuses_auto_rebuild() {
     let conn = open_db(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "refusal must not stamp");
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(n, 3, "no entry may be dropped by the refused upgrade");
 }
@@ -274,23 +300,33 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
             [],
         )
         .unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
     // Log covers the id but with the ORIGINAL payload (base_args content 'ok').
     let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
-    assert!(rebuilt, "covering log rebuilds — log is the source of truth");
+    assert!(
+        rebuilt,
+        "covering log rebuilds — log is the source of truth"
+    );
 
     // Live DB now reflects the log (rolled back to 'ok') and is stamped.
     let conn = open_db(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let content: String = conn
-        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
+        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(content, "ok", "rebuild materializes the log");
 
     // The pre-upgrade DB (with 'NEW db payload') is preserved and recoverable.
     let backup = paths.db.with_extension("db.pre-v2.bak");
-    assert!(backup.exists(), "pre-upgrade backup must exist: {}", backup.display());
+    assert!(
+        backup.exists(),
+        "pre-upgrade backup must exist: {}",
+        backup.display()
+    );
     // VACUUM INTO snapshot must be a clean single file (no WAL sidecar).
     assert!(
         !backup.with_extension("bak-wal").exists(),
@@ -298,9 +334,14 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
     );
     let bak = rusqlite::Connection::open(&backup).unwrap();
     let bak_content: String = bak
-        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| r.get(0))
+        .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
-    assert_eq!(bak_content, "NEW db payload", "backup preserves the pre-upgrade state");
+    assert_eq!(
+        bak_content, "NEW db payload",
+        "backup preserves the pre-upgrade state"
+    );
 }
 
 /// Backup is MANDATORY: if the snapshot cannot be written, the upgrade aborts
@@ -314,7 +355,8 @@ fn test_upgrade_aborts_when_backup_fails() {
     add(&paths, &NoopEmbedder, base_args("keep")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
     // Make the backup target unwritable: pre-create it as a directory so
     // VACUUM INTO / remove_file cannot produce the snapshot file.
@@ -329,7 +371,9 @@ fn test_upgrade_aborts_when_backup_fails() {
     let conn = open_db(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "aborted upgrade must not stamp");
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(n, 1, "entry must survive the aborted upgrade");
 }
@@ -346,7 +390,8 @@ fn test_concurrent_upgrade_single_flight() {
     add(&paths, &NoopEmbedder, base_args("cc-1")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", []).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
     }
 
     let results: Vec<bool> = std::thread::scope(|s| {
@@ -360,12 +405,17 @@ fn test_concurrent_upgrade_single_flight() {
     });
 
     let rebuilds = results.iter().filter(|r| **r).count();
-    assert_eq!(rebuilds, 1, "exactly one of the racers must rebuild, got {results:?}");
+    assert_eq!(
+        rebuilds, 1,
+        "exactly one of the racers must rebuild, got {results:?}"
+    );
 
     let conn = open_db(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(n, 1, "entries must survive the racing upgrade");
 }
@@ -385,9 +435,15 @@ fn test_rebuild_survives_oversized_legacy_event() {
 
     let conn = rusqlite::Connection::open(&paths.db).unwrap();
     let (s, c) = entry_lens(&conn, "legacy-big");
-    assert_eq!((s, c), (200, 10_000), "oversized legacy entry must be clamped, not lost");
+    assert_eq!(
+        (s, c),
+        (200, 10_000),
+        "oversized legacy entry must be clamped, not lost"
+    );
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(n, 2);
 }

@@ -13,7 +13,13 @@ use rusqlite::Connection;
 
 // ─── Corpus generation ───────────────────────────────────────────────────────
 
-fn make_event(id: &str, path: &str, summary: &str, content: &str, tags: &[&str]) -> serde_json::Value {
+fn make_event(
+    id: &str,
+    path: &str,
+    summary: &str,
+    content: &str,
+    tags: &[&str],
+) -> serde_json::Value {
     serde_json::json!({
         "action": "upsert", "table": "entries",
         "id": id, "path": path, "summary": summary, "content": content,
@@ -47,7 +53,11 @@ fn load_corpus(conn: &Connection) {
             &["auth", "ascii"],
         );
         apply_event(conn, &embedder, &ev).unwrap();
-        let ev2 = make_evidence(&format!("ascii-{i}"), i, &format!("fn validate_token_{i}() {{}}"));
+        let ev2 = make_evidence(
+            &format!("ascii-{i}"),
+            i,
+            &format!("fn validate_token_{i}() {{}}"),
+        );
         apply_event(conn, &embedder, &ev2).unwrap();
     }
 
@@ -65,11 +75,22 @@ fn load_corpus(conn: &Connection) {
 
     // CJK tokens (≥10 entries)
     for (i, cjk) in [
-        ("数据库", "索引"), ("认证", "令牌"), ("会话", "管理"),
-        ("搜索", "引擎"), ("压缩", "算法"), ("日志", "记录"),
-        ("缓存", "策略"), ("并发", "控制"), ("配置", "加载"),
-        ("错误", "处理"), ("测试", "框架"), ("部署", "脚本"),
-    ].iter().enumerate() {
+        ("数据库", "索引"),
+        ("认证", "令牌"),
+        ("会话", "管理"),
+        ("搜索", "引擎"),
+        ("压缩", "算法"),
+        ("日志", "记录"),
+        ("缓存", "策略"),
+        ("并发", "控制"),
+        ("配置", "加载"),
+        ("错误", "处理"),
+        ("测试", "框架"),
+        ("部署", "脚本"),
+    ]
+    .iter()
+    .enumerate()
+    {
         let ev = make_event(
             &format!("cjk-{i}"),
             &format!("docs/cjk/{i}.md"),
@@ -81,8 +102,13 @@ fn load_corpus(conn: &Connection) {
     }
 
     // Emoji tokens (≥10 entries)
-    for (i, em) in ["rocket", "shield", "key", "lock", "warning",
-                     "check", "fire", "gear", "bug", "sparkles", "zap", "star"].iter().enumerate() {
+    for (i, em) in [
+        "rocket", "shield", "key", "lock", "warning", "check", "fire", "gear", "bug", "sparkles",
+        "zap", "star",
+    ]
+    .iter()
+    .enumerate()
+    {
         let ev = make_event(
             &format!("emoji-{i}"),
             &format!("docs/emoji/{i}.md"),
@@ -94,9 +120,23 @@ fn load_corpus(conn: &Connection) {
     }
 
     // Code identifier tokens (≥10 entries)
-    for (i, sym) in ["HashMap", "BTreeMap", "Arc", "Mutex", "RwLock",
-                      "tokio", "serde_json", "rusqlite", "proptest", "tracing",
-                      "anyhow", "thiserror"].iter().enumerate() {
+    for (i, sym) in [
+        "HashMap",
+        "BTreeMap",
+        "Arc",
+        "Mutex",
+        "RwLock",
+        "tokio",
+        "serde_json",
+        "rusqlite",
+        "proptest",
+        "tracing",
+        "anyhow",
+        "thiserror",
+    ]
+    .iter()
+    .enumerate()
+    {
         let ev = make_event(
             &format!("code-{i}"),
             &format!("src/code/{i}.rs"),
@@ -120,9 +160,23 @@ fn load_corpus(conn: &Connection) {
     }
 
     // Regex-like punctuation tokens (≥10 entries)
-    for (i, pat) in ["backslash", "dotstar", "caret", "dollar", "pipe",
-                      "question", "plus", "brace", "bracket", "paren",
-                      "percent", "ampersand"].iter().enumerate() {
+    for (i, pat) in [
+        "backslash",
+        "dotstar",
+        "caret",
+        "dollar",
+        "pipe",
+        "question",
+        "plus",
+        "brace",
+        "bracket",
+        "paren",
+        "percent",
+        "ampersand",
+    ]
+    .iter()
+    .enumerate()
+    {
         let ev = make_event(
             &format!("regex-{i}"),
             &format!("src/regex/{i}.rs"),
@@ -140,8 +194,18 @@ fn build_query_suite() -> Vec<String> {
     let mut queries: Vec<String> = Vec::new();
 
     // Top-1% frequency: very common tokens from the corpus, repeated to 50+
-    let top_freq_terms = ["authentication", "session", "token", "database", "connection",
-                           "management", "validation", "module", "implementation", "content"];
+    let top_freq_terms = [
+        "authentication",
+        "session",
+        "token",
+        "database",
+        "connection",
+        "management",
+        "validation",
+        "module",
+        "implementation",
+        "content",
+    ];
     for _ in 0..6 {
         for t in &top_freq_terms {
             queries.push(t.to_string());
@@ -151,9 +215,23 @@ fn build_query_suite() -> Vec<String> {
     queries.truncate(50);
 
     // Middle-frequency: moderate-occurrence tokens
-    let mid_freq_terms = ["pool", "retry", "backoff", "revision", "status",
-                           "indicator", "example", "heading", "section", "pattern",
-                           "metachar", "framework", "detail", "record", "strategy"];
+    let mid_freq_terms = [
+        "pool",
+        "retry",
+        "backoff",
+        "revision",
+        "status",
+        "indicator",
+        "example",
+        "heading",
+        "section",
+        "pattern",
+        "metachar",
+        "framework",
+        "detail",
+        "record",
+        "strategy",
+    ];
     for _ in 0..4 {
         for t in &mid_freq_terms {
             queries.push(t.to_string());
@@ -169,8 +247,18 @@ fn build_query_suite() -> Vec<String> {
     let _low_freq: Vec<String> = (0..50).map(|i| format!("unique{i:04}token")).collect();
     // These don't appear in corpus → they become zero-result queries, which is fine.
     // Add low-freq corpus terms that appear exactly once
-    let rare_terms = ["backoff", "cycle", "sparkles", "BTreeMap", "thiserror",
-                       "dotstar", "brace", "paren", "percent", "ampersand"];
+    let rare_terms = [
+        "backoff",
+        "cycle",
+        "sparkles",
+        "BTreeMap",
+        "thiserror",
+        "dotstar",
+        "brace",
+        "paren",
+        "percent",
+        "ampersand",
+    ];
     queries.extend(rare_terms.iter().map(|s| s.to_string()));
     // Pad to 50 rare queries
     for i in 0..(50usize.saturating_sub(rare_terms.len())) {
@@ -263,17 +351,19 @@ fn test_fts5_parity_zero_divergence() {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let v1_ids: std::collections::BTreeSet<String> = fts_query_contentless(&conn, &safe_q, &opts)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect();
+        let v1_ids: std::collections::BTreeSet<String> =
+            fts_query_contentless(&conn, &safe_q, &opts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect();
 
-        let v2_ids: std::collections::BTreeSet<String> = fts_query_content_entries(&conn, &safe_q, &opts)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect();
+        let v2_ids: std::collections::BTreeSet<String> =
+            fts_query_content_entries(&conn, &safe_q, &opts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect();
 
         if v1_ids != v2_ids {
             divergent.push((

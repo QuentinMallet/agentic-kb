@@ -2,8 +2,8 @@
 
 pub mod add;
 pub mod add_validation;
-pub mod cited_by;
 pub mod cite;
+pub mod cited_by;
 pub mod compact;
 pub mod compress;
 pub mod context;

@@ -25,7 +25,9 @@ fn create_destination_root(root: &Path) -> anyhow::Result<()> {
         Err(err) => return Err(err.into()),
     }
     fs::create_dir(root).map_err(|err| match err.kind() {
-        io::ErrorKind::AlreadyExists => anyhow::anyhow!("destination already exists: {}", root.display()),
+        io::ErrorKind::AlreadyExists => {
+            anyhow::anyhow!("destination already exists: {}", root.display())
+        }
         _ => err.into(),
     })?;
     Ok(())

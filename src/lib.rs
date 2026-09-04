@@ -4,7 +4,12 @@
 //! (local materialized SQLite cache). Modeled on `br` (beads).
 
 #![deny(unsafe_code)]
-#![warn(rust_2018_idioms, trivial_casts, unused_lifetimes, unused_qualifications)]
+#![warn(
+    rust_2018_idioms,
+    trivial_casts,
+    unused_lifetimes,
+    unused_qualifications
+)]
 
 pub mod application;
 #[doc(hidden)]

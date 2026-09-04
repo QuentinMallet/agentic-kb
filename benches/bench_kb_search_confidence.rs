@@ -70,9 +70,7 @@ fn bench_search_confidence(c: &mut Criterion) {
     // Baseline: same query, no source_weights rows (would be identical structure)
     // We measure the query including the confidence prefetch
     c.bench_function("kb_search_confidence_enabled_50entries", |b| {
-        b.iter(|| {
-            db::search_entries(&conn, &emb, "bench entry", &opts_with).unwrap()
-        });
+        b.iter(|| db::search_entries(&conn, &emb, "bench entry", &opts_with).unwrap());
     });
 }
 

@@ -66,7 +66,10 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 fn is_corruption_error(err: &SqlError) -> bool {
     match err {
         SqlError::SqliteFailure(inner, _) => {
-            matches!(inner.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+            matches!(
+                inner.code,
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+            )
         }
         _ => false,
     }
@@ -427,7 +430,8 @@ mod tests {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .unwrap();
-        lock_conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+        lock_conn
+            .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
             .unwrap();
 
         record_hits(&path, &["blocked".into()], "test");

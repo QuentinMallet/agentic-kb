@@ -269,10 +269,19 @@ pub fn benchmark_greedy_select(
     candidates: &[(String, usize, f32, bool)],
     budget: usize,
 ) -> (usize, usize) {
-    let candidates = candidates.iter().map(|(id, tokens, score, has_signal)| Candidate {
-        id: id.clone(), path: id.clone(), summary: id.clone(), rendered: id.clone(),
-        tokens: *tokens, score: *score, has_signal: *has_signal, cited_file: None,
-    }).collect();
+    let candidates = candidates
+        .iter()
+        .map(|(id, tokens, score, has_signal)| Candidate {
+            id: id.clone(),
+            path: id.clone(),
+            summary: id.clone(),
+            rendered: id.clone(),
+            tokens: *tokens,
+            score: *score,
+            has_signal: *has_signal,
+            cited_file: None,
+        })
+        .collect();
     let (selection, spent) = greedy_select(candidates, budget, None);
     (selection.entries.len(), spent)
 }
@@ -299,7 +308,9 @@ pub fn benchmark_context_path(
     budget: usize,
 ) -> anyhow::Result<(usize, usize)> {
     let working_set = enumerate_working_set(repo_root);
-    let tokens = current_branch(repo_root).map(|b| branch_tokens(&b)).unwrap_or_default();
+    let tokens = current_branch(repo_root)
+        .map(|b| branch_tokens(&b))
+        .unwrap_or_default();
     benchmark_db_selection(conn, &working_set, &tokens, budget)
 }
 

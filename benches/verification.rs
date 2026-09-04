@@ -23,8 +23,7 @@ const CITATION_START: usize = 0;
 const CITATION_END: usize = 200;
 // Pre-computed: sha256(Cargo.toml[0:200]).
 // Recompute with: python3 -c "import hashlib; d=open('Cargo.toml','rb').read(); print(hashlib.sha256(d[0:200]).hexdigest())"
-const CITATION_HASH: &str =
-    "c2b77be7fb1c2b48453aa7cc8e3fedffdbf9bc595f778590d0d9d40a2971021c";
+const CITATION_HASH: &str = "c2b77be7fb1c2b48453aa7cc8e3fedffdbf9bc595f778590d0d9d40a2971021c";
 
 /// Resolve the repo root (worktree root = dir containing Cargo.toml).
 /// The bench binary is always run from the worktree root via `cargo bench`.

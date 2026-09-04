@@ -135,7 +135,11 @@ fn build_rows(
 
 /// Run the cited-by query and FileOnly verification path without rendering.
 #[doc(hidden)]
-pub fn benchmark_cited_by(conn: &Connection, file: &str, repo_root: &Path) -> anyhow::Result<usize> {
+pub fn benchmark_cited_by(
+    conn: &Connection,
+    file: &str,
+    repo_root: &Path,
+) -> anyhow::Result<usize> {
     Ok(build_rows(conn, file, Some(repo_root))?.len())
 }
 
