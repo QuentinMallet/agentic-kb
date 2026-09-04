@@ -221,10 +221,7 @@ impl StaleCheck {
 /// Opens its own mutating connection rather than reusing the caller's read
 /// connection: a mutation must be performed on a handle obtained with the lock
 /// in hand (ADR-1, principle 2).
-fn heal_relocations(
-    paths: &config::Paths,
-    report: &mut StaleCheckReport,
-) -> anyhow::Result<()> {
+fn heal_relocations(paths: &config::Paths, report: &mut StaleCheckReport) -> anyhow::Result<()> {
     use crate::commands::add::acquire_lock;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events;

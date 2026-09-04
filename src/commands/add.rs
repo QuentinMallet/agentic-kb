@@ -224,8 +224,8 @@ static HELD_LOCKS: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn held_locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, String>>
-{
+fn held_locks(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, String>> {
     // A panic while the registry is held would otherwise poison every later
     // acquire; the map itself is always left consistent, so recover in place.
     HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
@@ -274,8 +274,7 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
 
     if let Err(e) = f.lock_exclusive() {
         held_locks().remove(&canonical);
-        return Err(anyhow::Error::new(e)
-            .context(format!("acquire lock {}", lock_path.display())));
+        return Err(anyhow::Error::new(e).context(format!("acquire lock {}", lock_path.display())));
     }
     Ok(Lock {
         file: f,
