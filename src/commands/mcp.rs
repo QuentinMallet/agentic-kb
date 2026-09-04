@@ -34,8 +34,14 @@ pub struct Mcp {
 impl Runnable for Mcp {
     fn run(&self) {
         if let Err(e) = self.execute() {
+            // ADR-3 rule 6 (.state/.omc/plans/c2-exclusion-boundary.md): the
+            // cause must travel on the protocol (stdout), not die on
+            // stderr, so PortManager's await_ready can surface the real
+            // reason instead of reporting a bare handshake_timeout. Explicit
+            // flush because process::exit skips buffered-writer flushing.
             let err = json!({"type":"error","code":"internal","message":e.to_string()});
-            eprintln!("{err}");
+            println!("{err}");
+            let _ = io::stdout().flush();
             std::process::exit(1);
         }
     }
