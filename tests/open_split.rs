@@ -145,11 +145,9 @@ fn open_ro_recovers_a_hot_wal_left_by_a_crashed_writer() {
 
     let conn = db::open_ro(&paths.db).expect("open_ro must recover a hot WAL");
     let summary: String = conn
-        .query_row(
-            "SELECT summary FROM entries WHERE id='crashed'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT summary FROM entries WHERE id='crashed'", [], |r| {
+            r.get(0)
+        })
         .expect("open_ro must read data committed before the crash");
     assert_eq!(summary, "summary");
 }
@@ -269,7 +267,11 @@ fn open_or_init_releases_the_lock() {
     let (tx, rx) = mpsc::channel();
     let lock_path = paths.lock.clone();
     thread::spawn(move || {
-        let _ = tx.send(acquire_lock(&lock_path).map(|_| ()).map_err(|e| e.to_string()));
+        let _ = tx.send(
+            acquire_lock(&lock_path)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
     });
     let outcome = rx
         .recv_timeout(DEADLOCK_TIMEOUT)
@@ -290,12 +292,16 @@ fn second_in_process_acquire_errors_instead_of_blocking() {
     let (tx, rx) = mpsc::channel();
     let lock_path = paths.lock.clone();
     thread::spawn(move || {
-        let _ = tx.send(acquire_lock(&lock_path).map(|_| ()).map_err(|e| format!("{e:#}")));
+        let _ = tx.send(
+            acquire_lock(&lock_path)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}")),
+        );
     });
 
-    let outcome = rx.recv_timeout(DEADLOCK_TIMEOUT).expect(
-        "a second in-process acquire must return an error, not block on the flock forever",
-    );
+    let outcome = rx
+        .recv_timeout(DEADLOCK_TIMEOUT)
+        .expect("a second in-process acquire must return an error, not block on the flock forever");
     let err = outcome.expect_err("the second acquire must fail");
     assert!(
         err.contains("open_split.rs"),
@@ -320,7 +326,10 @@ fn registry_canonicalizes_two_spellings_of_one_lock_file() {
         .join("agent-kb")
         .join("..")
         .join(".lock");
-    assert_ne!(aliased, paths.lock, "the two spellings must differ textually");
+    assert_ne!(
+        aliased, paths.lock,
+        "the two spellings must differ textually"
+    );
     assert_eq!(
         std::fs::canonicalize(&aliased).unwrap(),
         std::fs::canonicalize(&paths.lock).unwrap(),
@@ -329,7 +338,11 @@ fn registry_canonicalizes_two_spellings_of_one_lock_file() {
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(acquire_lock(&aliased).map(|_| ()).map_err(|e| format!("{e:#}")));
+        let _ = tx.send(
+            acquire_lock(&aliased)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}")),
+        );
     });
     let outcome = rx
         .recv_timeout(DEADLOCK_TIMEOUT)
@@ -441,7 +454,9 @@ fn add_acquires_the_lock_for_callers_that_hold_none() {
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(result);
     });
-    let outcome = rx.recv_timeout(DEADLOCK_TIMEOUT).expect("add must not hang");
+    let outcome = rx
+        .recv_timeout(DEADLOCK_TIMEOUT)
+        .expect("add must not hang");
     assert_eq!(outcome.unwrap(), "wrapped-1");
 }
 

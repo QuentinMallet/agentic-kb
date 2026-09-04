@@ -2818,7 +2818,11 @@ mod tests {
         let (_dir, paths, _emb) = setup();
         assert!(!paths.db.exists());
 
-        let resp = handle_kb_get(&json!("first-run"), &json!({"entry_id": "anything"}), &paths);
+        let resp = handle_kb_get(
+            &json!("first-run"),
+            &json!({"entry_id": "anything"}),
+            &paths,
+        );
 
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "entry_not_found");
@@ -2833,7 +2837,11 @@ mod tests {
         let (_dir, paths, _emb) = setup();
         assert!(!paths.db.exists());
 
-        let resp = handle_provenance(&json!("first-run"), &json!({"entry_id": "anything"}), &paths);
+        let resp = handle_provenance(
+            &json!("first-run"),
+            &json!({"entry_id": "anything"}),
+            &paths,
+        );
 
         assert_eq!(resp["type"], "result");
         assert_eq!(resp["roots"], json!([]));
