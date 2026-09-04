@@ -4,6 +4,7 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
 use crate::components::{db, events};
 use crate::config;
+use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
 use anyhow::Context;
 use clap::Parser;
@@ -93,8 +94,10 @@ fn take_phase2_barrier(events_path: &Path) -> Option<Phase2TestHook> {
 struct Phase3Timing {
     lock_acquired: std::time::Instant,
     catchup_finished: std::time::Instant,
-    unlink_finished: std::time::Instant,
+    checkpoint_finished: std::time::Instant,
     rename_finished: std::time::Instant,
+    unlink_finished: std::time::Instant,
+    dir_sync_finished: std::time::Instant,
     lock_released: std::time::Instant,
 }
 
@@ -376,7 +379,6 @@ impl Rebuild {
                 // that a concurrent writer may be mid-writing after Phase 1.
                 let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
                 let conn = db::open_db(tmp.path())?;
-                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
                 if let Some(torn_tail) = &evts.torn_tail {
                     eprintln!(
                         "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
@@ -419,39 +421,114 @@ impl Rebuild {
                     torn_tail.bytes.len()
                 );
             }
-            if !catchup.events.is_empty() {
-                eprintln!("catching up {} new event(s)...", catchup.events.len());
+            {
+                // Opened unconditionally so the WAL-mode assertion runs on every
+                // swap, not only on the paths that have catch-up work. Dropping
+                // this connection at the end of the block is D4 step 3's tmp
+                // finalization: a clean close checkpoints and unlinks the tmp's
+                // sidecars, which is what makes the renamed file self-contained.
                 let conn = db::open_db(tmp.path())?;
-                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-                for event in &catchup.events {
-                    db::apply_event(&conn, embedder, event)
-                        .with_context(|| format!("apply event (catch-up): {}", event))?;
+                let tmp_mode: String = conn
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .with_context(|| "read rebuilt tmp DB journal mode")?;
+                anyhow::ensure!(
+                    tmp_mode.eq_ignore_ascii_case("wal"),
+                    "rebuilt tmp DB is in journal mode {tmp_mode:?}, expected WAL; \
+                     the swapped-in DB must be WAL-headered because C2's open_ro \
+                     no longer self-heals the journal mode after the rename"
+                );
+                if !catchup.events.is_empty() {
+                    eprintln!("catching up {} new event(s)...", catchup.events.len());
+                    for event in &catchup.events {
+                        db::apply_event(&conn, embedder, event)
+                            .with_context(|| format!("apply event (catch-up): {}", event))?;
+                    }
                 }
             }
             #[cfg(test)]
             let phase3_catchup_finished = std::time::Instant::now();
 
-            // Remove old WAL/SHM before rename. This is required: the tmp DB uses
-            // journal_mode=DELETE (no WAL), so if the old WAL files remain after
-            // the rename, new SQLite connections would attempt WAL recovery against
-            // the rebuilt DB, producing corruption or an error.
+            // The D4 swap sequence. Each step is kill-point instrumented and the
+            // labels map one-for-one onto `RebuildProtocol.tla`'s `phase` values.
+            //
+            // Ordering safety, amended for the WAL-mode swap (was: unlink first,
+            // rename second, tmp in journal_mode=DELETE). The old argument leaned
+            // on the tmp being a DELETE-mode file: SQLite would then ignore any
+            // sidecar that survived the rename outright. The tmp is now renamed in
+            // WAL mode, because C2's `open_ro` drops `open_db`'s unconditional
+            // `PRAGMA journal_mode=WAL` and with it the self-heal that made a
+            // DELETE-mode swap survivable. With a WAL-headered file the header no
+            // longer ignores a stale sidecar, so the guarantee rests entirely on
+            // step 2: a zero-length `-wal` carries no valid header, recovery
+            // adopts no frames, and `walIndexRecover` rebuilds the stale `-shm`
+            // when no live holder remains. Steps 1-2 are therefore load-bearing,
+            // not belt-and-braces; step 5's unlink is only hygiene. Renaming
+            // before unlinking is also what keeps the name's committed WAL state
+            // covered by an atomic replacement at all times (T0b, CE4).
+            //
             // Safety (Linux): the per-request connection model means no MCP handler
             // holds a connection across the lock boundary, so no reader has the WAL
             // open when we unlink it. On Linux, any FD open at unlink time remains
             // valid (the inode persists until the last close), so this is safe even
             // if a reader opened just before the lock was acquired. fs::rename then
             // atomically replaces the DB file in one syscall.
+            //
+            // ASSUMPTION, not discharged here — liveness depends on C2. Step 1
+            // needs exclusive WAL access, and every read path in this repo still
+            // opens the live DB *without* this flock (mcp.rs:233, 306, 517, 775,
+            // 1065, 1177, 1644, 1731, 1849, 1923, 1974, plus rebuild.rs:118), and
+            // "reader" is a misnomer: `open_db` runs `ensure_schema`'s ALTERs and
+            // `sweep_expired_peers`' DELETE. So against a live MCP server
+            // `busy != 0` is the common case and this rebuild aborts instead of
+            // proceeding: C1 is safe standalone but NOT live standalone. C2's
+            // universal-flock task is what makes the checkpoint reliably
+            // acquirable; until it lands, a busy abort may mean "stop the server,
+            // then re-run", which is a liveness cost and never a safety one.
+            kill_point(KillPoint::SwapPreCheckpoint);
+
+            // Step 1: drain the live WAL under the flock, with a bounded retry.
+            let live_conn = checkpoint_live_db(&paths.db)?;
+            #[cfg(test)]
+            let phase3_checkpoint_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapPostCheckpoint);
+
+            // Step 2: the real gate. `wal_checkpoint(TRUNCATE)` reports
+            // (busy, log, checkpointed) = (0, 0, 0) for a successful truncation
+            // and for a no-op alike, so only the zero-length `-wal` proves the
+            // live DB file is self-contained. Do not weaken this check.
+            verify_live_wal_drained(&paths.db)?;
+
+            // Step 3: drop the live connection BEFORE the rename. SQLite's close
+            // path checkpoints and unlinks `<db>-wal` *by name*, so closing after
+            // the rename would act on the newly swapped-in DB's WAL instead.
+            drop(live_conn);
+            finalize_tmp_db(tmp.path())?;
+            kill_point(KillPoint::SwapPostTmpSync);
+
+            // Step 4: rename tmp over the live DB.
+            fs::rename(tmp.path(), &paths.db).with_context(|| "rename rebuilt DB into place")?;
+            tmp.disarm();
+            #[cfg(test)]
+            let phase3_rename_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapAfterRename);
+
+            // Step 5: hygiene — drop the sidecars the replaced inode left behind.
             let db_str = paths.db.to_string_lossy();
             let _ = fs::remove_file(format!("{}-wal", db_str));
             let _ = fs::remove_file(format!("{}-shm", db_str));
             #[cfg(test)]
             let phase3_unlink_finished = std::time::Instant::now();
-            fs::rename(tmp.path(), &paths.db).with_context(|| "rename rebuilt DB into place")?;
-            tmp.disarm();
+            kill_point(KillPoint::SwapAfterUnlink);
+
+            // Step 6: fsync the containing directory so the rename itself is
+            // durable, not just the bytes it points at.
+            sync_parent_dir(&paths.db)?;
+            #[cfg(test)]
+            let phase3_dir_sync_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapPostDirSync);
 
             #[cfg(test)]
             {
-                let phase3_rename_finished = std::time::Instant::now();
                 // The measured swap window is the complete Phase-3 flock lifetime,
                 // so release the guard before taking its final timestamp.
                 drop(_lock);
@@ -460,8 +537,10 @@ impl Rebuild {
                     sink.lock().unwrap().push(Phase3Timing {
                         lock_acquired: phase3_lock_acquired,
                         catchup_finished: phase3_catchup_finished,
-                        unlink_finished: phase3_unlink_finished,
+                        checkpoint_finished: phase3_checkpoint_finished,
                         rename_finished: phase3_rename_finished,
+                        unlink_finished: phase3_unlink_finished,
+                        dir_sync_finished: phase3_dir_sync_finished,
                         lock_released: phase3_lock_released,
                     });
                 }
@@ -535,6 +614,112 @@ fn sweep_dead_tmp_files(db_path: &Path, own_tmp: &Path) {
             remove_tmp_shape(&base);
         }
     }
+}
+
+/// D4 step 1: drain the live DB's WAL with `wal_checkpoint(TRUNCATE)`, retrying
+/// a bounded number of times while it reports busy, then aborting.
+///
+/// Returns the connection that performed the checkpoint so the caller can drop
+/// it at the exact point D4 requires (step 3, before the rename). Returns `None`
+/// when there is no live DB yet — the first rebuild has nothing to drain.
+///
+/// Aborting leaves the live DB untouched: nothing has been renamed or unlinked
+/// at this point, and the caller's `TmpDbGuard` removes the abandoned tmp.
+fn checkpoint_live_db(db_path: &Path) -> anyhow::Result<Option<rusqlite::Connection>> {
+    /// Bounded so a persistently busy live DB aborts instead of spinning under
+    /// the Phase-3 flock, which every writer is blocked on.
+    const ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    // Deliberately NOT db::open_db: that runs ensure_schema's ALTERs and
+    // sweep_expired_peers' DELETE, which would write fresh frames into the very
+    // WAL this is trying to drain.
+    let conn = rusqlite::Connection::open(db_path)
+        .with_context(|| format!("open live DB {} for checkpoint", db_path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+
+    let mut last_busy = 0i64;
+    for attempt in 1..=ATTEMPTS {
+        let (busy, _log, _checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .with_context(|| format!("checkpoint live DB {}", db_path.display()))?;
+        if busy == 0 {
+            return Ok(Some(conn));
+        }
+        last_busy = busy;
+        if attempt < ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    anyhow::bail!(
+        "live DB {} could not be checkpointed after {ATTEMPTS} attempts (busy={last_busy}): \
+         another connection holds an open read or write transaction. The live DB is untouched \
+         and no swap was performed. Stop the concurrent readers/writers (the MCP server opens \
+         the DB outside the rebuild lock today) and re-run.",
+        db_path.display()
+    )
+}
+
+/// D4 step 2: prove the live DB file is self-contained.
+///
+/// `wal_checkpoint(TRUNCATE)` reports `(0, 0, 0)` both for a successful
+/// truncation and for a no-op, so its return value cannot distinguish them. A
+/// zero-length (or absent) `-wal` can: it carries no valid header, so recovery
+/// initialises an empty index and adopts no frames.
+fn verify_live_wal_drained(db_path: &Path) -> anyhow::Result<()> {
+    let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+    match fs::metadata(&wal) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                meta.len() == 0,
+                "live WAL {} is {} bytes after the checkpoint — refusing to swap while it may \
+                 still hold committed frames",
+                wal.display(),
+                meta.len()
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("stat live WAL {}", wal.display())),
+    }
+}
+
+/// D4 step 3, tmp half: the tmp's last connection has just been dropped, so
+/// SQLite's clean close has already checkpointed and unlinked its sidecars.
+/// Assert that, then flush the file — after the rename it is the whole database.
+fn finalize_tmp_db(tmp_path: &Path) -> anyhow::Result<()> {
+    let raw = tmp_path.to_string_lossy().to_string();
+    let wal = PathBuf::from(format!("{raw}-wal"));
+    anyhow::ensure!(
+        !wal.exists(),
+        "rebuilt tmp DB still has a WAL sidecar at {} — refusing to rename a database whose \
+         frames are not in the file being renamed",
+        wal.display()
+    );
+    // The clean close removes this too; unlink defensively so a stray tmp-shm is
+    // never left behind by the rename, which only moves the DB file itself.
+    let _ = fs::remove_file(format!("{raw}-shm"));
+    fs::File::open(tmp_path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("fsync rebuilt DB {}", tmp_path.display()))?;
+    Ok(())
+}
+
+/// D4 step 6: fsync the directory holding `path` so the rename is durable.
+fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
+    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("fsync directory {}", dir.display()))?;
+    Ok(())
 }
 
 fn prefix_matches(events_path: &Path, byte_len: u64, expected: &[u8]) -> anyhow::Result<bool> {
@@ -879,7 +1064,6 @@ mod tests {
         );
         drop(dir);
     }
-
 
     #[test]
     fn test_cmd_rebuild_from_events() {
@@ -1408,16 +1592,24 @@ mod tests {
             .collect();
         let swap_window = phase3.lock_released.duration_since(phase3.lock_acquired);
         let catchup_time = phase3.catchup_finished.duration_since(phase3.lock_acquired);
-        let unlink_time = phase3
-            .unlink_finished
+        let checkpoint_time = phase3
+            .checkpoint_finished
             .duration_since(phase3.catchup_finished);
         let rename_time = phase3
             .rename_finished
+            .duration_since(phase3.checkpoint_finished);
+        let unlink_time = phase3
+            .unlink_finished
+            .duration_since(phase3.rename_finished);
+        let dir_sync_time = phase3
+            .dir_sync_finished
             .duration_since(phase3.unlink_finished);
         let dominant = [
             ("catch_up_replay", catchup_time),
-            ("wal_shm_unlink", unlink_time),
+            ("wal_checkpoint", checkpoint_time),
             ("rename", rename_time),
+            ("wal_shm_unlink", unlink_time),
+            ("dir_fsync", dir_sync_time),
         ]
         .into_iter()
         .max_by_key(|(_, duration)| *duration)
@@ -1489,9 +1681,11 @@ mod tests {
             },
             "phase3_subphases_ms": {
                 "catch_up_replay": ms(catchup_time),
-                "wal_shm_unlink": ms(unlink_time),
+                "wal_checkpoint": ms(checkpoint_time),
                 "rename": ms(rename_time),
-                "post_rename_lock_release": ms(phase3.lock_released.duration_since(phase3.rename_finished)),
+                "wal_shm_unlink": ms(unlink_time),
+                "dir_fsync": ms(dir_sync_time),
+                "post_swap_lock_release": ms(phase3.lock_released.duration_since(phase3.dir_sync_finished)),
                 "dominant": dominant
             },
             "overlap_evidence": {
