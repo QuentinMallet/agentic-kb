@@ -24,10 +24,16 @@ defmodule AgenticKbMcp.McpServer do
         # not name is a client error, not something to drop silently.
         "additionalProperties" => false,
         "properties" => %{
-          "query" => %{"type" => "string", "description" => "Search query"},
+          "query" => %{
+            "type" => "string",
+            "maxLength" => 8192,
+            "description" => "Search query (at most 8 KiB)"
+          },
           "limit" => %{
             "type" => "integer",
-            "description" => "Max results (default 10, clamped to 100)"
+            "minimum" => 1,
+            "maximum" => 100,
+            "description" => "Max results (default 10). Outside 1..100 the request is rejected."
           },
           "mode" => %{
             "type" => "string",
@@ -44,8 +50,9 @@ defmodule AgenticKbMcp.McpServer do
           },
           "inline_verify_k" => %{
             "type" => "integer",
+            "minimum" => 0,
             "description" =>
-              "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`), clamped to 20. Results beyond this budget have `verified=null`."
+              "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`). Above the server's cap the request is rejected, and the error states the accepted range. Results beyond this budget have `verified=null`."
           },
           "expand_ids" => %{
             "type" => "array",
@@ -53,7 +60,7 @@ defmodule AgenticKbMcp.McpServer do
             "minItems" => 1,
             "maxItems" => 32,
             "description" =>
-              "Frontier expand mode: instead of a query, return entries ADJACENT to these entry ids (same path directory, shared tag, shared cue, or shared evidence file), ranked by facet overlap. Use after a normal search when results feel incomplete: expand the best hits, then decide to expand further, re-query with refined terms, or stop. `query` is ignored in this mode. Max 32 seed ids."
+              "Frontier expand mode: instead of a query, return entries ADJACENT to these entry ids (same path directory, shared tag, shared cue, or shared evidence file), ranked by facet overlap. Use after a normal search when results feel incomplete: expand the best hits, then decide to expand further, re-query with refined terms, or stop. `query` is ignored in this mode. At most 32 seed ids, all strings: a longer array or a non-string member is rejected, never trimmed."
           }
         },
         "required" => [],
@@ -331,7 +338,10 @@ defmodule AgenticKbMcp.McpServer do
           },
           "max_chars" => %{
             "type" => "integer",
-            "description" => "Skip entries exceeding this char limit (default 1800)"
+            "minimum" => 1,
+            "maximum" => 100_000,
+            "description" =>
+              "Skip entries exceeding this char limit (default 1800). Outside 1..100000 the request is rejected."
           }
         }
       }
