@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
-use crate::components::{db, events};
+use crate::components::{db, events, fsync::sync_parent_dir};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
@@ -709,17 +709,6 @@ fn finalize_tmp_db(tmp_path: &Path) -> anyhow::Result<()> {
     fs::File::open(tmp_path)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("fsync rebuilt DB {}", tmp_path.display()))?;
-    Ok(())
-}
-
-/// D4 step 6: fsync the directory holding `path` so the rename is durable.
-fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
-    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-        return Ok(());
-    };
-    fs::File::open(dir)
-        .and_then(|handle| handle.sync_all())
-        .with_context(|| format!("fsync directory {}", dir.display()))?;
     Ok(())
 }
 

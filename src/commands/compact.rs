@@ -1,7 +1,7 @@
 //! `compact` subcommand
 
 use crate::commands::add::acquire_lock;
-use crate::components::events;
+use crate::components::{events, fsync::sync_parent_dir};
 use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Context;
@@ -279,6 +279,7 @@ impl Compact {
             f.sync_data()?; // flush pages before rename to prevent truncation on crash
         }
         fs::rename(&tmp, &paths.events)?;
+        sync_parent_dir(&paths.events)?;
 
         // Optional VACUUM: fires AFTER the atomic rename so a crash during VACUUM
         // still leaves the compacted DB (already renamed into place) intact and readable.
