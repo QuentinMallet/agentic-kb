@@ -44,6 +44,33 @@ pub fn expire_guard(
     }
 }
 
+/// Total relevance order shared by every Rust ranking lane.
+///
+/// Scores descend and ids ascend.  `-0.0` is canonicalised because SQLite
+/// compares both zero representations equal. FTS5's `rank` is BM25 ascending,
+/// i.e. the inverse-sign convention of the descending relevance scores here.
+pub fn compare_rank(score_a: f32, id_a: &str, score_b: f32, id_b: &str) -> std::cmp::Ordering {
+    let score_a = if score_a == 0.0 { 0.0 } else { score_a };
+    let score_b = if score_b == 0.0 { 0.0 } else { score_b };
+    score_b.total_cmp(&score_a).then_with(|| id_a.cmp(id_b))
+}
+
+fn validate_embedding(embedding: Vec<f32>) -> Result<Vec<f32>> {
+    anyhow::ensure!(embedding.iter().all(|x| x.is_finite()), "embedder returned a non-finite component");
+    Ok(embedding)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchStats {
+    pub corrupt_embeddings: u64,
+}
+
+impl SearchStats {
+    pub fn snapshot() -> Self {
+        Self { corrupt_embeddings: crate::models::corrupt_embedding_count() }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resource caps (br-h9g, security I2)
 // ---------------------------------------------------------------------------
@@ -1315,7 +1342,7 @@ pub fn apply_event(
                     let mode = EmbedTextMode::from_env();
                     check_embed_mode_vintage(conn, mode);
                     let text = entry_embed_text(mode, path, summary, content, &tags);
-                    let emb = embedder.embed(&text)?;
+                    let emb = validate_embedding(embedder.embed(&text)?)?;
                     let blob = f32s_to_f16_blob(&emb);
                     conn.execute(
                         "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
@@ -1332,7 +1359,7 @@ pub fn apply_event(
                         let blob: Option<Vec<u8>> = if embedder.is_noop() {
                             None
                         } else {
-                            Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                            Some(f32s_to_f16_blob(&validate_embedding(embedder.embed(cue)?)?))
                         };
                         conn.execute(
                             "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
@@ -1849,7 +1876,7 @@ impl FtsReadPath {
     }
 }
 
-pub type FtsRow = (String, String, String, String, String, String);
+pub type FtsRow = (String, String, String, String, String, String, f64);
 
 pub fn fts_query_contentless(
     conn: &Connection,
@@ -1858,14 +1885,14 @@ pub fn fts_query_contentless(
 ) -> Result<Vec<FtsRow>> {
     let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts f
          JOIN entries e ON e.id = f.id
          WHERE f.entries_fts MATCH ?1
            AND e.is_stale = 0
            AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
@@ -1884,6 +1911,7 @@ pub fn fts_query_contentless(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
@@ -1899,14 +1927,14 @@ pub fn fts_query_content_entries(
 ) -> Result<Vec<FtsRow>> {
     let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts_v2 f
          JOIN entries e ON e.rowid = f.rowid
          WHERE f.entries_fts_v2 MATCH ?1
            AND e.is_stale = 0
            AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
@@ -1925,12 +1953,45 @@ pub fn fts_query_content_entries(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+/// Fetch the requested prefix plus the complete BM25 tie run at its boundary.
+/// The query grows geometrically only while the final fetched row is still tied,
+/// avoiding the O(database-size) cost of an unlimited parity query.
+fn fts_rows_through_boundary_tie(
+    conn: &Connection,
+    path: FtsReadPath,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut extended = opts.clone();
+    extended.limit = opts.limit.saturating_add(1);
+    loop {
+        let rows = match path {
+            FtsReadPath::Contentless => fts_query_contentless(conn, safe_query, &extended)?,
+            FtsReadPath::ContentEntries => fts_query_content_entries(conn, safe_query, &extended)?,
+        };
+        if opts.limit == 0 || rows.len() <= opts.limit {
+            return Ok(rows);
+        }
+        let boundary = rows[opts.limit - 1].6;
+        if rows.last().is_some_and(|row| row.6 != boundary) {
+            let end = rows.iter().position(|row| row.6 != boundary && row.6 > boundary)
+                .unwrap_or(rows.len());
+            return Ok(rows.into_iter().take(end).collect());
+        }
+        if rows.len() < extended.limit || extended.limit == usize::MAX {
+            return Ok(rows);
+        }
+        extended.limit = extended.limit.saturating_mul(2);
+    }
 }
 
 /// Shared hybrid search used by both the CLI and MCP handler.
@@ -2108,12 +2169,7 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
             });
         }
     }
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    scored.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
     scored.truncate(limit);
     Ok(scored)
 }
@@ -2181,7 +2237,7 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
                     .unwrap_or(0.0);
                 (i, lambda * rel - (1.0 - lambda) * max_sim)
             })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| compare_rank(a.1, &remaining[a.0].id, b.1, &remaining[b.0].id))
             .unwrap_or((0, 0.0));
         selected.push(remaining.remove(best_idx));
     }
@@ -2213,20 +2269,17 @@ pub fn search_entries(
             FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
         };
 
-        // Divergence detection: compare both read paths and emit a warning when
-        // they disagree. In debug builds, assert equality to catch regressions
-        // early. In release builds, log only so production is never disrupted.
+        // Divergence detection compares ordered sequences. `ORDER BY rank,e.id`
+        // makes a tie crossing LIMIT deterministic without an unbounded debug
+        // query; geometric growth stops just past the complete boundary tie run,
+        // so ordinary parity overhead remains O(limit), not O(database size).
         #[cfg(debug_assertions)]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, opts);
+            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, opts);
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 debug_assert_eq!(
                     primary_ids, alt_ids,
                     "fts5_dual_write_divergence: primary={:?} alt={:?}",
@@ -2236,15 +2289,11 @@ pub fn search_entries(
         }
         #[cfg(not(debug_assertions))]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, opts);
+            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, opts);
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 if primary_ids != alt_ids {
                     eprintln!(
                         "kb: fts5_dual_write_divergence read_path={:?} \
@@ -2267,7 +2316,7 @@ pub fn search_entries(
             );
         }
 
-        for (id, path, summary, content, tags, updated_at) in rows {
+        for (id, path, summary, content, tags, updated_at, _rank) in rows {
             seen_ids.insert(id.clone());
             entries.push(SearchEntry {
                 id,
@@ -2288,7 +2337,7 @@ pub fn search_entries(
     }
 
     if opts.do_semantic && !embedder.is_noop() {
-        let q_emb = embedder.embed(query)?;
+        let q_emb = validate_embedding(embedder.embed(query)?)?;
         let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
         let mut stmt = conn.prepare(
             "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
@@ -2334,7 +2383,7 @@ pub fn search_entries(
             candidates.push((sim, id, path, summary, content, tags, updated_at));
         }
 
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
 
         // Cue lane (Memora pickup .4): score each live entry by its best-cosine
         // cue anchor. Ranked separately so RRF fuses it as a third source.
@@ -2351,10 +2400,11 @@ pub fn search_entries(
                AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         ) {
-            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String, String)> = stmt
+            let cue_rows: Vec<(String, String, Vec<u8>, String, String, String, String, String)> = stmt
                 .query_map(params![path_prefix, opts.tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
@@ -2367,9 +2417,9 @@ pub fn search_entries(
                 .unwrap_or_default();
 
             // Best cue score per entry.
-            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String)> =
+            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String, String)> =
                 std::collections::HashMap::new();
-            for (entry_id, blob, path, summary, content, tags, updated_at) in cue_rows {
+            for (entry_id, cue, blob, path, summary, content, tags, updated_at) in cue_rows {
                 decode_f16_blob_into(&blob, &mut scratch);
                 let sim = if scratch.is_empty() {
                     let fallback = decode_emb_blob(&blob);
@@ -2378,20 +2428,20 @@ pub fn search_entries(
                     cosine_similarity(&q_emb, &scratch)
                 };
                 match best.get(&entry_id) {
-                    Some((prev, ..)) if *prev >= sim => {}
+                    Some((prev, prev_cue, ..))
+                        if compare_rank(*prev, prev_cue, sim, &cue).is_lt() => {}
                     _ => {
-                        best.insert(entry_id, (sim, path, summary, content, tags, updated_at));
+                        best.insert(entry_id, (sim, cue, path, summary, content, tags, updated_at));
                     }
                 }
             }
             cue_ranked = best
                 .into_iter()
-                .map(|(id, (sim, path, summary, content, tags, updated_at))| {
+                .map(|(id, (sim, _cue, path, summary, content, tags, updated_at))| {
                     (sim, id, path, summary, content, tags, updated_at)
                 })
                 .collect();
-            cue_ranked
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
             cue_ranked.truncate(opts.limit.saturating_mul(2));
         }
         }
@@ -2495,11 +2545,7 @@ pub fn search_entries(
             // Sort by RRF score descending and cap at limit.
             // With MMR enabled, keep a 2×limit pool so diversification has
             // candidates to swap in; the final truncate happens after MMR.
-            entries.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
             let pool = if opts.mmr_lambda > 0.0 {
                 opts.limit.saturating_mul(2)
             } else {
@@ -2551,11 +2597,7 @@ pub fn search_entries(
                     entry.score *= decay;
                 }
                 // Re-sort: multiplication may change relative order.
-                entries.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
             }
 
             // MMR diversification pass (Memora pickup .6): greedy re-rank of
@@ -2848,10 +2890,24 @@ pub fn search_entries(
     Ok(entries)
 }
 
+/// Search plus the number of corrupt embedding blobs observed by this call.
+pub fn search_entries_with_stats(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    opts: &SearchOptions,
+) -> Result<(Vec<SearchEntry>, SearchStats)> {
+    let before = crate::models::corrupt_embedding_count();
+    let entries = search_entries(conn, embedder, query, opts)?;
+    let after = crate::models::corrupt_embedding_count();
+    Ok((entries, SearchStats { corrupt_embeddings: after.saturating_sub(before) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use proptest::prelude::*;
     use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -2876,6 +2932,36 @@ mod tests {
             matches!(err, SqlError::InvalidPath(ref p) if *p == paths.db),
             "open_auxiliary must refuse a live repository db path, got: {err:?}"
         );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ranking_total_order_and_shuffle_invariant(seed in any::<u64>()) {
+            use rand::{seq::SliceRandom, SeedableRng};
+            let original = vec![(f32::NAN,"nan"),(f32::INFINITY,"inf"),(f32::NEG_INFINITY,"neg-inf"),(-0.0,"a-zero"),(0.0,"b-zero"),(1.0,"one-a"),(1.0,"one-b")];
+            let mut expected = original.clone();
+            expected.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+            let expected_bytes = expected.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+            // Semantic, cue, RRF, post-recency, expansion and MMR argmax all
+            // delegate to this same ordering contract.
+            for lane in 0..6 {
+                let mut shuffled = original.clone();
+                shuffled.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed ^ lane));
+                shuffled.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+                let actual = shuffled.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+                prop_assert_eq!(&actual, &expected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_zero_ties_match_sql_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ranked(id TEXT, score REAL); INSERT INTO ranked VALUES('b',0.0),('a',-0.0);").unwrap();
+        let sql: Vec<String> = conn.prepare("SELECT id FROM ranked ORDER BY score DESC,id").unwrap().query_map([],|r|r.get(0)).unwrap().map(Result::unwrap).collect();
+        let mut rust = vec![(-0.0,"a"),(0.0,"b")];
+        rust.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+        assert_eq!(sql, rust.into_iter().map(|x|x.1.to_string()).collect::<Vec<_>>());
     }
 
     fn proptest_cases(default_full: u32) -> u32 {
@@ -2963,6 +3049,95 @@ mod tests {
             recency_lambda,
             mmr_lambda: 0.0,
         }
+    }
+
+    /// Post-S1/pre-P1 ordered-id baseline consumed by bd-21ef.3.12.
+    #[test]
+    fn post_s1_pre_p1_ordering_baseline() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let ids: Vec<String> = search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+        assert_eq!(ids, ["rank-a", "rank-b", "rank-c"]);
+    }
+
+    #[test]
+    fn parity_gate_compares_ordered_tie_run_past_limit() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(&conn, &[("tie-c","t/c"),("tie-a","t/a"),("tie-b","t/b")]);
+        let mut opts = single_fetch_opts(true, false, 0.0);
+        opts.limit = 1;
+        let v1 = fts_rows_through_boundary_tie(&conn, FtsReadPath::Contentless, "\"pathprefixneedle\"", &opts).unwrap();
+        let v2 = fts_rows_through_boundary_tie(&conn, FtsReadPath::ContentEntries, "\"pathprefixneedle\"", &opts).unwrap();
+        assert!(v1.len() > opts.limit, "the boundary tie must be extended");
+        assert_eq!(v1.iter().map(|r| &r.0).collect::<Vec<_>>(), v2.iter().map(|r| &r.0).collect::<Vec<_>>());
+    }
+
+    /// 384-dim analogue of `SearchTestEmbedder`. The shared 2-element test
+    /// embedder round-trips its blobs through `decode_emb_blob`'s legacy-f32
+    /// branch (any 4-byte-multiple length, including a 2-element f16 blob's 4
+    /// bytes), which reinterprets the bytes as a *different-length* vector and
+    /// always mismatches the query embedding's length — every candidate scores
+    /// 0.0 regardless of corruption, which would mask the behavior this test
+    /// exists to check. Padding to `EMB_DIMS` makes the stored blob exactly
+    /// `EMB_BLOB_BYTES`, so it takes the canonical f16 decode path and produces
+    /// a genuine, differentiated cosine score.
+    struct FullDimEmbedder;
+
+    impl crate::components::embedder::Embedder for FullDimEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let first = if text.contains("rank-c") {
+                0.7
+            } else if text.contains("rank-b") {
+                0.8
+            } else {
+                0.9
+            };
+            let mut v = vec![0.0f32; EMB_DIMS];
+            v[0] = first;
+            v[1] = (1.0_f32 - first * first).sqrt();
+            Ok(v)
+        }
+
+        fn is_noop(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn nan_blob_is_zero_scored_and_reported_in_search_stats() {
+        let conn = open_db_memory().unwrap();
+        for (id, summary) in [
+            ("rank-a", "sealedwaiver sealedwaiver rank-a"),
+            (
+                "rank-b",
+                "sealedwaiver rank-b with deliberately longer filler text",
+            ),
+            ("rank-c", "semantic-only rank-c"),
+        ] {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": format!("tests/{id}.md"), "summary": summary,
+                "content": "fixed corpus", "tags": [], "kind": "observation",
+                "evidence_status": "missing", "is_stale": false,
+                "ts": "2999-01-01 00:00:00"
+            });
+            apply_event(&conn, &FullDimEmbedder, &event).unwrap();
+        }
+        let blob = f32s_to_blob(&[f32::NAN, 1.0]);
+        conn.execute("UPDATE entries_emb SET embedding=?1 WHERE rowid=(SELECT rowid FROM entries WHERE id='rank-a')", [blob]).unwrap();
+        let (rows, stats) = search_entries_with_stats(&conn, &FullDimEmbedder, "sealedwaiver", &single_fetch_opts(false, true, 0.0)).unwrap();
+        assert!(stats.corrupt_embeddings > 0);
+        assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
+        assert_eq!(rows.last().map(|r| r.score), Some(0.0));
     }
 
     #[test]
