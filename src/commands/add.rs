@@ -9,6 +9,7 @@
 //! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
 //! The `expire_reason` is `"replaced by --replace-path"`.
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
 use crate::components::embedder;
 use crate::components::kb_core;
@@ -204,11 +205,46 @@ pub fn make_embedder_with_opts(
     }
 }
 
+/// Lock files this process currently holds, keyed on the CANONICALIZED path
+/// and valued by the source location that acquired each one.
+///
+/// `fs2::lock_exclusive` is `flock(2)`, which is associated with the open file
+/// description: a second `acquire_lock` for the same file from anywhere in this
+/// process opens a second description and blocks on itself forever. The type
+/// system cannot see that — `&Lock` proves a live guard exists at a mutating
+/// open, not that the process did not try to take the same lock twice — so the
+/// registry converts a self-deadlock into an immediate error naming the first
+/// acquisition site.
+///
+/// Keying on the canonical path is load-bearing: two spellings of one lock file
+/// (a relative path, a `..` component, a symlinked repo root) must collapse to
+/// one entry or a re-entrant acquire slips through under an alias and hangs.
+/// See `.state/agent-kb/tla/decisions/lock-contract-no-spec.md`, re-entrancy row.
+static HELD_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn held_locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, String>>
+{
+    // A panic while the registry is held would otherwise poison every later
+    // acquire; the map itself is always left consistent, so recover in place.
+    HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Acquire the agentic lock.
+///
+/// Blocking and exclusive, released when the returned [`Lock`] is dropped.
+/// A second acquire of the same file *from this process* is rejected rather
+/// than deadlocked — callers that already hold the lock must pass the guard
+/// down (see [`crate::components::kb_core::add_locked`]).
+#[track_caller]
 pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
     use anyhow::Context;
     use fs2::FileExt;
     use std::fs::{self, OpenOptions};
+
+    let caller = std::panic::Location::caller();
+    let site = format!("{}:{}", caller.file(), caller.line());
 
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
@@ -219,13 +255,56 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
         .truncate(false)
         .open(lock_path)
         .with_context(|| format!("open lock {}", lock_path.display()))?;
-    f.lock_exclusive()
-        .with_context(|| format!("acquire lock {}", lock_path.display()))?;
-    Ok(Lock(f))
+    // Canonicalize only after the file exists, so a first-ever acquire resolves.
+    let canonical = fs::canonicalize(lock_path)
+        .with_context(|| format!("canonicalize lock {}", lock_path.display()))?;
+
+    {
+        let mut held = held_locks();
+        if let Some(first) = held.get(&canonical) {
+            anyhow::bail!(
+                "re-entrant acquire of {}: this process already holds it (acquired at {first}). \
+                 Pass the existing Lock down instead of re-acquiring — e.g. kb_core::add_locked \
+                 or db::open_rw(&paths, &lock).",
+                canonical.display()
+            );
+        }
+        held.insert(canonical.clone(), site);
+    }
+
+    if let Err(e) = f.lock_exclusive() {
+        held_locks().remove(&canonical);
+        return Err(anyhow::Error::new(e)
+            .context(format!("acquire lock {}", lock_path.display())));
+    }
+    Ok(Lock {
+        file: f,
+        path: canonical,
+    })
 }
 
 /// RAII lock guard — holds the file lock until dropped.
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+///
+/// Carries the canonicalized path of the file it locks so a mutating open can
+/// assert it was handed the *right* lock, not merely *a* lock (ADR-1).
+pub struct Lock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl Lock {
+    /// Canonicalized path of the locked file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        held_locks().remove(&self.path);
+    }
+}
 
 #[cfg(test)]
 mod tests {

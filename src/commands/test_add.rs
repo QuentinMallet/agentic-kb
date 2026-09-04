@@ -42,7 +42,7 @@ impl TestAdd {
     /// Execute the test-add command.
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let _lock = acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let id = self
             .id
             .clone()
@@ -66,7 +66,7 @@ impl TestAdd {
         });
 
         events::append_event(&paths.events, &event)?;
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let embedder = crate::components::embedder::NoopEmbedder;
         db::apply_event(&conn, &embedder, &event)?;
 

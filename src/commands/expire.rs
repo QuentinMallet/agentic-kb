@@ -43,8 +43,8 @@ impl Expire {
         paths: &config::Paths,
         embedder: &dyn Embedder,
     ) -> anyhow::Result<()> {
-        let _lock = acquire_lock(&paths.lock)?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &lock)?;
 
         // Guard: refuse to expire permanent entries unless --force
         if !self.force {

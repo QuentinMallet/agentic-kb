@@ -15,6 +15,7 @@
 //!   8. End-to-end: kb rebuild over a log containing an oversized event
 //!      succeeds and stores the clamped entry.
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use kb::commands::rebuild::{rebuild_if_schema_obsolete, Rebuild};
 use kb::components::db::{apply_event, open_db, open_db_memory, schema_is_current};
 use kb::components::embedder::{Embedder, NoopEmbedder};

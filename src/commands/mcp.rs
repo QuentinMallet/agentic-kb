@@ -5,6 +5,7 @@
 //!
 //! Protocol: see .omc/specs/agentic-kb-port-protocol.md
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
@@ -230,8 +231,15 @@ fn handle_search(
             return json!({"id":id,"type":"error","code":"parse_error","message":"expand_ids must be a non-empty array of entry ids"});
         }
         let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
-        let conn = match db::open_db(&paths.db) {
+        // Pure read: open_ro, never the write lock (ADR-7). An uninitialized
+        // repository yields an empty entry list, matching the first-run
+        // behaviour of the pre-split read path.
+        let conn = match db::open_ro(&paths.db) {
             Ok(c) => c,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                return json!({"id": id, "type": "result", "entries": []});
+            }
             Err(e) => {
                 return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
             }
@@ -303,8 +311,12 @@ fn handle_search(
         mmr_lambda: mmr_lambda_default,
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            db::note_uninitialized(&paths.db);
+            return json!({"id": id, "type": "result", "entries": [], "_meta": search_meta(paths, &[])});
+        }
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
@@ -514,8 +526,20 @@ fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         }
     };
 
-    let conn = match db::open_db(&paths.db) {
+    // Pure read (ADR-7). An uninitialized repository produces exactly the
+    // response a fresh, empty database produced before the split: the entry is
+    // not found.
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            db::note_uninitialized(&paths.db);
+            return json!({
+                "id": id,
+                "type": "error",
+                "code": "entry_not_found",
+                "message": format!("entry '{}' not found", entry_id)
+            });
+        }
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
@@ -905,7 +929,7 @@ fn handle_run(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let _lock = match acquire_lock(&paths.lock) {
+    let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -922,7 +946,7 @@ fn handle_run(
     if let Err(e) = events::append_event(&paths.events, &event) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -974,7 +998,7 @@ fn handle_test_add(
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}-{}", app, name.replace(' ', "-")));
 
-    let _lock = match acquire_lock(&paths.lock) {
+    let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -990,7 +1014,7 @@ fn handle_test_add(
     if let Err(e) = events::append_event(&paths.events, &event) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1259,12 +1283,12 @@ fn handle_expire(
         .map(|s| s.to_string());
     let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let _lock = match acquire_lock(&paths.lock) {
+    let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1425,12 +1449,12 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         return json!({"id":id,"type":"error","code":"parse_error","message":"mode must be 'uniform' or 'traffic'"});
     }
 
-    let _lock = match acquire_lock(&paths.lock) {
+    let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1511,12 +1535,12 @@ fn handle_audit_record(
         return json!({"id": id, "type": "ok", "recorded": 0, "expired": 0});
     }
 
-    let _lock = match acquire_lock(&paths.lock) {
+    let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1728,8 +1752,17 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         .unwrap_or(64)
         .min(1024) as usize;
 
-    let conn = match db::open_db(&paths.db) {
+    // Pure read (ADR-7). An uninitialized repository yields the empty graph a
+    // fresh database produced before the split.
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            db::note_uninitialized(&paths.db);
+            return json!({
+                "id": id, "type": "result",
+                "roots": [], "graph": [], "truncated": false,
+            });
+        }
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 

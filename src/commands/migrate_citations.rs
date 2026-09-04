@@ -4,6 +4,7 @@
 //! new bare whole-file form `path`, but only when the current file still hashes
 //! to the stored `citation_hash` and still has size `N`.
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
@@ -83,7 +84,7 @@ impl MigrateCitations {
         let repo_root = repo_root_from_paths(paths)?;
         let mut report = plan_migration(&conn, repo_root.as_path(), &paths.events)?;
         if !self.dry_run {
-            apply_heals(paths, &conn, repo_root.as_path(), &mut report)?;
+            apply_heals(paths, repo_root.as_path(), &mut report)?;
         }
         render_cli(&report, self.dry_run);
         Ok(report)
@@ -237,14 +238,19 @@ fn citation_targets_events_log(file_rel: &str, repo_root: &Path, events_path: &P
     normalize_repo_relative(configured_rel).as_ref() == Some(&citation_rel)
 }
 
+/// Apply the planned heals under the write lock.
+///
+/// Opens its own mutating connection rather than reusing the planning read
+/// connection: a mutation must be performed on a handle obtained with the lock
+/// in hand (ADR-1, principle 2).
 fn apply_heals(
     paths: &config::Paths,
-    conn: &Connection,
     repo_root: &Path,
     report: &mut MigrationReport,
 ) -> Result<()> {
     let version_ref = config::git_head_sha_at(repo_root);
-    let _lock = acquire_lock(&paths.lock)?;
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = &db::open_rw(paths, &lock)?;
 
     let planned = std::mem::take(&mut report.would_heal);
     for row in planned {
@@ -763,7 +769,7 @@ mod tests {
         apply_event(&conn, &NoopEmbedder, &expire).unwrap();
         let before = read_events(&paths.events).unwrap().events.len();
 
-        apply_heals(&paths, &conn, &root, &mut report).unwrap();
+        apply_heals(&paths, &root, &mut report).unwrap();
 
         assert_eq!(report.emitted_events, 0);
         assert!(report.would_heal.is_empty());
