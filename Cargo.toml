@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Agent knowledge base CLI — JSONL event log + SQLite materialized cache with FTS5 and semantic search"
 
+[features]
+default = []
+crash-sim = []
+
 [[bin]]
 name = "kb"
 path = "src/bin/kb/main.rs"
