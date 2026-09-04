@@ -2,6 +2,14 @@
 
 use half::f16;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CORRUPT_EMBEDDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of embedding blobs rejected while decoding.
+pub fn corrupt_embedding_count() -> u64 {
+    CORRUPT_EMBEDDINGS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Wire-format constants — single source of truth for entries_emb blob encoding
@@ -18,7 +26,7 @@ pub const EMB_BLOB_BYTES: usize = EMB_DIMS * EMB_ELEMENT_BYTES; // 768
 /// Returns 0.0 if vectors have different lengths (dimension mismatch from
 /// model upgrade or corrupt embedding blob).
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
+    if a.len() != b.len() || !a.iter().chain(b).all(|x| x.is_finite()) {
         eprintln!(
             "kb: cosine_similarity dimension mismatch: {} vs {}",
             a.len(),
@@ -32,7 +40,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if norm_a == 0.0 || norm_b == 0.0 {
         0.0
     } else {
-        dot / (norm_a * norm_b)
+        let result = dot / (norm_a * norm_b);
+        if result.is_finite() { result } else { 0.0 }
     }
 }
 
@@ -55,7 +64,7 @@ pub fn f32s_to_f16_blob(v: &[f32]) -> Vec<u8> {
 /// - any other multiple of 4: f32 le path (legacy format — existing DBs)
 /// - anything else: returns empty vec (corrupt blob; caller gets sim=0.0)
 pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
-    if blob.len() == EMB_BLOB_BYTES {
+    let decoded = if blob.len() == EMB_BLOB_BYTES {
         // f16 path (current format)
         blob.chunks_exact(EMB_ELEMENT_BYTES)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -70,6 +79,12 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
             "kb: decode_emb_blob: unexpected blob length {} — corrupt embedding?",
             blob.len()
         );
+        Vec::new()
+    };
+    if !decoded.is_empty() && decoded.iter().all(|x| x.is_finite()) {
+        decoded
+    } else {
+        CORRUPT_EMBEDDINGS.fetch_add(1, Ordering::Relaxed);
         Vec::new()
     }
 }
@@ -94,6 +109,10 @@ pub fn decode_f16_blob_into(blob: &[u8], scratch: &mut Vec<f32>) {
     scratch.reserve(EMB_DIMS);
     for c in blob.chunks_exact(EMB_ELEMENT_BYTES) {
         scratch.push(f16::from_le_bytes([c[0], c[1]]).to_f32());
+    }
+    if !scratch.iter().all(|x| x.is_finite()) {
+        CORRUPT_EMBEDDINGS.fetch_add(1, Ordering::Relaxed);
+        scratch.clear();
     }
 }
 
@@ -377,6 +396,20 @@ mod tests {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
         assert_eq!(cosine_similarity(&[1.0, 2.0], &[0.0, 0.0]), 0.0);
         assert_eq!(cosine_similarity(&[0.0], &[0.0]), 0.0);
+    }
+
+    #[test]
+    fn non_finite_inputs_and_result_are_rejected() {
+        assert_eq!(cosine_similarity(&[f32::NAN], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[f32::INFINITY], &[1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[f32::MAX, f32::MAX], &[f32::MAX, f32::MAX]), 0.0);
+    }
+
+    #[test]
+    fn nan_bearing_blob_is_wholly_corrupt_and_counted() {
+        let before = corrupt_embedding_count();
+        assert!(decode_emb_blob(&f32s_to_blob(&[1.0, f32::NAN])).is_empty());
+        assert!(corrupt_embedding_count() > before);
     }
 
     /// f32s round-trip through blob encoding
