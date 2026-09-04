@@ -296,8 +296,8 @@ fn handle_search(
         .and_then(|v| v.as_u64())
         .unwrap_or(inline_verify_k_default as u64) as usize;
 
-    // br-h9g (security I2): clamp untrusted request inputs to prevent
-    // thread::scope amplification (limit * inline_verify_k * evidence_rows).
+    // Redundant with `search_entries` boundary clamps; kept here so untrusted
+    // MCP requests are normalized before building SearchOptions.
     let limit = limit.min(db::MAX_LIMIT);
     let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
 
@@ -3066,35 +3066,75 @@ mod tests {
             handle_add(&id, &req_add, &paths, &emb);
         }
 
-        // Request inline_verify_k far above MAX_INLINE_VERIFY_K and a limit
-        // that returns all of them.
-        let req = json!({
-            "method":"search","id":"clamp-ivk-search",
+        let count_verified = |entries: &[serde_json::Value]| {
+            entries
+                .iter()
+                .filter(|e| {
+                    e["evidence"]
+                        .as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|ev| ev.get("verified"))
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+
+        // `limit` and `inline_verify_k` share the same request-side ceiling
+        // (MAX_LIMIT == MAX_INLINE_VERIFY_K, br-h9g ruling O1), so a request
+        // must ask for `limit` at that ceiling — not for all `n` seeded
+        // entries (n exceeds MAX_LIMIT by construction) — to isolate the
+        // inline_verify_k clamp from the independent limit clamp.
+        let requested_limit = db::MAX_LIMIT;
+        let expected_entries = n.min(requested_limit);
+
+        // A value at the cap must pass through unchanged.
+        let req_at_cap = json!({
+            "method":"search","id":"clamp-ivk-search-at-cap",
             "query":"clamp-ivk-needle","mode":"fts",
-            "limit": n,
+            "limit": requested_limit,
+            "inline_verify_k": db::MAX_INLINE_VERIFY_K
+        });
+        let resp_at_cap =
+            handle_search(&id, &req_at_cap, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp_at_cap["type"], "result");
+        let entries_at_cap = resp_at_cap["entries"].as_array().unwrap();
+        assert_eq!(
+            entries_at_cap.len(),
+            expected_entries,
+            "entries must be returned up to the limit cap"
+        );
+        let verified_count_at_cap = count_verified(entries_at_cap);
+        assert_eq!(
+            verified_count_at_cap,
+            db::MAX_INLINE_VERIFY_K,
+            "inline_verify_k at MAX_INLINE_VERIFY_K must pass through unchanged"
+        );
+
+        // A value above the cap must be clamped down to MAX_INLINE_VERIFY_K.
+        let req_above_cap = json!({
+            "method":"search","id":"clamp-ivk-search-above-cap",
+            "query":"clamp-ivk-needle","mode":"fts",
+            "limit": requested_limit,
             "inline_verify_k": 10_000
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
-        assert_eq!(resp["type"], "result");
-        let entries = resp["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), n, "all entries must be returned");
+        let resp_above_cap =
+            handle_search(&id, &req_above_cap, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp_above_cap["type"], "result");
+        let entries_above_cap = resp_above_cap["entries"].as_array().unwrap();
+        assert_eq!(
+            entries_above_cap.len(),
+            expected_entries,
+            "entries must be returned up to the limit cap"
+        );
 
-        let verified_count = entries
-            .iter()
-            .filter(|e| {
-                e["evidence"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|ev| ev.get("verified"))
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false)
-            })
-            .count();
-        assert!(
-            verified_count <= db::MAX_INLINE_VERIFY_K,
-            "inline_verify_k must be clamped to MAX_INLINE_VERIFY_K={}, got {} verified",
+        let verified_count_above_cap = count_verified(entries_above_cap);
+        assert_eq!(
+            verified_count_above_cap,
             db::MAX_INLINE_VERIFY_K,
-            verified_count
+            "inline_verify_k above MAX_INLINE_VERIFY_K must be clamped to MAX_INLINE_VERIFY_K={}, got {} verified",
+            db::MAX_INLINE_VERIFY_K,
+            verified_count_above_cap
         );
     }
 
