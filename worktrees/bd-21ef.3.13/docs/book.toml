@@ -1,0 +1,7 @@
+[book]
+title = "Project Documentation"
+authors = []
+src = "src"
+
+[build]
+build-dir = "book"
