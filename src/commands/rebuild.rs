@@ -568,6 +568,7 @@ mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
+    use crate::crash_sim::KillPoint;
     use rusqlite::Connection;
     use std::fs;
     use std::process::Command as Cmd;
@@ -619,6 +620,279 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap()
     }
+
+    // ---------------------------------------------------------------- D4 swap
+    //
+    // The six kill points are exercised by re-executing this test binary as a
+    // child with KB_CRASH_AFTER set. Two children run per case: a seeder that
+    // materializes the log into the live DB and then exits *without* SQLite's
+    // close path, leaving committed frames in the live `-wal` exactly as a
+    // killed writer would, and the rebuild itself, which dies at the kill
+    // point. The parent then inspects the on-disk state with a plain
+    // `Connection::open` and no journal-mode pragma — the future `open_ro`.
+
+    /// Entries seeded into the log AND materialized into the live DB before the
+    /// swap runs.
+    const SWAP_SEEDED: u32 = 6;
+    /// Extra events appended to the log after the live DB was materialized, so
+    /// the pre-swap and post-swap databases have different contents. Without
+    /// this the two are indistinguishable and every kill-point assertion is
+    /// vacuous — a stale WAL adopted over the renamed file would still report
+    /// the expected rows.
+    const SWAP_APPENDED: u32 = 3;
+    const SWAP_TOTAL: u32 = SWAP_SEEDED + SWAP_APPENDED;
+
+    /// Runs in the re-executed child when `KB_SWAP_CRASH_ROLE` is set; returns
+    /// immediately in the parent so the same `#[test]` body serves both.
+    fn swap_crash_child_dispatch() {
+        let Ok(role) = std::env::var("KB_SWAP_CRASH_ROLE") else {
+            return;
+        };
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = Paths::from_root(Path::new(&root));
+        match role.as_str() {
+            "seed" => {
+                let conn = db::open_db(&paths.db).unwrap();
+                for event in &events::read_events(&paths.events).unwrap().events {
+                    db::apply_event(&conn, &NoopEmbedder, event).unwrap();
+                }
+                // exit(0) skips destructors, so SQLite's close path never runs
+                // and the committed frames stay in the live `-wal`. Dropping the
+                // connection would checkpoint and unlink it, which is precisely
+                // the state the swap must not depend on.
+                std::process::exit(0);
+            }
+            "rebuild" => {
+                let result = Rebuild.execute_with(&paths, &NoopEmbedder);
+                panic!("child rebuild returned {result:?} without hitting the kill point");
+            }
+            other => panic!("unknown swap crash role {other:?}"),
+        }
+    }
+
+    fn spawn_swap_child(
+        dir: &Path,
+        test_name: &str,
+        role: &str,
+        kill: Option<KillPoint>,
+    ) -> Option<i32> {
+        let mut cmd = Cmd::new(std::env::current_exe().unwrap());
+        // libtest filters on the full test path, which is what `--exact` matches.
+        cmd.arg(format!("commands::rebuild::tests::{test_name}"))
+            .arg("--exact")
+            .arg("--nocapture")
+            .current_dir(dir)
+            .env("KB_SWAP_CRASH_ROLE", role)
+            .env("KB_CRASH_TEST_ROOT", dir);
+        if let Some(point) = kill {
+            cmd.env("KB_CRASH_AFTER", point.to_string());
+        }
+        cmd.status().unwrap().code()
+    }
+
+    /// Seeds the log, materializes a prefix of it into a live DB that still
+    /// carries an undrained `-wal`, appends more events, then crashes a rebuild
+    /// at `kill`.
+    ///
+    /// `expected` is `SWAP_SEEDED` for a kill before the rename and
+    /// `SWAP_TOTAL` after it: the DB a plain reader sees must be exactly one of
+    /// the two whole databases, never a mixture, and must never lose a row it
+    /// already held.
+    fn assert_swap_kill_leaves_self_contained_db(test_name: &str, kill: KillPoint, expected: u32) {
+        let (dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+
+        assert_eq!(
+            spawn_swap_child(dir.path(), test_name, "seed", None),
+            Some(0),
+            "seeding child must materialize the log into the live DB"
+        );
+        let wal = PathBuf::from(format!("{}-wal", paths.db.to_string_lossy()));
+        assert!(
+            wal.exists() && fs::metadata(&wal).unwrap().len() > 0,
+            "fixture must leave committed frames in the live WAL at {}",
+            wal.display()
+        );
+        for idx in SWAP_SEEDED..SWAP_TOTAL {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+
+        assert_eq!(
+            spawn_swap_child(dir.path(), test_name, "rebuild", Some(kill)),
+            Some(137),
+            "rebuild child must terminate at kill point {kill}"
+        );
+
+        // Plain open, no journal_mode pragma: this is what C2's open_ro will do.
+        let conn = Connection::open(&paths.db).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "a crash at {kill} must leave a structurally intact DB"
+        );
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let want: Vec<String> = (0..expected).map(|idx| format!("swap{idx}")).collect();
+        assert_eq!(
+            ids, want,
+            "a crash at {kill} must leave exactly the pre-swap or post-swap database, \
+             with every transaction it committed"
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_pre_checkpoint_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_pre_checkpoint_leaves_self_contained_db",
+            KillPoint::SwapPreCheckpoint,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_checkpoint_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_checkpoint_leaves_self_contained_db",
+            KillPoint::SwapPostCheckpoint,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_tmp_sync_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_tmp_sync_leaves_self_contained_db",
+            KillPoint::SwapPostTmpSync,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_rename_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_rename_leaves_self_contained_db",
+            KillPoint::SwapAfterRename,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_unlink_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_unlink_leaves_self_contained_db",
+            KillPoint::SwapAfterUnlink,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_dir_sync_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_dir_sync_leaves_self_contained_db",
+            KillPoint::SwapPostDirSync,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_renames_wal_headered_db_readable_without_journal_pragma() {
+        let (_dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+
+        // Header bytes 18/19 are the write/read file format versions: 2 means
+        // WAL. This is the regression test for the self-heal C2's open_ro
+        // removes — nothing after the swap re-applies journal_mode=WAL.
+        let header = fs::read(&paths.db).unwrap();
+        assert_eq!(
+            (header[18], header[19]),
+            (2, 2),
+            "swapped-in DB must be WAL-headered, got file format versions {:?}",
+            (header[18], header[19])
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", paths.db.to_string_lossy()));
+            assert!(
+                !sidecar.exists(),
+                "swapped-in DB must have no {suffix} sidecar, found {}",
+                sidecar.display()
+            );
+        }
+
+        // Plain open, no pragmas at all: the future open_ro.
+        let conn = Connection::open(&paths.db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, SWAP_SEEDED as i64);
+    }
+
+    #[test]
+    fn test_swap_aborts_cleanly_when_checkpoint_stays_busy() {
+        let (dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+        let live = db::open_db(&paths.db).unwrap();
+        for event in &events::read_events(&paths.events).unwrap().events {
+            db::apply_event(&live, &NoopEmbedder, event).unwrap();
+        }
+
+        // A separate connection holding an open read transaction takes a WAL
+        // read mark, so wal_checkpoint(TRUNCATE) cannot reset the WAL and keeps
+        // reporting busy for as long as the transaction is open.
+        let reader = Connection::open(&paths.db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let held: i64 = reader
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, SWAP_SEEDED as i64);
+
+        let error = Rebuild
+            .execute_with(&paths, &NoopEmbedder)
+            .expect_err("a persistently busy checkpoint must abort the rebuild");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not be checkpointed"),
+            "abort must name the checkpoint as the cause, got: {message}"
+        );
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            count_entries(&paths),
+            SWAP_SEEDED as i64,
+            "an aborted swap must leave the live DB untouched"
+        );
+        let leftovers: Vec<String> = fs::read_dir(paths.db.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".db.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an aborted swap must not leave tmp DB files behind, found {leftovers:?}"
+        );
+        drop(dir);
+    }
+
 
     #[test]
     fn test_cmd_rebuild_from_events() {
