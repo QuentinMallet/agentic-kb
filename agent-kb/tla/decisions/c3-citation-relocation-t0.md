@@ -78,12 +78,20 @@ that contract one level down:
   `NoStaleHealCommit` restated as a test.
 - `ApplyHeal`'s failure arm **discards**; it does not fall back, downgrade, or commit a
   weakened version. That is the behaviour V3 must implement, and it is why the plan's
-  third silent-default finding matters here: `stale_check.rs:349` substitutes
-  `rel_path.clone()` for an undecodable `citation_path` column, which would make
-  `premisePath` a fabricated value and the premise check a comparison of one invention
-  against another.
+  third silent-default finding matters here: `stale_check.rs:350` and
+  `stale_check.rs:362` both substitute `rel_path.clone()` for an undecodable
+  `citation_path` column, which would make `premisePath` a fabricated value and the
+  premise check a comparison of one invention against another. Both sites must be fixed
+  for the T0 premise contract to hold.
 - V2's identity check immediately before emission is the same premise pattern at the
   descriptor level: the premise is "this pathname still names the descriptor I read".
+
+The module deliberately does **not** claim that an unchanged premise implies the same
+destination at code level. `PlanHeal` records a nondeterministically chosen destination,
+and foreign moves are modelled only through `ReVerify` and `ConcurrentHeal`. A stale
+destination with an otherwise unchanged premise is therefore left to the code-side
+obligations in V2 (`bd-21ef.3.4`) and V3 (`bd-21ef.3.5`): re-run relocation and emit only
+if it still yields the same destination.
 
 ### Residual risk, stated
 
@@ -133,9 +141,9 @@ code so the mapping becomes sound.
 
 Precisely: the number of byte offsets `i` in each visited file such that
 `file[i .. i + len(excerpt)] = excerpt`, summed over every file the walk visits, with the
-cited file contributing **exactly once**. `candidates` is capped at `MaxCandidates` in the
-model; in the code the distinction that matters is only 0 / 1 / more-than-1, which is why
-`MaxCandidates = 2` is a sufficient bound.
+cited file contributing 1 to the count. The model stores the saturating image
+`candidates = min(actual, MaxCandidates)`; in the code the distinction that matters is
+only 0 / 1 / more-than-1, which is why `MaxCandidates = 2` is a sufficient bound.
 
 Three consequences the implementation must honour for the mapping to hold:
 
@@ -154,7 +162,8 @@ thoroughly: `scan_file` returns `CapExceeded` when a file exceeds the *remaining
 (`:657`, `:720`). With the walk made unconditional, a cap hit *after* one candidate has
 been found must report cap-exceeded and must never degrade to the in-file candidate.
 Degrading would reintroduce exactly the false `Unique` that #1 is about, and the model has
-no state for "the search gave up", so a degraded answer is unmappable.
+no state for "the search gave up": `CapExceeded` is outside the refinement map, not an
+encoding of any `candidates` value.
 
 ### Determinism (ADR-2's total order): documented no-change
 
@@ -219,8 +228,8 @@ two orders could disagree.
   path leaves `VerdictPremiseHolds` unguarded: the search evidence can go stale without
   the path moving.
 - An undecodable `citation_path` column errors rather than substituting `rel_path`
-  (`stale_check.rs:349`). Without this the premise path can be a fabricated value and the
-  comparison in the previous bullet proves nothing.
+  (`stale_check.rs:350`, `stale_check.rs:362`). Without this the premise path can be a
+  fabricated value and the comparison in the previous bullet proves nothing.
 - A hard link to the events JSONL is rejected as self-referential, by `(st_dev, st_ino)`
   and not by normalised path string (`migrate_citations.rs:230`).
 - A file mutated between hash resolution and append is caught by the pre-append
