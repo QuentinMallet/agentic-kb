@@ -1,3 +1,4 @@
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use kb::bench_fixture::{logical_checksum, seed_db, BenchEmbedder, DEFAULT_SEED};
 use kb::components::db;
 use std::fs;

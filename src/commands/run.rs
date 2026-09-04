@@ -39,7 +39,7 @@ impl Run {
             bail!("--result must be 'pass' or 'fail', got: {}", self.result);
         }
         let paths = config::Paths::discover()?;
-        let _lock = acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let ts = chrono::Utc::now().to_rfc3339();
         let (session, omc_session_id) = read_omc_session();
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -58,7 +58,7 @@ impl Run {
         });
 
         events::append_event(&paths.events, &event)?;
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let embedder = crate::components::embedder::NoopEmbedder;
         db::apply_event(&conn, &embedder, &event)?;
 

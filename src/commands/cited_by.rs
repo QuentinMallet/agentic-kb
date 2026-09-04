@@ -75,15 +75,33 @@ impl Runnable for CitedBy {
 impl CitedBy {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        if !paths.db.exists() {
-            return Ok(());
-        }
-
-        let conn = db::open_db(&paths.db)?;
         let repo_root = config::git_repo_root();
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        self.execute_with_conn(&conn, repo_root.as_deref(), &mut handle)
+        self.execute_with(&paths, repo_root.as_deref(), &mut handle)
+    }
+
+    /// Execute against explicit paths, rendering into `writer`.
+    ///
+    /// A pure read: it opens with [`db::open_ro`] and never takes the write
+    /// lock (ADR-7). An uninitialized repository yields an empty result plus a
+    /// one-line stderr note rather than an error, preserving the first-run
+    /// behaviour of the pre-split read path.
+    pub fn execute_with<W: Write>(
+        &self,
+        paths: &config::Paths,
+        repo_root: Option<&Path>,
+        writer: &mut W,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                return render_rows(&[], self.json, writer);
+            }
+            Err(e) => return Err(e),
+        };
+        self.execute_with_conn(&conn, repo_root, writer)
     }
 
     fn execute_with_conn<W: Write>(

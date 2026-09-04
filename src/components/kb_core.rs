@@ -35,14 +35,15 @@
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
-use crate::commands::add::acquire_lock;
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
+use crate::commands::add::{acquire_lock, Lock};
 use crate::crash_sim::{kill_point, KillPoint};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
 use crate::components::{db, embedder, events, redactor};
 use crate::config;
 use crate::models::Evidence;
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -130,21 +131,61 @@ pub struct AddOutcome {
     pub similar_existing: Vec<SimilarEntry>,
 }
 
-/// Unified add primitive.
+/// Unified add primitive: acquires the write lock, opens for mutation, and
+/// delegates to [`add_locked`].
 ///
-/// Acquires the flock, then:
-/// 1. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
-/// 2. Builds expire events + the upsert event + evidence-add events.
-/// 3. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
-/// 4. Applies each event to the DB in order, all under the held flock.
+/// A thin wrapper on purpose. Callers that already hold the lock — a locked
+/// batch import, any future multi-entry write path — must call [`add_locked`]
+/// directly; calling this one would re-acquire the flock and, before the
+/// re-entrancy registry existed, deadlock on itself (ADR-1).
 ///
 /// INVARIANT: this function NEVER reads `KB_NO_EMBED` from the environment.
 /// The caller must construct the Embedder before calling and pass it by reference.
 pub fn add(
     paths: &config::Paths,
     embedder: &dyn embedder::Embedder,
+    args: AddArgs,
+) -> Result<AddOutcome> {
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = db::open_rw(paths, &lock)?;
+    add_locked(&lock, &conn, paths, embedder, args)
+}
+
+/// The add logic, for a caller that already holds this repository's write lock.
+///
+/// 1. Validates, redacts, and caps the inputs.
+/// 2. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
+/// 3. Builds expire events + the upsert event + evidence-add events.
+/// 4. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
+/// 5. Applies each event to the DB in order, all under the caller's flock.
+///
+/// Input preparation runs inside the critical section rather than ahead of it,
+/// which is a deliberate trade: one code path for both entry points is worth
+/// more than the few milliseconds of citation hashing it adds to the lock hold.
+///
+/// `lock` is proof, not a resource: it is checked against `paths.lock` and never
+/// released here — the caller's guard still owns it.
+pub fn add_locked(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn embedder::Embedder,
     mut args: AddArgs,
 ) -> Result<AddOutcome> {
+    let expected_lock = std::fs::canonicalize(&paths.lock).with_context(|| {
+        format!(
+            "canonicalize write lock {} (add_locked requires a live lock guard)",
+            paths.lock.display()
+        )
+    })?;
+    if lock.path() != expected_lock {
+        anyhow::bail!(
+            "add_locked: the supplied lock guards {}, but this repository's write lock is {}",
+            lock.path().display(),
+            expected_lock.display()
+        );
+    }
+
     let repo_root = paths
         .db
         .parent()
@@ -235,9 +276,6 @@ pub fn add(
             args.content.chars().count()
         );
     }
-
-    let _lock = acquire_lock(&paths.lock)?;
-    let conn = db::open_db(&paths.db)?;
 
     // Near-duplicate probe (Memora pickup .5): semantic-only search for live
     // entries close to the incoming one. Runs BEFORE the new entry is written

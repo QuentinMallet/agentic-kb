@@ -178,6 +178,7 @@ impl Default for EmbedConfig {
 }
 
 /// Resolved paths for the kb workspace
+#[derive(Debug, Clone)]
 pub struct Paths {
     /// Lock file path
     pub lock: PathBuf,
