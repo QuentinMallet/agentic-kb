@@ -167,6 +167,11 @@
               cargo-nextest
               act # Run GitHub Actions locally
 
+              # Elixir MCP server (mcp/) — mix.exs requires OTP 27's :json module,
+              # a hard floor. Pin the versioned, OTP-scoped attribute (not bare
+              # `elixir`, which tracks the default BEAM set and can drift under it).
+              beam27Packages.elixir
+
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao
               dex
