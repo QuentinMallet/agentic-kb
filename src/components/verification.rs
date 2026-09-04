@@ -21,6 +21,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_os = "linux"))]
 use std::sync::Once;
@@ -628,6 +630,28 @@ struct Candidate {
     file_size: u64,
 }
 
+/// Stable filesystem identity for excluding an already-scanned file from a
+/// repository walk. V3's write path can reuse this instead of treating path
+/// spellings as object identity.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    /// Resolve `path` and return its `(st_dev, st_ino)` identity.
+    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
 enum ExcerptSearch {
     Unique(Candidate),
     NotFound,
@@ -642,6 +666,14 @@ enum ExcerptSearch {
 ///
 /// Stops as soon as a second candidate is seen: the answer "not unique" needs
 /// no further evidence, and stopping bounds the work.
+///
+/// Budget decision: exhaustion before any candidate and exhaustion after one
+/// candidate both return [`ExcerptSearch::CapExceeded`]. The latter must not
+/// degrade to `Unique`: in the TLA refinement, `candidates` is the saturating
+/// `min(actual repo-wide overlapping match locations, MaxCandidates)`.
+/// `CapExceeded` maps to an `Unverified` outcome, but has no single
+/// `candidates` image because the unscanned bytes leave the actual repo-wide
+/// count unknown (its model image is the set of such unverified states).
 fn search_for_excerpt(
     repo_root: &Path,
     cited_rel: &str,
@@ -650,16 +682,21 @@ fn search_for_excerpt(
 ) -> ExcerptSearch {
     let needle = excerpt.as_bytes();
     let mut budget = MAX_RELOCATION_SCAN_BYTES;
+    let mut found: Option<Candidate> = None;
+    let mut total = 0usize;
+    let mut cited_identity = None;
 
     // -- the cited file first: an in-file move is the cheap, common case --
     if let Some(abs) = safe_join(repo_root, cited_rel) {
+        cited_identity = FileIdentity::of(&abs).ok();
         match scan_file(&abs, repo_root, needle, &mut budget) {
             FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
             FileScan::Hits { count, first, size } if count > 0 => {
                 if count > 1 {
                     return ExcerptSearch::NonUnique(count);
                 }
-                return ExcerptSearch::Unique(Candidate {
+                total = count;
+                found = Some(Candidate {
                     rel_path: normalize_rel(cited_rel),
                     offset: first,
                     file_size: size,
@@ -670,7 +707,10 @@ fn search_for_excerpt(
     }
 
     if policy != RelocationPolicy::FileThenRepo {
-        return ExcerptSearch::NotFound;
+        return match found {
+            Some(candidate) => ExcerptSearch::Unique(candidate),
+            None => ExcerptSearch::NotFound,
+        };
     }
 
     // -- repo walk --
@@ -679,8 +719,6 @@ fn search_for_excerpt(
         Err(_) => return ExcerptSearch::NotFound,
     };
     let excluded = excluded_names(&canon_root);
-    let mut found: Option<Candidate> = None;
-    let mut total = 0usize;
     let mut stack = vec![canon_root.clone()];
 
     while let Some(dir) = stack.pop() {
@@ -713,6 +751,10 @@ fn search_for_excerpt(
                 continue;
             }
             if !meta.is_file() {
+                continue;
+            }
+            if cited_identity.is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
+            {
                 continue;
             }
 
@@ -755,7 +797,7 @@ enum FileScan {
     CapExceeded,
 }
 
-/// Read `path` and count non-overlapping occurrences of `needle`, charging the
+/// Read `path` and count overlapping occurrences of `needle`, charging the
 /// bytes read against `budget`.
 fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
     // Reject links immediately before opening, then validate the opened object.
@@ -800,7 +842,7 @@ fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> 
     }
 }
 
-/// Count non-overlapping occurrences of `needle` in `hay`, returning the count
+/// Count overlapping occurrences of `needle` in `hay`, returning the count
 /// and the first offset.
 ///
 /// Deliberately a plain first-byte-skip scan: the inner comparison only runs on
@@ -820,7 +862,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> (usize, Option<usize>) {
                 first = Some(i);
             }
             count += 1;
-            i += needle.len();
+            i += 1;
         } else {
             i += 1;
         }
@@ -1164,6 +1206,96 @@ mod tests {
         let outcome = verify_evidence(&ev, dir.path(), RelocationPolicy::FileThenRepo);
         assert_eq!(outcome.status, VerificationStatus::Relocated);
         assert_eq!(outcome.relocated_to.as_deref(), Some("new.rs"));
+    }
+
+    #[test]
+    fn test_repo_search_rejects_match_in_cited_and_other_file_as_non_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "fn duplicated_relocation_candidate() {\n",
+            "    let marker = \"this excerpt is deliberately strong and duplicated\";\n",
+            "}\n"
+        );
+        std::fs::write(
+            dir.path().join("cited.rs"),
+            format!("changed prefix\n{excerpt}"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("other.rs"), excerpt).unwrap();
+        let mut evidence = make_evidence(
+            Some(format!("cited.rs:0-{}", excerpt.len())),
+            hash_bytes(excerpt.as_bytes()),
+            "code",
+        );
+        evidence.citation_excerpt = Some(excerpt.to_string());
+
+        let outcome = verify_evidence(&evidence, dir.path(), RelocationPolicy::FileThenRepo);
+        assert_eq!(outcome.status, VerificationStatus::Unverified);
+        assert_eq!(
+            outcome.reason,
+            Some(UnverifiedReason::NonUnique { candidates: 2 })
+        );
+        assert_eq!(outcome.relocated_to, None);
+    }
+
+    #[test]
+    fn test_repo_search_cap_after_one_candidate_is_cap_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "fn candidate_before_budget_exhaustion() {\n",
+            "    let marker = \"the first candidate must never become false unique\";\n",
+            "}\n"
+        );
+        std::fs::write(dir.path().join("a-cited.rs"), excerpt).unwrap();
+        let oversized = File::create(dir.path().join("z-oversized.rs")).unwrap();
+        oversized
+            .set_len(MAX_RELOCATION_SCAN_BYTES)
+            .unwrap();
+
+        assert!(matches!(
+            search_for_excerpt(
+                dir.path(),
+                "a-cited.rs",
+                excerpt,
+                RelocationPolicy::FileThenRepo,
+            ),
+            ExcerptSearch::CapExceeded
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_repo_search_is_unique_iff_one_file_identity_has_a_match(
+            copies in 0usize..5,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let excerpt = concat!(
+                "fn property_relocation_candidate() {\n",
+                "    let marker = \"generated trees count each matching file identity once\";\n",
+                "}\n"
+            );
+            let cited_rel = if copies == 0 {
+                std::fs::write(dir.path().join("cited.rs"), b"changed\n").unwrap();
+                "cited.rs"
+            } else {
+                for i in 0..copies {
+                    std::fs::write(dir.path().join(format!("copy-{i}.rs")), excerpt).unwrap();
+                }
+                std::fs::hard_link(
+                    dir.path().join("copy-0.rs"),
+                    dir.path().join("cited-link.rs"),
+                ).unwrap();
+                "cited-link.rs"
+            };
+
+            let result = search_for_excerpt(
+                dir.path(), cited_rel, excerpt, RelocationPolicy::FileThenRepo,
+            );
+            prop_assert_eq!(matches!(&result, ExcerptSearch::Unique(_)), copies == 1);
+            if copies > 1 {
+                prop_assert!(matches!(&result, ExcerptSearch::NonUnique(_)));
+            }
+        }
     }
 
     #[test]
@@ -1627,8 +1759,17 @@ mod tests {
     }
 
     #[test]
-    fn test_count_occurrences_is_non_overlapping_and_reports_first() {
-        assert_eq!(count_occurrences(b"aaaa", b"aa"), (2, Some(0)));
+    fn test_count_occurrences_counts_overlapping_periodic_multiline_excerpt() {
+        let period = b"abcdefghijklmnopqrstuvwxyzABCDE\n";
+        let needle = [period.as_slice(), period.as_slice()].concat();
+        let hay = [period.as_slice(), period.as_slice(), period.as_slice()].concat();
+        assert!(needle.len() >= MIN_EXCERPT_BYTES);
+        assert_eq!(count_occurrences(&hay, &needle), (2, Some(0)));
+    }
+
+    #[test]
+    fn test_count_occurrences_reports_first() {
+        assert_eq!(count_occurrences(b"aaaa", b"aa"), (3, Some(0)));
         assert_eq!(count_occurrences(b"xxabab", b"ab"), (2, Some(2)));
         assert_eq!(count_occurrences(b"abc", b"zz"), (0, None));
         assert_eq!(count_occurrences(b"ab", b"abcdef"), (0, None));
