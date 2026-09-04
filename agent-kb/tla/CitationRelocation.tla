@@ -42,20 +42,22 @@
 
   `PlanHeal` records a plan against a row snapshot: the path it searched from,
   the row's liveness, and the content it hashed.  `ApplyHeal` commits only if
-  that premise still holds, and otherwise discards the plan.  The premise
-  check on the PATH is the one the code omits, so it is the one the constant
-  `UnsafeApply` removes: with `UnsafeApply = TRUE` the model reproduces the
-  code's behaviour and `NoStaleHealCommit` fails, and only that invariant
-  fails.  See CitationRelocation-planheal-trace.md for the trace and the run
-  matrix, and decisions/c3-citation-relocation-t0.md for the refinement
-  mapping, the write-path scope decision, and the determinism decision.
+  that premise still holds, and otherwise discards the plan.  `UnsafeApply`
+  removes the PATH half of that premise, modelling the code's under-lock
+  omission of `citation_path`; `UnsafeVerdict` additionally removes the
+  content/verdict half, modelling the full omission of path, content and
+  verdict rechecks.  With `UnsafeApply = TRUE`, `NoStaleHealCommit` fails and
+  the other eight invariants are expected green; with `UnsafeVerdict = TRUE`,
+  verdict-sensitive invariants are expected to fail as well.  See
+  CitationRelocation-planheal-trace.md for the trace and the run matrix, and
+  decisions/c3-citation-relocation-t0.md for the refinement mapping, the
+  write-path scope decision, and the determinism decision.
 
-  Relocation search is treated as a deterministic function of the row's search
-  inputs (path, contentHash, excerptStrong, candidates).  `ApplyHeal` therefore
-  re-checks those inputs rather than re-deriving a destination: an unchanged
-  premise yields the same destination by construction, which is exactly what
-  V3's "re-run relocation and emit only if it still yields the same
-  destination" acceptance means.
+  Relocation search is treated as a nondeterministic choice recorded in the
+  plan.  `ApplyHeal` re-checks the search inputs rather than re-deriving a
+  destination.  A foreign move is modelled only through `ReVerify` and
+  `ConcurrentHeal`; a stale destination with an otherwise unchanged premise is
+  therefore left to the code-side obligations in V2/V3.
 *)
 
 EXTENDS Naturals, FiniteSets, TLC
@@ -64,13 +66,15 @@ CONSTANTS
   MaxRows,
   MaxCandidates,
   MaxPaths,
-  UnsafeApply    \* TRUE drops ONLY the path premise check, modelling the code
+  UnsafeApply,    \* TRUE drops ONLY the path premise check
+  UnsafeVerdict   \* TRUE also drops the content/verdict premise checks
 
 ASSUME MaxRows \in Nat /\ MaxRows > 0
 ASSUME MaxCandidates \in Nat /\ MaxCandidates > 0
 (* Two distinct paths are the minimum that lets a citation move. *)
 ASSUME MaxPaths \in Nat /\ MaxPaths > 1
 ASSUME UnsafeApply \in BOOLEAN
+ASSUME UnsafeVerdict \in BOOLEAN
 
 RowIds == 1..MaxRows
 PathIds == 1..MaxPaths
@@ -100,7 +104,8 @@ HealPlans ==
    premiseLive : BOOLEAN,        \* the row still needed healing
    premiseContent : Hashes]      \* the content the search hashed
 
-ActionKinds == {"Init", "Verify", "ReVerify", "PlanHeal", "ApplyHeal"}
+ActionKinds == {"Init", "Verify", "ReVerify", "ConcurrentHeal",
+                "PlanHeal", "ApplyHeal"}
 
 VARIABLES
   rows,          \* evidence rows, indexed by their stable row identifier
@@ -108,7 +113,7 @@ VARIABLES
   plans,         \* outstanding relocation plan per row
   previousRows,  \* rows immediately before the last transition
   previousPass,  \* pass immediately before the last transition
-  lastAction     \* [kind, row, before, pathStale, liveStale, committed] witness
+  lastAction     \* [kind, row, before, *_Stale, committed] witness
 
 vars == <<rows, pass, plans, previousRows, previousPass, lastAction>>
 
@@ -139,6 +144,8 @@ TypeOK ==
                      before : Statuses,
                      pathStale : BOOLEAN,
                      liveStale : BOOLEAN,
+                     contentStale : BOOLEAN,
+                     verdictStale : BOOLEAN,
                      committed : BOOLEAN]
 
 Init ==
@@ -153,21 +160,26 @@ Init ==
   /\ previousRows = rows
   /\ previousPass = pass
   /\ lastAction = [kind |-> "Init", row |-> 1, before |-> "Unverified",
-                   pathStale |-> FALSE, liveStale |-> FALSE, committed |-> FALSE]
+                   pathStale |-> FALSE, liveStale |-> FALSE,
+                   contentStale |-> FALSE, verdictStale |-> FALSE,
+                   committed |-> FALSE]
 
-Mark(kind, row, isPathStale, isLiveStale, didCommit) ==
+Mark(kind, row, isPathStale, isLiveStale, isContentStale, isVerdictStale,
+     didCommit) ==
   /\ previousRows' = rows
   /\ previousPass' = pass
   /\ lastAction' = [kind |-> kind, row |-> row,
                     before |-> rows[row].status,
                     pathStale |-> isPathStale,
                     liveStale |-> isLiveStale,
+                    contentStale |-> isContentStale,
+                    verdictStale |-> isVerdictStale,
                     committed |-> didCommit]
 
 (* Only ApplyHeal consumes a plan, so only ApplyHeal can be stale or can
    discard.  For every other action the effect is applied unconditionally and
    the staleness flags do not apply. *)
-Snapshot(kind, row) == Mark(kind, row, FALSE, FALSE, TRUE)
+Snapshot(kind, row) == Mark(kind, row, FALSE, FALSE, FALSE, FALSE, TRUE)
 
 (* A matching hash verifies directly; no relocation search is performed.
    Verify only resolves a row still unresolved in the current pass, so it can
@@ -205,6 +217,16 @@ ReVerify(row, newContent, newCandidates, newExcerptStrong, newPath) ==
   /\ pass' = 1 - pass
   /\ Snapshot("ReVerify", row)
   /\ UNCHANGED plans
+
+(* A concurrent writer may commit a path-only relocation before this worker
+   reaches ApplyHeal.  The model keeps status and search evidence unchanged,
+   because db.rs:1055 overwrites only citation_path and starts no verification
+   pass. *)
+ConcurrentHeal(row, newPath) ==
+  /\ newPath \in PathIds
+  /\ rows' = [rows EXCEPT ![row].path = newPath]
+  /\ Snapshot("ConcurrentHeal", row)
+  /\ UNCHANGED <<pass, plans>>
 
 (* PlanHeal runs the relocation search for a non-Verified row.  This is
    `run_stale_check` building the report, outside the lock.
