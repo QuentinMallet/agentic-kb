@@ -20,7 +20,8 @@ kb context --budget 1200 [--floor 0.05] [--json]
 
 The command blends those signals, sorts by score, and greedily packs whole
 entries until the token budget is exhausted. Tokens use the simple heuristic
-`ceil(UTF-8 bytes / 4)`.
+`ceil(UTF-8 bytes / 4)`, measured on the exact bytes that will be emitted for
+the chosen output mode.
 
 Text mode emits:
 
@@ -36,15 +37,19 @@ handle is the expansion key for later `kb_get` use in MCP flows.
 
 ## Budget and Floor
 
-- `--budget` is required and applies to emitted entries, not to search work.
+- `--budget` is required and applies to the exact emitted representation, not
+  to search work.
 - `--floor` is optional. When unset, the rule is "relevance or silence":
   include any entry with non-zero signal; if nothing has signal, print nothing.
 - Entries are indivisible. A large entry that would exceed the remaining budget
   is skipped rather than clipped.
+- The reported count is approximate and labeled as `approx. tokens`.
 
 ## JSON Mode
 
-`--json` emits a JSON array of `{id, path, summary, tokens, score}` rows.
+`--json` emits a JSON array of `{id, path, summary, approx_tokens, score}` rows.
+In JSON mode, escaping and JSON punctuation count toward the same approximate
+budget.
 
 ## Telemetry
 
