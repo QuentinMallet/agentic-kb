@@ -172,6 +172,9 @@ pub fn add_locked(
     embedder: &dyn embedder::Embedder,
     mut args: AddArgs,
 ) -> Result<AddOutcome> {
+    // Redundant but intentional: open_rw canonicalized paths.lock before it
+    // opened `conn`; re-checking here keeps add_locked self-contained for any
+    // future caller handed a live lock + connection pair from elsewhere.
     let expected_lock = std::fs::canonicalize(&paths.lock).with_context(|| {
         format!(
             "canonicalize write lock {} (add_locked requires a live lock guard)",

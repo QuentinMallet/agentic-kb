@@ -223,6 +223,25 @@ fn open_scratch_refuses_the_live_db() {
 }
 
 #[test]
+fn open_scratch_refuses_the_live_db_through_an_equivalent_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = repo(dir.path());
+    db::open_or_init(&paths).unwrap();
+
+    let spelled_differently = dir
+        .path()
+        .join(".")
+        .join(".state")
+        .join("agent-kb")
+        .join("agent-kb.db");
+    let err = db::open_scratch(&spelled_differently).unwrap_err();
+    assert!(
+        err.to_string().contains("live"),
+        "open_scratch must refuse the live DB even through an equivalent path spelling, got: {err}"
+    );
+}
+
+#[test]
 fn open_scratch_opens_a_tmp_db_with_schema() {
     let dir = tempfile::tempdir().unwrap();
     let paths = repo(dir.path());
@@ -234,6 +253,19 @@ fn open_scratch_opens_a_tmp_db_with_schema() {
         [],
     )
     .expect("scratch DB must carry the schema and accept writes");
+}
+
+#[test]
+fn open_scratch_allows_an_unrelated_agent_kb_db_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let unrelated = dir.path().join("nested").join("agent-kb.db");
+
+    let conn = db::open_scratch(&unrelated).unwrap();
+    conn.execute(
+        "INSERT INTO entries(id, path, summary, content, tags) VALUES('u','p','s','c','[]')",
+        [],
+    )
+    .expect("an unrelated agent-kb.db filename must not be treated as the live DB");
 }
 
 // ---------------------------------------------------------------------------
