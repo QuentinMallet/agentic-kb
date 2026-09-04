@@ -692,6 +692,42 @@ fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T
     }
 }
 
+/// Run `f` inside a SAVEPOINT named `name`.
+///
+/// Like [`with_apply_event_savepoint`], a savepoint composes inside a
+/// caller-owned transaction (nesting) while still providing atomicity when
+/// called standalone (SQLite opens an implicit transaction for a top-level
+/// savepoint). A failure rolls back to the savepoint before propagating the
+/// error, so partial writes made by `f` never survive.
+///
+/// `name` must be a fixed, caller-controlled literal — it is interpolated
+/// directly into the SAVEPOINT/RELEASE/ROLLBACK statements, never built from
+/// request input.
+pub fn with_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match f() {
+        Ok(value) => {
+            if let Err(error) = conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+                let _ = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                ));
+                return Err(error.into());
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+            ));
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 static CROSS_ENTRY_EVIDENCE_WARNINGS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
