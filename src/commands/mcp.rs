@@ -1808,6 +1808,11 @@ fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+    // Response shape:
+    // - roots: real entry ids that exist and have no derived parents
+    // - dangling: missing parent entry ids referenced by derived_from
+    // - graph: directed edges from child -> parent, including dangling parents
+    // - truncated: true when traversal stops at max_depth before exhausting ancestors
     let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
         Some(e) => e.to_string(),
         None => {
@@ -1837,7 +1842,21 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 
     let mut graph: Vec<Value> = Vec::new();
     let mut roots: Vec<String> = Vec::new();
+    let mut dangling: Vec<String> = Vec::new();
     let mut truncated = false;
+
+    let mut exists_stmt = match conn.prepare("SELECT COUNT(*) FROM entries WHERE id=?1") {
+        Ok(s) => s,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    let mut parents_stmt = match conn.prepare(
+        "SELECT DISTINCT derived_from FROM evidence
+         WHERE entry_id=?1 AND kind='derived' AND derived_from IS NOT NULL
+         ORDER BY derived_from",
+    ) {
+        Ok(s) => s,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
     // Iterative DFS with Enter/Leave events for correct cycle vs diamond detection.
     // in_progress tracks nodes on the current DFS path — a back-edge is a true cycle.
@@ -1867,6 +1886,27 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                 if visited.contains(&node_id) {
                     continue; // diamond — already processed via another path
                 }
+
+                let exists: i64 = match exists_stmt.query_row(params![&node_id], |r| r.get(0)) {
+                    Ok(count) => count,
+                    Err(e) => {
+                        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+                    }
+                };
+                if exists == 0 {
+                    if depth == 0 {
+                        return json!({
+                            "id": id,
+                            "type": "error",
+                            "code": "entry_not_found",
+                            "message": format!("entry '{}' not found", node_id)
+                        });
+                    }
+                    visited.insert(node_id.clone());
+                    dangling.push(node_id);
+                    continue;
+                }
+
                 visited.insert(node_id.clone());
                 in_progress.insert(node_id.clone());
                 stack.push(Frame::Leave(node_id.clone()));
@@ -1876,17 +1916,9 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
                     continue;
                 }
 
-                let mut stmt = match conn.prepare(
-                    "SELECT DISTINCT derived_from FROM evidence
-                     WHERE entry_id=?1 AND kind='derived' AND derived_from IS NOT NULL",
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
-                    }
-                };
-
-                let parents: Vec<String> = match stmt.query_map(params![node_id], |r| r.get(0)) {
+                let parents: Vec<String> = match parents_stmt
+                    .query_map(params![&node_id], |r| r.get(0))
+                {
                     Ok(rows) => match rows.collect::<rusqlite::Result<Vec<String>>>() {
                         Ok(parents) => parents,
                         Err(e) => {
@@ -1914,6 +1946,7 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         "id": id,
         "type": "result",
         "roots": roots,
+        "dangling": dangling,
         "graph": graph,
         "truncated": truncated,
     })
@@ -4230,6 +4263,51 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_provenance_missing_start_returns_entry_not_found() {
+        let (_dir, paths, _emb) = setup();
+        let id = json!("prov-missing-start");
+
+        let resp = handle_provenance(&id, &json!({"entry_id": "missing-entry"}), &paths);
+
+        assert_eq!(
+            resp,
+            json!({
+                "id": id,
+                "type": "error",
+                "code": "entry_not_found",
+                "message": "entry 'missing-entry' not found"
+            })
+        );
+    }
+
+    #[test]
+    fn test_handle_provenance_reports_dangling_parent_separately_from_roots() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let child = handle_add(
+            &id,
+            &json!({
+                "path": "p/dangling-child", "summary": "child", "content": "child", "tags": [],
+                "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": "missing-parent", "citation_hash": "sha256:dangling"}]
+            }),
+            &paths,
+            &emb,
+        );
+        let child_id = child["entry_id"].as_str().unwrap().to_string();
+
+        let resp = handle_provenance(&id, &json!({"entry_id": child_id}), &paths);
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["roots"], json!([]));
+        assert_eq!(resp["dangling"], json!(["missing-parent"]));
+        assert_eq!(
+            resp["graph"],
+            json!([{"from": child_id, "to": "missing-parent"}])
+        );
+    }
+
+    #[test]
     fn test_handle_provenance_resolves_derived_edge_to_expired_entry() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
@@ -4265,6 +4343,69 @@ mod tests {
         assert_eq!(resp["graph"][0]["from"], child_id);
         assert_eq!(resp["graph"][0]["to"], root_id);
         assert_eq!(resp["roots"], json!([root_id]));
+    }
+
+    #[test]
+    fn test_handle_provenance_is_deterministic_across_parent_insertion_order() {
+        fn build_fixture(inserted_parents: [&str; 2]) -> (tempfile::TempDir, config::Paths, Value) {
+            let (_dir, paths, emb) = setup();
+            let id = json!("prov-deterministic");
+            let conn = db::open_db(&paths.db).unwrap();
+
+            for (entry_id, path) in [
+                ("prov-root-a", "prov/root-a"),
+                ("prov-root-b", "prov/root-b"),
+                ("prov-child", "prov/child"),
+            ] {
+                db::apply_event(
+                    &conn,
+                    &emb,
+                    &json!({
+                        "action": "upsert",
+                        "table": "entries",
+                        "id": entry_id,
+                        "path": path,
+                        "summary": entry_id,
+                        "content": entry_id,
+                        "tags": [],
+                        "kind": "belief",
+                        "ts": "2024-01-01T00:00:00Z"
+                    }),
+                )
+                .unwrap();
+            }
+
+            for (idx, parent_id) in inserted_parents.into_iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO evidence(id,entry_id,kind,citation_hash,derived_from,recorded_at)
+                     VALUES(?1,?2,'derived',?3,?4,?5)",
+                    params![
+                        format!("prov-ev-{idx}"),
+                        "prov-child",
+                        format!("sha256:{idx}"),
+                        parent_id,
+                        format!("2024-01-01T00:00:0{}Z", idx)
+                    ],
+                )
+                .unwrap();
+            }
+
+            let resp = handle_provenance(&id, &json!({"entry_id": "prov-child"}), &paths);
+            (_dir, paths, resp)
+        }
+
+        let (_dir_forward, paths_forward, resp_forward) =
+            build_fixture(["prov-root-a", "prov-root-b"]);
+        let repeated_forward = handle_provenance(
+            &json!("prov-deterministic"),
+            &json!({"entry_id": "prov-child"}),
+            &paths_forward,
+        );
+        let (_dir_reverse, _paths_reverse, resp_reverse) =
+            build_fixture(["prov-root-b", "prov-root-a"]);
+
+        assert_eq!(resp_forward, repeated_forward);
+        assert_eq!(resp_forward, resp_reverse);
     }
 
     #[test]
@@ -4310,6 +4451,59 @@ mod tests {
             .collect();
         assert_eq!(roots, vec![a_id.clone()]);
         assert_eq!(resp["graph"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_handle_provenance_diamond_is_not_reported_as_cycle() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let root = handle_add(
+            &id,
+            &json!({"path":"p/diamond-root","summary":"root","content":"root","tags":[],"kind":"convention"}),
+            &paths,
+            &emb,
+        );
+        let root_id = root["entry_id"].as_str().unwrap().to_string();
+        let left = handle_add(
+            &id,
+            &json!({
+                "path": "p/diamond-left", "summary": "left", "content": "left", "tags": [], "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:left"}]
+            }),
+            &paths,
+            &emb,
+        );
+        let left_id = left["entry_id"].as_str().unwrap().to_string();
+        let right = handle_add(
+            &id,
+            &json!({
+                "path": "p/diamond-right", "summary": "right", "content": "right", "tags": [], "kind": "belief",
+                "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:right"}]
+            }),
+            &paths,
+            &emb,
+        );
+        let right_id = right["entry_id"].as_str().unwrap().to_string();
+        let child = handle_add(
+            &id,
+            &json!({
+                "path": "p/diamond-child", "summary": "child", "content": "child", "tags": [], "kind": "belief",
+                "evidence": [
+                    {"kind": "derived", "derived_from": left_id, "citation_hash": "sha256:child-left"},
+                    {"kind": "derived", "derived_from": right_id, "citation_hash": "sha256:child-right"}
+                ]
+            }),
+            &paths,
+            &emb,
+        );
+        let child_id = child["entry_id"].as_str().unwrap().to_string();
+
+        let resp = handle_provenance(&id, &json!({"entry_id": child_id}), &paths);
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["roots"], json!([root_id]));
+        assert_eq!(resp["dangling"], json!([]));
+        assert_eq!(resp["graph"].as_array().unwrap().len(), 4);
     }
 
     #[test]
