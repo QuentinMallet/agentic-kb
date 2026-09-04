@@ -638,9 +638,7 @@ mod tests {
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
 
-        let event_log = fs::read_to_string(&paths.events).unwrap();
-        let evidence_event: Value =
-            serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
+        let evidence_event = ev_mod::read_events(&paths.events).unwrap().events.remove(1);
         assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
         assert_eq!(
             evidence_event["evidence"]["citation_sha"],
@@ -788,7 +786,7 @@ mod tests {
         }
 
         // Count lines before.
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
         assert_eq!(before_lines, 2, "seeded 2 events");
 
         let args = AddArgs {
@@ -813,24 +811,23 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
-        // 2 seed events + 2 expire + 1 upsert = 5 total lines.
+        // 2 seed events + 2 expire + 1 upsert = 5 total events.
         assert_eq!(
             lines.len(),
             5,
-            "expected 5 lines (2 seed + 2 expire + 1 upsert), got {}",
+            "expected 5 events (2 seed + 2 expire + 1 upsert), got {}",
             lines.len()
         );
 
-        // Lines 2 and 3 (0-indexed) must be expire events.
-        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
-        let ev3: Value = serde_json::from_str(lines[3]).unwrap();
-        let ev4: Value = serde_json::from_str(lines[4]).unwrap();
-        assert_eq!(ev2["action"], "expire", "line[2] must be expire");
-        assert_eq!(ev3["action"], "expire", "line[3] must be expire");
-        assert_eq!(ev4["action"], "upsert", "line[4] must be upsert");
+        // Events 2 and 3 (0-indexed) must be expire events.
+        let ev2 = &lines[2];
+        let ev3 = &lines[3];
+        let ev4 = &lines[4];
+        assert_eq!(ev2["action"], "expire", "event[2] must be expire");
+        assert_eq!(ev3["action"], "expire", "event[3] must be expire");
+        assert_eq!(ev4["action"], "upsert", "event[4] must be upsert");
         assert_eq!(ev4["id"], "new-1");
 
         // DB: old entries must be stale, new entry active.
@@ -972,7 +969,7 @@ mod tests {
         };
         seed_cmd.execute_with(&paths, &emb).unwrap();
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         // Now add with replace_path — all events must land in one batch.
         let cmd = Add {
@@ -991,8 +988,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &emb).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
@@ -1003,8 +999,8 @@ mod tests {
             lines.len()
         );
         // The expire must appear BEFORE the upsert.
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire");
         assert_eq!(upsert_ev["action"], "upsert");
         assert_eq!(upsert_ev["id"], "conv-new-1");
@@ -1030,7 +1026,7 @@ mod tests {
         db::apply_event(&conn, &emb, &seed_ev).unwrap();
         drop(conn);
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         let id = serde_json::json!("mcp-test");
         let req = serde_json::json!({
@@ -1041,8 +1037,7 @@ mod tests {
         let resp = handle_add_for_test(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok", "resp: {resp}");
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
             lines.len(),
@@ -1051,8 +1046,8 @@ mod tests {
             before_lines + 2,
             lines.len()
         );
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire", "expire must come first");
         assert_eq!(upsert_ev["action"], "upsert");
     }

@@ -288,6 +288,7 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
         held_locks().remove(&key);
         return Err(anyhow::Error::new(e).context(format!("acquire lock {}", lock_path.display())));
     }
+    crate::components::events::note_log_lock_acquired();
     Ok(Lock {
         file: f,
         path: canonical,
@@ -299,6 +300,9 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
 ///
 /// Carries the canonicalized path of the file it locks so a mutating open can
 /// assert it was handed the *right* lock, not merely *a* lock (ADR-1).
+/// Construction and drop are the only places the event-log lock depth moves, so
+/// the append path's destructive span repair can assert the flock structurally
+/// instead of documenting it.
 pub struct Lock {
     #[allow(dead_code)]
     file: std::fs::File,
@@ -318,6 +322,7 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         held_locks().remove(&(self.owner, self.path.clone()));
+        crate::components::events::note_log_lock_released();
     }
 }
 
@@ -786,27 +791,26 @@ mod tests {
         cmd.execute_with(&paths, &embedder).unwrap();
 
         // Verify events.jsonl has Add followed by 2 EvidenceAdd events
-        let events_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = events_content.lines().collect();
-        // Should have 3 lines: 1 upsert + 2 evidence_add
+        let lines = events::read_events(&paths.events).unwrap().events;
+        // Should have 3 events: 1 upsert + 2 evidence_add (markers are not events)
         assert_eq!(
             lines.len(),
             3,
-            "expected 3 event lines (1 add + 2 evidence_add)"
+            "expected 3 events (1 add + 2 evidence_add)"
         );
 
-        let ev0: Value = serde_json::from_str(lines[0]).unwrap();
+        let ev0 = &lines[0];
         assert_eq!(ev0["action"], "upsert");
         assert_eq!(ev0["table"], "entries");
         assert_eq!(ev0["id"], "batch-ev-1");
         assert_eq!(ev0["kind"], "observation");
         assert_eq!(ev0["evidence_status"], "present");
 
-        let ev1: Value = serde_json::from_str(lines[1]).unwrap();
+        let ev1 = &lines[1];
         assert_eq!(ev1["action"], "evidence_add");
         assert_eq!(ev1["entry_id"], "batch-ev-1");
 
-        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
+        let ev2 = &lines[2];
         assert_eq!(ev2["action"], "evidence_add");
         assert_eq!(ev2["entry_id"], "batch-ev-1");
 
@@ -887,8 +891,8 @@ mod tests {
         );
 
         // AC1: the upsert event in the JSONL must also carry session_id.
-        let events_content = fs::read_to_string(&paths.events).unwrap();
-        let ev: Value = serde_json::from_str(events_content.lines().next().unwrap()).unwrap();
+        // Read through the span-aware reader: commit markers are not events.
+        let ev = events::read_events(&paths.events).unwrap().events.remove(0);
         assert_eq!(
             ev["session_id"],
             serde_json::json!("test123"),
