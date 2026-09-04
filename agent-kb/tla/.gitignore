@@ -1,0 +1,4 @@
+states/
+.omc/
+*.st
+*_TTrace_*.bin
