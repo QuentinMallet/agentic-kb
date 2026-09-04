@@ -3206,6 +3206,26 @@ mod tests {
         let resp = handle_run(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["result"], "pass");
+        // T3 (bd-21ef.1.8): the mcp `run` emitter must always carry a
+        // run_id — the keyed-insertion apply arm relies on it for
+        // idempotent replay (CompactMaterialize.tla D5.1).
+        let run_id = resp["run_id"].as_str().expect("run_id must be present");
+        assert!(
+            uuid::Uuid::parse_str(run_id).is_ok(),
+            "run_id must be a uuid, got {run_id}"
+        );
+        let logged = crate::components::events::read_events(&paths.events)
+            .unwrap()
+            .events;
+        let run_event = logged
+            .iter()
+            .find(|e| e["action"] == "insert" && e["table"] == "run_history")
+            .expect("run event must be logged");
+        assert_eq!(
+            run_event["run_id"].as_str(),
+            Some(run_id),
+            "logged event must carry the same run_id returned to the caller"
+        );
     }
 
     #[test]
