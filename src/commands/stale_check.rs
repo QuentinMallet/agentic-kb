@@ -9,7 +9,7 @@
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy};
 use crate::config;
-use crate::models::VerificationStatus;
+use crate::models::{Evidence, VerificationStatus};
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -222,7 +222,7 @@ impl StaleCheck {
         // path only — never the stored hash.
         let cfg = config::KbConfig::from_paths(paths);
         if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
-            heal_relocations(paths, &mut report)?;
+            heal_relocations(paths, &mut report, policy)?;
         }
 
         Ok(report)
@@ -236,12 +236,17 @@ impl StaleCheck {
 /// Opens its own mutating connection rather than reusing the caller's read
 /// connection: a mutation must be performed on a handle obtained with the lock
 /// in hand (ADR-1, principle 2).
-fn heal_relocations(paths: &config::Paths, report: &mut StaleCheckReport) -> anyhow::Result<()> {
+fn heal_relocations(
+    paths: &config::Paths,
+    report: &mut StaleCheckReport,
+    policy: RelocationPolicy,
+) -> anyhow::Result<()> {
     use crate::commands::add::acquire_lock;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events;
 
-    let version_ref = config::git_head_sha();
+    let repo_root = paths.root.as_path();
+    let version_ref = config::git_head_sha_at(repo_root);
     let lock = acquire_lock(&paths.lock)?;
     let conn = &db::open_rw(paths, &lock)?;
 
@@ -250,24 +255,48 @@ fn heal_relocations(paths: &config::Paths, report: &mut StaleCheckReport) -> any
             Some(p) if r.status == VerificationStatus::Relocated => p.clone(),
             _ => continue,
         };
-        // The stored hash is read back and echoed into the event unchanged;
-        // it is audit data, never an input to the UPDATE.
-        let Some(citation_hash): Option<String> = conn
+        // ApplyHeal re-reads the complete evidence row and live parent while
+        // holding the flock, then repeats PlanHeal and requires exact agreement.
+        let Some(evidence): Option<Evidence> = conn
             .query_row(
-                "SELECT citation_hash FROM evidence WHERE id=?1 AND entry_id=?2",
+                "SELECT ev.id, ev.entry_id, ev.kind, ev.citation_path, ev.citation_sha,
+                        ev.citation_hash, ev.citation_excerpt, ev.derived_from, ev.recorded_at
+                 FROM evidence ev JOIN entries e ON e.id=ev.entry_id
+                 WHERE ev.id=?1 AND ev.entry_id=?2 AND e.is_stale=0",
                 params![r.evidence_id, r.entry_id],
-                |row| row.get(0),
+                |row| {
+                    Ok(Evidence {
+                        id: row.get(0)?,
+                        entry_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        citation_path: row.get(3)?,
+                        citation_sha: row.get(4)?,
+                        citation_hash: row.get(5)?,
+                        citation_excerpt: row.get(6)?,
+                        derived_from: row.get(7)?,
+                        recorded_at: row.get(8)?,
+                    })
+                },
             )
             .optional()?
         else {
             continue;
         };
+        if evidence.citation_path.as_deref() != Some(r.old_path.as_str()) {
+            continue;
+        }
+        let repeated = verify_evidence(&evidence, repo_root, policy);
+        if repeated.status != VerificationStatus::Relocated
+            || repeated.relocated_to.as_deref() != Some(new_path.as_str())
+        {
+            continue;
+        }
         let event = events::citation_healed_event(
             &r.entry_id,
             &r.evidence_id,
             &r.old_path,
             &new_path,
-            &citation_hash,
+            &evidence.citation_hash,
             version_ref.as_deref(),
         );
         events::append_event(&paths.events, &event)?;
@@ -363,11 +392,10 @@ pub fn run_stale_check(
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                    r.get::<_, String>(3)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.extend(
             substring_fallback
                 .query_map(params![like_safe, rel_path], |r| {
@@ -375,10 +403,10 @@ pub fn run_stale_check(
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, String>(3).unwrap_or_else(|_| rel_path.clone()),
+                        r.get::<_, String>(3)?,
                     ))
                 })?
-                .filter_map(|r| r.ok()),
+                .collect::<rusqlite::Result<Vec<_>>>()?,
         );
 
         for (id, summary, version_ref, stored_path) in rows {
@@ -1294,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn heal_relocations_skips_missing_evidence_rows_and_keeps_renderable_report() {
+    fn heal_relocations_discards_missing_and_nonconforming_plans() {
         use crate::components::events;
         use rusqlite::params;
 
@@ -1348,10 +1376,13 @@ mod tests {
             ..Default::default()
         };
 
-        heal_relocations(&paths, &mut report).unwrap();
+        heal_relocations(&paths, &mut report, RelocationPolicy::FileThenRepo).unwrap();
 
         assert!(!report.relocation[0].healed, "missing rows are skipped");
-        assert!(report.relocation[1].healed, "remaining rows still heal");
+        assert!(
+            !report.relocation[1].healed,
+            "a stale planned destination is discarded"
+        );
 
         let lines = render_lines(&report);
         assert!(lines
@@ -1359,14 +1390,10 @@ mod tests {
             .any(|l| l.contains("seed.rs:10-20") && l.ends_with("(report-only)")));
         assert!(lines
             .iter()
-            .any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
+            .any(|l| l.contains("seed.rs:0-10") && l.ends_with("(report-only)")));
 
         let events = events::read_events(&paths.events).unwrap();
-        assert_eq!(
-            events.events.len(),
-            1,
-            "only the surviving heal is appended"
-        );
+        assert_eq!(events.events.len(), 0, "neither stale plan is appended");
 
         let healed_path: String = conn
             .query_row(
@@ -1375,7 +1402,165 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(healed_path, "seed.rs:20-30");
+        assert_eq!(healed_path, "seed.rs:0-10");
+    }
+
+    #[test]
+    fn concurrent_heal_writers_discard_second_stale_destination() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let (paths, conn) = db::test_db(dir.path());
+        let excerpt = format!("{}\n{}", "b".repeat(64), "unique relocation tail");
+        std::fs::write(dir.path().join("a.rs"), "0123456789").unwrap();
+        std::fs::write(dir.path().join("b.rs"), &excerpt).unwrap();
+        conn.execute(
+            "INSERT INTO entries(id,path,summary,content,tags,is_stale) VALUES('e1','a.rs','s','c','[]',0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,entry_id,kind,citation_path,citation_hash,citation_excerpt)
+             VALUES('ev1','e1','code','a.rs:0-10','sha256:wrong',?1)",
+            [&excerpt],
+        )
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut joins = Vec::new();
+        for destination in ["b.rs:0-10", "c.rs:0-10"] {
+            let paths = paths.clone();
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                let mut report = StaleCheckReport {
+                    relocation: vec![RelocationEntry {
+                        entry_id: "e1".into(),
+                        evidence_id: "ev1".into(),
+                        status: VerificationStatus::Relocated,
+                        old_path: "a.rs:0-10".into(),
+                        new_path: Some(destination.into()),
+                        reason: None,
+                        healed: false,
+                    }],
+                    ..Default::default()
+                };
+                barrier.wait();
+                heal_relocations(&paths, &mut report, RelocationPolicy::FileThenRepo).unwrap();
+                report.relocation[0].healed
+            }));
+        }
+        barrier.wait();
+        let healed: Vec<bool> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+        assert_eq!(healed.iter().filter(|&&value| value).count(), 1);
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let path: String = conn
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "b.rs:0-10", "the A->C plan must not overwrite A->B");
+    }
+
+    /// br-b3-legacy: `heal_relocations` must resolve `repo_root` from
+    /// `paths.root`, not by walking three parents of `paths.db`. On the
+    /// tolerated legacy layout (`<root>/agent-kb/agent-kb.db`), three parents
+    /// lands one directory ABOVE the repository root
+    /// (docs/decisions/b3-root-derivation.md names this exact construction
+    /// as rejected). A wrong root would make the re-verification PlanHeal
+    /// look for `a.rs`/`b.rs` outside the repository and find neither, so
+    /// this heal only succeeds when the root resolution is correct.
+    #[test]
+    fn heal_relocations_resolves_against_repo_root_on_legacy_layout() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        std::fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        let paths = config::Paths::from_db(&legacy_db);
+        db::open_or_init(&paths).unwrap();
+
+        let excerpt = format!("{}\n{}", "b".repeat(64), "legacy-layout relocation tail");
+        std::fs::write(root.join("a.rs"), "0123456789").unwrap();
+        std::fs::write(root.join("b.rs"), &excerpt).unwrap();
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO entries(id,path,summary,content,tags,is_stale) VALUES('e1','a.rs','s','c','[]',0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,entry_id,kind,citation_path,citation_hash,citation_excerpt)
+             VALUES('ev1','e1','code','a.rs:0-10','sha256:wrong',?1)",
+            [&excerpt],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut report = StaleCheckReport {
+            relocation: vec![RelocationEntry {
+                entry_id: "e1".into(),
+                evidence_id: "ev1".into(),
+                status: VerificationStatus::Relocated,
+                old_path: "a.rs:0-10".into(),
+                new_path: Some("b.rs:0-10".into()),
+                reason: None,
+                healed: false,
+            }],
+            ..Default::default()
+        };
+
+        heal_relocations(&paths, &mut report, RelocationPolicy::FileThenRepo).unwrap();
+
+        assert!(
+            report.relocation[0].healed,
+            "heal must succeed when repo_root resolves to the legacy layout's actual \
+             repository root instead of its parent"
+        );
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let path: String = conn
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "b.rs:0-10");
+    }
+
+    #[test]
+    fn heal_relocations_errors_on_undecodable_citation_path_column() {
+        let dir = TempDir::new().unwrap();
+        let (paths, conn) = db::test_db(dir.path());
+        conn.execute(
+            "INSERT INTO entries(id,path,summary,content,tags,is_stale) VALUES('e1','a.rs','s','c','[]',0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id,entry_id,kind,citation_path,citation_hash)
+             VALUES('ev1','e1','code',CAST(X'FF' AS BLOB),'sha256:wrong')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let mut report = StaleCheckReport {
+            relocation: vec![RelocationEntry {
+                entry_id: "e1".into(),
+                evidence_id: "ev1".into(),
+                status: VerificationStatus::Relocated,
+                old_path: "a.rs".into(),
+                new_path: Some("b.rs".into()),
+                reason: None,
+                healed: false,
+            }],
+            ..Default::default()
+        };
+        let err =
+            heal_relocations(&paths, &mut report, RelocationPolicy::FileThenRepo).unwrap_err();
+        assert!(err.to_string().contains("Invalid column type"), "{err:#}");
+        assert!(!report.relocation[0].healed);
     }
 
     #[test]

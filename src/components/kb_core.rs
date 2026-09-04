@@ -37,7 +37,10 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
-use crate::components::verification::{compute_citation_hash, parse_citation_path};
+use crate::components::verification::{
+    compute_citation_hash, compute_citation_hash_and_size_from, open_citation_descriptor,
+    parse_citation_path, FileIdentity,
+};
 use crate::components::{db, embedder, events, redactor};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
@@ -46,6 +49,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -68,8 +72,38 @@ fn resolve_citation_hash(
     #[cfg(test)]
     CITATION_HASH_RESOLUTION_CALLS.with(|c| c.set(c.get() + 1));
 
-    compute_citation_hash(repo_root, file_rel, range)
+    let file = open_citation_descriptor(repo_root, file_rel)?;
+    Ok(format!(
+        "sha256:{}",
+        compute_citation_hash_and_size_from(&file, file_rel, range)?.sha256_hex
+    ))
 }
+
+#[derive(Clone)]
+struct ResolvedCitation {
+    citation_path: String,
+    absolute_path: PathBuf,
+    identity: FileIdentity,
+    hash: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CITATION_REVERIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_citation_reverify_hook() {
+    BEFORE_CITATION_REVERIFY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_citation_reverify_hook() {}
 
 /// Input arguments for `kb_core::add`.
 ///
@@ -191,45 +225,70 @@ pub fn add_locked(
 
     let repo_root = &paths.root;
 
-    // Normalize path-only evidence before constructing any events. Explicit
-    // assertions are authoritative and are never replaced, even when wrong.
-    let mut resolved_hashes_by_path: HashMap<String, String> = HashMap::new();
+    // Resolve and validate all in-repository path evidence while holding the
+    // flock. File identity, rather than path spelling, is the memoization key.
+    let mut resolved_hashes: HashMap<(FileIdentity, Option<(usize, usize)>), String> =
+        HashMap::new();
+    let mut resolved_citations = Vec::new();
     for evidence in &mut args.evidence_rows {
         let hash_missing = evidence
             .get("citation_hash")
             .and_then(Value::as_str)
             .map(str::is_empty)
             .unwrap_or(true);
-        if !hash_missing {
-            continue;
-        }
-        let citation_path = evidence
+        let Some(citation_path) = evidence
             .get("citation_path")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("evidence row missing required citation_path or citation_hash")
-            })?;
-        let (file_rel, range) = parse_citation_path(citation_path)
+            .map(str::to_string)
+        else {
+            if hash_missing {
+                anyhow::bail!("evidence row missing required citation_path or citation_hash");
+            }
+            continue;
+        };
+        let (file_rel, range) = parse_citation_path(&citation_path)
             .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
-        let citation_hash = if let Some(existing) = resolved_hashes_by_path.get(citation_path) {
+        let absolute_path = repo_root.join(file_rel);
+        let identity = FileIdentity::of(&absolute_path)
+            .with_context(|| format!("resolve citation_path {citation_path:?}"))?;
+        let citation_hash = if let Some(existing) = resolved_hashes.get(&(identity, range)) {
             existing.clone()
         } else {
             let resolved = resolve_citation_hash(repo_root, file_rel, range).map_err(|error| {
                 anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
             })?;
-            resolved_hashes_by_path.insert(citation_path.to_string(), resolved.clone());
+            resolved_hashes.insert((identity, range), resolved.clone());
             resolved
         };
+        if !hash_missing {
+            let supplied = evidence
+                .get("citation_hash")
+                .and_then(Value::as_str)
+                .unwrap();
+            if supplied != citation_hash {
+                anyhow::bail!("citation_hash mismatch for {citation_path:?}");
+            }
+        }
         let object = evidence
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("evidence row must be a JSON object"))?;
-        object.insert("citation_hash".to_string(), Value::String(citation_hash));
+        object.insert(
+            "citation_hash".to_string(),
+            Value::String(citation_hash.clone()),
+        );
         if object.get("citation_sha").map_or(true, Value::is_null) {
-            if let Some(head) = config::git_head_sha() {
+            let cited_dir = absolute_path.parent().unwrap_or(repo_root);
+            if let Some(head) = config::git_head_sha_at(cited_dir) {
                 object.insert("citation_sha".to_string(), Value::String(head));
             }
         }
+        resolved_citations.push(ResolvedCitation {
+            citation_path,
+            absolute_path,
+            identity,
+            hash: citation_hash,
+        });
     }
 
     // Resource caps for cue anchors (mirrors evidence-row caps): bounded count
@@ -334,6 +393,34 @@ pub fn add_locked(
     } else {
         vec![]
     };
+
+    run_before_citation_reverify_hook();
+    let mut verified_identities: HashMap<(FileIdentity, Option<(usize, usize)>), String> =
+        HashMap::new();
+    for resolved in &resolved_citations {
+        let (file_rel, range) = parse_citation_path(&resolved.citation_path)?;
+        let current_identity = FileIdentity::of(&resolved.absolute_path)
+            .with_context(|| format!("re-verify citation_path {:?}", resolved.citation_path))?;
+        if current_identity != resolved.identity {
+            anyhow::bail!(
+                "citation changed before append: {:?}",
+                resolved.citation_path
+            );
+        }
+        let current_hash = if let Some(hash) = verified_identities.get(&(current_identity, range)) {
+            hash.clone()
+        } else {
+            let hash = resolve_citation_hash(repo_root, file_rel, range)?;
+            verified_identities.insert((current_identity, range), hash.clone());
+            hash
+        };
+        if current_hash != resolved.hash {
+            anyhow::bail!(
+                "citation changed before append: {:?}",
+                resolved.citation_path
+            );
+        }
+    }
 
     // Build expire events (one per existing entry being replaced).
     let expire_events: Vec<Value> = existing_ids
@@ -634,7 +721,7 @@ mod tests {
             .unwrap();
         assert_eq!(evidence_status, "present");
         assert_eq!(evidence.citation_hash, expected_hash);
-        assert_eq!(evidence.citation_sha, config::git_head_sha());
+        assert_eq!(evidence.citation_sha, config::git_head_sha_at(dir.path()));
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
 
@@ -642,10 +729,7 @@ mod tests {
         let evidence_event: Value =
             serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
         assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
-        assert_eq!(
-            evidence_event["evidence"]["citation_sha"],
-            config::git_head_sha().unwrap()
-        );
+        assert_eq!(evidence_event["evidence"]["citation_sha"], Value::Null);
     }
 
     #[test]
@@ -701,31 +785,54 @@ mod tests {
             .all(|row| row.citation_hash == expected_hash));
         assert!(evidence_rows
             .iter()
-            .all(|row| row.citation_sha == config::git_head_sha()));
-        assert_eq!(CITATION_HASH_RESOLUTION_CALLS.with(|c| c.get()), 1);
+            .all(|row| row.citation_sha == config::git_head_sha_at(dir.path())));
+        assert_eq!(
+            CITATION_HASH_RESOLUTION_CALLS.with(|c| c.get()),
+            2,
+            "one resolution plus the mandatory pre-append re-verification"
+        );
     }
 
     #[test]
-    fn test_kb_core_add_preserves_explicit_citation_hash() {
-        use crate::components::verification::{verify_evidence, RelocationPolicy};
-        use crate::models::VerificationStatus;
-
+    fn test_kb_core_add_rejects_wrong_explicit_citation_hash() {
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
         let explicit = "sha256:not-the-file-hash";
-        add(
+        let before = fs::read(&paths.events).unwrap_or_default();
+        let err = add(
             &paths,
             &NoopEmbedder,
             evidence_args(vec![serde_json::json!({
                 "kind": "code", "citation_path": "cited.txt", "citation_hash": explicit
             })]),
         )
-        .unwrap();
-        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
-        let evidence = load_test_evidence(&conn);
-        assert_eq!(evidence.citation_hash, explicit);
-        let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
-        assert_eq!(result.status, VerificationStatus::Unverified);
+        .unwrap_err();
+        assert!(err.to_string().contains("citation_hash mismatch"), "{err}");
+        assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
+    }
+
+    #[test]
+    fn test_kb_core_add_catches_mutation_between_resolution_and_append() {
+        let (dir, paths) = setup();
+        let cited = dir.path().join("cited.txt");
+        fs::write(&cited, b"before").unwrap();
+        BEFORE_CITATION_REVERIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(&cited, b"after!").unwrap()));
+        });
+        let before = fs::read(&paths.events).unwrap_or_default();
+        let err = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![
+                serde_json::json!({"kind":"code","citation_path":"cited.txt"}),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("citation changed before append"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
     }
 
     #[test]

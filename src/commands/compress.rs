@@ -110,7 +110,10 @@ pub fn run(
         .iter()
         .map(|p| embedder.embed(p))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    anyhow::ensure!(embeddings.iter().flatten().all(|x| x.is_finite()), "embedder returned a non-finite component");
+    anyhow::ensure!(
+        embeddings.iter().flatten().all(|x| x.is_finite()),
+        "embedder returned a non-finite component"
+    );
 
     // Step 5: greedy cosine deduplication — keep first, drop subsequent near-duplicates.
     let cutoff = config.compress_cosine_cutoff;
@@ -432,6 +435,10 @@ mod tests {
     #[test]
     fn test_compress_strands_no_evidence_on_expired_entry_id() {
         let dir = tempdir().unwrap();
+        // add_locked resolves + re-verifies citation_path against a real repo
+        // file under the flock when carrying evidence into the new entry.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), b"12345\n").unwrap();
         let paths = make_paths(dir.path());
         let conn = db::open_db(&paths.db).unwrap();
         let emb = NoopEmbedder;
@@ -442,11 +449,20 @@ mod tests {
             "tags": [], "kind": "belief", "ts": "2024-01-01T00:00:00Z"
         });
         db::apply_event(&conn, &emb, &upsert).unwrap();
+        // add_locked re-verifies the caller-supplied citation_hash against the
+        // real file when compress carries this evidence into the new entry,
+        // so the seeded hash must actually match "src/lib.rs" bytes 1-2.
+        let real_hash = crate::components::verification::compute_citation_hash(
+            dir.path(),
+            "src/lib.rs",
+            Some((1, 2)),
+        )
+        .unwrap();
         let evidence = serde_json::json!({
             "action": "evidence_add", "table": "evidence", "entry_id": "compress-old",
             "evidence": {
                 "id": "compress-old-ev", "kind": "code",
-                "citation_path": "src/lib.rs:1-2", "citation_hash": "sha256:ok"
+                "citation_path": "src/lib.rs:1-2", "citation_hash": real_hash
             }
         });
         db::apply_event(&conn, &emb, &evidence).unwrap();

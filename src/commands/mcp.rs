@@ -1129,7 +1129,9 @@ fn handle_cite(req: &CiteRequest, paths: &config::Paths) -> Value {
     let start = match NumField::non_negative(&req.start, "start") {
         Ok(Some(n)) => match usize::try_from(n) {
             Ok(n) => Some(n),
-            Err(_) => return json!({"id":id,"type":"error","code":"parse_error","message":"start offset exceeds platform limit"}),
+            Err(_) => {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"start offset exceeds platform limit"})
+            }
         },
         Ok(None) => None,
         Err(e) => return parse_error(id, e),
@@ -1137,7 +1139,9 @@ fn handle_cite(req: &CiteRequest, paths: &config::Paths) -> Value {
     let end = match NumField::non_negative(&req.end, "end") {
         Ok(Some(n)) => match usize::try_from(n) {
             Ok(n) => Some(n),
-            Err(_) => return json!({"id":id,"type":"error","code":"parse_error","message":"end offset exceeds platform limit"}),
+            Err(_) => {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"end offset exceeds platform limit"})
+            }
         },
         Ok(None) => None,
         Err(e) => return parse_error(id, e),
@@ -1155,14 +1159,16 @@ fn handle_cite(req: &CiteRequest, paths: &config::Paths) -> Value {
         }
     };
 
-    match with_citation_fields(&paths.root, path, range, |fields| Ok(json!({
+    match with_citation_fields(&paths.root, path, range, |fields| {
+        Ok(json!({
             "id": id,
             "type": "result",
             "citation_path": fields.citation_path,
             "citation_sha": fields.citation_sha,
             "citation_hash": fields.citation_hash,
             "file_size": fields.file_size,
-        }))) {
+        }))
+    }) {
         Ok(response) => response,
         Err(e) => json!({"id":id,"type":"error","code":"cite_error","message":e.to_string()}),
     }
@@ -2930,13 +2936,26 @@ mod tests {
         // Override kind: add_live_entry hard-codes kind="observation"; we patch via
         // the low-level event path so the kind column is correct for bucket matching.
         let id_val = json!(null);
+        // add_locked now resolves + re-verifies citation_path against a real
+        // repo file under the flock, so the cited file must actually exist.
+        let repo_root = paths
+            .db
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .unwrap();
+        let citation_file = repo_root.join("src/foo.rs");
+        if !citation_file.exists() {
+            fs::create_dir_all(citation_file.parent().unwrap()).unwrap();
+            fs::write(&citation_file, b"12345\n").unwrap();
+        }
         let mut req = json!({
             "path": path,
             "summary": "s",
             "content": "c",
             "tags": [],
             "kind": kind,
-            "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]
+            "evidence": [{"kind":"code","citation_path":"src/foo.rs:1-5"}]
         });
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
@@ -3387,7 +3406,6 @@ mod tests {
                 "kind":"code",
                 "citation_path":"src/get.rs:0-10",
                 "citation_sha":null,
-                "citation_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "citation_excerpt":"fn kb_get"
             }]
         });
@@ -4226,8 +4244,21 @@ mod tests {
         session_id: Option<&str>,
     ) -> String {
         let id = json!(null);
+        // add_locked now resolves + re-verifies citation_path against a real
+        // repo file under the flock, so the cited file must actually exist.
+        let repo_root = paths
+            .db
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .unwrap();
+        let citation_file = repo_root.join("src/foo.rs");
+        if !citation_file.exists() {
+            fs::create_dir_all(citation_file.parent().unwrap()).unwrap();
+            fs::write(&citation_file, b"12345\n").unwrap();
+        }
         let mut req = json!({"path": path, "summary": "s", "content": "c", "tags": [], "kind": "observation",
-                              "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
+                              "evidence": [{"kind":"code","citation_path":"src/foo.rs:1-5"}]});
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
         }
@@ -4616,15 +4647,19 @@ mod tests {
 
     #[test]
     fn test_handle_audit_record_refuses_permanent_sample_and_expires_non_permanent_sample() {
-        let (_dir, paths, emb) = setup();
+        let (dir, paths, emb) = setup();
         let id = json!(null);
+        // add_locked resolves + re-verifies citation_path against a real
+        // repo file under the flock, so the cited file must actually exist.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/foo.rs"), b"12345\n").unwrap();
         // kind must stay audit-eligible: `convention`/`memory` entries get
         // evidence_status='n/a' and audit_sample_entries excludes anything
         // that isn't evidence_status='present' (see the n/a-exclusion test
         // above), so a permanent `convention` entry would never be sampled.
         let permanent_req = json!({"path":"p/permanent-audit","summary":"s","content":"c","tags":[],
                                     "kind":"observation","permanent":true,
-                                    "evidence":[{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
+                                    "evidence":[{"kind":"code","citation_path":"src/foo.rs:1-5"}]});
         let permanent_resp =
             handle_add(&tr::<AddRequest>("add", &id, &permanent_req), &paths, &emb);
         let permanent_id = permanent_resp["entry_id"].as_str().unwrap().to_string();

@@ -52,7 +52,16 @@ pub const MIN_EXCERPT_BYTES: usize = 64;
 pub const MIN_EXCERPT_LINES: usize = 2;
 
 /// Directory names never descended into during a repo-wide relocation search.
-const EXCLUDED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+///
+/// `.state` holds the KB's own managed files (`agent-kb.db`,
+/// `agent-kb-events.jsonl`, ...) on the canonical layout; `agent-kb` holds
+/// the same files directly at the repository root on the tolerated legacy
+/// layout (`<root>/agent-kb/agent-kb.db`, no `.state` wrapper). Both store
+/// every recorded `citation_excerpt` verbatim as row/event data. Without
+/// these exclusions a repo-wide scan matches its own database as a second
+/// "candidate" location for any excerpt the KB has ever recorded, turning a
+/// legitimate unique relocation into a false `NonUnique`.
+const EXCLUDED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".state", "agent-kb"];
 
 /// How hard to look for a citation whose hash no longer matches.
 ///
@@ -505,6 +514,7 @@ enum HashCheck {
 ///
 /// Never propagates I/O errors as `Err` — those are folded into
 /// [`HashCheck::Failed`] per AC16.
+#[cfg(test)]
 fn hash_check_at_citation(
     repo_root: &Path,
     file_rel: &str,
@@ -849,7 +859,8 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
                 if !meta.is_file() {
                     continue;
                 }
-                if cited_identity.is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
+                if cited_identity
+                    .is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
                 {
                     continue;
                 }
@@ -895,7 +906,9 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
 
         let (file_rel, range) = match parse_citation_path(raw_path) {
             Ok(parsed) => parsed,
-            Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
+            Err(_) => {
+                return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath)
+            }
         };
 
         let decayed = match self.hash_check_at_citation(file_rel, range, &ev.citation_hash) {
@@ -918,11 +931,13 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
         let excerpt = match &ev.citation_excerpt {
             Some(e) if excerpt_is_strong(e) => e.as_str(),
             _ => {
-                return VerificationOutcome::unverified(if decayed == UnverifiedReason::HashMismatch {
-                    UnverifiedReason::ExcerptTooWeak
-                } else {
-                    decayed
-                })
+                return VerificationOutcome::unverified(
+                    if decayed == UnverifiedReason::HashMismatch {
+                        UnverifiedReason::ExcerptTooWeak
+                    } else {
+                        decayed
+                    },
+                )
             }
         };
 
@@ -1166,6 +1181,7 @@ enum ExcerptSearch {
 /// `CapExceeded` maps to an `Unverified` outcome, but has no single
 /// `candidates` image because the unscanned bytes leave the actual repo-wide
 /// count unknown (its model image is the set of such unverified states).
+#[cfg(test)]
 fn search_for_excerpt(
     repo_root: &Path,
     cited_rel: &str,
@@ -1195,6 +1211,7 @@ enum FileScan {
 
 /// Read `path` and count overlapping occurrences of `needle`, charging the
 /// bytes read against `budget`.
+#[cfg(test)]
 fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
     let reporter = NoopCapabilityReporter;
     let already_emitted = AtomicBool::new(true);
@@ -1274,8 +1291,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
 
     struct RecordingCapabilityReporter {
@@ -1739,9 +1756,7 @@ mod tests {
         );
         std::fs::write(dir.path().join("a-cited.rs"), excerpt).unwrap();
         let oversized = File::create(dir.path().join("z-oversized.rs")).unwrap();
-        oversized
-            .set_len(MAX_RELOCATION_SCAN_BYTES)
-            .unwrap();
+        oversized.set_len(MAX_RELOCATION_SCAN_BYTES).unwrap();
 
         assert!(matches!(
             search_for_excerpt(
