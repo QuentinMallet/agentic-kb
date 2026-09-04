@@ -220,11 +220,16 @@ where
             &candidate.tags,
         );
         match emb.embed(&text) {
-            Ok(vector) => writes.push(PendingWrite {
+            Ok(vector) if vector.iter().all(|x| x.is_finite()) => writes.push(PendingWrite {
                 id: candidate.id,
                 updated_at: candidate.updated_at,
                 blob: f32s_to_f16_blob(&vector),
             }),
+            Ok(_) => record_failure(
+                &mut report,
+                candidate.id,
+                "embedder returned a non-finite component".to_string(),
+            ),
             Err(error) => record_failure(&mut report, candidate.id, error.to_string()),
         }
     }
