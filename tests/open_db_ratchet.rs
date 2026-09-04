@@ -11,7 +11,16 @@ use std::path::Path;
 /// Lowered 87 -> 72 by L1b: peers.rs and mcp.rs's kb_peers_* handlers moved
 /// their remaining production `open_db` call sites to `open_ro`/`open_rw`
 /// (peer TTL read-time filter + locked sweep).
-const OPEN_DB_CALLSITE_RATCHET: usize = 72;
+///
+/// Bumped 72 -> 74 here: T5a's D4 swap-sequence crash tests in this same
+/// commit add 3 new `db::open_db(&paths.db)` test-fixture call sites in
+/// `src/commands/rebuild.rs` (unrelated to rebuild's own tmp-DB opens, which
+/// this rebase already carries as `open_scratch`), pushing the real count to
+/// 73. C1's subsequent D1/T3/D3 work moves this ratchet through 74 and back
+/// down to 70 without needing its own touch here; see the commit that lowers
+/// it to 69 once C1's D3 write helper (`cursor::append_and_apply`) finishes
+/// migrating call sites off `open_db`.
+const OPEN_DB_CALLSITE_RATCHET: usize = 74;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
