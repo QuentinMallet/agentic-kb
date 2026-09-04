@@ -396,3 +396,552 @@
 {"action":"batch_begin","batch_id":"93b4c669-cbfb-494b-83a6-e40f57f72d70","n":1}
 {"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:30.593210512+00:00","version_ref":"bench-write"}
 {"action":"batch_commit","batch_id":"93b4c669-cbfb-494b-83a6-e40f57f72d70","n":1}
+{"action":"batch_begin","batch_id":"85e9b3e5-239e-4e4f-aa0b-3c3b83a65668","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:30.860875992+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"85e9b3e5-239e-4e4f-aa0b-3c3b83a65668","n":1}
+{"action":"batch_begin","batch_id":"83dcf67b-e1e3-4077-ac2a-189aabe300a3","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:31.116233740+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"83dcf67b-e1e3-4077-ac2a-189aabe300a3","n":1}
+{"action":"batch_begin","batch_id":"643d533e-b0bf-4609-a529-a6f8ab9b97fd","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:31.382324149+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"643d533e-b0bf-4609-a529-a6f8ab9b97fd","n":1}
+{"action":"batch_begin","batch_id":"2584f8c5-91b2-425e-8fc3-b29721af8d5b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:31.613357951+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2584f8c5-91b2-425e-8fc3-b29721af8d5b","n":1}
+{"action":"batch_begin","batch_id":"83377ed9-c3f2-443a-b0cd-3d140616aa56","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:31.856045376+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"83377ed9-c3f2-443a-b0cd-3d140616aa56","n":1}
+{"action":"batch_begin","batch_id":"1de8c81d-1bbb-4808-bf3a-fd3d1115c76e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:32.101635728+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1de8c81d-1bbb-4808-bf3a-fd3d1115c76e","n":1}
+{"action":"batch_begin","batch_id":"02c0ba80-aa4b-4e26-9c67-3b9af3a8bb8e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:32.372260368+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"02c0ba80-aa4b-4e26-9c67-3b9af3a8bb8e","n":1}
+{"action":"batch_begin","batch_id":"ce272156-bec5-43a7-b0a1-6b9e96a74d16","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:32.690165733+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"ce272156-bec5-43a7-b0a1-6b9e96a74d16","n":1}
+{"action":"batch_begin","batch_id":"e1e4d933-ea69-404b-a058-e0a7bca869c3","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:32.935606278+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e1e4d933-ea69-404b-a058-e0a7bca869c3","n":1}
+{"action":"batch_begin","batch_id":"859d54bb-d659-4db8-9696-82aa2ca6ea3f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:33.189671967+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"859d54bb-d659-4db8-9696-82aa2ca6ea3f","n":1}
+{"action":"batch_begin","batch_id":"d859763d-710d-49e4-8adb-042370d5a37f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:33.439920420+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d859763d-710d-49e4-8adb-042370d5a37f","n":1}
+{"action":"batch_begin","batch_id":"775e25a1-5d2e-46a5-8675-69c6ff40f72f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:33.713368790+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"775e25a1-5d2e-46a5-8675-69c6ff40f72f","n":1}
+{"action":"batch_begin","batch_id":"3beca4ff-9183-4546-8108-57c94ffdc31f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:33.950033191+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"3beca4ff-9183-4546-8108-57c94ffdc31f","n":1}
+{"action":"batch_begin","batch_id":"6be65682-2613-4e82-b728-de4f0dcee983","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:34.203864858+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"6be65682-2613-4e82-b728-de4f0dcee983","n":1}
+{"action":"batch_begin","batch_id":"7af96a99-c0e0-4b77-8700-861e3d042d81","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:34.482394291+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7af96a99-c0e0-4b77-8700-861e3d042d81","n":1}
+{"action":"batch_begin","batch_id":"e8c8037b-48fd-4d0e-8c74-1e2b96c2daf2","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:34.708909270+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e8c8037b-48fd-4d0e-8c74-1e2b96c2daf2","n":1}
+{"action":"batch_begin","batch_id":"b4817169-1622-4a6c-b23a-7c2318f62a18","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:34.974871732+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b4817169-1622-4a6c-b23a-7c2318f62a18","n":1}
+{"action":"batch_begin","batch_id":"d0fc0dfc-b9c9-4d0f-9325-701aba1888af","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:35.267912101+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d0fc0dfc-b9c9-4d0f-9325-701aba1888af","n":1}
+{"action":"batch_begin","batch_id":"664fca2a-fe85-4e44-af44-6dd38465f4b1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:35.561212219+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"664fca2a-fe85-4e44-af44-6dd38465f4b1","n":1}
+{"action":"batch_begin","batch_id":"4299ff0e-fa3d-4435-a314-7274b2ffb93e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:35.836036363+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"4299ff0e-fa3d-4435-a314-7274b2ffb93e","n":1}
+{"action":"batch_begin","batch_id":"e8c0f2d9-fdd4-46c4-9209-fa7d6072f1dd","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:36.083026593+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e8c0f2d9-fdd4-46c4-9209-fa7d6072f1dd","n":1}
+{"action":"batch_begin","batch_id":"feeaba00-eb90-431a-bd01-87d4fc4e73e7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:36.337341322+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"feeaba00-eb90-431a-bd01-87d4fc4e73e7","n":1}
+{"action":"batch_begin","batch_id":"52f62208-b65b-4068-bb35-a7135790690b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:36.639400162+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"52f62208-b65b-4068-bb35-a7135790690b","n":1}
+{"action":"batch_begin","batch_id":"0b85a22c-2ef3-4fa9-92bc-7af3f22f2641","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:36.903606247+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0b85a22c-2ef3-4fa9-92bc-7af3f22f2641","n":1}
+{"action":"batch_begin","batch_id":"19dffe17-e41e-4736-b1fd-8cb52fc9dbd7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:37.153478134+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"19dffe17-e41e-4736-b1fd-8cb52fc9dbd7","n":1}
+{"action":"batch_begin","batch_id":"98c9ab2f-fb7b-428a-917b-cfe92826c6b9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:37.424928681+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"98c9ab2f-fb7b-428a-917b-cfe92826c6b9","n":1}
+{"action":"batch_begin","batch_id":"c1dbd19e-bfe2-443a-a70f-f57e8df17841","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:37.693853500+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c1dbd19e-bfe2-443a-a70f-f57e8df17841","n":1}
+{"action":"batch_begin","batch_id":"933947f3-8885-4c93-b50e-511ee6d4815e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:37.985957728+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"933947f3-8885-4c93-b50e-511ee6d4815e","n":1}
+{"action":"batch_begin","batch_id":"16d91309-9fbf-4f0c-a9eb-593427935c1d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:38.244870417+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"16d91309-9fbf-4f0c-a9eb-593427935c1d","n":1}
+{"action":"batch_begin","batch_id":"037ddbc2-82f4-49f9-b74a-84cc3bb04d52","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:38.527636693+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"037ddbc2-82f4-49f9-b74a-84cc3bb04d52","n":1}
+{"action":"batch_begin","batch_id":"69d99980-322a-468a-86c8-2556d8e55d37","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:38.778432197+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"69d99980-322a-468a-86c8-2556d8e55d37","n":1}
+{"action":"batch_begin","batch_id":"63bc1847-25cd-433c-afee-fb88be305778","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:39.055035600+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"63bc1847-25cd-433c-afee-fb88be305778","n":1}
+{"action":"batch_begin","batch_id":"d0daa83c-4963-487c-ab13-ca6f9f98e431","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:39.311945066+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d0daa83c-4963-487c-ab13-ca6f9f98e431","n":1}
+{"action":"batch_begin","batch_id":"0e79575c-eded-4e44-a6e8-2a804940a702","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:39.589139381+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0e79575c-eded-4e44-a6e8-2a804940a702","n":1}
+{"action":"batch_begin","batch_id":"b6ef64af-97bb-4151-8992-366461f6509f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:39.867179300+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b6ef64af-97bb-4151-8992-366461f6509f","n":1}
+{"action":"batch_begin","batch_id":"d2a2dbcb-6728-43fd-9288-0d046a3bee91","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:40.155898701+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d2a2dbcb-6728-43fd-9288-0d046a3bee91","n":1}
+{"action":"batch_begin","batch_id":"7170aea9-a4cc-43f5-9f0f-3ffae0eeb078","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:40.429100686+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7170aea9-a4cc-43f5-9f0f-3ffae0eeb078","n":1}
+{"action":"batch_begin","batch_id":"d3d6032b-383b-4f96-b540-3ffc9ac5f72e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:40.694435337+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d3d6032b-383b-4f96-b540-3ffc9ac5f72e","n":1}
+{"action":"batch_begin","batch_id":"a5dd0827-1af9-4e86-9834-8a55fdcaa597","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:40.938806615+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"a5dd0827-1af9-4e86-9834-8a55fdcaa597","n":1}
+{"action":"batch_begin","batch_id":"7bc67e9f-1e28-4584-ada0-887a02e943ed","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:41.236296469+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7bc67e9f-1e28-4584-ada0-887a02e943ed","n":1}
+{"action":"batch_begin","batch_id":"83948571-6d4b-4587-a2a0-0620b0bb10ca","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:41.526517385+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"83948571-6d4b-4587-a2a0-0620b0bb10ca","n":1}
+{"action":"batch_begin","batch_id":"bdd28144-31a7-4caf-a01a-63cdf2ccf667","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:41.774290232+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"bdd28144-31a7-4caf-a01a-63cdf2ccf667","n":1}
+{"action":"batch_begin","batch_id":"68ada89c-446b-4c45-a9ba-6ee51182e93d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:42.015485318+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"68ada89c-446b-4c45-a9ba-6ee51182e93d","n":1}
+{"action":"batch_begin","batch_id":"9ac9bed7-babe-4b98-9ba7-32697ef4e21e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:42.273295740+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"9ac9bed7-babe-4b98-9ba7-32697ef4e21e","n":1}
+{"action":"batch_begin","batch_id":"08fedfb1-dfcb-44f0-acc3-61a7b2cd20f4","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:42.531551896+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"08fedfb1-dfcb-44f0-acc3-61a7b2cd20f4","n":1}
+{"action":"batch_begin","batch_id":"04be88e5-9aab-4b5a-9772-687aea2ef6e9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:42.774307858+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"04be88e5-9aab-4b5a-9772-687aea2ef6e9","n":1}
+{"action":"batch_begin","batch_id":"9662f47b-ed8e-46e0-8d4b-08ae67452aba","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:43.029321600+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"9662f47b-ed8e-46e0-8d4b-08ae67452aba","n":1}
+{"action":"batch_begin","batch_id":"1852c288-f396-4fe7-95b7-506db0fac656","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:43.302574750+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1852c288-f396-4fe7-95b7-506db0fac656","n":1}
+{"action":"batch_begin","batch_id":"190e50f6-7c0c-4e19-8ad3-7d7e80078f2d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:43.527992540+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"190e50f6-7c0c-4e19-8ad3-7d7e80078f2d","n":1}
+{"action":"batch_begin","batch_id":"b7f97cf3-d4c7-4f7f-87f3-72300a749c95","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:43.758674732+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b7f97cf3-d4c7-4f7f-87f3-72300a749c95","n":1}
+{"action":"batch_begin","batch_id":"80bea49f-623d-4700-bcbd-490914366755","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:44.007487351+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"80bea49f-623d-4700-bcbd-490914366755","n":1}
+{"action":"batch_begin","batch_id":"d41f875b-7a5a-43f1-b894-04e49274d30c","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:44.241512503+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d41f875b-7a5a-43f1-b894-04e49274d30c","n":1}
+{"action":"batch_begin","batch_id":"004997c0-418c-4964-9319-ff2d0d73c510","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:44.516592360+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"004997c0-418c-4964-9319-ff2d0d73c510","n":1}
+{"action":"batch_begin","batch_id":"d9988c3f-1788-4bfe-8c19-616ccfc1afa0","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:44.755466646+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d9988c3f-1788-4bfe-8c19-616ccfc1afa0","n":1}
+{"action":"batch_begin","batch_id":"e87d0d7a-69df-41df-8634-4e2d48ab4630","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:44.987553986+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e87d0d7a-69df-41df-8634-4e2d48ab4630","n":1}
+{"action":"batch_begin","batch_id":"7ecfd04b-fee8-4e5b-afcd-8eb9820cfedc","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:45.217160359+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7ecfd04b-fee8-4e5b-afcd-8eb9820cfedc","n":1}
+{"action":"batch_begin","batch_id":"344fd374-f9cc-4c6d-9d91-dc652915cb21","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:45.474771924+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"344fd374-f9cc-4c6d-9d91-dc652915cb21","n":1}
+{"action":"batch_begin","batch_id":"75c71a69-07b3-4d5e-af27-731708b4a645","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:45.737258640+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"75c71a69-07b3-4d5e-af27-731708b4a645","n":1}
+{"action":"batch_begin","batch_id":"bbb4edf5-9dd9-4fbd-bebd-d1763680bb8f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:45.981979936+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"bbb4edf5-9dd9-4fbd-bebd-d1763680bb8f","n":1}
+{"action":"batch_begin","batch_id":"cc99f312-4c69-4c68-b222-cde786a0a0fc","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:46.229249812+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"cc99f312-4c69-4c68-b222-cde786a0a0fc","n":1}
+{"action":"batch_begin","batch_id":"51fbfc94-7629-4ace-a8d1-b3474c5d700f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:46.454869866+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"51fbfc94-7629-4ace-a8d1-b3474c5d700f","n":1}
+{"action":"batch_begin","batch_id":"2037ec6c-8766-4359-854a-b7e0a24d22ba","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:46.684954434+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2037ec6c-8766-4359-854a-b7e0a24d22ba","n":1}
+{"action":"batch_begin","batch_id":"0959fbe8-d9a3-455e-a855-9f66394389a6","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:46.946864224+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0959fbe8-d9a3-455e-a855-9f66394389a6","n":1}
+{"action":"batch_begin","batch_id":"79d35e0f-7741-48b1-a545-3f738916409d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:47.185892305+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"79d35e0f-7741-48b1-a545-3f738916409d","n":1}
+{"action":"batch_begin","batch_id":"6b38e120-1cbe-4872-8257-dead55146020","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:47.419536192+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"6b38e120-1cbe-4872-8257-dead55146020","n":1}
+{"action":"batch_begin","batch_id":"4aa7c75f-8c74-48ed-bf2d-c418fd75b4b7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:47.666689303+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"4aa7c75f-8c74-48ed-bf2d-c418fd75b4b7","n":1}
+{"action":"batch_begin","batch_id":"a3ce6cd3-e58b-43e1-b315-572ee61074a5","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:47.892606507+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"a3ce6cd3-e58b-43e1-b315-572ee61074a5","n":1}
+{"action":"batch_begin","batch_id":"f3906cea-9db4-469e-a69f-4c71f2f96a57","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:48.133205040+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"f3906cea-9db4-469e-a69f-4c71f2f96a57","n":1}
+{"action":"batch_begin","batch_id":"b83be4c1-5fe9-4d07-ba9f-0e1449344119","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:48.382052263+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b83be4c1-5fe9-4d07-ba9f-0e1449344119","n":1}
+{"action":"batch_begin","batch_id":"eb8c7e62-13f1-419d-abdb-5c77e9ead32e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:48.618711845+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"eb8c7e62-13f1-419d-abdb-5c77e9ead32e","n":1}
+{"action":"batch_begin","batch_id":"c5aef755-c7b9-4080-aa56-bbfa759f3cba","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:48.857334827+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c5aef755-c7b9-4080-aa56-bbfa759f3cba","n":1}
+{"action":"batch_begin","batch_id":"e6bd02fe-ed4c-47af-9b01-360424bf5ab9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:49.105966982+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e6bd02fe-ed4c-47af-9b01-360424bf5ab9","n":1}
+{"action":"batch_begin","batch_id":"3f69c5dd-0565-412d-ae87-aa542e4b2428","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:49.342849786+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"3f69c5dd-0565-412d-ae87-aa542e4b2428","n":1}
+{"action":"batch_begin","batch_id":"4aeb8af7-95c1-40ac-ad50-8d0aff35f706","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:49.610942266+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"4aeb8af7-95c1-40ac-ad50-8d0aff35f706","n":1}
+{"action":"batch_begin","batch_id":"af085f59-40ad-4530-8343-0ddcd12c06a9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:49.861621605+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"af085f59-40ad-4530-8343-0ddcd12c06a9","n":1}
+{"action":"batch_begin","batch_id":"53fcc7ea-ae7e-4ca2-a065-617aa60c9089","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:50.102794300+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"53fcc7ea-ae7e-4ca2-a065-617aa60c9089","n":1}
+{"action":"batch_begin","batch_id":"7bebd023-c376-47d4-9257-9896730a06d4","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:50.378247667+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7bebd023-c376-47d4-9257-9896730a06d4","n":1}
+{"action":"batch_begin","batch_id":"7ee8627c-51b4-4011-8cc0-1dbb4a27f233","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:50.622340551+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7ee8627c-51b4-4011-8cc0-1dbb4a27f233","n":1}
+{"action":"batch_begin","batch_id":"40887c55-540b-40d9-b3f7-70f8adef0095","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:50.861955997+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"40887c55-540b-40d9-b3f7-70f8adef0095","n":1}
+{"action":"batch_begin","batch_id":"0dea72c1-9edb-4e9c-98c9-69eb4b0c3b66","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:51.119403007+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0dea72c1-9edb-4e9c-98c9-69eb4b0c3b66","n":1}
+{"action":"batch_begin","batch_id":"7b22adc3-b082-4fd0-aaff-b740b8920c50","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:51.380120754+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7b22adc3-b082-4fd0-aaff-b740b8920c50","n":1}
+{"action":"batch_begin","batch_id":"d0b88501-4e05-487d-9987-b081d86bd0bb","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:51.617878636+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d0b88501-4e05-487d-9987-b081d86bd0bb","n":1}
+{"action":"batch_begin","batch_id":"8c31bb68-af32-4a42-adc3-edfef2595170","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:51.865960484+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"8c31bb68-af32-4a42-adc3-edfef2595170","n":1}
+{"action":"batch_begin","batch_id":"569dbb4a-2ced-4cbf-b2a1-a216bcb254f1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:52.136734961+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"569dbb4a-2ced-4cbf-b2a1-a216bcb254f1","n":1}
+{"action":"batch_begin","batch_id":"6d726057-24a2-40a0-842a-4cf44090bd89","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:52.381535453+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"6d726057-24a2-40a0-842a-4cf44090bd89","n":1}
+{"action":"batch_begin","batch_id":"1163161d-ea50-4cdf-bee7-88b22e85f9f7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:52.616090475+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1163161d-ea50-4cdf-bee7-88b22e85f9f7","n":1}
+{"action":"batch_begin","batch_id":"64de558f-a306-4d52-87d7-3d11ba5f392b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:52.842364608+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"64de558f-a306-4d52-87d7-3d11ba5f392b","n":1}
+{"action":"batch_begin","batch_id":"47cc4372-c8ce-4b55-a929-954b91b5bc95","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:53.179005808+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"47cc4372-c8ce-4b55-a929-954b91b5bc95","n":1}
+{"action":"batch_begin","batch_id":"356c0035-c398-4a92-aa0e-387288af96de","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:53.401951589+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"356c0035-c398-4a92-aa0e-387288af96de","n":1}
+{"action":"batch_begin","batch_id":"31dfe18c-199c-46bb-91fb-10c1d3af632f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:53.620454095+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"31dfe18c-199c-46bb-91fb-10c1d3af632f","n":1}
+{"action":"batch_begin","batch_id":"dd4e1ff4-71de-4aee-85f5-7391cc12c571","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:53.863428121+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"dd4e1ff4-71de-4aee-85f5-7391cc12c571","n":1}
+{"action":"batch_begin","batch_id":"f9df843a-1d54-4026-9dd6-43e03b5661d1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:54.110394676+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"f9df843a-1d54-4026-9dd6-43e03b5661d1","n":1}
+{"action":"batch_begin","batch_id":"11db1ae3-ecfc-4ccc-82a4-83f520b3c6a3","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:54.357916709+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"11db1ae3-ecfc-4ccc-82a4-83f520b3c6a3","n":1}
+{"action":"batch_begin","batch_id":"be6a4c44-8e60-4da5-8353-4d987485c65d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:54.607963860+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"be6a4c44-8e60-4da5-8353-4d987485c65d","n":1}
+{"action":"batch_begin","batch_id":"d72153c4-4ade-4150-9490-88c6e852d90d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:54.874453526+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d72153c4-4ade-4150-9490-88c6e852d90d","n":1}
+{"action":"batch_begin","batch_id":"62a99f97-34c8-4742-9f16-10e546677bd8","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:55.127912103+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"62a99f97-34c8-4742-9f16-10e546677bd8","n":1}
+{"action":"batch_begin","batch_id":"aa443e60-d98d-4f5f-aa55-6892d5f164f6","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:55.371050292+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"aa443e60-d98d-4f5f-aa55-6892d5f164f6","n":1}
+{"action":"batch_begin","batch_id":"be8978a7-59a4-40fd-952e-41bf11a09405","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:55.645926392+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"be8978a7-59a4-40fd-952e-41bf11a09405","n":1}
+{"action":"batch_begin","batch_id":"103b3b77-83fe-4a6d-a54c-ac6c55dbd240","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:55.883783508+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"103b3b77-83fe-4a6d-a54c-ac6c55dbd240","n":1}
+{"action":"batch_begin","batch_id":"c7a69697-1029-45c8-86a9-4ce21237d852","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:56.151928684+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c7a69697-1029-45c8-86a9-4ce21237d852","n":1}
+{"action":"batch_begin","batch_id":"ff77bdd6-8eba-49d6-98f2-690e512cc2f5","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:56.426071498+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"ff77bdd6-8eba-49d6-98f2-690e512cc2f5","n":1}
+{"action":"batch_begin","batch_id":"ff6be997-46e8-4ff0-b97e-3f35f517756f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:56.666895128+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"ff6be997-46e8-4ff0-b97e-3f35f517756f","n":1}
+{"action":"batch_begin","batch_id":"5dc73c13-64cf-4f9d-a4e9-9779358cfa55","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:56.937642866+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5dc73c13-64cf-4f9d-a4e9-9779358cfa55","n":1}
+{"action":"batch_begin","batch_id":"7015bd27-aca1-4f12-a578-867223fa026f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:57.243136927+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7015bd27-aca1-4f12-a578-867223fa026f","n":1}
+{"action":"batch_begin","batch_id":"b00ed111-8e5a-423c-b37b-b3fea015bfca","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:57.543959422+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b00ed111-8e5a-423c-b37b-b3fea015bfca","n":1}
+{"action":"batch_begin","batch_id":"5f18a711-7696-433a-b0a2-c00581b50567","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:57.801789400+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5f18a711-7696-433a-b0a2-c00581b50567","n":1}
+{"action":"batch_begin","batch_id":"f12b8ef7-f592-468f-b2d0-01cffa485093","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:58.043026344+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"f12b8ef7-f592-468f-b2d0-01cffa485093","n":1}
+{"action":"batch_begin","batch_id":"6f4db2d6-1c31-4746-bc69-bdc70fe70d83","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:58.307072373+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"6f4db2d6-1c31-4746-bc69-bdc70fe70d83","n":1}
+{"action":"batch_begin","batch_id":"4de46ca2-c155-4d98-b2a0-66b48b573ce1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:58.572632742+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"4de46ca2-c155-4d98-b2a0-66b48b573ce1","n":1}
+{"action":"batch_begin","batch_id":"2e50c112-e4c1-4393-961c-4fca428f5d5c","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:58.824274430+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2e50c112-e4c1-4393-961c-4fca428f5d5c","n":1}
+{"action":"batch_begin","batch_id":"a826a317-3f6c-4dc4-ad84-0ece39e04b5b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:59.059135016+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"a826a317-3f6c-4dc4-ad84-0ece39e04b5b","n":1}
+{"action":"batch_begin","batch_id":"4d5c88c3-c81e-462c-b8b5-826452d448d1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:59.327552286+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"4d5c88c3-c81e-462c-b8b5-826452d448d1","n":1}
+{"action":"batch_begin","batch_id":"53107345-2b7b-4f89-88cb-1ebf93a99197","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:59.583246026+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"53107345-2b7b-4f89-88cb-1ebf93a99197","n":1}
+{"action":"batch_begin","batch_id":"48f19551-11f6-4beb-91f9-6e7dc4d46be8","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:58:59.868056821+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"48f19551-11f6-4beb-91f9-6e7dc4d46be8","n":1}
+{"action":"batch_begin","batch_id":"0e0f3d81-3dda-4e8b-b666-5041ffcf945d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:00.133631737+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0e0f3d81-3dda-4e8b-b666-5041ffcf945d","n":1}
+{"action":"batch_begin","batch_id":"dcc8270f-76b2-45f2-a93a-51e08d90e097","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:00.420715965+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"dcc8270f-76b2-45f2-a93a-51e08d90e097","n":1}
+{"action":"batch_begin","batch_id":"fb97e382-5771-4dbd-8c5b-ec46d8ebcc12","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:00.690145175+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"fb97e382-5771-4dbd-8c5b-ec46d8ebcc12","n":1}
+{"action":"batch_begin","batch_id":"3bab23d1-215c-4616-b049-9fa41034e8d0","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:00.956624733+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"3bab23d1-215c-4616-b049-9fa41034e8d0","n":1}
+{"action":"batch_begin","batch_id":"9717c7f2-8856-43aa-be58-1d2033430a9b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:01.241954698+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"9717c7f2-8856-43aa-be58-1d2033430a9b","n":1}
+{"action":"batch_begin","batch_id":"1b55226c-3f28-41a0-a220-38620f6a9983","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:01.482795320+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1b55226c-3f28-41a0-a220-38620f6a9983","n":1}
+{"action":"batch_begin","batch_id":"c0c9ee2d-2ef2-4fd4-a89b-9f9fb1c49223","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:01.832934031+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c0c9ee2d-2ef2-4fd4-a89b-9f9fb1c49223","n":1}
+{"action":"batch_begin","batch_id":"84ebb266-a993-483c-92df-0c66f7838248","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:02.147766154+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"84ebb266-a993-483c-92df-0c66f7838248","n":1}
+{"action":"batch_begin","batch_id":"0ede8da9-6977-4b30-a69d-0323bc1e3282","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:02.403925003+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0ede8da9-6977-4b30-a69d-0323bc1e3282","n":1}
+{"action":"batch_begin","batch_id":"dc4afa7e-42f6-466f-9297-860a1614cffd","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:02.700347784+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"dc4afa7e-42f6-466f-9297-860a1614cffd","n":1}
+{"action":"batch_begin","batch_id":"5202dca6-a64a-47a5-9da0-05f23280c585","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:02.942941686+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5202dca6-a64a-47a5-9da0-05f23280c585","n":1}
+{"action":"batch_begin","batch_id":"1f1ab151-1094-41e9-87ed-64c9e626901f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:03.187433037+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1f1ab151-1094-41e9-87ed-64c9e626901f","n":1}
+{"action":"batch_begin","batch_id":"9088b7a1-1239-4e63-9a7f-b099e9f85d1b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:03.419845848+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"9088b7a1-1239-4e63-9a7f-b099e9f85d1b","n":1}
+{"action":"batch_begin","batch_id":"3a2ea3c7-f3e9-481e-85f5-d68ea39b24e2","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:03.684953029+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"3a2ea3c7-f3e9-481e-85f5-d68ea39b24e2","n":1}
+{"action":"batch_begin","batch_id":"5ea7be2b-d70b-4f10-a639-82b55f788600","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:03.940766018+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5ea7be2b-d70b-4f10-a639-82b55f788600","n":1}
+{"action":"batch_begin","batch_id":"a83d856c-6d34-49f9-bb1a-d601ffee1d77","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:04.199116859+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"a83d856c-6d34-49f9-bb1a-d601ffee1d77","n":1}
+{"action":"batch_begin","batch_id":"d9afdaed-0bff-49c1-887f-e81d207a98c1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:04.486670004+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"d9afdaed-0bff-49c1-887f-e81d207a98c1","n":1}
+{"action":"batch_begin","batch_id":"c4a1ff1d-983f-4113-8863-abb01f469bb9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:04.742397145+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c4a1ff1d-983f-4113-8863-abb01f469bb9","n":1}
+{"action":"batch_begin","batch_id":"125e733f-abcd-4d1b-b9e9-73b1992013d1","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:04.980989119+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"125e733f-abcd-4d1b-b9e9-73b1992013d1","n":1}
+{"action":"batch_begin","batch_id":"727cb107-1d6e-470e-aec9-597b8ab71b7f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:05.245930894+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"727cb107-1d6e-470e-aec9-597b8ab71b7f","n":1}
+{"action":"batch_begin","batch_id":"feddf7c0-e259-40b2-90ed-fa76a96a1525","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:05.490407928+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"feddf7c0-e259-40b2-90ed-fa76a96a1525","n":1}
+{"action":"batch_begin","batch_id":"7329a045-68ef-4c0a-9c79-60e98053e2cd","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:05.748706382+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7329a045-68ef-4c0a-9c79-60e98053e2cd","n":1}
+{"action":"batch_begin","batch_id":"7af3fcc3-dedd-4327-b524-966d09665fa2","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:06.004029316+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7af3fcc3-dedd-4327-b524-966d09665fa2","n":1}
+{"action":"batch_begin","batch_id":"e9542637-8892-4d37-955a-1c7eb2894883","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:06.250094736+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e9542637-8892-4d37-955a-1c7eb2894883","n":1}
+{"action":"batch_begin","batch_id":"5aa6649f-fa1d-4df7-8f22-01e05819777c","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:06.505103909+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5aa6649f-fa1d-4df7-8f22-01e05819777c","n":1}
+{"action":"batch_begin","batch_id":"f1902802-f742-45b3-a25c-19d25d8dcdb4","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:06.745781649+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"f1902802-f742-45b3-a25c-19d25d8dcdb4","n":1}
+{"action":"batch_begin","batch_id":"7635e0a3-484b-4e97-83da-5275a7aedbd3","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:07.006379895+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7635e0a3-484b-4e97-83da-5275a7aedbd3","n":1}
+{"action":"batch_begin","batch_id":"6fad6e5f-3a03-4338-a977-025b82df254b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:07.272875252+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"6fad6e5f-3a03-4338-a977-025b82df254b","n":1}
+{"action":"batch_begin","batch_id":"5cf2f615-e089-4e78-b764-11f15bb1b3e5","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:07.536067393+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"5cf2f615-e089-4e78-b764-11f15bb1b3e5","n":1}
+{"action":"batch_begin","batch_id":"69b09578-2cd9-4608-8743-cae9ad643d7e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:07.790733171+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"69b09578-2cd9-4608-8743-cae9ad643d7e","n":1}
+{"action":"batch_begin","batch_id":"2c860289-8fa8-4039-b3d8-24d78185aab9","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:08.048841965+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2c860289-8fa8-4039-b3d8-24d78185aab9","n":1}
+{"action":"batch_begin","batch_id":"abda19d4-d496-4b2c-a4e5-877db03f40e7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:08.312639605+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"abda19d4-d496-4b2c-a4e5-877db03f40e7","n":1}
+{"action":"batch_begin","batch_id":"fe3be49d-9046-4438-8a4a-b728cf40c43e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:08.565843281+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"fe3be49d-9046-4438-8a4a-b728cf40c43e","n":1}
+{"action":"batch_begin","batch_id":"caa746e2-16bb-42dd-8037-5ffd1dbe2818","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:08.809352896+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"caa746e2-16bb-42dd-8037-5ffd1dbe2818","n":1}
+{"action":"batch_begin","batch_id":"e32db633-17d0-4c87-b4c3-388e95a7a876","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:09.065784329+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"e32db633-17d0-4c87-b4c3-388e95a7a876","n":1}
+{"action":"batch_begin","batch_id":"b4db4fa7-2947-4f84-a8c8-c749ddf1b208","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:09.336281594+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b4db4fa7-2947-4f84-a8c8-c749ddf1b208","n":1}
+{"action":"batch_begin","batch_id":"7ac52fdb-40c3-4be6-9d10-e85cc9ba604f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:09.607145156+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7ac52fdb-40c3-4be6-9d10-e85cc9ba604f","n":1}
+{"action":"batch_begin","batch_id":"cdb5ee7d-14c7-4d49-baf2-5c25b1a6f1a8","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:09.851770394+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"cdb5ee7d-14c7-4d49-baf2-5c25b1a6f1a8","n":1}
+{"action":"batch_begin","batch_id":"c31b4d1c-7e94-45cc-9eb8-a676c1827187","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:10.110268527+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c31b4d1c-7e94-45cc-9eb8-a676c1827187","n":1}
+{"action":"batch_begin","batch_id":"0ffb5647-f05f-4a31-8417-69970ebc738f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:10.354877955+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0ffb5647-f05f-4a31-8417-69970ebc738f","n":1}
+{"action":"batch_begin","batch_id":"fb2d0852-9750-41e7-ad4d-eed25470e2eb","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:10.619876816+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"fb2d0852-9750-41e7-ad4d-eed25470e2eb","n":1}
+{"action":"batch_begin","batch_id":"b584970e-f4fb-476c-9d81-7a1e77c42196","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:10.927301986+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"b584970e-f4fb-476c-9d81-7a1e77c42196","n":1}
+{"action":"batch_begin","batch_id":"bf22b7dc-edeb-42b2-a941-915cc5045a45","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:11.176850365+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"bf22b7dc-edeb-42b2-a941-915cc5045a45","n":1}
+{"action":"batch_begin","batch_id":"71d6b9be-bddf-4d62-9f74-9fe811264ca7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:11.438181966+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"71d6b9be-bddf-4d62-9f74-9fe811264ca7","n":1}
+{"action":"batch_begin","batch_id":"0b403f0e-7919-4340-bffc-144633207295","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:11.697281822+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0b403f0e-7919-4340-bffc-144633207295","n":1}
+{"action":"batch_begin","batch_id":"7e280a12-b51d-470c-9dd9-5a670256d409","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:11.940847300+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"7e280a12-b51d-470c-9dd9-5a670256d409","n":1}
+{"action":"batch_begin","batch_id":"a4e79370-f283-4c9a-af40-fcf6f9cd3822","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:12.208387349+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"a4e79370-f283-4c9a-af40-fcf6f9cd3822","n":1}
+{"action":"batch_begin","batch_id":"03c26f6f-a650-46eb-b2e2-b69464450f50","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:12.462121194+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"03c26f6f-a650-46eb-b2e2-b69464450f50","n":1}
+{"action":"batch_begin","batch_id":"bcab1c68-af0b-4245-8936-8d46cadf76d6","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:12.712297354+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"bcab1c68-af0b-4245-8936-8d46cadf76d6","n":1}
+{"action":"batch_begin","batch_id":"82826362-6af0-4b63-ad8f-11b60446478f","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:12.974185043+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"82826362-6af0-4b63-ad8f-11b60446478f","n":1}
+{"action":"batch_begin","batch_id":"c8c3e0db-3654-4612-919f-bacf24df4a66","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:13.237088670+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"c8c3e0db-3654-4612-919f-bacf24df4a66","n":1}
+{"action":"batch_begin","batch_id":"2b1175e6-3d5b-4c44-9c33-15854e32802e","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:13.649212348+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2b1175e6-3d5b-4c44-9c33-15854e32802e","n":1}
+{"action":"batch_begin","batch_id":"40d25c73-5e15-483c-b5ae-6dce4deae30d","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:13.909311380+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"40d25c73-5e15-483c-b5ae-6dce4deae30d","n":1}
+{"action":"batch_begin","batch_id":"f4cfd556-bbe3-4b19-8747-6e232e446f1c","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:14.177106240+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"f4cfd556-bbe3-4b19-8747-6e232e446f1c","n":1}
+{"action":"batch_begin","batch_id":"98b69dae-5f9b-48b1-a180-684a25d657a7","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:14.479502093+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"98b69dae-5f9b-48b1-a180-684a25d657a7","n":1}
+{"action":"batch_begin","batch_id":"ab505756-569d-455d-9790-44040f51c083","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:14.730980680+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"ab505756-569d-455d-9790-44040f51c083","n":1}
+{"action":"batch_begin","batch_id":"ec490060-3cc6-4ff1-937f-1b665b03a5fd","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:15.022448732+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"ec490060-3cc6-4ff1-937f-1b665b03a5fd","n":1}
+{"action":"batch_begin","batch_id":"1405872b-ea2a-4b5b-a1c2-eb07f16a975c","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:15.264872570+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"1405872b-ea2a-4b5b-a1c2-eb07f16a975c","n":1}
+{"action":"batch_begin","batch_id":"870e6467-2163-4438-95df-e5104d3205c5","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:15.519446529+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"870e6467-2163-4438-95df-e5104d3205c5","n":1}
+{"action":"batch_begin","batch_id":"3884e104-aabe-41c4-bc23-8ad91884b622","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:15.736405011+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"3884e104-aabe-41c4-bc23-8ad91884b622","n":1}
+{"action":"batch_begin","batch_id":"35dd8a04-5f01-44b5-9bce-eb9db638c007","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:15.992063725+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"35dd8a04-5f01-44b5-9bce-eb9db638c007","n":1}
+{"action":"batch_begin","batch_id":"2690153f-05b6-4622-8d3d-4933cbf45779","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:16.254056389+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2690153f-05b6-4622-8d3d-4933cbf45779","n":1}
+{"action":"batch_begin","batch_id":"fcf65f3a-ae68-426e-8680-f57ecd14ce5b","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:16.514559919+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"fcf65f3a-ae68-426e-8680-f57ecd14ce5b","n":1}
+{"action":"batch_begin","batch_id":"cfbddbca-da53-4220-8fcf-205dbfd45665","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:16.760248362+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"cfbddbca-da53-4220-8fcf-205dbfd45665","n":1}
+{"action":"batch_begin","batch_id":"8dc0b400-a874-49bf-b2f1-f06b5a1d18ad","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:17.008473795+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"8dc0b400-a874-49bf-b2f1-f06b5a1d18ad","n":1}
+{"action":"batch_begin","batch_id":"06ae2c59-59f8-4c08-87bb-338267c5b528","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:17.261229333+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"06ae2c59-59f8-4c08-87bb-338267c5b528","n":1}
+{"action":"batch_begin","batch_id":"0f7c80d0-85a0-4aec-8a31-6d7227bd5e79","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:17.508223550+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"0f7c80d0-85a0-4aec-8a31-6d7227bd5e79","n":1}
+{"action":"batch_begin","batch_id":"712bbb35-d0f5-42fb-8955-0f3d1ecdeb4a","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:17.759491637+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"712bbb35-d0f5-42fb-8955-0f3d1ecdeb4a","n":1}
+{"action":"batch_begin","batch_id":"2d2e6443-1f0c-48bf-8dfc-10db1c718bad","n":1}
+{"action":"upsert","content":"write path benchmark entry for log append and db apply","evidence_status":"missing","id":"bench-write-lane","kind":"belief","path":"bench/write/added-entry","permanent":false,"session":"cli","session_id":null,"summary":"bench write lane","table":"entries","tags":["bench","write"],"ts":"2026-09-04T20:59:18.021693317+00:00","version_ref":"bench-write"}
+{"action":"batch_commit","batch_id":"2d2e6443-1f0c-48bf-8dfc-10db1c718bad","n":1}
