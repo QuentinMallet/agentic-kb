@@ -443,10 +443,11 @@ impl Rebuild {
             #[cfg(test)]
             let phase3_catchup_finished = std::time::Instant::now();
 
-            // Remove old WAL/SHM before rename. This is required: the tmp DB uses
-            // journal_mode=DELETE (no WAL), so if the old WAL files remain after
-            // the rename, new SQLite connections would attempt WAL recovery against
-            // the rebuilt DB, producing corruption or an error.
+            // C2/ADR-1: after the open split, readers no longer heal
+            // journal_mode, so C1/T5a must ensure the tmp DB is already in WAL
+            // mode before rename. If old WAL files remained here while tmp were
+            // still DELETE-mode, a new connection could recover against the
+            // wrong journal state and corrupt or reject the rebuilt DB.
             // Safety (Linux): the per-request connection model means no MCP handler
             // holds a connection across the lock boundary, so no reader has the WAL
             // open when we unlink it. On Linux, any FD open at unlink time remains

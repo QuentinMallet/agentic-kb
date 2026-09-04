@@ -10,8 +10,9 @@ use crate::models::{
     f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -232,18 +233,27 @@ fn ensure_schema_and_stamp(conn: &Connection) -> Result<()> {
 /// crashed writer — a reader arriving after a crash would fail instead of
 /// recovering (ADR-1, Option D rejection; pinned by
 /// `tests/open_split.rs::open_ro_recovers_a_hot_wal_left_by_a_crashed_writer`).
+/// It also deliberately does NOT force `PRAGMA journal_mode=WAL`: a database
+/// left in DELETE mode by a pre-C1/T5a rebuild is not "healed" by readers.
+/// C1/T5a puts the tmp DB into WAL mode before rename, and C1/T4 wires
+/// [`open_or_init`] at process entry per ADR-7.
 ///
 /// Returns [`DbUninitialized`] when the file or the `entries` table is absent.
 /// Never creates, never runs DDL, never sweeps.
 pub fn open_ro(db_path: &Path) -> Result<Connection> {
-    if !db_path.exists() {
-        return Err(DbUninitialized {
-            db_path: db_path.to_path_buf(),
+    let conn = match Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
         }
-        .into());
-    }
-    let conn =
-        Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
+        Err(err) => return Err(err).with_context(|| format!("open DB {}", db_path.display())),
+    };
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
     // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
     // corrupt file, an unreadable page — surface as themselves instead of
@@ -310,19 +320,52 @@ pub fn open_scratch(db_path: &Path) -> Result<Connection> {
 
 /// True when `db_path` names a repository's live database.
 ///
-/// Two independent guards, because either alone leaves a hole: the structural
-/// one recognizes `<root>/.state/agent-kb/agent-kb.db` for the root the path
-/// sits under, and the name one refuses the live database's canonical file name
-/// in any layout. Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) trip neither.
+/// Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) are distinct names, so the
+/// only path to refuse is exactly `<root>/.state/agent-kb/agent-kb.db`.
 fn is_live_db_path(db_path: &Path) -> bool {
-    if db_path.file_name() == Some(std::ffi::OsStr::new("agent-kb.db")) {
-        return true;
+    let Some(file_name) = db_path.file_name() else {
+        return false;
+    };
+    if file_name != std::ffi::OsStr::new("agent-kb.db") {
+        return false;
     }
-    db_path
+
+    let candidate = if db_path.exists() {
+        match db_path.parent().map(fs::canonicalize).transpose() {
+            Ok(Some(parent)) => parent.join(file_name),
+            _ => return false,
+        }
+    } else {
+        normalize_absolute_path(db_path)
+    };
+
+    candidate
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
-        .is_some_and(|root| config::Paths::from_root(root).db == db_path)
+        .is_some_and(|root| config::Paths::from_root(root).db == candidate)
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let base = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let mut normalized = base;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 /// Initialize a repository's knowledge base: parent dirs, schema, the
