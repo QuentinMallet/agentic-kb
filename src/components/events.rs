@@ -201,11 +201,33 @@ fn write_span(f: &mut File, events: &[serde_json::Value]) -> Result<()> {
 /// reader-accepted until its `batch_commit` line lands with its newline, so an
 /// interrupted append contributes zero events rather than a prefix.
 pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<()> {
+    append_events_batch_with_sync(
+        events_path,
+        events,
+        File::sync_data,
+        crate::components::fsync::sync_dir,
+    )
+}
+
+/// Implementation seam used to prove sync ordering and failure behavior.
+fn append_events_batch_with_sync<S, D>(
+    events_path: &Path,
+    events: &[serde_json::Value],
+    mut sync_file: S,
+    mut sync_dir: D,
+) -> Result<()>
+where
+    S: FnMut(&File) -> std::io::Result<()>,
+    D: FnMut(&Path) -> Result<()>,
+{
     if events.is_empty() {
         return Ok(());
     }
-    if let Some(p) = events_path.parent() {
-        fs::create_dir_all(p)?;
+    let file_was_created = !events_path.exists();
+    let parent = events_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_was_created = parent.is_some_and(|p| !p.exists());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
     }
     repair_uncommitted_tail_before_append(events_path)?;
     let mut f = OpenOptions::new()
@@ -213,7 +235,27 @@ pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> 
         .create(true)
         .open(events_path)
         .with_context(|| format!("open events {}", events_path.display()))?;
-    write_span(&mut f, events)
+    write_span(&mut f, events)?;
+
+    // Do not retry a failed sync and then trust a later success: on Linux an
+    // fsync error may report and clear an earlier writeback error. Propagate the
+    // first failure so callers cannot proceed to any DB apply.
+    sync_file(&f).with_context(|| format!("sync event log {}", events_path.display()))?;
+
+    if file_was_created {
+        if let Some(parent) = parent {
+            sync_dir(parent)?;
+        }
+    }
+    if parent_was_created {
+        if let Some(grandparent) = parent.and_then(Path::parent) {
+            sync_dir(grandparent)?;
+        }
+    }
+    // "AfterSync" means the complete log durability boundary: data plus any
+    // directory entries created by this append are stable before DB apply.
+    kill_point(KillPoint::AfterSync);
+    Ok(())
 }
 
 /// Append a single event to the JSONL log.
@@ -659,7 +701,10 @@ pub fn read_events_from_offset(events_path: &Path, offset: u64) -> Result<ReadEv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
+    use std::io;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     fn torn_sidecars(dir: &Path) -> Vec<PathBuf> {
@@ -673,6 +718,114 @@ mod tests {
                     .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
             })
             .collect()
+    }
+
+    #[test]
+    fn test_append_sync_precedes_caller_apply() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let sync_order = Rc::clone(&order);
+
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "ordered"})],
+            move |_| {
+                sync_order.borrow_mut().push("sync_data");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        // This represents the first operation the caller may perform after a
+        // successful append; the append cannot return before the sync hook.
+        order.borrow_mut().push("apply_event");
+
+        assert_eq!(&*order.borrow(), &["sync_data", "apply_event"]);
+    }
+
+    #[test]
+    fn test_sync_failure_returns_once_and_caller_applies_nothing() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let sync_attempts = Rc::new(RefCell::new(0));
+        let attempts = Rc::clone(&sync_attempts);
+        let mut db_writes = 0;
+
+        let append = append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "sync-fail"})],
+            move |_| {
+                *attempts.borrow_mut() += 1;
+                Err(io::Error::new(io::ErrorKind::Other, "injected sync failure"))
+            },
+            |_| Ok(()),
+        );
+        if append.is_ok() {
+            db_writes += 1;
+        }
+
+        assert!(append.unwrap_err().to_string().contains("sync event log"));
+        assert_eq!(
+            *sync_attempts.borrow(),
+            1,
+            "sync failure must not be retried"
+        );
+        assert_eq!(db_writes, 0, "a failed sync must prevent every DB write");
+    }
+
+    #[test]
+    fn test_directory_syncs_only_for_created_file_or_directory() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join(".state");
+        fs::create_dir(&state).unwrap();
+        let log_dir = state.join("agent-kb");
+        let events_path = log_dir.join("events.jsonl");
+
+        let synced = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "first"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*synced.borrow(), &[log_dir.clone(), state.clone()]);
+
+        synced.borrow_mut().clear();
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "second"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            synced.borrow().is_empty(),
+            "existing entries need no directory sync"
+        );
+
+        fs::remove_file(&events_path).unwrap();
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "recreated"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*synced.borrow(), &[log_dir]);
     }
 
     #[test]
