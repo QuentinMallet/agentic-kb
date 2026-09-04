@@ -16,7 +16,7 @@
 //!      succeeds and stores the clamped entry.
 
 use kb::commands::rebuild::{rebuild_if_schema_obsolete, Rebuild};
-use kb::components::db::{apply_event, open_db, open_db_memory, schema_is_current};
+use kb::components::db::{apply_event, open_db, open_db_memory, schema_is_current, SCHEMA_VERSION};
 use kb::components::embedder::{Embedder, NoopEmbedder};
 use kb::components::events;
 use kb::components::kb_core::{add, AddArgs};
@@ -321,7 +321,9 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
     assert_eq!(content, "ok", "rebuild materializes the log");
 
     // The pre-upgrade DB (with 'NEW db payload') is preserved and recoverable.
-    let backup = paths.db.with_extension("db.pre-v2.bak");
+    let backup = paths
+        .db
+        .with_extension(format!("db.pre-v{SCHEMA_VERSION}.bak"));
     assert!(
         backup.exists(),
         "pre-upgrade backup must exist: {}",
@@ -360,7 +362,9 @@ fn test_upgrade_aborts_when_backup_fails() {
     }
     // Make the backup target unwritable: pre-create it as a directory so
     // VACUUM INTO / remove_file cannot produce the snapshot file.
-    let backup = paths.db.with_extension("db.pre-v2.bak");
+    let backup = paths
+        .db
+        .with_extension(format!("db.pre-v{SCHEMA_VERSION}.bak"));
     fs::create_dir(&backup).unwrap();
     fs::create_dir(backup.join("blocker")).unwrap(); // non-empty → remove_file & rmdir fail
 
