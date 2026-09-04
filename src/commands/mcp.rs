@@ -9,7 +9,7 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
-use crate::commands::cite::compute_citation_fields;
+use crate::commands::cite::with_citation_fields;
 use crate::components::{db, embedder, events, kb_core, query_hits};
 use crate::config;
 use abscissa_core::{Application, Command, Runnable};
@@ -559,7 +559,10 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 
     let start = match req.get("start") {
         Some(v) => match v.as_u64() {
-            Some(n) => Some(n as usize),
+            Some(n) => match usize::try_from(n) {
+                Ok(n) => Some(n),
+                Err(_) => return json!({"id":id,"type":"error","code":"parse_error","message":"start offset exceeds platform limit"}),
+            },
             None => {
                 return json!({"id":id,"type":"error","code":"parse_error","message":"start must be a non-negative integer"});
             }
@@ -568,7 +571,10 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     };
     let end = match req.get("end") {
         Some(v) => match v.as_u64() {
-            Some(n) => Some(n as usize),
+            Some(n) => match usize::try_from(n) {
+                Ok(n) => Some(n),
+                Err(_) => return json!({"id":id,"type":"error","code":"parse_error","message":"end offset exceeds platform limit"}),
+            },
             None => {
                 return json!({"id":id,"type":"error","code":"parse_error","message":"end must be a non-negative integer"});
             }
@@ -578,8 +584,8 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     let range = match (start, end) {
         (None, None) => None,
         (Some(start), Some(end)) => {
-            if start > end {
-                return json!({"id":id,"type":"error","code":"parse_error","message":"start must be <= end"});
+            if start >= end {
+                return json!({"id":id,"type":"error","code":"parse_error","message":"start must be less than end"});
             }
             Some((start, end))
         }
@@ -589,15 +595,15 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     };
 
     let repo_root = root_from_db(&paths.db);
-    match compute_citation_fields(&repo_root, path, range) {
-        Ok(fields) => json!({
+    match with_citation_fields(&repo_root, path, range, |fields| Ok(json!({
             "id": id,
             "type": "result",
             "citation_path": fields.citation_path,
             "citation_sha": fields.citation_sha,
             "citation_hash": fields.citation_hash,
             "file_size": fields.file_size,
-        }),
+        }))) {
+        Ok(response) => response,
         Err(e) => json!({"id":id,"type":"error","code":"cite_error","message":e.to_string()}),
     }
 }
@@ -3316,6 +3322,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("provided together"));
+    }
+
+    #[test]
+    fn test_handle_cite_rejects_empty_range_exactly() {
+        let (_dir, paths, _emb) = setup();
+        let resp = handle_cite(
+            &json!("cite-empty"),
+            &json!({"path":"f.rs","start":4,"end":4}),
+            &paths,
+        );
+        assert_eq!(resp["code"], "parse_error");
+        assert_eq!(resp["message"], "start must be less than end");
+    }
+
+    #[test]
+    fn test_handle_cite_rejects_end_beyond_file_size() {
+        let (dir, paths, _emb) = setup();
+        fs::write(dir.path().join("f.rs"), b"1234").unwrap();
+        let resp = handle_cite(
+            &json!("cite-oob"),
+            &json!({"path":"f.rs","start":0,"end":5}),
+            &paths,
+        );
+        assert_eq!(resp["code"], "cite_error");
+        assert!(resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("end offset 5 exceeds file size 4"));
     }
 
     fn add_live_entry(
