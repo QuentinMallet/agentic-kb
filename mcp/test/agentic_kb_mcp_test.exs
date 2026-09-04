@@ -421,6 +421,31 @@ defmodule AgenticKbMcpTest do
     end
   end
 
+  describe "kb_add tool registration" do
+    test "kb_add derived evidence schema requires bounded derived_from" do
+      tool = Enum.find(McpServer.tools(), &(&1["name"] == "kb_add"))
+      refute is_nil(tool)
+
+      evidence_items = tool["inputSchema"]["properties"]["evidence"]["items"]
+
+      assert evidence_items["if"] == %{
+               "properties" => %{"kind" => %{"const" => "derived"}},
+               "required" => ["kind"]
+             }
+
+      assert evidence_items["then"] == %{
+               "required" => ["derived_from"],
+               "properties" => %{
+                 "derived_from" => %{
+                   "type" => "string",
+                   "minLength" => 1,
+                   "maxLength" => 200
+                 }
+               }
+             }
+    end
+  end
+
   describe "[kb#id] marker round-trip" do
     test "the marker id can be extracted back out and matches the fixture id" do
       fixture = RenderFixture.entry(%{"id" => "ent-roundtrip-42"})

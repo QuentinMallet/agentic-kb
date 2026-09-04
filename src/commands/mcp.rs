@@ -607,6 +607,9 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 /// Accepts optional `kind` (default "belief") and `evidence` (array of objects,
 /// default []).  Evidence objects must have `kind="code"` (Phase 1 only; other
 /// kinds deferred to Phase 2 per L6 / AC9).
+/// If an evidence row has `kind="derived"`, it must include `derived_from` as
+/// a non-empty string no longer than 200 characters naming the supporting
+/// entry id.
 ///
 /// Kind enum: observation | belief | procedure | convention | memory
 ///

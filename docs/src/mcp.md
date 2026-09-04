@@ -11,6 +11,7 @@ evidence metadata. Each evidence row carries:
 - `status = relocated` — citation moved but was uniquely re-found.
 - `status = unverified` — citation no longer verifies.
 - `status = deferred` — verification was outside the inline budget, not a failure.
+- If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id.
 
 Search results intentionally withhold `citation_excerpt`. Each hit includes a
 `[kb#<id>]` marker; pass that id to `kb_get` when you need the full record.
