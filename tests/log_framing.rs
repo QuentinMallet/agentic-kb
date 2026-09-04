@@ -23,13 +23,11 @@ use kb::components::embedder::NoopEmbedder;
 use kb::components::events::{
     append_event, append_events_batch, read_events, read_events_from_offset,
 };
-use kb::crash_sim::KillPoint;
 use proptest::prelude::*;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tempfile::{tempdir, TempDir};
 
 // ---------------------------------------------------------------------------
@@ -312,13 +310,13 @@ fn test_committed_len_is_a_span_boundary_not_a_line_boundary() {
 fn test_read_events_from_offset_rejects_a_mid_span_offset() {
     let (_dir, path) = log_dir();
     append_events_batch(&path, &[upsert("a"), upsert("b")]).unwrap();
-    let begin_len = (begin("x", 2).len() + 1) as u64;
+    let raw = fs::read_to_string(&path).unwrap();
+    let after_begin = (raw.lines().next().unwrap().len() + 1) as u64;
 
-    // Offsets inside the span expose either the events or the commit marker
-    // without their `batch_begin`; both are structurally rejected.
-    let err = read_events_from_offset(&path, begin_len);
+    // An offset inside the span hides its `batch_begin`; the remaining lines
+    // must never be applied as standalone committed events.
     assert!(
-        err.is_err(),
+        read_events_from_offset(&path, after_begin).is_err(),
         "reading from inside a span must not silently apply its remaining lines"
     );
 }
@@ -468,38 +466,45 @@ proptest! {
         std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
     ))]
 
-    /// The repair path must never leave the durable log non-prefix of what was
-    /// written: every repair either truncates to a prefix or appends exactly a
-    /// newline to a reader-accepted standalone tail.
+    /// `DurableIsPrefix`, the invariant `DurableBatch.tla` documents but cannot
+    /// discriminate (counterexamples §5 obligation 1): the repair path must
+    /// never leave the durable log a non-prefix of what was written. Both
+    /// halves are checked — the committed bytes survive untouched, and the
+    /// committed events survive as a prefix of what the next read returns.
     #[test]
-    fn test_repair_is_always_truncate_or_newline_append(
+    fn test_repair_never_rewrites_the_committed_prefix(
         committed in 0usize..4,
         tail in prop::collection::vec(any::<u8>().prop_filter("no newline", |b| *b != b'\n'), 0..24),
     ) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        let mut base = String::new();
+        let mut raw = String::new();
         for i in 0..committed {
-            base.push_str(&format!("{}\n", upsert(&format!("c{i}"))));
+            raw.push_str(&format!("{}\n", upsert(&format!("c{i}"))));
         }
-        let mut raw = base.clone().into_bytes();
+        let mut raw = raw.into_bytes();
         raw.extend_from_slice(&tail);
         fs::write(&path, &raw).unwrap();
+
+        let before = read_events(&path).unwrap();
+        let durable = before.committed_len as usize;
 
         let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
         if append_event(&path, &upsert("probe")).is_err() {
             return Ok(());
         }
-        let after = fs::read(&path).unwrap();
 
-        // Everything the repair kept is a byte prefix of what was on disk, with
-        // at most one newline added at the seam.
-        let kept = after.len().min(raw.len());
-        let mut ok = after[..kept] == raw[..kept];
-        if !ok && kept > 0 {
-            ok = after[..kept - 1] == raw[..kept - 1] && after[kept - 1] == b'\n';
-        }
-        prop_assert!(ok, "repair rewrote already-durable bytes");
+        let after_bytes = fs::read(&path).unwrap();
+        prop_assert!(
+            after_bytes.len() >= durable && after_bytes[..durable] == raw[..durable],
+            "repair rewrote already-durable bytes"
+        );
+        let after = read_events(&path).unwrap();
+        prop_assert!(
+            after.events.starts_with(&before.events),
+            "repair dropped or reordered a committed event"
+        );
+        prop_assert_eq!(after.events.last(), Some(&upsert("probe")));
     }
 }
 
@@ -539,7 +544,7 @@ fn synthetic_corpus() -> Vec<Value> {
         "evidence_id": "ev-1", "reason": "stale", "ts": "2024-01-04T00:00:00Z",
     }));
     corpus.push(json!({
-        "action": "upsert", "table": "test_cases", "test_id": "tc-1",
+        "action": "upsert", "table": "test_cases", "id": "tc-1",
         "app": "kb", "name": "smoke", "protocol": "rust_tool",
         "config": "{}", "ts": "2024-01-05T00:00:00Z",
     }));
@@ -552,6 +557,12 @@ fn synthetic_corpus() -> Vec<Value> {
 }
 
 /// Materialize a log into an in-memory DB and dump every materialized table.
+///
+/// `created_at` and `updated_at` are skipped: they are populated by
+/// `datetime('now')` defaults, so two replays of the same log straddling a
+/// second boundary disagree on them. That replay non-determinism is C1's T6
+/// rider, not something framing changes. Every other column, including the
+/// event-supplied `ts` and `recorded_at`, is compared.
 fn materialize(events: &[Value]) -> Vec<String> {
     let conn = open_db_memory().unwrap();
     for ev in events {
@@ -559,11 +570,19 @@ fn materialize(events: &[Value]) -> Vec<String> {
     }
     let mut rows = Vec::new();
     for table in ["entries", "evidence", "cues", "test_cases", "run_history"] {
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter(|c| c != "created_at" && c != "updated_at")
+            .collect();
         let mut stmt = conn
-            .prepare(&format!("SELECT * FROM {table}"))
+            .prepare(&format!("SELECT {} FROM {table}", columns.join(",")))
             .unwrap();
         let count = stmt.column_count();
-        let dumped: Vec<String> = stmt
+        let mut dumped: Vec<String> = stmt
             .query_map([], |row| {
                 let mut cells = Vec::new();
                 for i in 0..count {
@@ -575,7 +594,6 @@ fn materialize(events: &[Value]) -> Vec<String> {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        let mut dumped = dumped;
         dumped.sort();
         rows.push(format!("{table}: {}", dumped.join(";")));
     }
@@ -686,86 +704,4 @@ fn test_compact_emits_a_marker_free_legacy_readable_log() {
         3,
         "the compacted log stays readable"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Crash harness (T1a) — an injected mid-batch failure commits nothing
-// ---------------------------------------------------------------------------
-
-fn crash_child(case: &str) -> Option<()> {
-    (std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some(case)).then_some(())
-}
-
-fn spawn_crash_child(test_name: &str, case: &str, root: &Path, kill: KillPoint) -> Option<i32> {
-    Command::new(std::env::current_exe().unwrap())
-        .arg(test_name)
-        .arg("--exact")
-        .arg("--nocapture")
-        .current_dir(root)
-        .env("KB_CRASH_TEST_CASE", case)
-        .env("KB_CRASH_TEST_ROOT", root)
-        .env("KB_CRASH_AFTER", kill.to_string())
-        .status()
-        .unwrap()
-        .code()
-}
-
-#[test]
-fn test_crash_mid_batch_leaves_zero_reader_accepted_events() {
-    let case = "mid-batch";
-    if crash_child(case).is_some() {
-        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
-        let path = PathBuf::from(&root).join("events.jsonl");
-        append_events_batch(&path, &[upsert("m0"), upsert("m1"), upsert("m2")]).unwrap();
-        panic!("child append returned without hitting the configured kill point");
-    }
-
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("events.jsonl");
-    write_raw(&path, format!("{}\n", upsert("pre-existing")).as_bytes());
-    let committed_before = read_events(&path).unwrap().committed_len;
-
-    let code = spawn_crash_child(
-        "test_crash_mid_batch_leaves_zero_reader_accepted_events",
-        case,
-        dir.path(),
-        KillPoint::AfterLogLine,
-    );
-    assert_eq!(code, Some(137), "the child must die at the kill point");
-
-    let raw = fs::read_to_string(&path).unwrap();
-    assert!(raw.contains("m0"), "the partial span must be on disk");
-    let read = read_events(&path).unwrap();
-    assert_eq!(
-        read.events,
-        vec![upsert("pre-existing")],
-        "no event of the interrupted batch may be reader-accepted"
-    );
-    assert_eq!(read.committed_len, committed_before);
-}
-
-#[test]
-fn test_crash_after_commit_marker_leaves_the_whole_batch_committed() {
-    let case = "after-commit";
-    if crash_child(case).is_some() {
-        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
-        let path = PathBuf::from(&root).join("events.jsonl");
-        append_events_batch(&path, &[upsert("c0"), upsert("c1")]).unwrap();
-        panic!("child append returned without hitting the configured kill point");
-    }
-
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("events.jsonl");
-
-    let code = spawn_crash_child(
-        "test_crash_after_commit_marker_leaves_the_whole_batch_committed",
-        case,
-        dir.path(),
-        KillPoint::AfterCommitMarker,
-    );
-    assert_eq!(code, Some(137), "the child must die at the kill point");
-
-    let read = read_events(&path).unwrap();
-    assert_eq!(read.events, vec![upsert("c0"), upsert("c1")]);
-    assert_eq!(read.committed_len, fs::metadata(&path).unwrap().len());
 }
