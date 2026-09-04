@@ -285,6 +285,44 @@ pub(crate) fn compute_citation_hash_and_size(
     })
 }
 
+pub(crate) fn open_citation_descriptor(repo_root: &Path, file_rel: &str) -> Result<File> {
+    if syntactically_escapes_root(file_rel) {
+        bail!("citation path escapes repository root");
+    }
+    let file_abs = repo_root.join(file_rel);
+    let file = open_citation_file(repo_root, Path::new(file_rel))
+        .map_err(|error| anyhow!("open citation file {file_rel:?}: {error}"))?;
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        bail!("opened citation file is outside repository root");
+    }
+    Ok(file)
+}
+
+pub(crate) fn compute_citation_hash_and_size_from(
+    file: &File,
+    rel_path: &str,
+    range: Option<(usize, usize)>,
+) -> Result<CitationHash> {
+    hash_citation_bytes_from(file, range).map_err(|reason| {
+        let detail = match reason {
+            UnverifiedReason::FileTooLarge => {
+                format!("file exceeds MAX_FILE_BYTES ({} bytes)", MAX_FILE_BYTES)
+            }
+            UnverifiedReason::RangeTooLarge => {
+                format!("range exceeds MAX_RANGE_BYTES ({} bytes)", MAX_RANGE_BYTES)
+            }
+            UnverifiedReason::RangeOutOfBounds => match (range, file.metadata()) {
+                (Some((_, end)), Ok(metadata)) if end as u64 > metadata.len() => {
+                    format!("end offset {end} exceeds file size {}", metadata.len())
+                }
+                _ => reason.as_str().to_string(),
+            },
+            _ => reason.as_str().to_string(),
+        };
+        anyhow!("compute citation hash for {rel_path:?}: {detail}")
+    })
+}
+
 fn hash_citation_bytes(
     repo_root: &Path,
     file_rel: &str,
@@ -294,7 +332,7 @@ fn hash_citation_bytes(
         return Err(UnverifiedReason::PathEscape);
     }
     let file_abs = repo_root.join(file_rel);
-    let mut file = match open_citation_file(repo_root, Path::new(file_rel)) {
+    let file = match open_citation_file(repo_root, Path::new(file_rel)) {
         Ok(f) => f,
         Err(_) => return Err(UnverifiedReason::FileMissing),
     };
@@ -302,6 +340,13 @@ fn hash_citation_bytes(
     if !opened_file_within_repo(&file, &file_abs, repo_root) {
         return Err(UnverifiedReason::ReadError);
     }
+    hash_citation_bytes_from(&file, range)
+}
+
+fn hash_citation_bytes_from(
+    file: &File,
+    range: Option<(usize, usize)>,
+) -> std::result::Result<CitationHash, UnverifiedReason> {
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(_) => return Err(UnverifiedReason::ReadError),
@@ -332,7 +377,8 @@ fn hash_citation_bytes(
         None => (0usize, file_size as usize),
     };
 
-    if file.seek(SeekFrom::Start(start as u64)).is_err() {
+    let mut reader = file;
+    if reader.seek(SeekFrom::Start(start as u64)).is_err() {
         return Err(UnverifiedReason::ReadError);
     }
 
@@ -342,7 +388,7 @@ fn hash_citation_bytes(
 
     while remaining > 0 {
         let chunk_len = remaining.min(HASH_READ_BUFFER_BYTES as u64) as usize;
-        let read = match file.read(&mut buffer[..chunk_len]) {
+        let read = match reader.read(&mut buffer[..chunk_len]) {
             Ok(read) => read,
             Err(_) => return Err(UnverifiedReason::ReadError),
         };
@@ -482,6 +528,18 @@ fn hash_check_at_citation(
     }
 }
 
+fn hash_check_from(file: &File, range: Option<(usize, usize)>, expected: &str) -> HashCheck {
+    let computed = match hash_citation_bytes_from(file, range) {
+        Ok(computed) => computed.sha256_hex,
+        Err(reason) => return HashCheck::Failed(reason),
+    };
+    if computed.eq_ignore_ascii_case(strip_hash_prefix(expected)) {
+        HashCheck::Match
+    } else {
+        HashCheck::Mismatch
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 static DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE: Once = Once::new();
 
@@ -552,12 +610,51 @@ pub fn verify_evidence(
         None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
     };
 
+    let (file_rel, _) = match parse_citation_path(raw_path) {
+        Ok(parsed) => parsed,
+        Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
+    };
+
+    if syntactically_escapes_root(file_rel) {
+        return VerificationOutcome::unverified(UnverifiedReason::PathEscape);
+    }
+    let file_abs = repo_root.join(file_rel);
+    let file = match open_citation_file(repo_root, Path::new(file_rel)) {
+        Ok(file) => file,
+        Err(_) => return VerificationOutcome::unverified(UnverifiedReason::FileMissing),
+    };
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        return VerificationOutcome::unverified(UnverifiedReason::ReadError);
+    }
+    verify_evidence_from(&file, ev, repo_root, policy)
+}
+
+/// Verify evidence using an already-open citation descriptor.
+///
+/// Cite callers retain this descriptor through hashing, self-check, and the
+/// final pathname identity check. This provides snapshot consistency: the
+/// emitted hash describes bytes actually read from one open file. The stored
+/// `(citation_path, citation_hash)` pair cannot be atomic against a rename
+/// after that identity check; C3 explicitly accepts that residual window.
+pub fn verify_evidence_from(
+    file: &File,
+    ev: &Evidence,
+    repo_root: &Path,
+    policy: RelocationPolicy,
+) -> VerificationOutcome {
+    if ev.kind != "code" {
+        return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
+    }
+    let raw_path = match &ev.citation_path {
+        Some(p) => p,
+        None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
+    };
     let (file_rel, range) = match parse_citation_path(raw_path) {
         Ok(parsed) => parsed,
         Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
     };
 
-    let decayed = match hash_check_at_citation(repo_root, file_rel, range, &ev.citation_hash) {
+    let decayed = match hash_check_from(file, range, &ev.citation_hash) {
         HashCheck::Match => return VerificationOutcome::verified(),
         HashCheck::Mismatch => UnverifiedReason::HashMismatch,
         HashCheck::Failed(reason) => reason,
