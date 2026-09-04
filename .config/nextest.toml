@@ -1,0 +1,11 @@
+[profile.default]
+retries = 0
+fail-fast = false
+test-threads = "num-cpus"
+
+[profile.full]
+inherits = "default"
+
+# nextest profiles do not provide a profile-scoped test environment block in the
+# repository config schema. Run the full tier with:
+#   PROPTEST_CASES=256 cargo nextest run -P full

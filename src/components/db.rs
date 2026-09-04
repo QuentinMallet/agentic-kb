@@ -2411,9 +2411,18 @@ fn find_repo_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static UPDATED_AT_FETCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
 
     fn count_updated_at_fetches(sql: &str) {
         if sql.starts_with("SELECT id, updated_at FROM entries WHERE id IN (") {
@@ -4918,6 +4927,10 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(256),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
         /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
         /// events into an in-memory DB produces the same materialized state as
         /// direct reduction via apply_event. Models TLA+ PartitionEquivalent.

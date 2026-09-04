@@ -15,6 +15,43 @@ Treat the lanes differently:
 - Use Criterion to explain where time goes.
 - Use Hyperfine CLI to decide whether the user-visible budget passed.
 
+## Test Tiers
+
+The Rust test suite has two property-test tiers:
+
+- Fast tier: default for local development and lander iteration. Heavy property tests read `PROPTEST_CASES`, and when it is unset or invalid they fall back to `16` cases.
+- Full tier: required for the pre-merge landing run. Export `PROPTEST_CASES=256` so the same heavy property tests run their full case count.
+
+Run the fast tier with nextest by default:
+
+```bash
+cargo nextest run
+```
+
+`cargo test` remains supported; use the same fast tier explicitly if needed:
+
+```bash
+PROPTEST_CASES=16 cargo test
+```
+
+Run the pre-merge full tier like this:
+
+```bash
+PROPTEST_CASES=256 cargo nextest run -P full
+```
+
+If `cargo-nextest` is unavailable, the equivalent full-tier fallback is:
+
+```bash
+PROPTEST_CASES=256 cargo test
+```
+
+Expectations for this split:
+
+- Fast tier target: under 2 minutes wall time.
+- Full tier target: under 8 minutes wall time.
+- Single-core looking tails are expected to shrink mainly by shortening the heavy single-test proptest tail; prefer case-count tiering over `#[ignore]` gating unless a test is still distortive at 16 cases.
+
 ## Re-Running The Lanes
 
 ### Hyperfine CLI lane

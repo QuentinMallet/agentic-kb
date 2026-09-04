@@ -12,20 +12,24 @@
 //! noop embedder) must return every kind.
 
 use kb::components::db::{
-    apply_event, fts_query_content_entries, fts_query_contentless, open_db_memory,
-    search_entries, SearchOptions,
+    apply_event, fts_query_content_entries, fts_query_contentless, open_db_memory, search_entries,
+    SearchOptions,
 };
 use kb::components::embedder::NoopEmbedder;
 use proptest::prelude::*;
 use serde_json::json;
+use std::env;
 
-const VALID_KINDS: [&str; 5] = [
-    "observation",
-    "belief",
-    "procedure",
-    "convention",
-    "memory",
-];
+const VALID_KINDS: [&str; 5] = ["observation", "belief", "procedure", "convention", "memory"];
+
+const FAST_PROPTEST_CASES: u32 = 16;
+
+fn proptest_cases(default_full: u32) -> u32 {
+    env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+}
 
 fn evidence_status_for_kind(kind: &str) -> &'static str {
     match kind {
@@ -192,7 +196,7 @@ fn test_all_kinds_are_indexed_and_retrievable() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(256)))]
 
     #[test]
     fn prop_kind_does_not_change_fts_retrievability(

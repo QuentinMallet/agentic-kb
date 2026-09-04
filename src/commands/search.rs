@@ -355,8 +355,18 @@ mod tests {
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
     use crate::models::VerificationStatus;
+    use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
 
     #[test]
     fn test_evidence_display_line_includes_status() {
@@ -805,6 +815,10 @@ mod tests {
         /// are treated as literals, not operators. Quote/backslash escaping
         /// preserves valid FTS5 syntax.
         proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig {
+                cases: proptest_cases(256),
+                .. proptest::prelude::ProptestConfig::default()
+            })]
             #[test]
             fn prop_fts_query_injection_no_panic(query in arb_adversarial_fts_query()) {
                 use crate::components::db::{open_db_memory, search_entries, SearchOptions};

@@ -39,8 +39,8 @@ impl Runnable for Cite {
 
 impl Cite {
     pub fn execute(&self) -> Result<()> {
-        let repo_root = config::git_repo_root()
-            .ok_or_else(|| anyhow!("kb cite requires a git repo root"))?;
+        let repo_root =
+            config::git_repo_root().ok_or_else(|| anyhow!("kb cite requires a git repo root"))?;
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         self.execute_with_root(&repo_root, &mut handle)
@@ -88,11 +88,7 @@ where
     Ok(fields)
 }
 
-fn self_check_citation_fields<F>(
-    repo_root: &Path,
-    fields: &CitationFields,
-    verify: F,
-) -> Result<()>
+fn self_check_citation_fields<F>(repo_root: &Path, fields: &CitationFields, verify: F) -> Result<()>
 where
     F: Fn(&Evidence, &Path) -> Result<VerificationOutcome>,
 {
@@ -157,7 +153,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::Value;
+    use std::env;
     use std::fs;
+
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
 
     fn verifier_always_unverified(_: &Evidence, _: &Path) -> Result<VerificationOutcome> {
         Ok(VerificationOutcome {
@@ -169,7 +175,7 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 64,
+            cases: proptest_cases(256),
             .. ProptestConfig::default()
         })]
         #[test]
@@ -272,6 +278,9 @@ mod tests {
         let out: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(out["citation_path"], "sample.rs:0-2");
         assert_eq!(out["file_size"], 13);
-        assert!(out["citation_hash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(out["citation_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
     }
 }

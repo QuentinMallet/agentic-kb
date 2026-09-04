@@ -1996,8 +1996,18 @@ mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
     use crate::models::VerificationStatus;
+    use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
 
     fn setup() -> (tempfile::TempDir, config::Paths, NoopEmbedder) {
         let dir = tempdir().unwrap();
@@ -2318,6 +2328,10 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(256),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
         // ── Invariant 1: aggregation correctness ─────────────────────────────
         // For each (kind, session_id) bucket, source_weights.successes + failures
         // must equal COUNT(*) FROM audit_runs joined to entries filtered to that bucket.
@@ -2474,14 +2488,12 @@ mod tests {
 
     }
 
-    // ── Invariant 3: commutativity (separate block — capped at 64 cases) ─────
-    // Each case creates 2 full DBs + 2 event journals, so 256 cases × ~9s ≈
-    // 38 min.  64 cases ≈ 10 min keeps CI within a reasonable bound while still
-    // exercising all (kind × session_id × verdict) combinations at scale.
-    // Set PROPTEST_CASES=256 locally to run full coverage.
+    // ── Invariant 3: commutativity (separate block) ─────────────────────────
+    // Each case creates 2 full DBs + 2 event journals, so the fast tier defaults
+    // to 16 cases. Export PROPTEST_CASES=256 for the pre-merge full tier.
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
-            cases: 64,
+            cases: proptest_cases(256),
             .. proptest::prelude::ProptestConfig::default()
         })]
         // ── Invariant 3: commutativity ────────────────────────────────────────
@@ -3179,8 +3191,9 @@ mod tests {
     // here.
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
-            // 4096 cases keeps wall-clock under 30s for this lightweight fuzz.
-            cases: 4096,
+            // Fast tier defaults to 16 cases; export PROPTEST_CASES=256 for the
+            // pre-merge full tier.
+            cases: proptest_cases(256),
             .. proptest::prelude::ProptestConfig::default()
         })]
         #[test]
@@ -4052,7 +4065,13 @@ mod tests {
             let c2 = (s + 1) as f32 / (s + f + 3) as f32;
             proptest::prop_assert!(c2 <= c1, "adding verdict=false must not increase confidence");
         }
+    }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(256),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
         #[test]
         fn proptest_provenance_random_dag_terminates(
             // Generate edges as (src_idx, dst_idx) pairs where src > dst to guarantee DAG

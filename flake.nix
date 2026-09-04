@@ -164,6 +164,7 @@
               tlaplus18
               mdbook
               hyperfine
+              cargo-nextest
               act # Run GitHub Actions locally
 
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)

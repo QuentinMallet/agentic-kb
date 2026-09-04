@@ -343,8 +343,18 @@ mod tests {
     use crate::components::events::append_event;
     use crate::config::{Paths, VacuumConfig};
     use proptest::strategy::Strategy;
+    use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
 
     #[test]
     fn test_cmd_compact_squashes_events() {
@@ -1199,14 +1209,14 @@ mod tests {
     // retained with is_stale=true, so the invariant is scoped to live state only.
     // Compact must not resurrect expired entries nor erase live ones.
     //
-    // br-joj fixed: the generator is now UNRESTRICTED — re-upsert after
+    // br-joj fixed: the generator is now UNRESTRICTED - re-upsert after
     // expire is a valid sequence and compact must honour last-write-wins.
     //
-    // PROPTEST_CASES default tuned to 256 — each case opens a tempdir +
-    // replays a small DB. Override via PROPTEST_CASES env var.
+    // Fast tier defaults to 16 cases; export PROPTEST_CASES=256 for the
+    // pre-merge full tier. Each case opens a tempdir and replays a small DB.
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
-            cases: 256,
+            cases: proptest_cases(256),
             .. proptest::prelude::ProptestConfig::default()
         })]
         #[test]
@@ -1491,9 +1501,26 @@ mod tests {
             .unwrap_or(0)
     }
 
+    // Full tier matches the documented AC fixture exactly: 12 000 entries at
+    // ~400 bytes each. Fast tier trades entry count for padding size so the
+    // same freelist-floor assertion holds with far fewer apply_event/
+    // append_event calls (the dominant per-entry cost), not fewer bytes freed.
+    const FULL_VACUUM_ENTRIES: usize = 12_000;
+    const FULL_VACUUM_PADDING_BYTES: usize = 400;
+    const FAST_VACUUM_ENTRIES: usize = 500;
+    const FAST_VACUUM_PADDING_BYTES: usize = 16_000;
+
+    fn vacuum_fixture_size() -> (usize, usize) {
+        if env::var("PROPTEST_CASES").is_ok() {
+            (FULL_VACUUM_ENTRIES, FULL_VACUUM_PADDING_BYTES)
+        } else {
+            (FAST_VACUUM_ENTRIES, FAST_VACUUM_PADDING_BYTES)
+        }
+    }
+
     /// Build a test root with a large DB so `freelist_count >= 1024` after expiry.
     ///
-    /// Strategy: insert N entries (each with ~400-byte content) into the DB via
+    /// Strategy: insert N entries (each with padded content) into the DB via
     /// apply_event, then expire them all. SQLite keeps the freed pages in its
     /// freelist until VACUUM reclaims them.
     fn setup_with_db(root: &std::path::Path) -> Paths {
@@ -1504,10 +1531,10 @@ mod tests {
         let conn = db::open_db(&paths.db).unwrap();
         let embedder = NoopEmbedder;
 
-        // Insert 12 000 entries with ~400 bytes of content each so that expiring
-        // them all leaves at least 1024 SQLite free pages.
-        let n_entries = 12_000_usize;
-        let padding: String = "x".repeat(400);
+        // Insert N entries with padded content each so that expiring them all
+        // leaves at least 1024 SQLite free pages (see vacuum_fixture_size).
+        let (n_entries, padding_bytes) = vacuum_fixture_size();
+        let padding: String = "x".repeat(padding_bytes);
         for i in 0..n_entries {
             let ev = serde_json::json!({
                 "action": "upsert", "table": "entries",
