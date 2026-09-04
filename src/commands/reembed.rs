@@ -102,13 +102,17 @@ impl Reembed {
         for (rowid, id, path, summary, content, tags) in &to_embed {
             let text = db::entry_embed_text(mode, path, summary, content, tags);
             match embedder.embed(&text) {
-                Ok(emb_vec) => {
+                Ok(emb_vec) if emb_vec.iter().all(|x| x.is_finite()) => {
                     let blob = f32s_to_f16_blob(&emb_vec);
                     conn.execute(
                         "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
                         params![rowid, blob],
                     )?;
                     done += 1;
+                }
+                Ok(_) => {
+                    eprintln!("  skip {id}: embedder returned a non-finite component");
+                    failed += 1;
                 }
                 Err(e) => {
                     eprintln!("  skip {id}: {e}");

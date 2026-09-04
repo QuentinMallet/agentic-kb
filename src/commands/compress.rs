@@ -4,6 +4,7 @@ use crate::commands::add::make_embedder;
 use crate::commands::add_validation::compute_evidence_status_write;
 use crate::components::{kb_core, redactor, text_chunker};
 use crate::config;
+use crate::models::cosine_similarity;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::{params, OptionalExtension};
@@ -108,6 +109,7 @@ pub fn run(
         .iter()
         .map(|p| embedder.embed(p))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(embeddings.iter().flatten().all(|x| x.is_finite()), "embedder returned a non-finite component");
 
     // Step 5: greedy cosine deduplication — keep first, drop subsequent near-duplicates.
     let cutoff = config.compress_cosine_cutoff;
@@ -120,7 +122,7 @@ pub fn run(
             if !keep[j] {
                 continue;
             }
-            if cosine_similarity(&embeddings[i], &embeddings[j]) > cutoff {
+            if is_near_duplicate(&embeddings[i], &embeddings[j], cutoff) {
                 keep[j] = false;
             }
         }
@@ -226,19 +228,8 @@ pub fn run(
     Ok(())
 }
 
-/// Compute cosine similarity between two f32 vectors.
-/// Returns 0.0 when either vector is zero-length or empty.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
+fn is_near_duplicate(a: &[f32], b: &[f32], cutoff: f32) -> bool {
+    cosine_similarity(a, b) > cutoff
 }
 
 #[cfg(test)]
@@ -369,6 +360,11 @@ mod tests {
     #[test]
     fn test_cosine_similarity_empty() {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn nan_embedding_is_not_promoted_by_compress_cutoff() {
+        assert!(!is_near_duplicate(&[f32::NAN, 1.0], &[1.0, 1.0], 0.9));
     }
 
     #[test]
