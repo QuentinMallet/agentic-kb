@@ -12,6 +12,7 @@ use crate::commands::add_validation::{
 use crate::commands::cite::compute_citation_fields;
 use crate::components::{db, embedder, events, kb_core, query_hits};
 use crate::config;
+use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -1580,60 +1581,101 @@ fn handle_audit_record(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if !verdict {
-            let expire_event = json!({
+        // The expire event, if any, is appended to the JSONL log here, before
+        // the transactional boundary below. That append is the one part of
+        // this operation A1 does NOT claim atomicity over: a crash between
+        // this append and the savepoint below leaves the log ahead of the DB.
+        // Closing that residual window is C1's fsync-ordering work (ADR-5's
+        // D2, bd-21ef.1.7) — A1 only guarantees that apply_event, the
+        // audit_runs row and the source_weights delta land or roll back
+        // together, never that the append itself is crash-atomic.
+        let expire_event = if !verdict {
+            let ev = json!({
                 "action": "expire", "table": "entries",
                 "id": entry_id, "reason": "audit verdict=false",
                 "ts": ts, "session": "mcp",
             });
-            if let Err(e) = events::append_event(&paths.events, &expire_event) {
+            if let Err(e) = events::append_event(&paths.events, &ev) {
                 return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
             }
-            if let Err(e) = db::apply_event(&conn, emb, &expire_event) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            expired += 1;
-        }
-
-        // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
-        let inserted = match conn.execute(
-            "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
-             VALUES(?1,?2,?3,?4,?5)",
-            params![
-                run_id,
-                entry_id,
-                if verdict { "true" } else { "false" },
-                note,
-                ts
-            ],
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
-            }
+            Some(ev)
+        } else {
+            None
         };
 
-        if inserted > 0 {
-            // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
-            let (entry_kind, entry_session_id): (String, String) = conn
-                .query_row(
-                    "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
-                    params![entry_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or_else(|_| ("belief".to_string(), "__GLOBAL__".to_string()));
+        // ADR-5 / A1: apply_event(expire) + the audit_runs insert + the
+        // source_weights upsert run inside one SAVEPOINT, so a failure
+        // anywhere in the three rolls all three back — the `inserted > 0`
+        // gate below then correctly implies the weight delta was applied,
+        // because both happened or neither did.
+        //
+        // Transaction ownership (Q2, settled 2026-09-04): C1's D3 owns the
+        // outer transaction that will wrap append+sync+apply+cursor once its
+        // helper (bd-21ef.1.9) lands; this SAVEPOINT joins that transaction
+        // when it exists and, called standalone as it is today, opens SQLite's
+        // implicit top-level transaction itself — either way the three
+        // statements commit or roll back as one unit.
+        let atomic: Result<(u32, u32)> =
+            db::with_savepoint(&conn, "audit_record", || -> Result<(u32, u32)> {
+                let mut rec = 0u32;
+                let mut exp = 0u32;
 
-            let weight_sql = if verdict {
-                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
-                 ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
-            } else {
-                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
-                 ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
-            };
-            if let Err(e) = conn.execute(weight_sql, params![entry_kind, entry_session_id]) {
+                if let Some(ev) = &expire_event {
+                    db::apply_event(&conn, emb, ev)?;
+                    exp = 1;
+                }
+
+                // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        run_id,
+                        entry_id,
+                        if verdict { "true" } else { "false" },
+                        note,
+                        ts
+                    ],
+                )?;
+
+                // Fault-injection point for the A1 crash test: kills the
+                // process between the audit_runs row insert and the
+                // source_weights upsert, so a crash test can assert the
+                // savepoint above leaves neither committed.
+                kill_point(KillPoint::AuditAfterRunInsert);
+
+                if inserted > 0 {
+                    // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
+                    let (entry_kind, entry_session_id): (String, String) = conn
+                        .query_row(
+                            "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
+                            params![entry_id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap_or_else(|_| ("belief".to_string(), "__GLOBAL__".to_string()));
+
+                    let weight_sql = if verdict {
+                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                         ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
+                    } else {
+                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                         ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
+                    };
+                    conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
+                    rec = 1;
+                }
+
+                Ok((rec, exp))
+            });
+
+        match atomic {
+            Ok((rec, exp)) => {
+                recorded += rec;
+                expired += exp;
+            }
+            Err(e) => {
                 return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
             }
-            recorded += 1;
         }
     }
 
@@ -3554,6 +3596,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "exactly one row after idempotent replay");
+
+        // The paired source_weights delta must also be unaffected by the replay —
+        // the INSERT OR IGNORE gate (`inserted > 0`) that decides whether the
+        // weight upsert runs at all must stay false on the no-op replay.
+        let successes: i64 = conn
+            .query_row(
+                "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(successes, 1, "replay must not double-count the weight delta");
+    }
+
+    #[test]
+    fn test_handle_audit_record_atomic_rollback_on_weight_failure() {
+        // ADR-5 / A1: apply_event + the audit_runs insert + the source_weights
+        // upsert run inside one SAVEPOINT. Drop source_weights so the upsert
+        // fails deterministically, then assert the savepoint rolled the
+        // audit_runs insert back too — a failure must roll all three back,
+        // never leave a split row.
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/atomic-weight", None);
+        seed_audit_candidate(&paths, "run-atomic-weight", &eid);
+        {
+            // ensure_schema's CREATE TABLE IF NOT EXISTS would silently heal a
+            // dropped source_weights table on the next open_db call inside
+            // handle_audit_record, so the failure is injected with a trigger
+            // instead — it survives re-open and fires deterministically on the
+            // weight upsert's INSERT.
+            let conn = db::open_db(&paths.db).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS test_fail_weight_insert
+                 BEFORE INSERT ON source_weights
+                 BEGIN SELECT RAISE(ABORT, 'test-injected weight upsert failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let id = json!(null);
+        let req =
+            json!({"run_id": "run-atomic-weight", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "error", "weight upsert failure must surface as an error");
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-atomic-weight'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "audit_runs insert must roll back when the paired weight upsert fails"
+        );
+    }
+
+    #[test]
+    fn test_handle_audit_record_atomic_rollback_includes_expire() {
+        // Same as above but for a verdict=false batch, so the rolled-back unit
+        // also covers apply_event's expire effects — all three statements named
+        // by ADR-5 (apply_event, the audit_runs insert, the source_weights
+        // upsert) must roll back together.
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/atomic-expire", None);
+        seed_audit_candidate(&paths, "run-atomic-expire", &eid);
+        {
+            // ensure_schema's CREATE TABLE IF NOT EXISTS would silently heal a
+            // dropped source_weights table on the next open_db call inside
+            // handle_audit_record, so the failure is injected with a trigger
+            // instead — it survives re-open and fires deterministically on the
+            // weight upsert's INSERT.
+            let conn = db::open_db(&paths.db).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS test_fail_weight_insert
+                 BEFORE INSERT ON source_weights
+                 BEGIN SELECT RAISE(ABORT, 'test-injected weight upsert failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let id = json!(null);
+        let req = json!({"run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "error");
+
+        let conn = db::open_db(&paths.db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-atomic-expire'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "audit_runs insert must roll back on weight-upsert failure");
+
+        let stale: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 0,
+            "apply_event's expire effects must roll back with the rest of the savepoint"
+        );
+    }
+
+    fn run_audit_crash_child() {
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let run_id = std::env::var("KB_CRASH_TEST_RUN_ID").unwrap();
+        let entry_id = std::env::var("KB_CRASH_TEST_ENTRY_ID").unwrap();
+        let paths = config::Paths::from_root(std::path::Path::new(&root));
+        let emb = NoopEmbedder;
+        let id = json!(null);
+        let req = json!({"run_id": run_id, "verdicts": [{"entry_id": entry_id, "verdict": true}]});
+        handle_audit_record(&id, &req, &paths, &emb);
+        panic!("child handle_audit_record returned without hitting the configured kill point");
+    }
+
+    #[test]
+    fn test_handle_audit_record_crash_after_run_insert_leaves_no_split_row() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("audit-after-run-insert") {
+            run_audit_crash_child();
+        }
+
+        let (dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/crash-audit", None);
+        let run_id = "run-crash-audit";
+        seed_audit_candidate(&paths, run_id, &eid);
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_handle_audit_record_crash_after_run_insert_leaves_no_split_row")
+            .arg("--nocapture")
+            .current_dir(dir.path())
+            .env("KB_CRASH_TEST_CASE", "audit-after-run-insert")
+            .env("KB_CRASH_TEST_ROOT", dir.path())
+            .env("KB_CRASH_TEST_RUN_ID", run_id)
+            .env("KB_CRASH_TEST_ENTRY_ID", &eid)
+            .env("KB_CRASH_AFTER", KillPoint::AuditAfterRunInsert.to_string())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "crash simulation should terminate the subprocess with exit code 137"
+        );
+
+        // The savepoint must have left neither half of the pair committed:
+        // the kill point fires strictly between the audit_runs insert and the
+        // source_weights upsert, so a crash there must roll the insert back
+        // too rather than leave it standing alone.
+        let conn = db::open_db(&paths.db).unwrap();
+        let audit_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let weight_successes: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(successes),0) FROM source_weights WHERE session_id='__GLOBAL__'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_rows, 0,
+            "audit_runs row must not survive a crash mid-savepoint"
+        );
+        assert_eq!(
+            weight_successes, 0,
+            "source_weights delta must not survive a crash mid-savepoint"
+        );
+
+        // Retry: replaying the request against the same DB must record both
+        // halves of the pair together.
+        let id = json!(null);
+        let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        assert_eq!(resp["type"], "ok");
+        assert_eq!(resp["recorded"], 1);
+
+        let audit_rows_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let weight_successes_after: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(successes),0) FROM source_weights WHERE session_id='__GLOBAL__'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_rows_after, 1, "retry must record the audit_runs row");
+        assert_eq!(
+            weight_successes_after, 1,
+            "retry must record the paired weight delta"
+        );
     }
 
     #[test]
