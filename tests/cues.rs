@@ -309,8 +309,8 @@ fn test_kb_core_add_propagates_cues() {
     .unwrap();
 
     // Event log carries the cues field.
-    let log = fs::read_to_string(&paths.events).unwrap();
-    let last: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    let log = kb::components::events::read_events(&paths.events).unwrap();
+    let last = log.events.last().unwrap();
     assert_eq!(last["cues"], json!(["cuetok anchor"]));
 
     // DB has the cue row.
