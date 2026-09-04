@@ -7,7 +7,12 @@ use std::path::Path;
 /// added 5 unmigrated `db::open_db(&paths.db)` call sites in
 /// `src/commands/mcp.rs` test helpers, ahead of L1a's own migration work.
 /// Not new legacy debt introduced by L1a itself.
-const OPEN_DB_CALLSITE_RATCHET: usize = 87;
+///
+/// Bumped 87 -> 90 when C1 (bd-21ef.1) rebased onto the aggregator: T5a's D4
+/// swap-sequence crash tests in `src/commands/rebuild.rs` added 3 new
+/// `db::open_db(&paths.db)` test-fixture call sites (unrelated to rebuild's
+/// own tmp-DB opens, which this rebase already carries as `open_scratch`).
+const OPEN_DB_CALLSITE_RATCHET: usize = 90;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
