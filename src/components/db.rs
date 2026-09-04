@@ -124,6 +124,15 @@ pub fn sweep_expired_peers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Shared TTL filter for consumer-visible peer reads.
+///
+/// ADR-1's peer TTL policy is "read-time filter, physical deletion later under
+/// the write lock". Every user-visible peer read must therefore splice this
+/// predicate into its SQL rather than rely on sweep timing.
+pub fn live_peer_predicate(alias: &str) -> String {
+    format!("({alias}.expires_at IS NULL OR {alias}.expires_at >= datetime('now'))")
+}
+
 /// Schema generation of THIS binary. Bump when derived-state shape changes
 /// in a way that requires replaying the event log (new tables/lanes whose
 /// rows only materialize through apply_event, changed embedding semantics).
@@ -368,8 +377,8 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Initialize a repository's knowledge base: parent dirs, schema, the
-/// `schema_version` stamp, and the locked sweep of expired peer edges.
+/// Initialize a repository's knowledge base: parent dirs, schema, and the
+/// `schema_version` stamp.
 ///
 /// Acquires and RELEASES `paths.lock` internally, and returns no connection —
 /// callers then choose [`open_ro`] or [`open_rw`], so no ungoverned handle
@@ -378,19 +387,17 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 pub fn open_or_init(paths: &config::Paths) -> Result<()> {
     let lock = crate::commands::add::acquire_lock(&paths.lock)?;
     let conn = open_rw(paths, &lock)?;
-    sweep_expired_peers(&conn)?;
     drop(conn);
     drop(lock);
     Ok(())
 }
 
-/// Legacy open: create, WAL, schema, stamp, sweep — all without a lock.
+/// Legacy open: create, WAL, schema, stamp — all without a lock.
 /// The body of the pre-split `open_db`, retained verbatim behind the
 /// deprecated wrapper so unmigrated call sites keep behaving as they did.
 fn legacy_open_db(db_path: &Path) -> Result<Connection> {
     let conn = open_conn_rw(db_path)?;
     ensure_schema_and_stamp(&conn)?;
-    sweep_expired_peers(&conn)?;
     Ok(conn)
 }
 
