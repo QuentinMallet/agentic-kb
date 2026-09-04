@@ -287,6 +287,7 @@ fn open_or_init_releases_the_lock() {
 fn second_in_process_acquire_errors_instead_of_blocking() {
     let dir = tempfile::tempdir().unwrap();
     let paths = repo(dir.path());
+    let first_site = line!() + 1;
     let first = acquire_lock(&paths.lock).unwrap();
 
     let (tx, rx) = mpsc::channel();
@@ -303,9 +304,12 @@ fn second_in_process_acquire_errors_instead_of_blocking() {
         .recv_timeout(DEADLOCK_TIMEOUT)
         .expect("a second in-process acquire must return an error, not block on the flock forever");
     let err = outcome.expect_err("the second acquire must fail");
+    // The FIRST acquisition's file:line, not the second's — that is what makes
+    // the error actionable when the two live in different modules.
+    let expected_site = format!("tests/open_split.rs:{first_site}");
     assert!(
-        err.contains("open_split.rs"),
-        "the error must name the first acquisition site, got: {err}"
+        err.contains(&expected_site),
+        "the error must name the first acquisition site ({expected_site}), got: {err}"
     );
     drop(first);
 }
