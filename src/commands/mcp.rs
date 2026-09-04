@@ -873,7 +873,8 @@ fn handle_search(
 
     // br-h9g (security I2): the boundary already rejected limit/inline_verify_k
     // outside their ranges; the clamp stays as defense in depth against a
-    // direct handler call bypassing handle_request.
+    // direct handler call bypassing handle_request. Also redundant with
+    // `search_entries`'s own boundary clamps.
     let limit = limit.min(db::MAX_LIMIT);
     let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
 
@@ -3672,11 +3673,19 @@ mod tests {
             handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         }
 
+        // `limit` and `inline_verify_k` share the same request-side ceiling
+        // (MAX_LIMIT == MAX_INLINE_VERIFY_K, br-h9g ruling O1), so a request
+        // must ask for `limit` at that ceiling — not for all `n` seeded
+        // entries (n exceeds MAX_LIMIT by construction) — to isolate the
+        // inline_verify_k rejection from the independent limit bound.
+        let requested_limit = db::MAX_LIMIT;
+        let expected_entries = n.min(requested_limit);
+
         // inline_verify_k far above MAX_INLINE_VERIFY_K is refused.
         let over = json!({
             "method":"search","id":"clamp-ivk-search",
             "query":"clamp-ivk-needle","mode":"fts",
-            "limit": n,
+            "limit": requested_limit,
             "inline_verify_k": 10_000
         });
         let rejected = handle_request(&over.to_string(), &paths, &emb, 10, None, 0.0, 0.0);
@@ -3696,7 +3705,7 @@ mod tests {
         let req = json!({
             "method":"search","id":"clamp-ivk-search",
             "query":"clamp-ivk-needle","mode":"fts",
-            "limit": n,
+            "limit": requested_limit,
             "inline_verify_k": db::MAX_INLINE_VERIFY_K
         });
         let resp = handle_search(
@@ -3710,7 +3719,11 @@ mod tests {
         );
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), n, "all entries must be returned");
+        assert_eq!(
+            entries.len(),
+            expected_entries,
+            "entries must be returned up to the limit cap"
+        );
 
         let verified_count = entries
             .iter()
@@ -3723,11 +3736,10 @@ mod tests {
                     .unwrap_or(false)
             })
             .count();
-        assert!(
-            verified_count <= db::MAX_INLINE_VERIFY_K,
-            "inline_verify_k must bound inline verification at MAX_INLINE_VERIFY_K={}, got {} verified",
+        assert_eq!(
+            verified_count,
             db::MAX_INLINE_VERIFY_K,
-            verified_count
+            "inline_verify_k at MAX_INLINE_VERIFY_K must verify exactly that many entries"
         );
     }
 

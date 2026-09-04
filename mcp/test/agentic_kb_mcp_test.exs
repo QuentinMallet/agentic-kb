@@ -755,7 +755,7 @@ defmodule AgenticKbMcpTest do
     test "every bounded numeric argument advertises both of its bounds" do
       expected = %{
         {"kb_search", "limit"} => {1, 100},
-        {"kb_search", "inline_verify_k"} => {0, 20},
+        {"kb_search", "inline_verify_k"} => {0, 100},
         {"kb_reembed", "max_chars"} => {1, 100_000}
       }
 
