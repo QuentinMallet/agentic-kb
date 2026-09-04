@@ -19,6 +19,7 @@ pub enum KillPoint {
     CompactAfterRewrite,
     SwapAfterRename,
     SwapAfterUnlink,
+    AuditAfterRunInsert,
 }
 
 impl KillPoint {
@@ -33,6 +34,7 @@ impl KillPoint {
             Self::CompactAfterRewrite => "compact-after-rewrite",
             Self::SwapAfterRename => "swap-after-rename",
             Self::SwapAfterUnlink => "swap-after-unlink",
+            Self::AuditAfterRunInsert => "audit-after-run-insert",
         }
     }
 }
@@ -70,6 +72,7 @@ impl FromStr for KillPoint {
             "compact-after-rewrite" => Ok(Self::CompactAfterRewrite),
             "swap-after-rename" => Ok(Self::SwapAfterRename),
             "swap-after-unlink" => Ok(Self::SwapAfterUnlink),
+            "audit-after-run-insert" => Ok(Self::AuditAfterRunInsert),
             _ => Err(ParseKillPointError {
                 input: value.to_string(),
             }),
