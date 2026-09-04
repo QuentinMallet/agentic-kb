@@ -102,6 +102,18 @@ fn clamp_chars<'a>(s: &'a str, max: usize, field: &str, id: &str) -> std::borrow
         std::borrow::Cow::Owned(s.chars().take(max).collect())
     }
 }
+
+fn like_prefix_pattern(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 pub const MAX_INLINE_VERIFY_K: usize = 20;
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
@@ -2073,14 +2085,13 @@ pub fn fetch_evidence_for_entries(
                     kind: r.get(2)?,
                     citation_path: r.get(3)?,
                     citation_sha: r.get(4)?,
-                    citation_hash: r.get(5).unwrap_or_default(),
+                    citation_hash: r.get(5)?,
                     citation_excerpt: r.get(6)?,
                     derived_from: r.get(7)?,
                     recorded_at: r.get(8)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .collect()
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         // Group rows by entry_id (rows are already sorted by entry_id via ORDER BY).
@@ -2131,13 +2142,14 @@ pub fn fts_query_contentless(
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
         "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
          FROM entries_fts f
          JOIN entries e ON e.id = f.id
          WHERE f.entries_fts MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
          ORDER BY rank
          LIMIT ?4",
@@ -2146,7 +2158,7 @@ pub fn fts_query_contentless(
         .query_map(
             params![
                 safe_query,
-                opts.path_prefix,
+                path_prefix,
                 opts.tag_filter,
                 opts.limit as i64
             ],
@@ -2171,13 +2183,14 @@ pub fn fts_query_content_entries(
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
         "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
          FROM entries_fts_v2 f
          JOIN entries e ON e.rowid = f.rowid
          WHERE f.entries_fts_v2 MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
          ORDER BY rank
          LIMIT ?4",
@@ -2186,7 +2199,7 @@ pub fn fts_query_content_entries(
         .query_map(
             params![
                 safe_query,
-                opts.path_prefix,
+                path_prefix,
                 opts.tag_filter,
                 opts.limit as i64
             ],
@@ -2562,12 +2575,13 @@ pub fn search_entries(
 
     if opts.do_semantic && !embedder.is_noop() {
         let q_emb = embedder.embed(query)?;
+        let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
         let mut stmt = conn.prepare(
             "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         )?;
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
@@ -2577,7 +2591,7 @@ pub fn search_entries(
         // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
         // decode_emb_blob fallback via length dispatch.
         let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
-            .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+            .query_map(params![path_prefix.clone(), opts.tag_filter], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -2620,11 +2634,11 @@ pub fn search_entries(
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
                AND c.embedding IS NOT NULL
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         ) {
             let cue_rows: Vec<(String, Vec<u8>, String, String, String, String, String)> = stmt
-                .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+                .query_map(params![path_prefix, opts.tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, Vec<u8>>(2)?,
@@ -3017,8 +3031,9 @@ pub fn search_entries(
         // both channels are bounded and the main thread sends work while workers
         // try to enqueue results.
         //
-        // Total result count is bounded externally: at most
-        // MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY (br-h9g security I2).
+        // Total result count here is bounded by the requested verify set:
+        // verify_count * MAX_EVIDENCE_ROWS_PER_ENTRY, where
+        // verify_count = min(opts.inline_verify_k, entries.len()).
         let work_chan_cap = (pool_size * 2).max(1);
         std::thread::scope(|scope| {
             let (tx_work, rx_work) =
@@ -3207,6 +3222,20 @@ mod tests {
         }
     }
 
+    fn seed_path_prefix_search_corpus(conn: &Connection, rows: &[(&str, &str)]) {
+        let embedder = NoopEmbedder;
+        for (id, path) in rows {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": path, "summary": "pathprefixneedle",
+                "content": "pathprefixneedle body", "tags": [],
+                "kind": "observation", "evidence_status": "missing",
+                "is_stale": false, "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(conn, &embedder, &event).unwrap();
+        }
+    }
+
     fn single_fetch_opts(do_fts: bool, do_semantic: bool, recency_lambda: f32) -> SearchOptions {
         SearchOptions {
             limit: 10,
@@ -3292,6 +3321,94 @@ mod tests {
                 "every {mode} result must carry updated_at from its retrieval lane"
             );
         }
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_backslash() {
+        assert_eq!(like_prefix_pattern(r"src\dir"), r"src\\dir");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_percent() {
+        assert_eq!(like_prefix_pattern("src/%"), r"src/\%");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_underscore() {
+        assert_eq!(like_prefix_pattern("src/_"), r"src/\_");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_mixed_meta_chars() {
+        assert_eq!(
+            like_prefix_pattern(r"src\_%\mix"),
+            r"src\\\_\%\\mix"
+        );
+    }
+
+    #[test]
+    fn test_search_path_prefix_matches_literal_underscore_prefix_only() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-percent", "src/%y"),
+            ],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/_".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let ids: Vec<String> = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["pp-under".to_string()],
+            "path_prefix=src/_ must match only the literal underscore prefix"
+        );
+    }
+
+    #[test]
+    fn test_search_path_prefix_percent_is_literal_and_can_return_empty() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[("pp-under", "src/_x"), ("pp-alpha", "src/ax"), ("pp-doc", "docs/%y")],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/%".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let rows = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts).unwrap();
+
+        assert!(
+            rows.is_empty(),
+            "path_prefix=src/% must not expand to every src/* path"
+        );
     }
 
     fn seed_entry_row(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
@@ -4863,6 +4980,37 @@ mod tests {
             rows.len(),
             MAX_EVIDENCE_ROWS_PER_ENTRY,
             "fetch_evidence_for_entries must truncate to MAX_EVIDENCE_ROWS_PER_ENTRY"
+        );
+    }
+
+    #[test]
+    fn test_fetch_evidence_for_entries_propagates_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "decode-host", "path": "src/decode.rs", "summary": "decode host",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, 'sha256:test', '2024-01-01T00:00:00Z')",
+            params![
+                "ev-decode-bad",
+                "decode-host",
+                rusqlite::types::Value::Blob(vec![0x80, 0x81, 0x82]),
+            ],
+        )
+        .unwrap();
+
+        let result = fetch_evidence_for_entries(&conn, &["decode-host".to_string()]);
+        assert!(
+            result.is_err(),
+            "corrupt evidence rows must surface as Err, never be dropped as absent"
         );
     }
 
