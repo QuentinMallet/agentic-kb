@@ -92,9 +92,11 @@ impl SearchStats {
 //
 // Values are deliberately conservative — they sit well above any observed
 // agent workflow (typical limit=10, inline_verify_k=10, evidence rows ~5)
-// while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
-// = 4k verification threads, which the test host tolerates.
+// while keeping worst-case fan-out bounded at
+// MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY.
 pub const MAX_LIMIT: usize = 100;
+pub const MAX_INLINE_VERIFY_K: usize = MAX_LIMIT;
+pub const MAX_VERIFY_POOL_SIZE: usize = 32;
 
 /// Relocation policy on the interactive search path — pinned to
 /// [`RelocationPolicy::Never`].
@@ -140,7 +142,6 @@ fn like_prefix_pattern(prefix: &str) -> String {
     escaped
 }
 
-pub const MAX_INLINE_VERIFY_K: usize = 20;
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
 
@@ -1610,9 +1611,8 @@ pub struct SearchOptions {
     /// spawned with cwd `/`). When `None`, verification still runs but always
     /// reports `Unverified` (no root to resolve citation paths against).
     pub repo_root: Option<PathBuf>,
-    /// Pool size for the bounded verify thread pool (br-23b.13).
-    /// Currently unused; reserved for forward-compatibility with the
-    /// 23b.13 task that replaces the per-request `thread::scope` path.
+    /// Pool size for the bounded verify thread pool.
+    /// Values above `MAX_VERIFY_POOL_SIZE` are clamped inside `search_entries`.
     pub verify_pool_size: Option<usize>,
     /// Recency-bias decay factor (λ in exp(-λ·days)) applied after RRF scoring.
     /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
@@ -1695,6 +1695,60 @@ pub struct SearchEntry {
     pub origin_repo: Option<String>,
     /// DB `updated_at` for stale-warning checks in presentation layers.
     pub updated_at: String,
+}
+
+#[derive(Clone, Copy)]
+struct EffectiveSearchCaps {
+    limit: usize,
+    inline_verify_k: usize,
+    verify_pool_size: usize,
+}
+
+fn default_verify_pool_size() -> usize {
+    num_cpus::get_physical().max(1)
+}
+
+fn clamp_search_caps(opts: &SearchOptions) -> EffectiveSearchCaps {
+    EffectiveSearchCaps {
+        limit: opts.limit.min(MAX_LIMIT),
+        inline_verify_k: opts.inline_verify_k.min(MAX_INLINE_VERIFY_K),
+        verify_pool_size: opts
+            .verify_pool_size
+            .unwrap_or_else(default_verify_pool_size)
+            .clamp(1, MAX_VERIFY_POOL_SIZE),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchRuntimeStats {
+    effective_limit: usize,
+    effective_inline_verify_k: usize,
+    effective_verify_pool_size: usize,
+    scheduled_verification_tasks: usize,
+    spawned_verify_workers: usize,
+}
+
+#[cfg(test)]
+fn search_runtime_stats_cell(
+) -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<SearchRuntimeStats>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn record_search_runtime_stats(stats: SearchRuntimeStats) {
+    *search_runtime_stats_cell().lock().unwrap() = Some(stats);
+}
+
+#[cfg(test)]
+fn take_search_runtime_stats() -> SearchRuntimeStats {
+    search_runtime_stats_cell()
+        .lock()
+        .unwrap()
+        .take()
+        .expect("search runtime stats must be recorded")
 }
 
 pub struct FetchEntryByIdResult {
@@ -2251,10 +2305,18 @@ pub fn search_entries(
     query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<SearchEntry>> {
+    let caps = clamp_search_caps(opts);
+    let mut effective_opts = opts.clone();
+    effective_opts.limit = caps.limit;
+    effective_opts.inline_verify_k = caps.inline_verify_k;
+    effective_opts.verify_pool_size = Some(caps.verify_pool_size);
+    let path_prefix = effective_opts.path_prefix.as_deref();
+    let tag_filter = effective_opts.tag_filter.as_deref();
+
     let mut entries: Vec<SearchEntry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    if opts.do_fts {
+    if effective_opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
         // operator injection (AND/OR/NOT) while allowing multi-term recall.
         let safe_query: String = query
@@ -2265,8 +2327,10 @@ pub fn search_entries(
 
         let read_path = FtsReadPath::from_env();
         let rows = match read_path {
-            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, opts)?,
-            FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
+            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, &effective_opts)?,
+            FtsReadPath::ContentEntries => {
+                fts_query_content_entries(conn, &safe_query, &effective_opts)?
+            }
         };
 
         // Divergence detection compares ordered sequences. `ORDER BY rank,e.id`
@@ -2275,8 +2339,8 @@ pub fn search_entries(
         // so ordinary parity overhead remains O(limit), not O(database size).
         #[cfg(debug_assertions)]
         {
-            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, opts);
-            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, opts);
+            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, &effective_opts);
             if let (Ok(primary), Ok(alt)) = (primary, alt) {
                 let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
                 let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
@@ -2289,8 +2353,8 @@ pub fn search_entries(
         }
         #[cfg(not(debug_assertions))]
         {
-            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, opts);
-            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, opts);
+            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, &effective_opts);
             if let (Ok(primary), Ok(alt)) = (primary, alt) {
                 let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
                 let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
@@ -2336,9 +2400,9 @@ pub fn search_entries(
         }
     }
 
-    if opts.do_semantic && !embedder.is_noop() {
+    if effective_opts.do_semantic && !embedder.is_noop() {
         let q_emb = validate_embedding(embedder.embed(query)?)?;
-        let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
+        let path_prefix = effective_opts.path_prefix.as_deref().map(like_prefix_pattern);
         let mut stmt = conn.prepare(
             "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
              FROM entries_emb emb
@@ -2354,7 +2418,7 @@ pub fn search_entries(
         // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
         // decode_emb_blob fallback via length dispatch.
         let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
-            .query_map(params![path_prefix.clone(), opts.tag_filter], |r| {
+            .query_map(params![path_prefix.clone(), tag_filter], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -2390,7 +2454,7 @@ pub fn search_entries(
         // Best-effort: absence of the cues table (pre-migration DB) is not an
         // error, just an empty lane.
         let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
-        if opts.do_fts {
+        if effective_opts.do_fts {
             if let Ok(mut stmt) = conn.prepare(
             "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
              FROM cues c
@@ -2401,7 +2465,7 @@ pub fn search_entries(
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         ) {
             let cue_rows: Vec<(String, String, Vec<u8>, String, String, String, String, String)> = stmt
-                .query_map(params![path_prefix, opts.tag_filter], |r| {
+                .query_map(params![path_prefix, tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
@@ -2442,11 +2506,11 @@ pub fn search_entries(
                 })
                 .collect();
             cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
-            cue_ranked.truncate(opts.limit.saturating_mul(2));
+            cue_ranked.truncate(effective_opts.limit.saturating_mul(2));
         }
         }
 
-        if opts.do_fts {
+        if effective_opts.do_fts {
             // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
             // FTS and semantic rankings. Each entry's RRF score is the sum of
             // 1/(k+rank) across all sources it appears in, where rank is 1-based.
@@ -2490,7 +2554,9 @@ pub fn search_entries(
             // For semantic-only entries (not in FTS), create new SearchEntry values.
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
             for (_, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit * 2)
+                candidates
+                    .into_iter()
+                    .take(effective_opts.limit.saturating_mul(2))
             {
                 if !fts_meta.contains_key(&id) {
                     fts_meta.insert(id.clone(), entries.len());
@@ -2546,17 +2612,17 @@ pub fn search_entries(
             // With MMR enabled, keep a 2×limit pool so diversification has
             // candidates to swap in; the final truncate happens after MMR.
             entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
-            let pool = if opts.mmr_lambda > 0.0 {
-                opts.limit.saturating_mul(2)
+            let pool = if effective_opts.mmr_lambda > 0.0 {
+                effective_opts.limit.saturating_mul(2)
             } else {
-                opts.limit
+                effective_opts.limit
             };
             entries.truncate(pool);
 
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
             // preserve byte-identical behavior with pre-recency-bias code.
-            if opts.recency_lambda != 0.0 && !entries.is_empty() {
+            if effective_opts.recency_lambda != 0.0 && !entries.is_empty() {
                 let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
                 let placeholders: String = (1..=ids.len())
                     .map(|i| format!("?{}", i))
@@ -2584,7 +2650,7 @@ pub fn search_entries(
                                         (secs / 86400.0).max(0.0)
                                     })
                                     .unwrap_or(0.0);
-                                    let decay = (-opts.recency_lambda * days).exp();
+                                    let decay = (-effective_opts.recency_lambda * days).exp();
                                     (id, decay)
                                 })
                                 .collect()
@@ -2604,16 +2670,16 @@ pub fn search_entries(
             // the pool penalizing similarity to already-selected results, then
             // cut to limit. Scores and score_kind are left untouched — MMR
             // changes ORDER and MEMBERSHIP, not the relevance signal.
-            if opts.mmr_lambda > 0.0 && entries.len() > 1 {
+            if effective_opts.mmr_lambda > 0.0 && entries.len() > 1 {
                 // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
                 // similarity REWARD, actively clustering duplicates.
-                mmr_rerank(conn, &mut entries, opts.mmr_lambda.clamp(0.0, 1.0));
-                entries.truncate(opts.limit);
+                mmr_rerank(conn, &mut entries, effective_opts.mmr_lambda.clamp(0.0, 1.0));
+                entries.truncate(effective_opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
             for (sim, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit)
+                candidates.into_iter().take(effective_opts.limit)
             {
                 entries.push(SearchEntry {
                     id,
@@ -2687,19 +2753,16 @@ pub fn search_entries(
     // (config::Paths::root) instead of relying on a CWD-based `.git` walk,
     // which could silently disagree with the root `add`/`cite` hash evidence
     // against (e.g. inside a nested checkout). See docs/decisions/b3-root-derivation.md.
-    let repo_root: Option<PathBuf> = opts.repo_root.clone();
+    let repo_root: Option<PathBuf> = effective_opts.repo_root.clone();
 
-    let verify_count = opts.inline_verify_k.min(entries.len());
+    let verify_count = effective_opts.inline_verify_k.min(entries.len());
 
     // br-improvement-catalog-23b.13: bounded scoped pool.
     // ADR-C: explicit std::thread, not rayon.
     //
     // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
     // min(1) guards against systems returning 0 physical CPUs.
-    let pool_size = opts
-        .verify_pool_size
-        .unwrap_or_else(num_cpus::get_physical)
-        .max(1);
+    let pool_size = effective_opts.verify_pool_size.unwrap_or(1);
 
     // --- Phase 1: pre-collect per-entry evidence and byte-budget state ---
     // We need to move ev_rows out of evidence_map before the thread::scope so
@@ -2768,6 +2831,15 @@ pub fn search_entries(
 
     // --- Phase 3: run all verification tasks through the bounded pool ---
     let total_tasks = flat_tasks.len();
+    #[cfg(test)]
+    record_search_runtime_stats(SearchRuntimeStats {
+        effective_limit: effective_opts.limit,
+        effective_inline_verify_k: effective_opts.inline_verify_k,
+        effective_verify_pool_size: pool_size,
+        scheduled_verification_tasks: total_tasks,
+        spawned_verify_workers: if total_tasks > 0 { pool_size } else { 0 },
+    });
+
     let mut outcomes_flat: Vec<VerificationOutcome> = vec![
         VerificationOutcome {
             status: VerificationStatus::Unverified,
@@ -5643,6 +5715,119 @@ mod tests {
              pool_size={pool_size}, allowed={allowed}. \
              Old unbounded code peaks at 50+ threads (one per evidence row)."
         );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_limit_and_inline_verify_k_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        for i in 0..(MAX_LIMIT + 5) {
+            let entry_id = format!("caps-entry-{i:03}");
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": entry_id,
+                "path": format!("src/caps_{i}.rs"),
+                "summary": "boundary clamp needle",
+                "content": format!("content {i}"),
+                "tags": ["caps"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+            for j in 0..2usize {
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', 'sha256:caps', ?3)",
+                    params![
+                        format!("caps-ev-{i:03}-{j:02}"),
+                        format!("caps-entry-{i:03}"),
+                        format!("2024-01-01T00:00:{:02}Z", j)
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let opts = SearchOptions {
+            limit: 10_000,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10_000,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 10),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let results = search_entries(&conn, &embedder, "boundary clamp needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(results.len(), MAX_LIMIT, "limit must be clamped at the boundary");
+        assert_eq!(stats.effective_limit, MAX_LIMIT);
+        assert_eq!(stats.effective_inline_verify_k, MAX_INLINE_VERIFY_K);
+        assert_eq!(
+            stats.scheduled_verification_tasks,
+            MAX_LIMIT * 2,
+            "scheduled verification tasks must be clamped to limit × evidence rows per returned entry"
+        );
+        assert_eq!(
+            stats.spawned_verify_workers,
+            MAX_VERIFY_POOL_SIZE,
+            "worker count must use the clamped verify pool size"
+        );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_verify_pool_size_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "pool-cap-entry",
+            "path": "src/pool_cap.rs",
+            "summary": "pool cap needle",
+            "content": "pool cap body",
+            "tags": ["pool-cap"],
+            "kind": "observation",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+             VALUES('pool-cap-ev', 'pool-cap-entry', 'code', 'sha256:pool', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let opts = SearchOptions {
+            limit: 1,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 1,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 500),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let _results = search_entries(&conn, &embedder, "pool cap needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(stats.effective_verify_pool_size, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.scheduled_verification_tasks, 1);
     }
 
     #[test]

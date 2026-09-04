@@ -23,6 +23,19 @@ fn evidence_display_line(ev: &db::SearchEvidence) -> String {
     )
 }
 
+fn parse_limit(arg: &str) -> Result<usize, String> {
+    let value: usize = arg
+        .parse()
+        .map_err(|_| format!("invalid value '{arg}' for '--limit': expected an integer"))?;
+    if !(1..=db::MAX_LIMIT).contains(&value) {
+        return Err(format!(
+            "invalid value '{arg}' for '--limit': must be in 1..={}",
+            db::MAX_LIMIT
+        ));
+    }
+    Ok(value)
+}
+
 /// Search knowledge entries (default: hybrid FTS5 + semantic re-rank)
 #[derive(Command, Debug, Parser)]
 pub struct Search {
@@ -38,7 +51,7 @@ pub struct Search {
     #[arg(long)]
     pub repo: Option<std::path::PathBuf>,
     /// Maximum number of results (default: 10)
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = parse_limit)]
     pub limit: usize,
     /// Include full content in output
     #[arg(long)]
@@ -105,7 +118,7 @@ impl Search {
             do_semantic: self.semantic || !self.fts,
             path_prefix: self.path_prefix.clone(),
             tag_filter: self.tag.clone(),
-            inline_verify_k: self.limit, // verify all results by default
+            inline_verify_k: self.limit, // verify all results by default, capped in search_entries
             repo_root: Some(paths.root.clone()),
             verify_pool_size: kb_config.verify_pool_size,
             recency_lambda: kb_config.recency_lambda,
@@ -667,6 +680,18 @@ mod tests {
         assert_eq!(
             physical_rows, 3,
             "the expired peer row must still be physically present before any locked sweep runs"
+        );
+    }
+
+    #[test]
+    fn test_cmd_search_limit_rejects_out_of_range_value() {
+        let too_large = (db::MAX_LIMIT + 1).to_string();
+        let err = Search::try_parse_from(["kb", "needle", "--limit", too_large.as_str()])
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&format!("must be in 1..={}", db::MAX_LIMIT)),
+            "expected explicit range error, got: {rendered}"
         );
     }
 
