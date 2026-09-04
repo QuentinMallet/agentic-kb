@@ -235,6 +235,49 @@ impl NumField {
     }
 }
 
+/// Per-field `String` deserializers whose error names the field.
+///
+/// `serde`'s own type error for a struct field ("invalid type: integer `42`,
+/// expected a string") names neither the field nor the struct, so a
+/// wrong-typed required field would be refused without telling the caller
+/// which one. These wrappers restore the field name.
+macro_rules! named_string_de {
+    ($($fn_name:ident => $field:literal),+ $(,)?) => {
+        $(
+            fn $fn_name<'de, D>(de: D) -> Result<String, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                use serde::de::Error as _;
+                match <Value as serde::Deserialize>::deserialize(de)? {
+                    Value::String(s) => Ok(s),
+                    other => Err(D::Error::custom(format!(
+                        "{} must be a string (got {other})",
+                        $field
+                    ))),
+                }
+            }
+        )+
+    };
+}
+
+named_string_de! {
+    de_path => "path",
+    de_summary => "summary",
+    de_content => "content",
+    de_entry_id => "entry_id",
+    de_test_id => "test_id",
+    de_result => "result",
+    de_app => "app",
+    de_name => "name",
+    de_protocol => "protocol",
+    de_config => "config",
+    de_run_id => "run_id",
+    de_target_repo => "target_repo",
+    de_graph_type => "graph_type",
+    de_peer_id => "peer_id",
+}
+
 /// Declare a dispatch-method request struct.
 ///
 /// Centralising the header guarantees the three properties B1 requires of
@@ -289,8 +332,11 @@ request_struct!(
     /// a missing or wrong-typed value is a rejection naming the field, never
     /// a silently stored empty string.
     AddRequest {
+        #[serde(deserialize_with = "de_path")]
         path: String,
+        #[serde(deserialize_with = "de_summary")]
         summary: String,
+        #[serde(deserialize_with = "de_content")]
         content: String,
         tags: Option<Value>,
         permanent: Option<bool>,
@@ -305,6 +351,7 @@ request_struct!(
 request_struct!(
     /// `import` — bulk-load a seed file.
     ImportRequest {
+        #[serde(deserialize_with = "de_path")]
         path: String,
         upsert: Option<bool>,
     }
@@ -313,6 +360,7 @@ request_struct!(
 request_struct!(
     /// `expire` — mark one entry stale.
     ExpireRequest {
+        #[serde(deserialize_with = "de_entry_id")]
         entry_id: String,
         reason: Option<String>,
         force: Option<bool>,
@@ -349,7 +397,9 @@ request_struct!(
 request_struct!(
     /// `run` — record a test-case run result.
     RunRequest {
+        #[serde(deserialize_with = "de_test_id")]
         test_id: String,
+        #[serde(deserialize_with = "de_result")]
         result: String,
         adapter: Option<String>,
         detail: Option<String>,
@@ -359,9 +409,13 @@ request_struct!(
 request_struct!(
     /// `test_add` — upsert a test-case definition.
     TestAddRequest {
+        #[serde(deserialize_with = "de_app")]
         app: String,
+        #[serde(deserialize_with = "de_name")]
         name: String,
+        #[serde(deserialize_with = "de_protocol")]
         protocol: String,
+        #[serde(deserialize_with = "de_config")]
         config: String,
         test_id: Option<String>,
     }
@@ -385,6 +439,7 @@ request_struct!(
 request_struct!(
     /// `audit_record` — record audit verdicts.
     AuditRecordRequest {
+        #[serde(deserialize_with = "de_run_id")]
         run_id: String,
         verdicts: Option<Vec<Value>>,
     }
@@ -398,6 +453,7 @@ request_struct!(
 request_struct!(
     /// `provenance` — walk the derived-from graph.
     ProvenanceRequest {
+        #[serde(deserialize_with = "de_entry_id")]
         entry_id: String,
         max_depth: Option<NumField>,
     }
@@ -406,6 +462,7 @@ request_struct!(
 request_struct!(
     /// `kb_get` — fetch one entry in full.
     KbGetRequest {
+        #[serde(deserialize_with = "de_entry_id")]
         entry_id: String,
     }
 );
@@ -413,6 +470,7 @@ request_struct!(
 request_struct!(
     /// `cite` — compute citation fields for a file or byte range.
     CiteRequest {
+        #[serde(deserialize_with = "de_path")]
         path: String,
         start: Option<NumField>,
         end: Option<NumField>,
@@ -422,7 +480,9 @@ request_struct!(
 request_struct!(
     /// `kb_peers_add` — register a peer repository edge.
     PeersAddRequest {
+        #[serde(deserialize_with = "de_target_repo")]
         target_repo: String,
+        #[serde(deserialize_with = "de_graph_type")]
         graph_type: String,
         epic_slug: Option<String>,
         ttl_days: Option<NumField>,
@@ -439,6 +499,7 @@ request_struct!(
 request_struct!(
     /// `kb_peers_remove` — drop one peer edge.
     PeersRemoveRequest {
+        #[serde(deserialize_with = "de_peer_id")]
         peer_id: String,
     }
 );
@@ -3454,7 +3515,10 @@ mod tests {
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "parse_error");
         let message = resp["message"].as_str().unwrap();
-        assert!(message.contains("limit"), "message must name the field: {message}");
+        assert!(
+            message.contains("limit"),
+            "message must name the field: {message}"
+        );
         assert!(
             message.contains(&format!("1..={}", db::MAX_LIMIT)),
             "message must state the accepted range: {message}"
@@ -5389,6 +5453,495 @@ mod tests {
                 "confidence must increase after verdict=true; got {}",
                 conf
             );
+        }
+    }
+    // ── B1 / ADR-4: reject at the outermost layer ───────────────────────────
+
+    fn dispatch(paths: &config::Paths, emb: &dyn embedder::Embedder, req: &Value) -> Value {
+        handle_request(&req.to_string(), paths, emb, 10, None, 0.0, 0.0)
+    }
+
+    fn frame(reader: &mut impl BufRead, cap: usize) -> Frame {
+        let mut buf = Vec::new();
+        read_frame(reader, &mut buf, cap).expect("framing must not fail on an in-memory reader")
+    }
+
+    /// Assert one deployed-pin request is accepted by its typed struct.
+    fn pin_accepted<T: serde::de::DeserializeOwned>(req: &Value) {
+        if let Err(e) = serde_json::from_value::<T>(req.clone()) {
+            panic!(
+                "deployed pin request must be accepted by {}: {req} -> {e}",
+                std::any::type_name::<T>()
+            );
+        }
+    }
+
+    /// Pre-landing blocking criterion: every request field the **deployed**
+    /// machines_conf pin sends must survive the new typed structs.
+    ///
+    /// The field sets are enumerated from the `dispatch_tool/3` clauses of
+    /// agentic-kb rev 058f82bdb650a1de44de167adea0672c54f1f2c1 — the revision
+    /// machines_conf's `flake.lock` pins — not inferred from merged code. See
+    /// `docs/decisions/b1-request-contract.md`. A failure here means the fleet
+    /// breaks on upgrade.
+    #[test]
+    fn test_deployed_machines_conf_pin_fields_are_all_accepted() {
+        let search = json!({"method":"search","id":"pin-search","query":"q","limit":10,
+                            "mode":"hybrid","path_prefix":"src/","tag":"t","inline_verify_k":3,
+                            "expand_ids":["a","b"]});
+        let add = json!({"method":"add","id":"pin-add","path":"pin/a","summary":"s","content":"c",
+                         "tags":["t"],"permanent":false,"replace_path":false,"kind":"convention",
+                         "evidence":[],"cues":["pin cue"]});
+        let cite = json!({"method":"cite","id":"pin-cite","path":"pin.txt","start":0,"end":1});
+        let import = json!({"method":"import","id":"pin-import","path":"seeds.json","upsert":true});
+        let stale = json!({"method":"stale_check","id":"pin-stale","files":["src/a.rs"],
+                           "commits":["0000000000000000000000000000000000000000"],"blame":false});
+        let expire = json!({"method":"expire","id":"pin-expire","entry_id":"nope","reason":"r",
+                            "force":true});
+        let run = json!({"method":"run","id":"pin-run","test_id":"t1","result":"pass",
+                         "adapter":"browser","detail":"d"});
+        let test_add = json!({"method":"test_add","id":"pin-test-add","app":"app","name":"n",
+                              "protocol":"browser","config":"{}","test_id":"tid"});
+        let tests = json!({"method":"tests","id":"pin-tests","app":"app"});
+        let reembed = json!({"method":"reembed","id":"pin-reembed","dry_run":true,
+                             "max_chars":1800});
+        let compact = json!({"method":"compact","id":"pin-compact"});
+        let rebuild = json!({"method":"rebuild","id":"pin-rebuild"});
+        let kb_get = json!({"method":"kb_get","id":"pin-kb-get","entry_id":"nope"});
+
+        pin_accepted::<SearchRequest>(&search);
+        pin_accepted::<AddRequest>(&add);
+        pin_accepted::<CiteRequest>(&cite);
+        pin_accepted::<ImportRequest>(&import);
+        pin_accepted::<StaleCheckRequest>(&stale);
+        pin_accepted::<ExpireRequest>(&expire);
+        pin_accepted::<RunRequest>(&run);
+        pin_accepted::<TestAddRequest>(&test_add);
+        pin_accepted::<TestsRequest>(&tests);
+        pin_accepted::<ReembedRequest>(&reembed);
+        pin_accepted::<CompactRequest>(&compact);
+        pin_accepted::<RebuildRequest>(&rebuild);
+        pin_accepted::<KbGetRequest>(&kb_get);
+
+        // …and each one still routes through the live dispatcher. `compact` is
+        // exercised by its own test: handle_request reads the vacuum config
+        // from the abscissa APP cell, which no unit test initialises.
+        let (dir, paths, emb) = setup();
+        fs::write(dir.path().join("pin.txt"), b"pin\n").unwrap();
+        for req in [
+            &search, &add, &cite, &import, &stale, &expire, &run, &test_add, &tests, &reembed,
+            &rebuild, &kb_get,
+        ] {
+            let resp = dispatch(&paths, &emb, req);
+            let code = resp["code"].as_str().unwrap_or("");
+            assert_ne!(
+                code, "parse_error",
+                "deployed pin request must clear the boundary: {req} -> {resp}"
+            );
+            assert_ne!(
+                code, "unknown_method",
+                "deployed pin method must be routed: {req} -> {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_field_is_rejected_naming_the_field() {
+        let (_dir, paths, emb) = setup();
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"add","id":"u1","path":"p/a","summary":"s","content":"c",
+                    "confidence":0.9}),
+        );
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "parse_error");
+        let message = resp["message"].as_str().unwrap();
+        assert!(
+            message.contains("confidence"),
+            "rejection must name the unknown field: {message}"
+        );
+        assert_eq!(resp["id"], "u1", "the rejection must correlate");
+    }
+
+    #[test]
+    fn test_missing_required_field_is_rejected_naming_the_field() {
+        let (_dir, paths, emb) = setup();
+        for missing in ["summary", "content"] {
+            let mut req =
+                json!({"method":"add","id":"m1","path":"p/a","summary":"s","content":"c"});
+            req.as_object_mut().unwrap().remove(missing);
+            let resp = dispatch(&paths, &emb, &req);
+            assert_eq!(resp["code"], "parse_error", "{missing}: {resp}");
+            let message = resp["message"].as_str().unwrap();
+            assert!(
+                message.contains(missing),
+                "rejection must name the missing field {missing}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrong_typed_required_field_is_rejected_and_never_becomes_empty_string() {
+        let (_dir, paths, emb) = setup();
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"add","id":"w1","path":"p/a","summary":42,"content":"c"}),
+        );
+        assert_eq!(resp["code"], "parse_error");
+        assert!(resp["message"].as_str().unwrap().contains("summary"));
+
+        // Nothing was written: the boundary refused before the handler ran.
+        let listed = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"w2","query":"p/a","mode":"fts"}),
+        );
+        assert_eq!(listed["entries"].as_array().map(|a| a.len()), Some(0));
+    }
+
+    #[test]
+    fn test_out_of_range_numerics_are_rejected_with_the_field_and_the_range() {
+        let (_dir, paths, emb) = setup();
+        let cases: Vec<(Value, &str, String)> = vec![
+            (
+                json!({"method":"search","id":"r1","query":"q","limit": db::MAX_LIMIT + 1}),
+                "limit",
+                format!("1..={}", db::MAX_LIMIT),
+            ),
+            (
+                json!({"method":"search","id":"r2","query":"q",
+                       "inline_verify_k": db::MAX_INLINE_VERIFY_K + 1}),
+                "inline_verify_k",
+                format!("0..={}", db::MAX_INLINE_VERIFY_K),
+            ),
+            (
+                json!({"method":"search","id":"r3","query":"q","max_hops": MAX_SEARCH_HOPS + 1}),
+                "max_hops",
+                format!("1..={MAX_SEARCH_HOPS}"),
+            ),
+            (
+                json!({"method":"reembed","id":"r4","max_chars": MAX_REEMBED_MAX_CHARS + 1}),
+                "max_chars",
+                format!("1..={MAX_REEMBED_MAX_CHARS}"),
+            ),
+        ];
+        for (req, field, range) in cases {
+            let resp = dispatch(&paths, &emb, &req);
+            assert_eq!(resp["code"], "parse_error", "{req} -> {resp}");
+            let message = resp["message"].as_str().unwrap();
+            assert!(message.contains(field), "must name {field}: {message}");
+            assert!(message.contains(&range), "must state {range}: {message}");
+        }
+    }
+
+    #[test]
+    fn test_wrong_typed_numerics_are_rejected_with_the_field_and_the_range() {
+        let (_dir, paths, emb) = setup();
+        let cases = [
+            (
+                json!({"method":"search","id":"t1","query":"q","limit":"ten"}),
+                "limit",
+            ),
+            (
+                json!({"method":"search","id":"t2","query":"q","inline_verify_k":-3}),
+                "inline_verify_k",
+            ),
+            (
+                json!({"method":"search","id":"t3","query":"q","max_hops":1.5}),
+                "max_hops",
+            ),
+            (
+                json!({"method":"reembed","id":"t4","max_chars":[1]}),
+                "max_chars",
+            ),
+        ];
+        for (req, field) in cases {
+            let resp = dispatch(&paths, &emb, &req);
+            assert_eq!(resp["code"], "parse_error", "{req} -> {resp}");
+            let message = resp["message"].as_str().unwrap();
+            assert!(message.contains(field), "must name {field}: {message}");
+            assert!(
+                message.contains("integer"),
+                "must state the accepted shape: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_ids_mixed_type_member_is_a_rejection_not_a_filtered_element() {
+        let (_dir, paths, emb) = setup();
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"e1","expand_ids":["good", 42, "also-good"]}),
+        );
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "parse_error");
+        assert!(
+            resp.get("entries").is_none(),
+            "a mixed-type array must not be silently filtered into a result: {resp}"
+        );
+    }
+
+    #[test]
+    fn test_expand_ids_above_max_is_rejected_not_truncated() {
+        let (_dir, paths, emb) = setup();
+        let ids: Vec<String> = (0..=MAX_EXPAND_IDS).map(|i| format!("id-{i}")).collect();
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"e2","expand_ids": ids}),
+        );
+        assert_eq!(resp["code"], "parse_error");
+        let message = resp["message"].as_str().unwrap();
+        assert!(message.contains("expand_ids"), "{message}");
+        assert!(message.contains(&MAX_EXPAND_IDS.to_string()), "{message}");
+
+        // Exactly at the cap is accepted.
+        let ids: Vec<String> = (0..MAX_EXPAND_IDS).map(|i| format!("id-{i}")).collect();
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"e3","expand_ids": ids}),
+        );
+        assert_eq!(resp["type"], "result", "{resp}");
+    }
+
+    #[test]
+    fn test_query_above_the_byte_cap_is_rejected() {
+        let (_dir, paths, emb) = setup();
+        let over = "q".repeat(MAX_QUERY_BYTES + 1);
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"q1","query":over,"mode":"fts"}),
+        );
+        assert_eq!(resp["code"], "parse_error");
+        let message = resp["message"].as_str().unwrap();
+        assert!(message.contains("query"), "{message}");
+        assert!(message.contains(&MAX_QUERY_BYTES.to_string()), "{message}");
+
+        let at_cap = "q".repeat(MAX_QUERY_BYTES);
+        let resp = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"q2","query":at_cap,"mode":"fts"}),
+        );
+        assert_eq!(resp["type"], "result", "{resp}");
+    }
+
+    // ── Input-line framing ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_an_oversized_line_is_refused_and_the_next_valid_request_is_answered() {
+        let (_dir, paths, emb) = setup();
+        let cap = 64usize;
+        let mut input = Vec::new();
+        input.extend(std::iter::repeat_n(b'x', cap * 4));
+        input.push(b'\n');
+        let valid = json!({"method":"kb_get","id":"after-overlong","entry_id":"nope"});
+        input.extend_from_slice(valid.to_string().as_bytes());
+        input.push(b'\n');
+        let mut reader = io::Cursor::new(input);
+
+        match frame(&mut reader, cap) {
+            Frame::Rejected(resp) => {
+                assert_eq!(resp["code"], "line_too_long", "{resp}");
+                assert!(resp["message"].as_str().unwrap().contains(&cap.to_string()));
+            }
+            other => panic!(
+                "an over-long line must be refused, got {}",
+                match other {
+                    Frame::Line(l) => format!("Line({l})"),
+                    Frame::Eof => "Eof".to_string(),
+                    Frame::Rejected(_) => unreachable!(),
+                }
+            ),
+        }
+
+        // The reader discarded to the newline, so the next frame is the real
+        // request — and it is answered.
+        let Frame::Line(line) = frame(&mut reader, cap) else {
+            panic!("the request following an over-long line must be readable");
+        };
+        let resp = handle_request(&line, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp["id"], "after-overlong");
+        assert_eq!(resp["code"], "entry_not_found", "{resp}");
+
+        assert!(matches!(frame(&mut reader, cap), Frame::Eof));
+    }
+
+    #[test]
+    fn test_a_line_at_exactly_the_cap_is_accepted() {
+        let cap = 32usize;
+        let mut input = vec![b'y'; cap];
+        input.push(b'\n');
+        let mut reader = io::Cursor::new(input);
+        let Frame::Line(line) = frame(&mut reader, cap) else {
+            panic!("a line of exactly cap bytes must be accepted");
+        };
+        assert_eq!(line.len(), cap);
+    }
+
+    #[test]
+    fn test_the_real_cap_is_ten_mebibytes() {
+        assert_eq!(MAX_INPUT_LINE_BYTES, 10 * 1024 * 1024);
+        let mut input = vec![b'z'; MAX_INPUT_LINE_BYTES + 1];
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"method\":\"compact\",\"id\":\"after\"}\n");
+        let mut reader = io::Cursor::new(input);
+        assert!(matches!(
+            frame(&mut reader, MAX_INPUT_LINE_BYTES),
+            Frame::Rejected(_)
+        ));
+        let Frame::Line(line) = frame(&mut reader, MAX_INPUT_LINE_BYTES) else {
+            panic!("the request after a 10 MiB line must still be read");
+        };
+        assert!(line.contains("\"id\":\"after\""));
+    }
+
+    #[test]
+    fn test_a_final_line_without_a_trailing_newline_is_still_a_frame() {
+        let mut reader = io::Cursor::new(b"{\"method\":\"compact\",\"id\":\"tail\"}".to_vec());
+        let Frame::Line(line) = frame(&mut reader, 1024) else {
+            panic!("EOF without a newline must still yield the line");
+        };
+        assert!(line.contains("tail"));
+        assert!(matches!(frame(&mut reader, 1024), Frame::Eof));
+    }
+
+    // ── Parse-error id recovery ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_error_envelope_carries_a_recovered_id() {
+        let (_dir, paths, emb) = setup();
+        // Truncated JSON: unparseable, but the id is textually recoverable.
+        let resp = handle_request(
+            "{\"id\":\"broken-42\",\"method\":\"add\",\"path\":",
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+        assert_eq!(resp["code"], "parse_error");
+        assert_eq!(resp["id"], "broken-42");
+
+        let resp = handle_request("{\"id\": 77, \"method\":", &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp["id"], 77);
+    }
+
+    #[test]
+    fn test_parse_error_envelope_id_is_null_when_nothing_is_recoverable() {
+        let (_dir, paths, emb) = setup();
+        for line in [
+            "not json at all",
+            "{\"method\":\"add\",",
+            "[1,2,3",
+            "{\"id\":{\"a\":1}",
+        ] {
+            let resp = handle_request(line, &paths, &emb, 10, None, 0.0, 0.0);
+            assert_eq!(resp["code"], "parse_error", "{line}");
+            assert_eq!(resp["id"], Value::Null, "{line} -> {resp}");
+        }
+    }
+
+    #[test]
+    fn test_shallow_scan_id_reads_only_the_top_level_key_position() {
+        // Nested ids are ignored.
+        assert_eq!(
+            shallow_scan_id("{\"evidence\":[{\"id\":\"nested\"}],\"id\":\"top\""),
+            json!("top")
+        );
+        // `"id"` in value position is not a key.
+        assert_eq!(shallow_scan_id("{\"field\":\"id\",\"x\":"), Value::Null);
+        // An escaped quote inside a preceding string does not desynchronise.
+        assert_eq!(
+            shallow_scan_id("{\"a\":\"quote\\\" here\",\"id\":\"after-escape\""),
+            json!("after-escape")
+        );
+    }
+
+    // br-h7c companion: B1's malformed-request property.
+    //
+    // For any generated `expand_ids` array (mixed member types, any length)
+    // and any undeclared extra key, the boundary either rejects the request or
+    // parses it whole — it never hands the handler a shortened array.
+    use proptest::strategy::Strategy as _;
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(256),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+        #[test]
+        fn proptest_malformed_requests_are_rejected_and_never_shorten_expand_ids(
+            members in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::string::string_regex("[a-z]{1,8}").unwrap()
+                        .prop_map(Value::String),
+                    proptest::prelude::Just(json!(42)),
+                    proptest::prelude::Just(json!(null)),
+                    proptest::prelude::Just(json!(true)),
+                    proptest::prelude::Just(json!({"nested":1})),
+                    proptest::prelude::Just(json!(["a"])),
+                ],
+                0..40usize,
+            ),
+            extra_key in proptest::option::of(
+                proptest::string::string_regex("zz[a-z]{1,4}").unwrap()
+            ),
+        ) {
+            let (_dir, paths, emb) = setup();
+            let mut req = json!({
+                "method": "search",
+                "id": "prop-expand",
+                "expand_ids": members.clone(),
+            });
+            if let Some(key) = &extra_key {
+                req[key.as_str()] = json!(1);
+            }
+
+            let all_strings = members.iter().all(Value::is_string);
+            let parsed = serde_json::from_value::<SearchRequest>(req.clone());
+
+            if all_strings && extra_key.is_none() {
+                let parsed = parsed.expect("a well-typed request must parse");
+                let ids = parsed
+                    .expand_ids
+                    .expect("expand_ids must survive deserialization");
+                proptest::prop_assert_eq!(
+                    ids.len(),
+                    members.len(),
+                    "expand_ids must never be silently shortened"
+                );
+            } else {
+                proptest::prop_assert!(
+                    parsed.is_err(),
+                    "a non-string member or an undeclared key must be rejected: {}",
+                    req
+                );
+            }
+
+            let must_reject = !all_strings
+                || extra_key.is_some()
+                || members.is_empty()
+                || members.len() > MAX_EXPAND_IDS;
+            let resp = handle_request(&req.to_string(), &paths, &emb, 10, None, 0.0, 0.0);
+            if must_reject {
+                proptest::prop_assert_eq!(
+                    &resp["type"],
+                    "error",
+                    "must be rejected: {} -> {}",
+                    req,
+                    resp
+                );
+            } else {
+                proptest::prop_assert_eq!(&resp["type"], "result", "{} -> {}", req, resp);
+            }
         }
     }
 }
