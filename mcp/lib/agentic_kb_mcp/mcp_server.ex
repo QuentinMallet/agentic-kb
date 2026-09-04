@@ -995,7 +995,10 @@ defmodule AgenticKbMcp.McpServer do
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
-  defp gen_id do
+  # Public (not just `defp`) so PortManager's correlation tests can assert
+  # uniqueness directly (bd-21ef.2.8, ADR-3 rule 2).
+  @doc false
+  def gen_id do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 
