@@ -262,14 +262,14 @@ ContentPremiseHolds(row) == rows[row].contentHash = plans[row].premiseContent
 VerdictPremiseHolds(row) == SafeSearch(row)
 
 (* UnsafeApply drops ONLY the path check, because that is precisely the check
-   `heal_relocations` omits: it requeries the hash under the lock and never the
-   path.  Isolating that one omission is what makes the counterexample name the
-   real defect instead of a strawman with no premise checking at all. *)
+   `heal_relocations` omits.  UnsafeVerdict additionally drops the
+   content/verdict checks, modelling the full omission of path, content and
+   verdict rechecks under the lock. *)
 PremiseHolds(row) ==
-  /\ (UnsafeApply \/ PathPremiseHolds(row))
+  /\ (UnsafeApply \/ UnsafeVerdict \/ PathPremiseHolds(row))
   /\ LivePremiseHolds(row)
-  /\ ContentPremiseHolds(row)
-  /\ VerdictPremiseHolds(row)
+  /\ (UnsafeVerdict \/ ContentPremiseHolds(row))
+  /\ (UnsafeVerdict \/ VerdictPremiseHolds(row))
 
 (* ApplyHeal is the commit under the lock.  A held premise commits the plan:
    the status becomes Relocated, the citation is repointed to the planned
@@ -286,10 +286,14 @@ ApplyHeal(row) ==
                     ![row].path = plans[row].newPath,
                     ![row].contentHash = relocatedContent]
              /\ Mark("ApplyHeal", row,
-                     ~PathPremiseHolds(row), ~LivePremiseHolds(row), TRUE)
+                     ~PathPremiseHolds(row), ~LivePremiseHolds(row),
+                     ~ContentPremiseHolds(row), ~VerdictPremiseHolds(row),
+                     TRUE)
         ELSE /\ UNCHANGED rows
              /\ Mark("ApplyHeal", row,
-                     ~PathPremiseHolds(row), ~LivePremiseHolds(row), FALSE)
+                     ~PathPremiseHolds(row), ~LivePremiseHolds(row),
+                     ~ContentPremiseHolds(row), ~VerdictPremiseHolds(row),
+                     FALSE)
   /\ plans' = [plans EXCEPT ![row] = NoPlan]
   /\ UNCHANGED pass
 
@@ -301,6 +305,7 @@ Next ==
         newExcerptStrong \in BOOLEAN,
         newPath \in PathIds :
        ReVerify(row, newHash, newCandidates, newExcerptStrong, newPath)
+  \/ \E row \in RowIds, newPath \in PathIds : ConcurrentHeal(row, newPath)
   \/ \E row \in RowIds : PlanHeal(row)
   \/ \E row \in RowIds : ApplyHeal(row)
 
@@ -330,15 +335,18 @@ NoStaleHealCommit ==
    V3 must implement.  It is deliberately NOT listed in any other cfg.
 
    The `~liveStale` conjunct is what makes the probe sharp: it demands a
-   discard driven by the PATH having moved while the row was still live, which
-   is exactly the case `heal_relocations` cannot currently detect.  Without it
-   the probe would be satisfied by a discard the liveness check alone would
-   have caught, and the path check would still be untested. *)
+   discard driven by the PATH having moved while the row was still live and the
+   search evidence was otherwise still current.  Without the
+   content/verdict-staleness conjuncts the probe would also be satisfied by a
+   discard caused by the search verdict going stale, and the path check would
+   still be untested. *)
 NoStalePlanEverDiscarded ==
   ~(lastAction.kind = "ApplyHeal"
     /\ ~lastAction.committed
     /\ lastAction.pathStale
-    /\ ~lastAction.liveStale)
+    /\ ~lastAction.liveStale
+    /\ ~lastAction.contentStale
+    /\ ~lastAction.verdictStale)
 
 (* Replaces the earlier "relocated implies hash matches", which was true only
    because Heal asserted it.  Now that Heal cannot assert it, this states the
@@ -377,7 +385,5 @@ NonUniqueUnverified ==
 WeakExcerptUnverified ==
   \A row \in RowIds :
     ~rows[row].excerptStrong => rows[row].status # "Relocated"
-
-Spec == Init /\ [][Next]_vars
 
 =============================================================================
