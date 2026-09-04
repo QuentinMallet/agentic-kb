@@ -1,5 +1,6 @@
 //! `rebuild` subcommand
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
 use crate::components::{db, events};
@@ -113,11 +114,18 @@ pub fn rebuild_if_schema_obsolete(
     paths: &config::Paths,
     embedder: &dyn Embedder,
 ) -> anyhow::Result<bool> {
-    // Fast path: no lock for the steady-state stamp read.
+    // Fast path: no lock for the steady-state stamp read. A repository whose
+    // database has never been created has nothing to upgrade — open_ro no
+    // longer creates it, so DbUninitialized is "nothing to do", not an error.
     {
-        let conn = db::open_db(&paths.db)?;
-        if db::schema_is_current(&conn) {
-            return Ok(false);
+        match db::open_ro(&paths.db) {
+            Ok(conn) => {
+                if db::schema_is_current(&conn) {
+                    return Ok(false);
+                }
+            }
+            Err(e) if db::is_db_uninitialized(&e) => return Ok(false),
+            Err(e) => return Err(e),
         }
     }
     // Single-flight (codex review finding): concurrent first interactions
@@ -128,6 +136,10 @@ pub fn rebuild_if_schema_obsolete(
     let upgrade_lock = paths.lock.with_extension("schema-upgrade.lock");
     let _flight = acquire_lock(&upgrade_lock)?;
     {
+        // Still the deprecated opener: this block also STAMPS schema_version
+        // below, and that write is governed by the schema-upgrade lock rather
+        // than paths.lock. Putting it under the write lock is C2/L2's job — a
+        // nested acquire here would invert the two locks' order.
         let conn = db::open_db(&paths.db)?;
         if db::schema_is_current(&conn) {
             return Ok(false);
@@ -196,7 +208,7 @@ pub fn rebuild_if_schema_obsolete(
         // it is obviously not this DB's history (truncated / foreign / wrong
         // path). Replaying it would drop those entries outright — refuse loudly
         // and let the operator reconcile rather than silently mangle the KB.
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         let live_ids: Vec<String> = conn
             .prepare("SELECT id FROM entries WHERE is_stale=0")?
             .query_map([], |r| r.get(0))?
@@ -250,8 +262,8 @@ pub fn rebuild_if_schema_obsolete(
         // snapshot. VACUUM INTO takes a read transaction and emits a single
         // transactionally-consistent file with no WAL sidecar — unlike a raw
         // fs::copy of a live WAL database, which can capture a torn state.
-        let _wlock = acquire_lock(&paths.lock)?;
-        let conn = db::open_db(&paths.db)?;
+        let wlock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &wlock)?;
         let _ = fs::remove_file(&backup);
         // Escape single quotes in the path for the SQL string literal (the
         // path is ours, but repo paths can legitimately contain quotes).
@@ -375,7 +387,7 @@ impl Rebuild {
                 // Stop at snapshot_len so we never encounter a partial tail line
                 // that a concurrent writer may be mid-writing after Phase 1.
                 let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
-                let conn = db::open_db(tmp.path())?;
+                let conn = db::open_scratch(tmp.path())?;
                 conn.execute_batch("PRAGMA journal_mode=DELETE")?;
                 if let Some(torn_tail) = &evts.torn_tail {
                     eprintln!(
@@ -421,7 +433,7 @@ impl Rebuild {
             }
             if !catchup.events.is_empty() {
                 eprintln!("catching up {} new event(s)...", catchup.events.len());
-                let conn = db::open_db(tmp.path())?;
+                let conn = db::open_scratch(tmp.path())?;
                 conn.execute_batch("PRAGMA journal_mode=DELETE")?;
                 for event in &catchup.events {
                     db::apply_event(&conn, embedder, event)
@@ -431,10 +443,11 @@ impl Rebuild {
             #[cfg(test)]
             let phase3_catchup_finished = std::time::Instant::now();
 
-            // Remove old WAL/SHM before rename. This is required: the tmp DB uses
-            // journal_mode=DELETE (no WAL), so if the old WAL files remain after
-            // the rename, new SQLite connections would attempt WAL recovery against
-            // the rebuilt DB, producing corruption or an error.
+            // C2/ADR-1: after the open split, readers no longer heal
+            // journal_mode, so C1/T5a must ensure the tmp DB is already in WAL
+            // mode before rename. If old WAL files remained here while tmp were
+            // still DELETE-mode, a new connection could recover against the
+            // wrong journal state and corrupt or reject the rebuilt DB.
             // Safety (Linux): the per-request connection model means no MCP handler
             // holds a connection across the lock boundary, so no reader has the WAL
             // open when we unlink it. On Linux, any FD open at unlink time remains

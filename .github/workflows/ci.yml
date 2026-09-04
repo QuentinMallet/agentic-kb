@@ -25,3 +25,9 @@ jobs:
         run: nix develop -c cargo clippy -- -D warnings
       - name: Format check
         run: nix develop -c cargo fmt --check
+      - name: Elixir compile (mcp)
+        run: nix develop -c sh -c 'cd mcp && mix compile --warnings-as-errors'
+      - name: Elixir test (mcp)
+        run: nix develop -c sh -c 'cd mcp && mix test'
+      - name: Elixir format check (mcp)
+        run: nix develop -c sh -c 'cd mcp && mix format --check-formatted'

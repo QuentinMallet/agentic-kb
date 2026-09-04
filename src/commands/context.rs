@@ -70,9 +70,34 @@ impl Runnable for Context {
 impl Context {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        if !paths.db.exists() {
-            return Ok(());
-        }
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        self.execute_with(&paths, &mut out)
+    }
+
+    /// Execute against explicit paths, rendering into `writer`.
+    ///
+    /// A pure read: it opens with [`db::open_ro`] and never takes the write
+    /// lock (ADR-7). On a repository whose database has never been created it
+    /// serves an empty selection plus a one-line stderr note, which is the
+    /// first-run behaviour the pre-split read path produced by silently
+    /// creating the database.
+    pub fn execute_with<W: Write>(
+        &self,
+        paths: &config::Paths,
+        writer: &mut W,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                if self.json {
+                    writer.write_all(b"[]\n")?;
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let repo_root = config::git_repo_root();
         let working_set = repo_root
             .as_deref()
@@ -83,16 +108,13 @@ impl Context {
             .and_then(current_branch)
             .map(|b| branch_tokens(&b))
             .unwrap_or_default();
-        let conn = db::open_db(&paths.db)?;
         // This command deliberately uses search_entries' FTS-only lane; a
         // no-op embedder keeps selection read-only and avoids model setup.
         let emb = crate::components::embedder::NoopEmbedder;
         let candidates = build_candidates(&conn, &emb, &working_set, &branch_tokens)?;
         let (selected, spent) = greedy_select(candidates, self.budget, self.floor);
 
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        render(&selected, self.json, &mut out)?;
+        render(&selected, self.json, writer)?;
         if let Ok(surface) = std::env::var("KB_INJECTION_SOURCE") {
             let session_id =
                 std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "unknown".into());

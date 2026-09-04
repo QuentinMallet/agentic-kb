@@ -11,6 +11,7 @@ defmodule AgenticKbMcp.McpServer do
   @server_info %{"name" => "agentic-kb-mcp", "version" => "0.1.0"}
   @format_entries_max_bytes 32_000
   @evidence_preview_limit 3
+  @derived_from_max_len 200
 
   @tools [
     %{
@@ -62,7 +63,7 @@ defmodule AgenticKbMcp.McpServer do
     %{
       "name" => "kb_add",
       "description" =>
-        "Call this after completing any task when you have just learned something that would have saved you time at the start of the task. Supply 2-3 `cues` per entry so vague future queries can still reach it. Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are stored with `evidence_status=\"missing\"` and a warning is emitted to stderr; attach evidence via `citation_path` (the server resolves sha/hash) or `kb cite` when available. The response may include `similar_existing` (entries with embedding cosine above the dedup cutoff) — when present, consider updating/expiring the listed entry instead of keeping both.",
+        "Call this after completing any task when you have just learned something that would have saved you time at the start of the task. Supply 2-3 `cues` per entry so vague future queries can still reach it. Add or update a knowledge entry in the agent knowledge base. Soft-mandate: entries with kind `observation`, `belief`, or `procedure` that have no evidence are stored with `evidence_status=\"missing\"` and a warning is emitted to stderr; attach evidence via `citation_path` (the server resolves sha/hash) or `kb cite` when available. If an evidence row has `kind=\"derived\"`, it must include `derived_from` as a non-empty string no longer than #{@derived_from_max_len} characters naming the supporting entry id. The response may include `similar_existing` (entries with embedding cosine above the dedup cutoff) — when present, consider updating/expiring the listed entry instead of keeping both.",
       "inputSchema" => %{
         "type" => "object",
         "properties" => %{
@@ -94,25 +95,29 @@ defmodule AgenticKbMcp.McpServer do
           "evidence" => %{
             "type" => "array",
             "description" =>
-              "Evidence citations (default: []). Phase 1 accepts kind=\"code\" | \"derived\" only; other kinds are rejected with an error naming Phase 2. Derived rows set `derived_from` to the supporting entry's id. Each item: {kind, citation_path, citation_sha, citation_hash, citation_excerpt?, derived_from?}.",
+              "Evidence citations (default: []). Phase 1 accepts kind=\"code\" | \"derived\" only; other kinds are rejected with an error naming Phase 2. Derived rows must set `derived_from` to the supporting entry's id. Each item: {kind, citation_path, citation_sha, citation_hash, citation_excerpt?, derived_from?}.",
             "items" => %{
               "type" => "object",
               "properties" => %{
                 "kind" => %{
                   "type" => "string",
-                  "description" => "Evidence kind. Phase 1: must be \"code\" or \"derived\"; derived rows set `derived_from` to the supporting entry's id."
+                  "description" =>
+                    "Evidence kind. Phase 1: must be \"code\" or \"derived\"; derived rows must set `derived_from` to the supporting entry's id."
                 },
                 "citation_path" => %{
                   "type" => "string",
-                  "description" => "File path (whole-file citation) or path:start-end byte range. When supplied without citation_hash, the server resolves the hash via the verifier's code path."
+                  "description" =>
+                    "File path (whole-file citation) or path:start-end byte range. When supplied without citation_hash, the server resolves the hash via the verifier's code path."
                 },
                 "citation_sha" => %{
                   "type" => "string",
-                  "description" => "Git commit SHA of the cited file revision (optional when citation_path is given; server fills it from git HEAD if absent)"
+                  "description" =>
+                    "Git commit SHA of the cited file revision (optional when citation_path is given; server fills it from git HEAD if absent)"
                 },
                 "citation_hash" => %{
                   "type" => "string",
-                  "description" => "sha256 of the whole file (bare form) or of the cited byte range (optional when citation_path is given; server resolves it via the verifier's code path)"
+                  "description" =>
+                    "sha256 of the whole file (bare form) or of the cited byte range (optional when citation_path is given; server resolves it via the verifier's code path)"
                 },
                 "citation_excerpt" => %{
                   "type" => "string",
@@ -122,10 +127,24 @@ defmodule AgenticKbMcp.McpServer do
                 "derived_from" => %{
                   "type" => "string",
                   "description" =>
-                    "ID of the parent entry this evidence row is derived from (optional)"
+                    "ID of the parent entry this evidence row is derived from (required when kind=\"derived\", 1-#{@derived_from_max_len} chars)"
                 }
               },
-              "required" => ["kind"]
+              "required" => ["kind"],
+              "if" => %{
+                "properties" => %{"kind" => %{"const" => "derived"}},
+                "required" => ["kind"]
+              },
+              "then" => %{
+                "required" => ["derived_from"],
+                "properties" => %{
+                  "derived_from" => %{
+                    "type" => "string",
+                    "minLength" => 1,
+                    "maxLength" => @derived_from_max_len
+                  }
+                }
+              }
             }
           },
           "cues" => %{
@@ -976,7 +995,10 @@ defmodule AgenticKbMcp.McpServer do
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
-  defp gen_id do
+  # Public (not just `defp`) so PortManager's correlation tests can assert
+  # uniqueness directly (bd-21ef.2.8, ADR-3 rule 2).
+  @doc false
+  def gen_id do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 

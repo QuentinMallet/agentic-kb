@@ -1,5 +1,6 @@
 //! `compress` subcommand — semantic paragraph deduplication for bloated KB entries
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::make_embedder;
 use crate::commands::add_validation::compute_evidence_status_write;
 use crate::components::{kb_core, redactor, text_chunker};
@@ -374,8 +375,7 @@ mod tests {
     #[test]
     fn test_compress_propagates_evidence_row_decode_failure() {
         let dir = tempdir().unwrap();
-        let paths = make_paths(dir.path());
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(dir.path());
         let emb = NoopEmbedder;
         let content = "paragraph one\n\nparagraph two\n\nparagraph three".repeat(80);
         let upsert = serde_json::json!({

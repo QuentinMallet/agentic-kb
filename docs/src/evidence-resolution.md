@@ -7,6 +7,7 @@ The agent KB implements server-side resolution of evidence citations at write ti
 When an agent calls `kb_add` with an evidence row containing only a `citation_path`, the server resolves that path to a complete evidence record before appending the event to the log. The contract is:
 
 - **Caller provides:** `citation_path` (file path or file path + byte range) and optionally `evidence.kind` and `evidence.derived_from`.
+- If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id.
 - **Server resolves:** `citation_hash` (SHA-256 of the byte range) and `citation_sha` (git HEAD commit SHA), computed at write time from the working repository.
 - **Explicit values preserved:** If the caller supplies `citation_hash` or `citation_sha` explicitly, those values are never overwritten — the caller assertion is authoritative.
 - **Before event append:** Resolution failures are loud write-time errors that reject the entire `kb_add` call, naming the problematic path and reason. A malformed citation or missing file causes the write to fail, never resulting in an unverifiable row in the database.
@@ -51,7 +52,7 @@ The entry-point call `kb_add` now succeeds or fails on its own, without requirin
 
 ### Evidence Status and the Soft Mandate
 
-The soft mandate on evidence (for observation, belief, and procedure kinds) does not block writes. Entries of these kinds are accepted with zero evidence rows, stored with `evidence_status="missing"`, and trigger a write-time warning to stderr. When evidence rows are provided, they need only include `citation_path`; the server resolves it to `citation_hash` and `citation_sha`. Evidence rows are capped at `MAX_EVIDENCE_ROWS_PER_ENTRY` (200), a limit enforced at both write and retrieval time.
+The soft mandate on evidence (for observation, belief, and procedure kinds) does not block writes. Entries of these kinds are accepted with zero evidence rows, stored with `evidence_status="missing"`, and trigger a write-time warning to stderr. When evidence rows are provided, they need only include `citation_path`; the server resolves it to `citation_hash` and `citation_sha`. If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id. Evidence rows are capped at `MAX_EVIDENCE_ROWS_PER_ENTRY` (200), a limit enforced at both write and retrieval time.
 
 Entries of kind convention or memory are not subject to the soft mandate and may carry zero evidence rows.
 

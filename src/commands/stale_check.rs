@@ -5,6 +5,7 @@
 //! stdout; the MCP handler serialises it to JSON.  No SQL or git subprocess
 //! invocation should be duplicated between the two call sites.
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy};
 use crate::config;
@@ -205,7 +206,7 @@ impl StaleCheck {
         // path only — never the stored hash.
         let cfg = config::KbConfig::from_paths(&paths);
         if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
-            heal_relocations(&paths, &conn, &mut report)?;
+            heal_relocations(&paths, &mut report)?;
         }
 
         render_cli(&report);
@@ -217,17 +218,17 @@ impl StaleCheck {
 ///
 /// The event log is the durable substrate (P2/F1): the DB update alone would
 /// not survive `kb rebuild`.  Runs under the same flock as every other writer.
-fn heal_relocations(
-    paths: &config::Paths,
-    conn: &Connection,
-    report: &mut StaleCheckReport,
-) -> anyhow::Result<()> {
+/// Opens its own mutating connection rather than reusing the caller's read
+/// connection: a mutation must be performed on a handle obtained with the lock
+/// in hand (ADR-1, principle 2).
+fn heal_relocations(paths: &config::Paths, report: &mut StaleCheckReport) -> anyhow::Result<()> {
     use crate::commands::add::acquire_lock;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events;
 
     let version_ref = config::git_head_sha();
-    let _lock = acquire_lock(&paths.lock)?;
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = &db::open_rw(paths, &lock)?;
 
     for r in report.relocation.iter_mut() {
         let new_path = match &r.new_path {
@@ -1179,13 +1180,13 @@ mod tests {
     #[test]
     fn heal_relocations_skips_missing_evidence_rows_and_keeps_renderable_report() {
         use crate::components::events;
-        use crate::config::Paths;
         use rusqlite::params;
 
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(dir.path());
-        let conn = db::open_db_memory().unwrap();
+        // On disk, not in memory: heal_relocations opens its own mutating
+        // connection under the write lock, so the seed rows must live in the
+        // repository's real database rather than a private handle.
+        let (paths, conn) = db::test_db(dir.path());
 
         conn.execute(
             "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
@@ -1231,7 +1232,7 @@ mod tests {
             ..Default::default()
         };
 
-        heal_relocations(&paths, &conn, &mut report).unwrap();
+        heal_relocations(&paths, &mut report).unwrap();
 
         assert!(!report.relocation[0].healed, "missing rows are skipped");
         assert!(report.relocation[1].healed, "remaining rows still heal");

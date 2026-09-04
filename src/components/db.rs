@@ -1,14 +1,18 @@
 //! Database operations
 
+#![allow(deprecated)] // open_db (ADR-1) still used by unmigrated call sites; removed in C2/L1c
+
 use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
+use crate::config;
 use crate::models::{
     blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
     f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -153,24 +157,271 @@ fn stamp_schema_version(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Open (or create) the SQLite database at the given path.
-pub fn open_db(db_path: &Path) -> Result<Connection> {
+// ---------------------------------------------------------------------------
+// The open split (C2/L1a, ADR-1)
+// ---------------------------------------------------------------------------
+//
+// One `open_db` used to serve pure reads, locked writes, and rebuild's private
+// tmp database alike — and it issued DDL plus two unlocked `DELETE`s on every
+// call, so no read was a read. It is now four functions with four different
+// obligations, and the write obligation is carried in the signature.
+
+/// The database does not exist yet, or exists without the `entries` table.
+///
+/// Distinct from every other open failure so pure read surfaces can map it to
+/// an empty result (first-run UX) while still reporting real I/O and corruption
+/// errors. `open_ro` never creates a database: initialization belongs to
+/// [`open_or_init`] and to the write paths, which hold the lock.
+#[derive(Debug, thiserror::Error)]
+#[error("knowledge base not initialized at {}", .db_path.display())]
+pub struct DbUninitialized {
+    pub db_path: PathBuf,
+}
+
+/// True when `err` is (or wraps) [`DbUninitialized`].
+pub fn is_db_uninitialized(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DbUninitialized>().is_some()
+}
+
+/// The one-line note a read surface prints when it serves an empty result
+/// because the database is not initialized (ADR-1's schema-creation policy,
+/// ADR-7's "readers never take the write lock").
+pub fn uninitialized_note(db_path: &Path) -> String {
+    format!(
+        "kb: no knowledge base at {} — returning an empty result; run `kb rebuild` to materialize it from the event log",
+        db_path.display()
+    )
+}
+
+/// Emit [`uninitialized_note`] on stderr. Reads stay silent on stdout so
+/// machine-readable output is unaffected.
+pub fn note_uninitialized(db_path: &Path) {
+    eprintln!("{}", uninitialized_note(db_path));
+}
+
+/// Open a read-write connection: WAL, foreign keys, parent dirs. No DDL, no
+/// stamp, no sweep, no lock. Shared by the openers that are allowed to mutate.
+fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
         fs::create_dir_all(p)?;
     }
     let conn =
         Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    // Fresh-DB detection BEFORE ensure_schema: a DB with no entries table was
-    // just created and gets stamped current; a pre-existing DB keeps whatever
-    // stamp it has (none = legacy = obsolete) so callers can force a rebuild.
-    let is_fresh: bool = !table_exists(&conn, "entries");
-    ensure_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Create the schema on a connection that may be opening a brand-new file.
+///
+/// Fresh-DB detection runs BEFORE `ensure_schema`: a DB with no `entries` table
+/// was just created and gets stamped current; a pre-existing DB keeps whatever
+/// stamp it has (none = legacy = obsolete) so callers can force a rebuild.
+fn ensure_schema_and_stamp(conn: &Connection) -> Result<()> {
+    let is_fresh: bool = !table_exists(conn, "entries");
+    ensure_schema(conn)?;
     if is_fresh {
-        stamp_schema_version(&conn)?;
+        stamp_schema_version(conn)?;
     }
+    Ok(())
+}
+
+/// Open an existing, schema-bearing DB for reading only.
+///
+/// `PRAGMA query_only=ON` gates write statements at the VDBE layer. It is
+/// deliberately NOT `SQLITE_OPEN_READ_ONLY`: a read-only *file handle* cannot
+/// write the `-shm` wal-index, so it cannot recover a database left hot by a
+/// crashed writer — a reader arriving after a crash would fail instead of
+/// recovering (ADR-1, Option D rejection; pinned by
+/// `tests/open_split.rs::open_ro_recovers_a_hot_wal_left_by_a_crashed_writer`).
+/// It also deliberately does NOT force `PRAGMA journal_mode=WAL`: a database
+/// left in DELETE mode by a pre-C1/T5a rebuild is not "healed" by readers.
+/// C1/T5a puts the tmp DB into WAL mode before rename, and C1/T4 wires
+/// [`open_or_init`] at process entry per ADR-7.
+///
+/// Returns [`DbUninitialized`] when the file or the `entries` table is absent.
+/// Never creates, never runs DDL, never sweeps.
+pub fn open_ro(db_path: &Path) -> Result<Connection> {
+    let conn = match Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(err) => return Err(err).with_context(|| format!("open DB {}", db_path.display())),
+    };
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
+    // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
+    // corrupt file, an unreadable page — surface as themselves instead of
+    // being flattened into "uninitialized".
+    let entries_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema of {}", db_path.display()))?;
+    if entries_tables == 0 {
+        return Err(DbUninitialized {
+            db_path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(conn)
+}
+
+/// Open for mutation, against proof that this repository's write lock is held.
+///
+/// `Paths` rather than a bare DB path because the lock is NOT derivable from
+/// the DB path — two layouts exist — and `lock` because a mutating open must
+/// carry its obligation in the signature. The guard's canonical path is checked
+/// against `paths.lock`, so holding *a* lock is not enough: it must be the one
+/// that governs this database.
+///
+/// Creates the schema when absent. That is legitimate DDL: the caller holds the
+/// exclusive lock.
+pub fn open_rw(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<Connection> {
+    let expected = fs::canonicalize(&paths.lock).with_context(|| {
+        format!(
+            "canonicalize write lock {} (open_rw requires a live lock guard)",
+            paths.lock.display()
+        )
+    })?;
+    if lock.path() != expected {
+        anyhow::bail!(
+            "open_rw: the supplied lock guards {}, but this repository's write lock is {}",
+            lock.path().display(),
+            expected.display()
+        );
+    }
+    let conn = open_conn_rw(&paths.db)?;
+    ensure_schema_and_stamp(&conn)?;
+    Ok(conn)
+}
+
+/// Open a scratch database — rebuild's private tmp file — with no governing
+/// lock. Refuses the live database, which may only be opened through
+/// [`open_ro`] or [`open_rw`].
+pub fn open_scratch(db_path: &Path) -> Result<Connection> {
+    if is_live_db_path(db_path) {
+        anyhow::bail!(
+            "open_scratch refuses the live database at {} — use open_ro or open_rw",
+            db_path.display()
+        );
+    }
+    let conn = open_conn_rw(db_path)?;
+    ensure_schema_and_stamp(&conn)?;
+    Ok(conn)
+}
+
+/// True when `db_path` names a repository's live database.
+///
+/// Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) are distinct names, so the
+/// only path to refuse is exactly `<root>/.state/agent-kb/agent-kb.db`.
+fn is_live_db_path(db_path: &Path) -> bool {
+    let Some(file_name) = db_path.file_name() else {
+        return false;
+    };
+    if file_name != std::ffi::OsStr::new("agent-kb.db") {
+        return false;
+    }
+
+    let candidate = if db_path.exists() {
+        match db_path.parent().map(fs::canonicalize).transpose() {
+            Ok(Some(parent)) => parent.join(file_name),
+            _ => return false,
+        }
+    } else {
+        normalize_absolute_path(db_path)
+    };
+
+    candidate
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .is_some_and(|root| config::Paths::from_root(root).db == candidate)
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let base = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let mut normalized = base;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+/// Initialize a repository's knowledge base: parent dirs, schema, the
+/// `schema_version` stamp, and the locked sweep of expired peer edges.
+///
+/// Acquires and RELEASES `paths.lock` internally, and returns no connection —
+/// callers then choose [`open_ro`] or [`open_rw`], so no ungoverned handle
+/// escapes the split. Must not be called while this process already holds the
+/// write lock; the re-entrancy registry rejects that rather than deadlocking.
+pub fn open_or_init(paths: &config::Paths) -> Result<()> {
+    let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+    let conn = open_rw(paths, &lock)?;
+    sweep_expired_peers(&conn)?;
+    drop(conn);
+    drop(lock);
+    Ok(())
+}
+
+/// Legacy open: create, WAL, schema, stamp, sweep — all without a lock.
+/// The body of the pre-split `open_db`, retained verbatim behind the
+/// deprecated wrapper so unmigrated call sites keep behaving as they did.
+fn legacy_open_db(db_path: &Path) -> Result<Connection> {
+    let conn = open_conn_rw(db_path)?;
+    ensure_schema_and_stamp(&conn)?;
     sweep_expired_peers(&conn)?;
     Ok(conn)
+}
+
+/// Open (or create) the SQLite database at the given path.
+///
+/// Deprecated by ADR-1. Behaviour is unchanged so that C1 and C3 get a rebase
+/// window instead of a detonation mid-task; `L1c` deletes it once both have
+/// rebased. Every remaining caller is either a pure read that has not moved to
+/// [`open_ro`] yet, an unlocked mutation that `L2`/`L3` will put under the lock,
+/// or a test fixture that should use [`test_db`].
+#[deprecated(
+    note = "ADR-1: use open_ro (pure reads), open_rw (mutation under the write lock), \
+            open_scratch (rebuild's tmp DB), or open_or_init (initialization). \
+            Removed by C2/L1c."
+)]
+pub fn open_db(db_path: &Path) -> Result<Connection> {
+    legacy_open_db(db_path)
+}
+
+/// Test fixture: an initialized repository plus a writable connection to it.
+///
+/// One substitution for the ~50 `#[cfg(test)]` fixtures that used to call
+/// `open_db` directly, so the split does not cost 50 hand edits (ADR-1,
+/// Consequences). The connection is unlocked on purpose — a fixture is the
+/// single writer in its own tempdir.
+#[doc(hidden)]
+pub fn test_db(root: &Path) -> (config::Paths, Connection) {
+    let paths = config::Paths::from_root(root);
+    open_or_init(&paths).expect("test_db: initialize the knowledge base");
+    let conn = open_conn_rw(&paths.db).expect("test_db: open the knowledge base");
+    (paths, conn)
 }
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -687,6 +938,42 @@ fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T
         Err(error) => {
             let _ =
                 conn.execute_batch("ROLLBACK TO SAVEPOINT apply_evt; RELEASE SAVEPOINT apply_evt");
+            Err(error)
+        }
+    }
+}
+
+/// Run `f` inside a SAVEPOINT named `name`.
+///
+/// Like [`with_apply_event_savepoint`], a savepoint composes inside a
+/// caller-owned transaction (nesting) while still providing atomicity when
+/// called standalone (SQLite opens an implicit transaction for a top-level
+/// savepoint). A failure rolls back to the savepoint before propagating the
+/// error, so partial writes made by `f` never survive.
+///
+/// `name` must be a fixed, caller-controlled literal — it is interpolated
+/// directly into the SAVEPOINT/RELEASE/ROLLBACK statements, never built from
+/// request input.
+pub fn with_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match f() {
+        Ok(value) => {
+            if let Err(error) = conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+                let _ = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                ));
+                return Err(error.into());
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+            ));
             Err(error)
         }
     }

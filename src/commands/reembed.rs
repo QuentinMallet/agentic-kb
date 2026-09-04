@@ -1,5 +1,6 @@
 //! `reembed` subcommand — backfill missing embeddings
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::make_embedder;
 use crate::components::{db, embedder};
 use crate::config;

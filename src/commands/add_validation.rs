@@ -19,6 +19,11 @@ const EVIDENCE_MANDATED_KINDS: &[&str] = &["observation", "belief", "procedure"]
 /// preventing large prompt-injection payloads from being smuggled through.
 pub const MAX_CITATION_EXCERPT_CHARS: usize = 512;
 
+/// Maximum allowed length of `derived_from` in characters.
+///
+/// Matches the current entry-id/documentation bound used by KB write surfaces.
+pub const MAX_DERIVED_FROM_LEN: usize = 200;
+
 /// Validate tags array shape and tag length (br-9lq).
 ///
 /// - `tags` must be a JSON array of strings.
@@ -51,7 +56,8 @@ pub fn validate_tags(tags: &Value) -> Result<()> {
 ///   and procedure entries receive `evidence_status="missing"` from
 ///   `compute_evidence_status_write` (bd-r05y.3 soft mandate).
 /// - Each evidence row must have `evidence.kind ∈ {"code","derived"}` (Phase 1 constraint).
-/// - For `evidence.kind = "derived"`, `derived_from` must not equal the entry's own id.
+/// - For `evidence.kind = "derived"`, `derived_from` must be a non-empty string
+///   of at most MAX_DERIVED_FROM_LEN chars and must not equal the entry's own id.
 /// - Each evidence row must have a non-empty `citation_path` or `citation_hash`.
 ///   Path-only rows are resolved by `kb_core::add` before event construction.
 /// - `citation_excerpt` (if present) must be ≤ MAX_CITATION_EXCERPT_CHARS and
@@ -87,10 +93,26 @@ pub fn validate_kb_add_inputs(
             );
         }
         if ev_kind == "derived" {
-            let derived_from = ev
-                .get("derived_from")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let derived_from_value = ev.get("derived_from").ok_or_else(|| {
+                anyhow::anyhow!("evidence.derived_from invalid: required when evidence.kind=derived")
+            })?;
+            let derived_from = derived_from_value.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "evidence.derived_from invalid: must be a string when evidence.kind=derived"
+                )
+            })?;
+            if derived_from.is_empty() {
+                anyhow::bail!(
+                    "evidence.derived_from invalid: must be non-empty when evidence.kind=derived"
+                );
+            }
+            if derived_from.len() > MAX_DERIVED_FROM_LEN {
+                anyhow::bail!(
+                    "evidence.derived_from invalid: length {} exceeds max {}",
+                    derived_from.len(),
+                    MAX_DERIVED_FROM_LEN
+                );
+            }
             if derived_from == entry_id {
                 anyhow::bail!(
                     "self_loop_provenance: evidence.derived_from must not equal the entry id"
@@ -283,7 +305,71 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_allows_kind_derived() {
+    fn test_validate_rejects_missing_derived_from_for_derived_evidence() {
+        let ev = json!({
+            "kind": "derived",
+            "citation_hash": "sha256:abc123",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("evidence.derived_from invalid: required when evidence.kind=derived"));
+    }
+
+    #[test]
+    fn test_validate_rejects_null_derived_from_for_derived_evidence() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": null,
+            "citation_hash": "sha256:abc123",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("evidence.derived_from invalid: must be a string when evidence.kind=derived"));
+    }
+
+    #[test]
+    fn test_validate_rejects_non_string_derived_from_for_derived_evidence() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": 7,
+            "citation_hash": "sha256:abc123",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("evidence.derived_from invalid: must be a string when evidence.kind=derived"));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_derived_from_for_derived_evidence() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": "",
+            "citation_hash": "sha256:abc123",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("evidence.derived_from invalid: must be non-empty when evidence.kind=derived"));
+    }
+
+    #[test]
+    fn test_validate_rejects_overlong_derived_from_for_derived_evidence() {
+        let ev = json!({
+            "kind": "derived",
+            "derived_from": "a".repeat(MAX_DERIVED_FROM_LEN + 1),
+            "citation_hash": "sha256:abc123",
+        });
+        let err = validate_kb_add_inputs("my-entry-id", "observation", &json!([]), &[ev]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("evidence.derived_from invalid: length {} exceeds max {}", MAX_DERIVED_FROM_LEN + 1, MAX_DERIVED_FROM_LEN)));
+    }
+
+    #[test]
+    fn test_validate_allows_kind_derived_with_valid_derived_from() {
         let ev = json!({
             "kind": "derived",
             "derived_from": "other-entry-id",
@@ -293,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_self_loop_derived() {
+    fn test_validate_rejects_self_referential_derived_from_for_derived_evidence() {
         let ev = json!({
             "kind": "derived",
             "derived_from": "my-entry-id",

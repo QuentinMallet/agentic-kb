@@ -35,13 +35,15 @@
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
-use crate::commands::add::acquire_lock;
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
+use crate::commands::add::{acquire_lock, Lock};
+use crate::crash_sim::{kill_point, KillPoint};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
 use crate::components::{db, embedder, events, redactor};
 use crate::config;
 use crate::models::Evidence;
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -129,21 +131,64 @@ pub struct AddOutcome {
     pub similar_existing: Vec<SimilarEntry>,
 }
 
-/// Unified add primitive.
+/// Unified add primitive: acquires the write lock, opens for mutation, and
+/// delegates to [`add_locked`].
 ///
-/// Acquires the flock, then:
-/// 1. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
-/// 2. Builds expire events + the upsert event + evidence-add events.
-/// 3. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
-/// 4. Applies each event to the DB in order, all under the held flock.
+/// A thin wrapper on purpose. Callers that already hold the lock — a locked
+/// batch import, any future multi-entry write path — must call [`add_locked`]
+/// directly; calling this one would re-acquire the flock and, before the
+/// re-entrancy registry existed, deadlock on itself (ADR-1).
 ///
 /// INVARIANT: this function NEVER reads `KB_NO_EMBED` from the environment.
 /// The caller must construct the Embedder before calling and pass it by reference.
 pub fn add(
     paths: &config::Paths,
     embedder: &dyn embedder::Embedder,
+    args: AddArgs,
+) -> Result<AddOutcome> {
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = db::open_rw(paths, &lock)?;
+    add_locked(&lock, &conn, paths, embedder, args)
+}
+
+/// The add logic, for a caller that already holds this repository's write lock.
+///
+/// 1. Validates, redacts, and caps the inputs.
+/// 2. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
+/// 3. Builds expire events + the upsert event + evidence-add events.
+/// 4. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
+/// 5. Applies each event to the DB in order, all under the caller's flock.
+///
+/// Input preparation runs inside the critical section rather than ahead of it,
+/// which is a deliberate trade: one code path for both entry points is worth
+/// more than the few milliseconds of citation hashing it adds to the lock hold.
+///
+/// `lock` is proof, not a resource: it is checked against `paths.lock` and never
+/// released here — the caller's guard still owns it.
+pub fn add_locked(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn embedder::Embedder,
     mut args: AddArgs,
 ) -> Result<AddOutcome> {
+    // Redundant but intentional: open_rw canonicalized paths.lock before it
+    // opened `conn`; re-checking here keeps add_locked self-contained for any
+    // future caller handed a live lock + connection pair from elsewhere.
+    let expected_lock = std::fs::canonicalize(&paths.lock).with_context(|| {
+        format!(
+            "canonicalize write lock {} (add_locked requires a live lock guard)",
+            paths.lock.display()
+        )
+    })?;
+    if lock.path() != expected_lock {
+        anyhow::bail!(
+            "add_locked: the supplied lock guards {}, but this repository's write lock is {}",
+            lock.path().display(),
+            expected_lock.display()
+        );
+    }
+
     let repo_root = paths
         .db
         .parent()
@@ -234,9 +279,6 @@ pub fn add(
             args.content.chars().count()
         );
     }
-
-    let _lock = acquire_lock(&paths.lock)?;
-    let conn = db::open_db(&paths.db)?;
 
     // Near-duplicate probe (Memora pickup .5): semantic-only search for live
     // entries close to the incoming one. Runs BEFORE the new entry is written
@@ -383,6 +425,7 @@ pub fn add(
     batch.push(add_event);
     batch.extend(evidence_events);
     events::append_events_batch(&paths.events, &batch)?;
+    kill_point(KillPoint::AfterLogBatch);
 
     for ev in &batch {
         db::apply_event(&conn, embedder, ev)?;
@@ -406,11 +449,13 @@ pub fn add(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crash_sim::KillPoint;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events as ev_mod;
     use crate::config::Paths;
     use rusqlite::Connection;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn setup() -> (tempfile::TempDir, Paths) {
@@ -441,6 +486,35 @@ mod tests {
             dedup_cutoff: None,
             cues: vec![],
         }
+    }
+
+    fn crash_gap_args(entry_id: &str) -> AddArgs {
+        AddArgs {
+            id: entry_id.to_string(),
+            path: "src/crash-gap.rs".to_string(),
+            summary: "crash gap".to_string(),
+            content: "persist me to the log first".to_string(),
+            tags: serde_json::json!(["crash", "test"]),
+            version_ref: Some("deadbeef".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "belief".to_string(),
+            evidence_status: "missing".to_string(),
+            evidence_rows: vec![],
+            ts: "2026-09-04T00:00:00Z".to_string(),
+            session: "test".to_string(),
+            session_id: None,
+            expire_reason: String::new(),
+            dedup_cutoff: None,
+            cues: vec![],
+        }
+    }
+
+    fn run_crash_gap_child() {
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = Paths::from_root(std::path::Path::new(&root));
+        add(&paths, &NoopEmbedder, crash_gap_args("crash-gap-entry")).unwrap();
+        panic!("child add returned without hitting the configured kill point");
     }
 
     fn load_test_evidence(conn: &Connection) -> Evidence {
@@ -490,6 +564,49 @@ mod tests {
         .unwrap()
         .map(|row| row.unwrap())
         .collect()
+    }
+
+    #[test]
+    fn test_add_crash_after_log_batch_leaves_db_behind_log() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-log-batch") {
+            run_crash_gap_child();
+        }
+
+        let (dir, paths) = setup();
+        let entry_id = "crash-gap-entry";
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("test_add_crash_after_log_batch_leaves_db_behind_log")
+            .arg("--nocapture")
+            .current_dir(dir.path())
+            .env("KB_CRASH_TEST_CASE", "after-log-batch")
+            .env("KB_CRASH_TEST_ROOT", dir.path())
+            .env("KB_CRASH_AFTER", KillPoint::AfterLogBatch.to_string())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "crash simulation should terminate the subprocess with exit code 137"
+        );
+
+        let events = fs::read_to_string(&paths.events).unwrap();
+        assert!(
+            events.contains(entry_id),
+            "event log should contain the appended entry after the simulated crash"
+        );
+
+        if paths.db.exists() {
+            let conn = Connection::open(&paths.db).unwrap();
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE id=?1",
+                    [entry_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "DB must not contain the entry after the crash");
+        }
     }
 
     #[test]

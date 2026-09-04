@@ -1,5 +1,6 @@
 //! `compact` subcommand
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::acquire_lock;
 use crate::components::events;
 use crate::config::{self, VacuumConfig};
@@ -85,7 +86,7 @@ impl Compact {
         paths: &config::Paths,
         vacuum_cfg: &VacuumConfig,
     ) -> anyhow::Result<(usize, usize)> {
-        let _lock = acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let read = events::read_events(&paths.events)?;
         let original_count = read.events.len();
         if let Some(torn_tail) = &read.torn_tail {
@@ -280,7 +281,7 @@ impl Compact {
 
         // Optional VACUUM: fires AFTER the atomic rename so a crash during VACUUM
         // still leaves the compacted DB (already renamed into place) intact and readable.
-        maybe_vacuum_after_compact(&paths.db, &paths.compact_state, vacuum_cfg)?;
+        maybe_vacuum_after_compact(paths, &lock, vacuum_cfg)?;
 
         Ok((original_count, compacted.len()))
     }
@@ -297,10 +298,12 @@ impl Compact {
 ///
 /// Non-fatal: the compact result (renamed JSONL) is already committed before this runs.
 fn maybe_vacuum_after_compact(
-    db_path: &std::path::Path,
-    state_path: &std::path::Path,
+    paths: &config::Paths,
+    lock: &crate::commands::add::Lock,
     vacuum_cfg: &VacuumConfig,
 ) -> anyhow::Result<()> {
+    let db_path = &paths.db;
+    let state_path = &paths.compact_state;
     // Load persisted counter (default 0 if absent).
     let mut state = CompactState::load(state_path);
 
@@ -319,7 +322,8 @@ fn maybe_vacuum_after_compact(
         state.save(state_path);
         return Ok(());
     }
-    let conn = crate::components::db::open_db(db_path)?;
+    // VACUUM is a mutation and runs inside the compact lock the caller holds.
+    let conn = crate::components::db::open_rw(paths, lock)?;
     let freelist_count: i64 =
         conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))?;
 
@@ -1525,10 +1529,7 @@ mod tests {
     /// freelist until VACUUM reclaims them.
     fn setup_with_db(root: &std::path::Path) -> Paths {
         use crate::components::{db, embedder::NoopEmbedder};
-        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(root);
-
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(root);
         let embedder = NoopEmbedder;
 
         // Insert N entries with padded content each so that expiring them all

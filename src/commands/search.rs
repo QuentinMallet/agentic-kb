@@ -1,5 +1,6 @@
 //! `search` subcommand
 
+#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::embedder;
 use crate::components::{db, query_hits};
 use crate::config;
@@ -112,13 +113,30 @@ impl Search {
             mmr_lambda: kb_config.mmr_lambda,
         };
 
-        let conn = db::open_db(&paths.db)?;
-        let local_results = db::search_entries(&conn, embedder, &self.query, &opts)?;
+        // A pure read: open_ro, never the write lock (ADR-7). An uninitialized
+        // repository serves an empty result plus a one-line stderr note, which
+        // is the first-run behaviour the pre-split read path produced by
+        // silently creating the database.
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => Some(conn),
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let local_results = match &conn {
+            Some(conn) => db::search_entries(conn, embedder, &self.query, &opts)?,
+            None => Vec::new(),
+        };
 
         // Peer federation: collect results from peer DBs and merge.
-        let results = if !self.local_only && (self.peers || self.reachable_from.is_some()) {
+        let results = if let (Some(conn), true) = (
+            conn.as_ref(),
+            !self.local_only && (self.peers || self.reachable_from.is_some()),
+        ) {
             let peer_paths = collect_peer_paths(
-                &conn,
+                conn,
                 self.reachable_from.as_deref(),
                 self.max_hops,
                 self.slug.as_deref(),
@@ -130,7 +148,9 @@ impl Search {
 
             for peer_path in peer_paths {
                 let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
-                let peer_conn = match db::open_db(&peer_db) {
+                // A peer's DB belongs to another repository: reading it must
+                // never create it, run DDL against it, or sweep its rows.
+                let peer_conn = match db::open_ro(&peer_db) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("warn: peer {peer_path}: {e}");
