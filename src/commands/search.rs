@@ -6,7 +6,64 @@ use crate::components::{db, query_hits};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+fn compare_federated_rows(a: &db::SearchEntry, b: &db::SearchEntry) -> std::cmp::Ordering {
+    db::compare_rank(a.score, "", b.score, "")
+        .then_with(|| match (&a.origin_repo, &b.origin_repo) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.cmp(b),
+        })
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// Merge already-ranked repository batches, deduplicate globally, and apply the
+/// sole federated truncation. The optional batch origin is stamped on peer rows.
+fn merge_federated_results(
+    batches: Vec<(Option<String>, Vec<db::SearchEntry>)>,
+    limit: usize,
+) -> Vec<db::SearchEntry> {
+    let mut by_origin_and_id: HashMap<(Option<String>, String), db::SearchEntry> = HashMap::new();
+
+    for (batch_origin, rows) in batches {
+        for mut candidate in rows {
+            candidate.origin_repo = batch_origin.clone();
+
+            let collision_key = by_origin_and_id
+                .keys()
+                .find(|(_, id)| id == &candidate.id)
+                .cloned();
+            if let Some(key) = collision_key {
+                let existing = by_origin_and_id.get(&key).expect("collision key exists");
+                // Local wins by contract. Spell this out instead of depending on
+                // Option's derived ordering to happen to put None first.
+                let replace = match (
+                    existing.origin_repo.is_none(),
+                    candidate.origin_repo.is_none(),
+                ) {
+                    (true, _) => false,
+                    (false, true) => true,
+                    (false, false) => compare_federated_rows(&candidate, existing).is_lt(),
+                };
+                if replace {
+                    by_origin_and_id.remove(&key);
+                } else {
+                    continue;
+                }
+            }
+
+            let key = (candidate.origin_repo.clone(), candidate.id.clone());
+            by_origin_and_id.insert(key, candidate);
+        }
+    }
+
+    let mut merged: Vec<_> = by_origin_and_id.into_values().collect();
+    merged.sort_by(compare_federated_rows);
+    merged.truncate(limit);
+    merged
+}
 
 fn evidence_display_line(ev: &db::SearchEvidence) -> String {
     let verified_str = match ev.verified {
@@ -169,9 +226,7 @@ impl Search {
                 self.slug.as_deref(),
             );
 
-            // Deduplicate: local results take priority.
-            let local_ids: HashSet<String> = local_results.iter().map(|r| r.id.clone()).collect();
-            let mut merged = local_results;
+            let mut batches = vec![(None, local_results)];
 
             for peer_path in peer_paths {
                 let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
@@ -204,20 +259,11 @@ impl Search {
                     ..opts.clone()
                 };
                 match db::search_entries(&peer_conn, embedder, &self.query, &peer_opts) {
-                    Ok(mut peer_results) => {
-                        for r in &mut peer_results {
-                            r.origin_repo = Some(peer_path.clone());
-                        }
-                        for r in peer_results {
-                            if !local_ids.contains(&r.id) {
-                                merged.push(r);
-                            }
-                        }
-                    }
+                    Ok(peer_results) => batches.push((Some(peer_path), peer_results)),
                     Err(e) => eprintln!("warn: peer {peer_path} search: {e}"),
                 }
             }
-            merged
+            merge_federated_results(batches, self.limit)
         } else {
             local_results
         };
@@ -427,6 +473,104 @@ mod tests {
     use tempfile::tempdir;
 
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn federated_row(id: &str, score: f32, origin_repo: Option<&str>) -> db::SearchEntry {
+        db::SearchEntry {
+            id: id.to_string(),
+            path: format!("{id}.md"),
+            summary: format!("summary {id}"),
+            content: String::new(),
+            tags: "[]".to_string(),
+            score,
+            source: "rrf",
+            score_kind: "rrf",
+            evidence: vec![],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: origin_repo.map(str::to_string),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn federated_contract_fixture(peer_order: &[&str]) -> Vec<db::SearchEntry> {
+        let local =
+            (0..8).map(|i| federated_row(&format!("local-{i}"), 1.0 / (60.0 + i as f32), None));
+        let mut batches = vec![(None, local.collect())];
+        for peer in peer_order {
+            let rows = match *peer {
+                "peer-a" => vec![
+                    federated_row("shared-peer", 1.0 / 61.0, Some(peer)),
+                    federated_row("shared-local", 1.0 / 62.0, Some(peer)),
+                    federated_row("peer-a-only", 1.0 / 63.0, Some(peer)),
+                ],
+                "peer-b" => vec![
+                    federated_row("shared-peer", 1.0 / 61.0, Some(peer)),
+                    federated_row("peer-b-only", 1.0 / 62.0, Some(peer)),
+                ],
+                _ => unreachable!(),
+            };
+            batches.push((Some((*peer).to_string()), rows));
+        }
+        batches[0]
+            .1
+            .push(federated_row("shared-local", 1.0 / 64.0, None));
+        merge_federated_results(batches, 10)
+    }
+
+    #[test]
+    fn test_federated_global_limit_dedup_and_local_collision_contract() {
+        let results = federated_contract_fixture(&["peer-a", "peer-b"]);
+        assert_eq!(
+            results.len(),
+            10,
+            "--limit is global across local and two peers"
+        );
+        assert_eq!(
+            results.iter().filter(|row| row.id == "shared-peer").count(),
+            1,
+            "an id present in two peers must appear once"
+        );
+        let collision = results.iter().find(|row| row.id == "shared-local").unwrap();
+        assert!(
+            collision.origin_repo.is_none(),
+            "the local row must explicitly win a local/peer id collision"
+        );
+    }
+
+    #[test]
+    fn test_federated_order_is_byte_stable_under_peer_traversal_permutation() {
+        fn bytes(rows: &[db::SearchEntry]) -> Vec<u8> {
+            rows.iter()
+                .flat_map(|row| {
+                    format!("{:?}\t{}\t{}\n", row.origin_repo, row.id, row.score).into_bytes()
+                })
+                .collect()
+        }
+        assert_eq!(
+            bytes(&federated_contract_fixture(&["peer-a", "peer-b"])),
+            bytes(&federated_contract_fixture(&["peer-b", "peer-a"])),
+        );
+    }
+
+    #[test]
+    fn test_federated_rank_position_top_tiny_peer_outranks_mid_local() {
+        let rows = merge_federated_results(
+            vec![
+                (None, vec![federated_row("local-mid", 1.0 / 62.0, None)]),
+                (
+                    Some("tiny-peer".to_string()),
+                    vec![federated_row("peer-top", 1.0 / 61.0, Some("tiny-peer"))],
+                ),
+            ],
+            10,
+        );
+        // This is by design: cross-repo RRF scores encode within-repo rank position,
+        // not relevance calibrated across differently sized corpora.
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["peer-top", "local-mid"]
+        );
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
@@ -689,10 +833,57 @@ mod tests {
     }
 
     #[test]
+    fn test_federated_global_limit_ignores_physically_present_expired_peer() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        db::open_or_init(&paths).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+
+        insert_peer_edge(&conn, "local", "peer-live-a", None);
+        insert_peer_edge(&conn, "local", "peer-expired", Some("2000-01-01 00:00:00"));
+        insert_peer_edge(&conn, "local", "peer-live-b", None);
+
+        let peer_paths = collect_peer_paths(&conn, None, 1, None);
+        let batches = peer_paths
+            .iter()
+            .map(|peer| {
+                let rows = (0..4)
+                    .map(|i| {
+                        federated_row(&format!("{peer}-{i}"), 1.0 / (61.0 + i as f32), Some(peer))
+                    })
+                    .collect();
+                (Some(peer.clone()), rows)
+            })
+            .collect();
+        let results = merge_federated_results(batches, 6);
+
+        assert_eq!(
+            results.len(),
+            6,
+            "expired peers must not consume the global limit"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|row| row.origin_repo.as_deref() != Some("peer-expired")),
+            "no result may come from the physically present expired peer"
+        );
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 3,
+            "the fixture must retain the expired row physically"
+        );
+    }
+
+    #[test]
     fn test_cmd_search_limit_rejects_out_of_range_value() {
         let too_large = (db::MAX_LIMIT + 1).to_string();
-        let err = Search::try_parse_from(["kb", "needle", "--limit", too_large.as_str()])
-            .unwrap_err();
+        let err =
+            Search::try_parse_from(["kb", "needle", "--limit", too_large.as_str()]).unwrap_err();
         let rendered = err.to_string();
         assert!(
             rendered.contains(&format!("must be in 1..={}", db::MAX_LIMIT)),
