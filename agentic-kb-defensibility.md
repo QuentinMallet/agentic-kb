@@ -192,7 +192,7 @@ A new skill `/kb-audit` (`skills/kb-audit/SKILL.md`) runs on demand or weekly:
 `derived_from` in evidence rows already enables this. MCP method `provenance`:
 
 ```
-kb_provenance(entry_id, max_depth?) -> { roots: [entry_id...], graph: [{from, to}...], truncated: bool }
+kb_provenance(entry_id, max_depth?) -> { roots: [entry_id...], dangling: [entry_id...], graph: [{from, to}...], truncated: bool }
 ```
 
 Returns the DAG of entries that this entry's evidence chain depends on, terminating at observation-kind entries (true roots). F4 becomes visible: "this belief rests on 2 distinct roots" vs "this belief rests on 1 root cited by 5 others."
@@ -214,7 +214,7 @@ kb_add(..., kind, evidence, supersedes?, acknowledged_contradictions?, session_i
 kb_search(..., min_confidence?, kinds?: [...], require_verified?: bool)
   -> [{ entry, score, confidence, audit_n, evidence: [...verified] }, ...]
 
-kb_provenance(entry_id, max_depth?) -> { roots, graph, truncated }
+kb_provenance(entry_id, max_depth?) -> { roots, dangling, graph, truncated }
 
 audit_run(sample_size?) -> { run_id, samples }
 audit_record(run_id, verdicts) -> { recorded, expired }

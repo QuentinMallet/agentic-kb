@@ -108,9 +108,9 @@ Use `kb_provenance` to walk the DAG:
 { "method": "provenance", "entry_id": "<id>", "max_depth": 64 }
 ```
 
-Response: `{ "roots": [...], "graph": [{ "from": "B", "to": "A" }, ...], "truncated": false }`
+Response: `{ "roots": [...], "dangling": [...], "graph": [{ "from": "B", "to": "A" }, ...], "truncated": false }`
 
-When the queried entry has no provenance parents, it is itself the root and appears in `roots`.
+When the queried entry has no provenance parents, it is itself the root and appears in `roots`. Missing parent ids referenced by `derived_from` appear in `dangling` instead of `roots`.
 
 ## Durability warning
 
