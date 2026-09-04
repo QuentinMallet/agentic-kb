@@ -11,7 +11,16 @@ use std::path::Path;
 /// Lowered 87 -> 72 by L1b: peers.rs and mcp.rs's kb_peers_* handlers moved
 /// their remaining production `open_db` call sites to `open_ro`/`open_rw`
 /// (peer TTL read-time filter + locked sweep).
-const OPEN_DB_CALLSITE_RATCHET: usize = 72;
+///
+/// Bumped 72 -> 73 when bd-21ef.3 (C3) rebased onto the aggregator carrying
+/// L1b: S3a's new
+/// `test_handle_provenance_is_deterministic_across_parent_insertion_order`
+/// test fixture in `src/commands/mcp.rs` opens its temp db with
+/// `db::open_db(&paths.db)`, matching every other test fixture in that file
+/// (only production handlers were migrated to `open_ro`/`open_rw`). Test
+/// convention, not new legacy debt in production code paths. Recounted
+/// directly against the post-rebase tree (73 call sites).
+const OPEN_DB_CALLSITE_RATCHET: usize = 73;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
