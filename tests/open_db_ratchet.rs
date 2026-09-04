@@ -7,7 +7,14 @@ use std::path::Path;
 /// added 5 unmigrated `db::open_db(&paths.db)` call sites in
 /// `src/commands/mcp.rs` test helpers, ahead of L1a's own migration work.
 /// Not new legacy debt introduced by L1a itself.
-const OPEN_DB_CALLSITE_RATCHET: usize = 87;
+///
+/// Bumped 87 -> 88 when bd-21ef.3 (C3) rebased onto the aggregator: S3a's new
+/// `test_handle_provenance_is_deterministic_across_parent_insertion_order`
+/// test fixture in `src/commands/mcp.rs` opens its temp db with
+/// `db::open_db(&paths.db)`, matching every other test fixture in that file
+/// (only production handlers were migrated to `open_ro`/`open_rw`). Test
+/// convention, not new legacy debt in production code paths.
+const OPEN_DB_CALLSITE_RATCHET: usize = 88;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
