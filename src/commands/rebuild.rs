@@ -331,7 +331,7 @@ impl Rebuild {
             // Phase 1: snapshot a byte identity under a brief lock. Hashing the
             // complete prefix is intentionally simple and robust: it detects
             // compaction, reordering, truncation, and same-size rewrites.
-            let (snapshot_len, snapshot_byte_len, snapshot_hash) = {
+            let (snapshot_byte_len, snapshot_hash) = {
                 let _lock = acquire_lock(&paths.lock)?;
                 let snapshot = events::read_events(&paths.events)?;
                 if let Some(torn_tail) = &snapshot.torn_tail {
@@ -348,13 +348,13 @@ impl Rebuild {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                     Err(error) => return Err(error.into()),
                 };
-                let complete_len = snapshot.torn_tail.as_ref().map_or(bytes.len(), |tail| {
-                    bytes.len().saturating_sub(tail.bytes.len())
-                });
+                // The snapshot boundary must be a committed_len value: no span
+                // straddles it, so Phase 2's prefix and Phase 3's catch-up
+                // cannot split a batch (plan §4 D1, Principle 3).
+                let committed_len = (snapshot.committed_len as usize).min(bytes.len());
                 (
-                    snapshot.events.len(),
-                    complete_len as u64,
-                    Sha256::digest(&bytes[..complete_len]).to_vec(),
+                    committed_len as u64,
+                    Sha256::digest(&bytes[..committed_len]).to_vec(),
                 )
             };
 
@@ -375,9 +375,10 @@ impl Rebuild {
             };
 
             {
-                // Stop at snapshot_len so we never encounter a partial tail line
-                // that a concurrent writer may be mid-writing after Phase 1.
-                let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
+                // Replay exactly the byte prefix Phase 1 hashed, so we never
+                // encounter a partial tail line, or a span, that a concurrent
+                // writer may be mid-writing after Phase 1.
+                let evts = events::read_events_prefix(&paths.events, snapshot_byte_len)?;
                 let conn = db::open_db(tmp.path())?;
                 if let Some(torn_tail) = &evts.torn_tail {
                     eprintln!(
@@ -1207,12 +1208,22 @@ mod tests {
 
         let events_path = paths.events.clone();
         let attempts = run_with_phase2_mutation(&paths, move || {
-            let rewritten = format!(
-                "{}\n{}\n",
-                serde_json::to_string(&second).unwrap(),
-                serde_json::to_string(&first).unwrap()
-            );
-            fs::write(&events_path, rewritten).unwrap();
+            // Swap the two event lines in place, leaving the commit envelopes
+            // where they are, so the rewrite is byte-length-preserving under
+            // the D1 framing exactly as it was under the un-framed format.
+            let raw = fs::read_to_string(&events_path).unwrap();
+            let first_line = serde_json::to_string(&first).unwrap();
+            let second_line = serde_json::to_string(&second).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            let event_at: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l == first_line || **l == second_line)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(event_at.len(), 2, "expected both event lines in {raw}");
+            lines.swap(event_at[0], event_at[1]);
+            fs::write(&events_path, format!("{}\n", lines.join("\n"))).unwrap();
             assert_eq!(fs::metadata(&events_path).unwrap().len(), original_len);
         });
 
