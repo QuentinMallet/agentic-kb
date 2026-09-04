@@ -2804,6 +2804,85 @@ mod tests {
         assert!(resp["message"].as_str().unwrap().contains("no-such-entry"));
     }
 
+    // -----------------------------------------------------------------
+    // C2/L1a — first-run UX on the MCP read surfaces (ADR-1, ADR-7)
+    //
+    // open_ro no longer creates the database, so these handlers now meet
+    // DbUninitialized on a repository that has never been written to. Each
+    // must answer exactly as it did when the read path silently created an
+    // empty database, and must leave the repository untouched.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn handle_kb_get_on_uninitialized_db_reports_not_found_without_creating_it() {
+        let (_dir, paths, _emb) = setup();
+        assert!(!paths.db.exists());
+
+        let resp = handle_kb_get(&json!("first-run"), &json!({"entry_id": "anything"}), &paths);
+
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "entry_not_found");
+        assert!(
+            !paths.db.exists(),
+            "a read must not create the database (ADR-1 schema-creation policy)"
+        );
+    }
+
+    #[test]
+    fn handle_provenance_on_uninitialized_db_returns_an_empty_graph() {
+        let (_dir, paths, _emb) = setup();
+        assert!(!paths.db.exists());
+
+        let resp = handle_provenance(&json!("first-run"), &json!({"entry_id": "anything"}), &paths);
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["roots"], json!([]));
+        assert_eq!(resp["graph"], json!([]));
+        assert_eq!(resp["truncated"], json!(false));
+        assert!(!paths.db.exists());
+    }
+
+    #[test]
+    fn handle_search_on_uninitialized_db_returns_no_entries() {
+        let (_dir, paths, emb) = setup();
+        assert!(!paths.db.exists());
+
+        let resp = handle_search(
+            &json!("first-run"),
+            &json!({"query": "anything"}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["entries"], json!([]));
+        assert!(!paths.db.exists());
+    }
+
+    #[test]
+    fn handle_search_expand_on_uninitialized_db_returns_no_entries() {
+        let (_dir, paths, emb) = setup();
+
+        let resp = handle_search(
+            &json!("first-run"),
+            &json!({"expand_ids": ["a"]}),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(resp["type"], "result");
+        assert_eq!(resp["entries"], json!([]));
+        assert!(!paths.db.exists());
+    }
+
     /// br-h9g (security I2): a request with limit far above MAX_LIMIT must be
     /// clamped so the response contains at most MAX_LIMIT entries, capping
     /// thread::scope amplification.

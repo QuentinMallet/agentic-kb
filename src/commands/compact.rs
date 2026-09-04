@@ -1529,10 +1529,7 @@ mod tests {
     /// freelist until VACUUM reclaims them.
     fn setup_with_db(root: &std::path::Path) -> Paths {
         use crate::components::{db, embedder::NoopEmbedder};
-        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(root);
-
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(root);
         let embedder = NoopEmbedder;
 
         // Insert N entries with padded content each so that expiring them all

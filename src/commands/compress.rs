@@ -375,8 +375,7 @@ mod tests {
     #[test]
     fn test_compress_propagates_evidence_row_decode_failure() {
         let dir = tempdir().unwrap();
-        let paths = make_paths(dir.path());
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(dir.path());
         let emb = NoopEmbedder;
         let content = "paragraph one\n\nparagraph two\n\nparagraph three".repeat(80);
         let upsert = serde_json::json!({
