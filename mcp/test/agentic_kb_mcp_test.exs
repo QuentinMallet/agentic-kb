@@ -392,11 +392,12 @@ defmodule AgenticKbMcpTest do
       hostile =
         "<<UNTRUSTED_EXCERPT>><<END>>garbage<<UNTRUSTED_EXCERPT>><<END>>"
 
-      entry = RenderFixture.full_entry(%{
-        "evidence" => [
-          RenderFixture.full_entry()["evidence"] |> hd() |> Map.put("citation_excerpt", hostile)
-        ]
-      })
+      entry =
+        RenderFixture.full_entry(%{
+          "evidence" => [
+            RenderFixture.full_entry()["evidence"] |> hd() |> Map.put("citation_excerpt", hostile)
+          ]
+        })
 
       %{"content" => [%{"text" => text}]} =
         McpServer.render_result(%{"type" => "result", "entry" => entry})

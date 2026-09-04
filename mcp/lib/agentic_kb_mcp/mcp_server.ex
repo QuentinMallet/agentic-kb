@@ -100,19 +100,23 @@ defmodule AgenticKbMcp.McpServer do
               "properties" => %{
                 "kind" => %{
                   "type" => "string",
-                  "description" => "Evidence kind. Phase 1: must be \"code\" or \"derived\"; derived rows set `derived_from` to the supporting entry's id."
+                  "description" =>
+                    "Evidence kind. Phase 1: must be \"code\" or \"derived\"; derived rows set `derived_from` to the supporting entry's id."
                 },
                 "citation_path" => %{
                   "type" => "string",
-                  "description" => "File path (whole-file citation) or path:start-end byte range. When supplied without citation_hash, the server resolves the hash via the verifier's code path."
+                  "description" =>
+                    "File path (whole-file citation) or path:start-end byte range. When supplied without citation_hash, the server resolves the hash via the verifier's code path."
                 },
                 "citation_sha" => %{
                   "type" => "string",
-                  "description" => "Git commit SHA of the cited file revision (optional when citation_path is given; server fills it from git HEAD if absent)"
+                  "description" =>
+                    "Git commit SHA of the cited file revision (optional when citation_path is given; server fills it from git HEAD if absent)"
                 },
                 "citation_hash" => %{
                   "type" => "string",
-                  "description" => "sha256 of the whole file (bare form) or of the cited byte range (optional when citation_path is given; server resolves it via the verifier's code path)"
+                  "description" =>
+                    "sha256 of the whole file (bare form) or of the cited byte range (optional when citation_path is given; server resolves it via the verifier's code path)"
                 },
                 "citation_excerpt" => %{
                   "type" => "string",

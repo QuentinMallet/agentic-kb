@@ -79,8 +79,11 @@ defmodule AgenticKbMcp.PortManager do
     if exit_code == 0 do
       Logger.info("kb rebuild started in background (log: #{log})")
     else
-      Logger.error("kb rebuild: sh exited #{exit_code} — rebuild may not have started (log: #{log})")
+      Logger.error(
+        "kb rebuild: sh exited #{exit_code} — rebuild may not have started (log: #{log})"
+      )
     end
+
     {:noreply, state}
   end
 
