@@ -30,7 +30,8 @@
 //!
 //! # TLA+ spec
 //!
-//! See `agent-kb/tla/replace_path_atomic.tla` — two refinement layers:
+//! See `.state/agent-kb/tla/InnerGap.tla` and
+//! `.state/agent-kb/tla/CrossBatch.tla` — two refinement layers:
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
@@ -313,7 +314,7 @@ pub fn add(
         .collect();
 
     // Build the upsert event. Cues ride the upsert event itself — there are
-    // no separate cue events in the JSONL (agent-kb/tla/CueBatch.tla).
+    // no separate cue events in the JSONL (.state/agent-kb/tla/CueBatch.tla).
     let mut add_event = serde_json::json!({
         "action": "upsert",
         "table": "entries",

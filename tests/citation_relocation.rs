@@ -1,6 +1,6 @@
 //! V1 — citation relocation engine.
 //!
-//! Every test here maps to an invariant of `agent-kb/tla/CitationRelocation.tla`
+//! Every test here maps to an invariant of `.state/agent-kb/tla/CitationRelocation.tla`
 //! or to an explicit AC of `.omc/plans/kb-delivery.md` §8 V1.  The mapping is
 //! named in each test's doc comment so a spec revision has an obvious blast
 //! radius.

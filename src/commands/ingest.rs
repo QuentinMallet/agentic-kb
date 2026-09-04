@@ -69,7 +69,7 @@ impl Ingest {
     /// all entries from prior iterations — silent data loss leaving only the last
     /// chunk active.
     ///
-    /// TLA+ spec: `agent-kb/tla/ingest_replace_path.tla`
+    /// TLA+ spec: `.state/agent-kb/tla/ingest_replace_path.tla`
     /// Invariant `AllChunkIdsPresent`: after the loop, non-stale entries cover
     /// all chunk indices {0..N-1}.
     pub fn execute_with(

@@ -6,7 +6,7 @@
 //!
 //! When the hash no longer matches, the citation may have MOVED rather than
 //! decayed. [`RelocationPolicy`] decides whether to look for it. Relocation is
-//! deliberately conservative (`agent-kb/tla/CitationRelocation.tla`,
+//! deliberately conservative (`.state/agent-kb/tla/CitationRelocation.tla`,
 //! `.omc/plans/kb-delivery.md` §6 S1): a strong excerpt and exactly one
 //! candidate, or nothing. It reports where the code went; it never claims the
 //! recorded hash still describes it.

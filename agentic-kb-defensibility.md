@@ -135,7 +135,7 @@ confidence = (successes + 1) / (successes + failures + 2)
 - After 10 passes, 0 failures: `11/12 ≈ 0.917`
 - Per `(kind × session_id)` — global fallback via `COALESCE(session_id, '__GLOBAL__')`
 
-This is the Laplace smoothing formula. It is provably in [0,1] for all non-negative integer inputs (see TLA+ spec `agent-kb/tla/audit/Audit.tla`, invariant `ConfidenceInUnitInterval`).
+This is the Laplace smoothing formula. It is provably in [0,1] for all non-negative integer inputs (see TLA+ spec `.state/agent-kb/tla/audit/Audit.tla`, invariant `ConfidenceInUnitInterval`).
 
 **Original composite formula (not yet shipped; deferred to Phase 2+):**
 
@@ -317,7 +317,7 @@ The composite formula in §5.3 requires calibrated weights, age-decay half-lives
 - Measurable immediately from audit verdicts alone
 - Bootstrap-safe (0.5 for fresh entries, no cold-start edge cases)
 - Monotonically increasing with successes
-- Formally verified: `ConfidenceInUnitInterval` invariant in `agent-kb/tla/audit/Audit.tla`
+- Formally verified: `ConfidenceInUnitInterval` invariant in `.state/agent-kb/tla/audit/Audit.tla`
 
 The composite formula is the long-run target once Phases 3–4 ship.
 
@@ -338,7 +338,7 @@ Phase 1 gated `kind=derived` to prevent provenance writes before the provenance 
 
 ### TLA+ specification
 
-`agent-kb/tla/audit/Audit.tla` models four invariants:
+`.state/agent-kb/tla/audit/Audit.tla` models four invariants:
 
 | Invariant | Statement |
 |-----------|-----------|
@@ -364,4 +364,4 @@ TLC model-checked with `MaxEntries=3`, `MaxAudits=4`.
 | `/kb-audit` skill (`skills/kb-audit/SKILL.md`) with verifier independence guidance | ✓ Done |
 | Benchmark `bench_kb_search_confidence` for confidence prefetch cost on 50-entry corpus | ✓ Done |
 | ≥19 unit tests, ≥6 proptests covering audit/confidence/provenance | ✓ Done |
-| TLA+ spec `agent-kb/tla/audit/Audit.tla` with 4 invariants, TLC-verified | ✓ Done |
+| TLA+ spec `.state/agent-kb/tla/audit/Audit.tla` with 4 invariants, TLC-verified | ✓ Done |

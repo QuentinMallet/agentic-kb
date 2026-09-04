@@ -45,7 +45,7 @@ MCP: pass `cues: ["...", ...]` to `kb_add`.
 Cues ride the entry's upsert event — there are no separate cue events in the
 JSONL. `apply_event` replaces the entry's cue rows wholesale inside a
 savepoint; expire deletes them in the same transaction as the entry. The
-design is verified by `agent-kb/tla/CueBatch.tla` (no orphan cue rows, no
+design is verified by `.state/agent-kb/tla/CueBatch.tla` (no orphan cue rows, no
 stale cue sets, crash + rebuild converges).
 
 ## Retrieval

@@ -154,7 +154,7 @@ pub struct Entry {
 }
 
 /// Status lattice for a citation, mirroring `Statuses` in
-/// `agent-kb/tla/CitationRelocation.tla`.
+/// `.state/agent-kb/tla/CitationRelocation.tla`.
 ///
 /// `Relocated` is deliberately NOT a weak form of `Verified`: an excerpt match
 /// says where the code went, never that the recorded hash still describes it.

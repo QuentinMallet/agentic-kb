@@ -2,7 +2,7 @@
 //!
 //! Cue anchors are agent-supplied semantic entry points ("[Main Entity] +
 //! [Key Aspect]", e.g. "recency bias decay") stored as embedded rows linked
-//! to their entry. Design verified by agent-kb/tla/CueBatch.tla:
+//! to their entry. Design verified by .state/agent-kb/tla/CueBatch.tla:
 //!   * cues ride the upsert event (no separate cue events)
 //!   * apply_event replaces the entry's cue rows transactionally
 //!   * expire removes entry + cue rows together

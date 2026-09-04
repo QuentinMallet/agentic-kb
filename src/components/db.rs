@@ -258,7 +258,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
         -- Cue anchors (Memora pickup .4): agent-supplied semantic entry points,
         -- embedded per row. Rows are replaced wholesale on entry upsert and
-        -- removed on expire (agent-kb/tla/CueBatch.tla S2/S3).
+        -- removed on expire (.state/agent-kb/tla/CueBatch.tla S2/S3).
         CREATE TABLE IF NOT EXISTS cues (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             entry_id  TEXT NOT NULL,
