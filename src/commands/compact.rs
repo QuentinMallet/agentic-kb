@@ -12,10 +12,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-/// Maximum number of `run_history` events to retain after compaction.
-/// Older records beyond this tail are purged.
-const RUN_HISTORY_CAP: usize = 500;
-
 /// Persistent state for the compact command (JSON-serialized alongside the event log).
 ///
 /// Tracks `compacts_since_vacuum` across invocations so the AND-gated VACUUM trigger
@@ -215,9 +211,15 @@ impl Compact {
             retained_indices.push(i);
         }
 
-        // Run history: keep only the last RUN_HISTORY_CAP records (original order).
-        let run_start = run_indices.len().saturating_sub(RUN_HISTORY_CAP);
-        for i in run_indices[run_start..].iter().copied() {
+        // Run history: every run event is retained (D5.2 — the positional cap
+        // is removed outright, not shrunk). A cap made compaction NOT a
+        // materialization-preserving rewrite: DB rows for capped-away run
+        // events survived (apply_event's INSERT already ran) while the log
+        // could no longer reproduce them, so a rebuild silently diverged from
+        // a live DB (CompactMaterialize.tla CE5 / Critical 4). Retention here
+        // no longer bounds `run_history` growth; T3's keyed insertion (D5.1)
+        // bounds duplication instead.
+        for i in run_indices {
             retained_indices.push(i);
         }
 
@@ -537,20 +539,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_compact_run_history_capped() {
+    fn test_cmd_compact_run_history_uncapped_all_retained() {
+        // D5.2: the positional retention cap is removed outright, not
+        // shrunk. A cap made compaction NOT a materialization-preserving
+        // rewrite: DB rows for capped-away run events survived (apply_event
+        // already ran) while the log could no longer reproduce them
+        // (CompactMaterialize.tla CE5 / Critical 4). Well past the old
+        // RUN_HISTORY_CAP (500), every run event must still survive.
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
 
-        let over = RUN_HISTORY_CAP + 50;
-        for i in 0..over {
+        const OVER_OLD_CAP: usize = 550;
+        for i in 0..OVER_OLD_CAP {
             let ev = serde_json::json!({
                 "action": "insert", "table": "run_history",
-                // Encode insertion order in test_id so we can verify which
-                // records survive: the LAST RUN_HISTORY_CAP (oldest 50 trimmed).
                 "test_id": format!("{i}"), "result": "pass",
-                "ts": "2024-01-01T00:00:00Z"
+                "ts": "2024-01-01T00:00:00Z", "run_id": format!("run-{i}")
             });
             append_event(&paths.events, &ev).unwrap();
         }
@@ -560,51 +566,90 @@ mod tests {
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
             after.events.len(),
-            RUN_HISTORY_CAP,
-            "compact must retain at most RUN_HISTORY_CAP run_history events"
-        );
-        // Verify the LAST RUN_HISTORY_CAP records are kept (oldest 50 trimmed).
-        assert_eq!(
-            after.events[0]["test_id"], "50",
-            "first retained must be event 50"
+            OVER_OLD_CAP,
+            "compaction must retain every run_history event, not a positional tail"
         );
         assert_eq!(
-            after.events[RUN_HISTORY_CAP - 1]["test_id"],
-            format!("{}", over - 1),
-            "last retained must be the most recent event"
+            after.events[0]["test_id"], "0",
+            "the oldest event, which the old cap would have trimmed, must survive"
+        );
+        assert_eq!(
+            after.events[OVER_OLD_CAP - 1]["test_id"],
+            format!("{}", OVER_OLD_CAP - 1),
+            "the newest event must survive"
         );
     }
 
     #[test]
-    fn test_cmd_compact_run_history_at_boundary_not_trimmed() {
-        // At exactly RUN_HISTORY_CAP events, no records should be trimmed.
-        // Guards against an off-by-one in the saturating_sub slice direction.
+    fn test_cmd_compact_run_history_materialization_preserving() {
+        // CompactMaterialize.tla run 10 (Safety_Current), the direct
+        // statement of CE5: compaction must not change what the log
+        // materializes to. A test that only counts post-compaction rows
+        // passes under the old cap and must not be accepted as coverage —
+        // this rebuilds from both logs and compares run_history row-for-row.
+        // Both rebuilds replay through `open_db_memory` (foreign_keys=ON),
+        // so this also exercises the run_history -> test_cases FK: it must
+        // still hold after cap removal retains older run events.
+        use crate::components::db::{apply_event, open_db_memory};
+        use crate::components::embedder::NoopEmbedder;
+
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
 
-        for i in 0..RUN_HISTORY_CAP {
+        let test_case = serde_json::json!({
+            "action": "upsert", "table": "test_cases",
+            "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
+            "config": "{}", "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &test_case).unwrap();
+
+        const RUNS: usize = 501; // old RUN_HISTORY_CAP (500) + 1
+        for i in 0..RUNS {
             let ev = serde_json::json!({
                 "action": "insert", "table": "run_history",
-                "test_id": format!("{i}"), "result": "pass",
-                "ts": "2024-01-01T00:00:00Z"
+                "test_id": "t1", "result": "pass",
+                "ts": "2024-01-01T00:00:00Z", "run_id": format!("run-{i}")
             });
             append_event(&paths.events, &ev).unwrap();
         }
 
+        let embedder = NoopEmbedder;
+        let pre_compaction_log = events::read_events(&paths.events).unwrap().events;
+        let pre_compaction_db = open_db_memory().unwrap();
+        for ev in &pre_compaction_log {
+            apply_event(&pre_compaction_db, &embedder, ev).unwrap();
+        }
+
         Compact.execute_with_paths(&paths).unwrap();
 
-        let after = events::read_events(&paths.events).unwrap();
+        let compacted_log = events::read_events(&paths.events).unwrap().events;
+        let compacted_db = open_db_memory().unwrap();
+        for ev in &compacted_log {
+            apply_event(&compacted_db, &embedder, ev).unwrap();
+        }
+
+        fn dump(conn: &rusqlite::Connection) -> Vec<(String, String, Option<String>)> {
+            conn.prepare("SELECT test_id, result, run_id FROM run_history ORDER BY run_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        let pre = dump(&pre_compaction_db);
+        let post = dump(&compacted_db);
         assert_eq!(
-            after.events.len(),
-            RUN_HISTORY_CAP,
-            "exactly RUN_HISTORY_CAP events must not be trimmed"
+            pre.len(),
+            RUNS,
+            "rebuild from the pre-compaction log must materialize every run"
         );
-        assert_eq!(after.events[0]["test_id"], "0");
         assert_eq!(
-            after.events[RUN_HISTORY_CAP - 1]["test_id"],
-            format!("{}", RUN_HISTORY_CAP - 1)
+            pre, post,
+            "compaction must be materialization-preserving: rebuild from the \
+             compacted log must equal rebuild from the pre-compaction log"
         );
     }
 
