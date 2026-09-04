@@ -5,6 +5,7 @@
 - [Citation Semantics](./citation-semantics.md)
 - [Evidence Resolution](./evidence-resolution.md)
 - [Peer Graph (kb peers)](./peer-graph-cli.md)
+- [Lock Contract](./lock-contract.md)
 - [MCP Surfaces](./mcp.md)
 - [Search Tuning](./search-tuning.md)
 - [Performance Baselines](./performance-baselines.md)

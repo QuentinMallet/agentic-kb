@@ -341,7 +341,11 @@ impl Rebuild {
             // complete prefix is intentionally simple and robust: it detects
             // compaction, reordering, truncation, and same-size rewrites.
             let (snapshot_len, snapshot_byte_len, snapshot_hash) = {
-                let _lock = acquire_lock(&paths.lock)?;
+                let lock = acquire_lock(&paths.lock)?;
+                {
+                    let conn = db::open_rw(paths, &lock)?;
+                    db::sweep_expired_peers(&conn)?;
+                }
                 let snapshot = events::read_events(&paths.events)?;
                 if let Some(torn_tail) = &snapshot.torn_tail {
                     eprintln!(
@@ -448,12 +452,10 @@ impl Rebuild {
             // mode before rename. If old WAL files remained here while tmp were
             // still DELETE-mode, a new connection could recover against the
             // wrong journal state and corrupt or reject the rebuilt DB.
-            // Safety (Linux): the per-request connection model means no MCP handler
-            // holds a connection across the lock boundary, so no reader has the WAL
-            // open when we unlink it. On Linux, any FD open at unlink time remains
-            // valid (the inode persists until the last close), so this is safe even
-            // if a reader opened just before the lock was acquired. fs::rename then
-            // atomically replaces the DB file in one syscall.
+            // Swap invariant (lens 4 finding 13): no connection is open for
+            // write against the old inode at the point of rename. Linux unlink
+            // semantics therefore make removing the old `-wal` / `-shm` files
+            // safe before the atomic rename replaces the DB path.
             let db_str = paths.db.to_string_lossy();
             let _ = fs::remove_file(format!("{}-wal", db_str));
             let _ = fs::remove_file(format!("{}-shm", db_str));
@@ -620,6 +622,26 @@ mod tests {
             .unwrap()
     }
 
+    fn insert_expired_peer(paths: &Paths) {
+        let conn = Connection::open(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES('rebuild-peer-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES(
+                'rebuild-peer-expired', 'rebuild-peer-graph', 'repo-a', 'repo-b', 'member',
+                '2024-01-01T00:00:00Z', '2000-01-01 00:00:00'
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_cmd_rebuild_from_events() {
         let (_dir, paths) = setup_repo();
@@ -646,6 +668,27 @@ mod tests {
             crate::components::query_hits::counts(&paths.query_hits).unwrap(),
             vec![("rb-hit".into(), 1)]
         );
+    }
+
+    #[test]
+    fn test_rebuild_physically_removes_expired_peers() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+        db::open_or_init(&paths).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        insert_expired_peer(&paths);
+
+        Rebuild.execute_with(&paths, &emb).unwrap();
+
+        let conn = Connection::open(&paths.db).unwrap();
+        let peers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE id='rebuild-peer-expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(peers, 0, "rebuild must not leave expired peers behind");
     }
 
     /// DB cleared (e.g. corrupted or missing) — rebuild reconstructs from event log.

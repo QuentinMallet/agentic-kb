@@ -87,6 +87,10 @@ impl Compact {
         vacuum_cfg: &VacuumConfig,
     ) -> anyhow::Result<(usize, usize)> {
         let lock = acquire_lock(&paths.lock)?;
+        {
+            let conn = crate::components::db::open_rw(paths, &lock)?;
+            crate::components::db::sweep_expired_peers(&conn)?;
+        }
         let read = events::read_events(&paths.events)?;
         let original_count = read.events.len();
         if let Some(torn_tail) = &read.torn_tail {
@@ -1563,6 +1567,26 @@ mod tests {
         paths
     }
 
+    fn insert_expired_peer(paths: &Paths) {
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES('compact-peer-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES(
+                'compact-peer-expired', 'compact-peer-graph', 'repo-a', 'repo-b', 'member',
+                '2024-01-01T00:00:00Z', '2000-01-01 00:00:00'
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
     // ── VACUUM gate tests (AC1–AC5) ──────────────────────────────────────────
 
     /// AC1 + AC4: after exactly 8 compacts with >=1024 free pages, VACUUM fires
@@ -1620,6 +1644,31 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap();
         assert!(count >= 0, "AC1: DB must be readable after VACUUM");
+    }
+
+    #[test]
+    fn test_compact_sweeps_expired_peers_under_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        crate::components::db::open_or_init(&paths).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        insert_expired_peer(&paths);
+
+        Compact
+            .execute_with_paths_and_vacuum(&paths, &VacuumConfig::default())
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let peers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE id='compact-peer-expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(peers, 0, "compact must physically delete expired peers");
     }
 
     /// AC2: after 7 compacts with >=1024 free pages, no VACUUM fires (counter stays at 7).
