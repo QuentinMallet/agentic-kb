@@ -1029,6 +1029,16 @@ fn warn_cross_entry_evidence_id(ev_id: &str, owner_entry_id: &str, attempted_ent
     CROSS_ENTRY_EVIDENCE_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Extract an event's `ts` for a replay-deterministic `updated_at` write
+/// (D6 R1). `Materialize` must be a pure function of the log: stamping
+/// `datetime('now')` on apply makes replaying the same log on two different
+/// days produce different `updated_at` values and different recency-weighted
+/// rankings. Legacy events with no `ts` return `None` so the caller leaves
+/// the existing row value untouched instead of stamping wall-clock.
+fn event_ts(event: &serde_json::Value) -> Option<&str> {
+    event["ts"].as_str().filter(|s| !s.is_empty())
+}
+
 /// Apply a single event atomically.
 ///
 /// The operation uses a savepoint and therefore composes inside a caller-owned
@@ -1220,15 +1230,22 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
+            let ts = event_ts(event);
             // Single transaction: spec-conformant expire reset + FTS/emb/cue GC.
             // Resetting evidence_status to 'n/a' and deleting evidence mirrors
             // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
             with_apply_event_savepoint(conn, || -> Result<()> {
-                conn.execute(
-                    "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
-                    params![id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=?2 WHERE id=?1",
+                        params![id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET is_stale=1, evidence_status='n/a' WHERE id=?1",
+                        params![id],
+                    ),
+                }?;
                 // ADR-2 intentionally does not cascade through derived_from:
                 // provenance edges on other entries may still name this stale
                 // entry, whose row remains available to provenance traversal.
@@ -1302,6 +1319,7 @@ pub fn apply_event(
             let citation_excerpt = ev["citation_excerpt"].as_str();
             let derived_from = ev["derived_from"].as_str();
             let recorded_at = ev["recorded_at"].as_str();
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 let existing_owner = conn
@@ -1352,10 +1370,16 @@ pub fn apply_event(
                 // The fix is to always call the soft-mandate helper after an evidence row
                 // change so both paths agree (br-f7y).
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -1390,6 +1414,7 @@ pub fn apply_event(
             let entry_id = event["entry_id"]
                 .as_str()
                 .context("evidence_expire: missing entry_id")?;
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 // Orphan-tolerant: absent and stale parents are equivalent under
@@ -1414,10 +1439,16 @@ pub fn apply_event(
                 )?;
 
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -3564,6 +3595,205 @@ mod tests {
             .unwrap();
         assert_eq!(is_stale, 1);
         assert_eq!(evidence_status, "n/a");
+    }
+
+    /// D6 R1 (failing-test-first regression): replaying the identical log
+    /// must materialize identical `updated_at` values no matter when the
+    /// replay runs. `updated_at` is derived from the event's own `ts`, not
+    /// wall-clock, on every arm that writes it (expire, evidence_add,
+    /// evidence_expire) — Materialize being a pure function of the log is
+    /// an assumption every spec in `.state/agent-kb/tla/` already makes.
+    #[test]
+    fn test_replay_expire_updated_at_is_derived_from_event_ts_not_wall_clock() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-expire-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "expire", "table": "entries", "id": "replay-expire-ts",
+                "ts": "2024-06-01T12:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-06-01T12:00:00Z");
+
+        // Replay the identical log again as if hours had passed on the wall
+        // clock — the materialized value must be byte-identical.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_expire_event_without_ts_leaves_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-expire-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy expire event carries no "ts" field.
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "legacy-expire-ts"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a legacy event with no ts must leave the existing updated_at untouched"
+        );
+    }
+
+    #[test]
+    fn test_replay_evidence_add_and_evidence_expire_updated_at_derived_from_event_ts() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-evidence-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_add", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence": {
+                    "id": "ev-replay-evidence-ts", "entry_id": "replay-evidence-ts",
+                    "kind": "code", "citation_path": "src/lib.rs:1-1",
+                    "citation_sha": null, "citation_hash": "sha256:abc",
+                    "citation_excerpt": null, "derived_from": null,
+                    "recorded_at": "2024-03-01T00:00:00Z"
+                },
+                "ts": "2024-03-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_expire", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence_id": "ev-replay-evidence-ts", "reason": "test",
+                "ts": "2024-09-01T00:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-09-01T00:00:00Z");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_evidence_add_and_evidence_expire_without_ts_leave_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-evidence-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy evidence_add event carries no "ts" field.
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence": {
+                "id": "ev-legacy-evidence-ts", "entry_id": "legacy-evidence-ts",
+                "kind": "code", "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null, "citation_hash": "sha256:abc",
+                "citation_excerpt": null, "derived_from": null,
+                "recorded_at": "2024-03-01T00:00:00Z"
+            }
+        });
+        apply_event(&conn, &embedder, &evidence_add).unwrap();
+        let after_add: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_add,
+            "a legacy evidence_add with no ts must leave updated_at untouched"
+        );
+
+        // Legacy evidence_expire event carries no "ts" field.
+        let evidence_expire = serde_json::json!({
+            "action": "evidence_expire", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence_id": "ev-legacy-evidence-ts", "reason": "test"
+        });
+        apply_event(&conn, &embedder, &evidence_expire).unwrap();
+        let after_expire: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_expire,
+            "a legacy evidence_expire with no ts must leave updated_at untouched"
+        );
     }
 
     #[test]
