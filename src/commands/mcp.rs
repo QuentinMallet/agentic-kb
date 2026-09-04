@@ -4338,7 +4338,18 @@ mod tests {
 
     #[test]
     fn test_handle_provenance_missing_start_returns_entry_not_found() {
-        let (_dir, paths, _emb) = setup();
+        // Initialize the repo with an unrelated entry so this exercises
+        // "entry not found in an initialized repo" — distinct from the
+        // empty-graph contract for a truly uninitialized db (see
+        // handle_provenance_on_uninitialized_db_returns_an_empty_graph,
+        // which owns the DbUninitialized-mapping case).
+        let (_dir, paths, emb) = setup();
+        handle_add(
+            &json!(null),
+            &json!({"path":"p/other","summary":"other","content":"other","tags":[],"kind":"belief"}),
+            &paths,
+            &emb,
+        );
         let id = json!("prov-missing-start");
 
         let resp = handle_provenance(&id, &json!({"entry_id": "missing-entry"}), &paths);
