@@ -57,7 +57,10 @@ pub fn compare_rank(score_a: f32, id_a: &str, score_b: f32, id_b: &str) -> std::
 }
 
 fn validate_embedding(embedding: Vec<f32>) -> Result<Vec<f32>> {
-    anyhow::ensure!(embedding.iter().all(|x| x.is_finite()), "embedder returned a non-finite component");
+    anyhow::ensure!(
+        embedding.iter().all(|x| x.is_finite()),
+        "embedder returned a non-finite component"
+    );
     Ok(embedding)
 }
 
@@ -68,7 +71,9 @@ pub struct SearchStats {
 
 impl SearchStats {
     pub fn snapshot() -> Self {
-        Self { corrupt_embeddings: crate::models::corrupt_embedding_count() }
+        Self {
+            corrupt_embeddings: crate::models::corrupt_embedding_count(),
+        }
     }
 }
 
@@ -2013,11 +2018,14 @@ struct SearchRuntimeStats {
     effective_verify_pool_size: usize,
     scheduled_verification_tasks: usize,
     spawned_verify_workers: usize,
+    semantic_materialized_rows: usize,
+    semantic_materialized_bytes: usize,
+    cue_materialized_rows: usize,
+    cue_materialized_bytes: usize,
 }
 
 #[cfg(test)]
-fn search_runtime_stats_cell(
-) -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
+fn search_runtime_stats_cell() -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
     static CELL: std::sync::OnceLock<std::sync::Mutex<Option<SearchRuntimeStats>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| std::sync::Mutex::new(None))
@@ -2237,12 +2245,7 @@ pub fn fts_query_contentless(
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -2279,12 +2282,7 @@ pub fn fts_query_content_entries(
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -2323,7 +2321,9 @@ fn fts_rows_through_boundary_tie(
         }
         let boundary = rows[opts.limit - 1].6;
         if rows.last().is_some_and(|row| row.6 != boundary) {
-            let end = rows.iter().position(|row| row.6 != boundary && row.6 > boundary)
+            let end = rows
+                .iter()
+                .position(|row| row.6 != boundary && row.6 > boundary)
                 .unwrap_or(rows.len());
             return Ok(rows.into_iter().take(end).collect());
         }
@@ -2585,6 +2585,56 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
     *entries = selected;
 }
 
+type SearchMetadata = (String, String, String, String, String);
+
+fn fetch_search_metadata(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, SearchMetadata>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ),
+        ))
+    })?;
+    let mut metadata = std::collections::HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, fields) = row?;
+        metadata.insert(id, fields);
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+fn materialization_size(
+    metadata: &std::collections::HashMap<String, SearchMetadata>,
+) -> (usize, usize) {
+    let bytes = metadata
+        .iter()
+        .map(|(id, (path, summary, content, tags, updated_at))| {
+            id.len() + path.len() + summary.len() + content.len() + tags.len() + updated_at.len()
+        })
+        .sum();
+    (metadata.len(), bytes)
+}
+
 pub fn search_entries(
     conn: &Connection,
     embedder: &dyn Embedder,
@@ -2601,6 +2651,10 @@ pub fn search_entries(
 
     let mut entries: Vec<SearchEntry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    #[cfg(test)]
+    let mut semantic_materialized = (0usize, 0usize);
+    #[cfg(test)]
+    let mut cue_materialized = (0usize, 0usize);
 
     if effective_opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
@@ -2625,8 +2679,17 @@ pub fn search_entries(
         // so ordinary parity overhead remains O(limit), not O(database size).
         #[cfg(debug_assertions)]
         {
-            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
-            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, &effective_opts);
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
             if let (Ok(primary), Ok(alt)) = (primary, alt) {
                 let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
                 let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
@@ -2639,8 +2702,17 @@ pub fn search_entries(
         }
         #[cfg(not(debug_assertions))]
         {
-            let primary = fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
-            let alt = fts_rows_through_boundary_tie(conn, match read_path { FtsReadPath::Contentless => FtsReadPath::ContentEntries, FtsReadPath::ContentEntries => FtsReadPath::Contentless }, &safe_query, &effective_opts);
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
             if let (Ok(primary), Ok(alt)) = (primary, alt) {
                 let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
                 let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
@@ -2688,9 +2760,12 @@ pub fn search_entries(
 
     if effective_opts.do_semantic && !embedder.is_noop() {
         let q_emb = validate_embedding(embedder.embed(query)?)?;
-        let path_prefix = effective_opts.path_prefix.as_deref().map(like_prefix_pattern);
+        let path_prefix = effective_opts
+            .path_prefix
+            .as_deref()
+            .map(like_prefix_pattern);
         let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
+            "SELECT e.id, emb.embedding
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
@@ -2703,25 +2778,13 @@ pub fn search_entries(
         // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
         // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
         // decode_emb_blob fallback via length dispatch.
-        let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
-            .query_map(params![path_prefix.clone(), tag_filter], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Vec<u8>>(6)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
         let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
-        let mut candidates: Vec<(f32, String, String, String, String, String, String)> =
-            Vec::with_capacity(rows.len());
-        for (id, path, summary, content, tags, updated_at, blob) in rows {
+        let mut candidates: Vec<(f32, String)> = Vec::new();
+        let rows = stmt.query_map(params![path_prefix.clone(), tag_filter], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (id, blob) = row?;
             decode_f16_blob_into(&blob, &mut scratch);
             let sim = if scratch.is_empty() {
                 // blob was not canonical f16 — fall back to graceful decode
@@ -2730,7 +2793,7 @@ pub fn search_entries(
             } else {
                 cosine_similarity(&q_emb, &scratch)
             };
-            candidates.push((sim, id, path, summary, content, tags, updated_at));
+            candidates.push((sim, id));
         }
 
         candidates.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
@@ -2739,61 +2802,66 @@ pub fn search_entries(
         // cue anchor. Ranked separately so RRF fuses it as a third source.
         // Best-effort: absence of the cues table (pre-migration DB) is not an
         // error, just an empty lane.
-        let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
+        let mut cue_ranked: Vec<(f32, String)> = Vec::new();
         if effective_opts.do_fts {
             if let Ok(mut stmt) = conn.prepare(
-            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
+                "SELECT c.entry_id, c.cue, c.embedding
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
                AND c.embedding IS NOT NULL
                AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
-        ) {
-            let cue_rows: Vec<(String, String, Vec<u8>, String, String, String, String, String)> = stmt
-                .query_map(params![path_prefix, tag_filter], |r| {
+            ) {
+                // Best cue score per entry.
+                let mut best: std::collections::HashMap<String, (f32, String)> =
+                    std::collections::HashMap::new();
+                let cue_rows = stmt.query_map(params![path_prefix, tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, String>(7)?,
                     ))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-
-            // Best cue score per entry.
-            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String, String)> =
-                std::collections::HashMap::new();
-            for (entry_id, cue, blob, path, summary, content, tags, updated_at) in cue_rows {
-                decode_f16_blob_into(&blob, &mut scratch);
-                let sim = if scratch.is_empty() {
-                    let fallback = decode_emb_blob(&blob);
-                    cosine_similarity(&q_emb, &fallback)
-                } else {
-                    cosine_similarity(&q_emb, &scratch)
-                };
-                match best.get(&entry_id) {
-                    Some((prev, prev_cue, ..))
-                        if compare_rank(*prev, prev_cue, sim, &cue).is_lt() => {}
-                    _ => {
-                        best.insert(entry_id, (sim, cue, path, summary, content, tags, updated_at));
+                })?;
+                for row in cue_rows {
+                    let (entry_id, cue, blob) = row?;
+                    decode_f16_blob_into(&blob, &mut scratch);
+                    let sim = if scratch.is_empty() {
+                        let fallback = decode_emb_blob(&blob);
+                        cosine_similarity(&q_emb, &fallback)
+                    } else {
+                        cosine_similarity(&q_emb, &scratch)
+                    };
+                    match best.get(&entry_id) {
+                        Some((prev, prev_cue, ..))
+                            if compare_rank(*prev, prev_cue, sim, &cue).is_lt() => {}
+                        _ => {
+                            best.insert(entry_id, (sim, cue));
+                        }
                     }
                 }
+                cue_ranked = best
+                    .into_iter()
+                    .map(|(id, (sim, _cue))| (sim, id))
+                    .collect();
+                cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
+                cue_ranked.truncate(effective_opts.limit.saturating_mul(2));
             }
-            cue_ranked = best
-                .into_iter()
-                .map(|(id, (sim, _cue, path, summary, content, tags, updated_at))| {
-                    (sim, id, path, summary, content, tags, updated_at)
-                })
-                .collect();
-            cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
-            cue_ranked.truncate(effective_opts.limit.saturating_mul(2));
         }
+
+        let materialize_limit = effective_opts.limit.saturating_mul(2);
+        let semantic_ids: Vec<String> = candidates
+            .iter()
+            .take(materialize_limit)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let cue_ids: Vec<String> = cue_ranked.iter().map(|(_, id)| id.clone()).collect();
+        let semantic_meta = fetch_search_metadata(conn, &semantic_ids)?;
+        let cue_meta = fetch_search_metadata(conn, &cue_ids)?;
+        #[cfg(test)]
+        {
+            semantic_materialized = materialization_size(&semantic_meta);
+            cue_materialized = materialization_size(&cue_meta);
         }
 
         if effective_opts.do_fts {
@@ -2816,14 +2884,14 @@ pub fn search_entries(
             }
 
             // Second RRF source: semantic candidate ranks.
-            for (sem_rank, (_, id, ..)) in candidates.iter().enumerate() {
+            for (sem_rank, (_, id)) in candidates.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
             }
 
             // Third RRF source: cue-anchor lane (best cue cosine per entry).
-            for (cue_rank, (_, id, ..)) in cue_ranked.iter().enumerate() {
+            for (cue_rank, (_, id)) in cue_ranked.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
@@ -2839,12 +2907,15 @@ pub fn search_entries(
 
             // For semantic-only entries (not in FTS), create new SearchEntry values.
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
-            for (_, id, path, summary, content, tags, updated_at) in
-                candidates
-                    .into_iter()
-                    .take(effective_opts.limit.saturating_mul(2))
+            for (_, id) in candidates
+                .into_iter()
+                .take(effective_opts.limit.saturating_mul(2))
             {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = semantic_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2866,8 +2937,12 @@ pub fn search_entries(
 
             // Cue-only entries (reached via a cue anchor, absent from both the
             // FTS and entry-embedding lanes) still need materializing.
-            for (_, id, path, summary, content, tags, updated_at) in cue_ranked.into_iter() {
+            for (_, id) in cue_ranked.into_iter() {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = cue_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("cue metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2959,14 +3034,20 @@ pub fn search_entries(
             if effective_opts.mmr_lambda > 0.0 && entries.len() > 1 {
                 // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
                 // similarity REWARD, actively clustering duplicates.
-                mmr_rerank(conn, &mut entries, effective_opts.mmr_lambda.clamp(0.0, 1.0));
+                mmr_rerank(
+                    conn,
+                    &mut entries,
+                    effective_opts.mmr_lambda.clamp(0.0, 1.0),
+                );
                 entries.truncate(effective_opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
-            for (sim, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(effective_opts.limit)
-            {
+            for (sim, id) in candidates.into_iter().take(effective_opts.limit) {
+                let (path, summary, content, tags, updated_at) = semantic_meta
+                    .get(&id)
+                    .cloned()
+                    .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                 entries.push(SearchEntry {
                     id,
                     path,
@@ -3124,6 +3205,10 @@ pub fn search_entries(
         effective_verify_pool_size: pool_size,
         scheduled_verification_tasks: total_tasks,
         spawned_verify_workers: if total_tasks > 0 { pool_size } else { 0 },
+        semantic_materialized_rows: semantic_materialized.0,
+        semantic_materialized_bytes: semantic_materialized.1,
+        cue_materialized_rows: cue_materialized.0,
+        cue_materialized_bytes: cue_materialized.1,
     });
 
     let mut outcomes_flat: Vec<VerificationOutcome> = vec![
@@ -3258,7 +3343,12 @@ pub fn search_entries_with_stats(
     let before = crate::models::corrupt_embedding_count();
     let entries = search_entries(conn, embedder, query, opts)?;
     let after = crate::models::corrupt_embedding_count();
-    Ok((entries, SearchStats { corrupt_embeddings: after.saturating_sub(before) }))
+    Ok((
+        entries,
+        SearchStats {
+            corrupt_embeddings: after.saturating_sub(before),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -3316,10 +3406,21 @@ mod tests {
     fn signed_zero_ties_match_sql_id_order() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE ranked(id TEXT, score REAL); INSERT INTO ranked VALUES('b',0.0),('a',-0.0);").unwrap();
-        let sql: Vec<String> = conn.prepare("SELECT id FROM ranked ORDER BY score DESC,id").unwrap().query_map([],|r|r.get(0)).unwrap().map(Result::unwrap).collect();
-        let mut rust = vec![(-0.0,"a"),(0.0,"b")];
-        rust.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
-        assert_eq!(sql, rust.into_iter().map(|x|x.1.to_string()).collect::<Vec<_>>());
+        let sql: Vec<String> = conn
+            .prepare("SELECT id FROM ranked ORDER BY score DESC,id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut rust = vec![(-0.0, "a"), (0.0, "b")];
+        rust.sort_by(|a, b| compare_rank(a.0, a.1, b.0, b.1));
+        assert_eq!(
+            sql,
+            rust.into_iter()
+                .map(|x| x.1.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn proptest_cases(default_full: u32) -> u32 {
@@ -3428,15 +3529,195 @@ mod tests {
     }
 
     #[test]
+    fn p1_ordering_baseline_is_byte_identical_in_hybrid_and_semantic_modes() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        for (do_fts, expected) in [
+            (true, vec!["rank-a", "rank-b", "rank-c"]),
+            (false, vec!["rank-a", "rank-b", "rank-c"]),
+        ] {
+            let rows = search_entries(
+                &conn,
+                &SearchTestEmbedder,
+                "sealedwaiver",
+                &single_fetch_opts(do_fts, true, 0.0),
+            )
+            .unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, expected);
+            let actual_bytes: Vec<(String, u32, &'static str, &'static str)> = rows
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits(), row.source, row.score_kind))
+                .collect();
+            let expected_bytes = if do_fts {
+                vec![
+                    (
+                        "rank-a".into(),
+                        (1.0f32 / 61.0 + 1.0 / 61.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-b".into(),
+                        (1.0f32 / 62.0 + 1.0 / 62.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-c".into(),
+                        (1.0f32 / 63.0).to_bits(),
+                        "semantic",
+                        "rrf",
+                    ),
+                ]
+            } else {
+                vec![
+                    ("rank-a".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                    ("rank-b".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                    ("rank-c".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                ]
+            };
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn p1_metadata_materialization_is_bounded_to_twice_limit_per_lane() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let cue_blob = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        for id in ["rank-a", "rank-b", "rank-c"] {
+            conn.execute(
+                "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1, ?2, ?3)",
+                params![id, format!("cue-{id}"), &cue_blob],
+            )
+            .unwrap();
+        }
+        let mut opts = single_fetch_opts(true, true, 0.0);
+        opts.limit = 1;
+        search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+        assert_eq!(stats.semantic_materialized_rows, 2);
+        assert_eq!(stats.cue_materialized_rows, 2);
+    }
+
+    #[test]
+    fn semantic_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute("UPDATE entries_emb SET embedding = 7 WHERE rowid = (SELECT rowid FROM entries WHERE id='rank-a')", []).unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-a','best',7)",
+            [],
+        )
+        .unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_keeps_best_cue_per_entry() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let best = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','best',?1)",
+            [&best],
+        )
+        .unwrap();
+        let opts = single_fetch_opts(true, true, 0.0);
+        let before: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        let worse = f32s_to_blob(&[-0.9, (1.0_f32 - 0.9 * 0.9).sqrt()]);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','worse',?1)",
+            [&worse],
+        )
+        .unwrap();
+        let after: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        assert_eq!(
+            after, before,
+            "an inferior extra cue must not replace the entry's best cue"
+        );
+    }
+
+    #[test]
+    #[ignore = "10k materialization measurement; run explicitly on the host"]
+    fn p1_materialization_measurement_10k() {
+        let conn = open_db_memory().unwrap();
+        let embedder = crate::bench_fixture::BenchEmbedder::new(crate::bench_fixture::DEFAULT_SEED);
+        crate::bench_fixture::seed_db(&conn, &embedder, 10_000, crate::bench_fixture::DEFAULT_SEED)
+            .unwrap();
+        for (lane, do_fts) in [("semantic", false), ("cue", true)] {
+            let mut opts = single_fetch_opts(do_fts, true, 0.0);
+            opts.limit = 100;
+            search_entries(&conn, &embedder, "architecture vector", &opts).unwrap();
+            let stats = take_search_runtime_stats();
+            eprintln!(
+                "{lane}: semantic_rows={} semantic_bytes={} cue_rows={} cue_bytes={}",
+                stats.semantic_materialized_rows,
+                stats.semantic_materialized_bytes,
+                stats.cue_materialized_rows,
+                stats.cue_materialized_bytes
+            );
+        }
+    }
+
+    #[test]
     fn parity_gate_compares_ordered_tie_run_past_limit() {
         let conn = open_db_memory().unwrap();
-        seed_path_prefix_search_corpus(&conn, &[("tie-c","t/c"),("tie-a","t/a"),("tie-b","t/b")]);
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[("tie-c", "t/c"), ("tie-a", "t/a"), ("tie-b", "t/b")],
+        );
         let mut opts = single_fetch_opts(true, false, 0.0);
         opts.limit = 1;
-        let v1 = fts_rows_through_boundary_tie(&conn, FtsReadPath::Contentless, "\"pathprefixneedle\"", &opts).unwrap();
-        let v2 = fts_rows_through_boundary_tie(&conn, FtsReadPath::ContentEntries, "\"pathprefixneedle\"", &opts).unwrap();
+        let v1 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::Contentless,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
+        let v2 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::ContentEntries,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
         assert!(v1.len() > opts.limit, "the boundary tie must be extended");
-        assert_eq!(v1.iter().map(|r| &r.0).collect::<Vec<_>>(), v2.iter().map(|r| &r.0).collect::<Vec<_>>());
+        assert_eq!(
+            v1.iter().map(|r| &r.0).collect::<Vec<_>>(),
+            v2.iter().map(|r| &r.0).collect::<Vec<_>>()
+        );
     }
 
     /// 384-dim analogue of `SearchTestEmbedder`. The shared 2-element test
@@ -3492,7 +3773,13 @@ mod tests {
         }
         let blob = f32s_to_blob(&[f32::NAN, 1.0]);
         conn.execute("UPDATE entries_emb SET embedding=?1 WHERE rowid=(SELECT rowid FROM entries WHERE id='rank-a')", [blob]).unwrap();
-        let (rows, stats) = search_entries_with_stats(&conn, &FullDimEmbedder, "sealedwaiver", &single_fetch_opts(false, true, 0.0)).unwrap();
+        let (rows, stats) = search_entries_with_stats(
+            &conn,
+            &FullDimEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0),
+        )
+        .unwrap();
         assert!(stats.corrupt_embeddings > 0);
         assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
         assert_eq!(rows.last().map(|r| r.score), Some(0.0));
@@ -3587,10 +3874,7 @@ mod tests {
 
     #[test]
     fn test_like_prefix_pattern_escapes_mixed_meta_chars() {
-        assert_eq!(
-            like_prefix_pattern(r"src\_%\mix"),
-            r"src\\\_\%\\mix"
-        );
+        assert_eq!(like_prefix_pattern(r"src\_%\mix"), r"src\\\_\%\\mix");
     }
 
     #[test]
@@ -3635,7 +3919,11 @@ mod tests {
         let conn = open_db_memory().unwrap();
         seed_path_prefix_search_corpus(
             &conn,
-            &[("pp-under", "src/_x"), ("pp-alpha", "src/ax"), ("pp-doc", "docs/%y")],
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-doc", "docs/%y"),
+            ],
         );
 
         let opts = SearchOptions {
@@ -6556,7 +6844,11 @@ mod tests {
         let results = search_entries(&conn, &embedder, "boundary clamp needle", &opts).unwrap();
         let stats = take_search_runtime_stats();
 
-        assert_eq!(results.len(), MAX_LIMIT, "limit must be clamped at the boundary");
+        assert_eq!(
+            results.len(),
+            MAX_LIMIT,
+            "limit must be clamped at the boundary"
+        );
         assert_eq!(stats.effective_limit, MAX_LIMIT);
         assert_eq!(stats.effective_inline_verify_k, MAX_INLINE_VERIFY_K);
         assert_eq!(
@@ -6565,8 +6857,7 @@ mod tests {
             "scheduled verification tasks must be clamped to limit × evidence rows per returned entry"
         );
         assert_eq!(
-            stats.spawned_verify_workers,
-            MAX_VERIFY_POOL_SIZE,
+            stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE,
             "worker count must use the clamped verify pool size"
         );
     }
