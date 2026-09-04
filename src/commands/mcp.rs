@@ -21,7 +21,7 @@ use clap::Parser;
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -130,25 +130,486 @@ impl Mcp {
         io::stdout().flush()?;
 
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let response = handle_request(
-                &line,
-                &paths,
-                emb.as_ref(),
-                inline_verify_k_default,
-                verify_pool_size_default,
-                recency_lambda_default,
-                mmr_lambda_default,
-            );
+        let mut reader = stdin.lock();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let response = match read_frame(&mut reader, &mut buf, MAX_INPUT_LINE_BYTES)? {
+                Frame::Eof => break,
+                Frame::Rejected(response) => response,
+                Frame::Line(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    handle_request(
+                        &line,
+                        &paths,
+                        emb.as_ref(),
+                        inline_verify_k_default,
+                        verify_pool_size_default,
+                        recency_lambda_default,
+                        mmr_lambda_default,
+                    )
+                }
+            };
             println!("{response}");
             io::stdout().flush()?;
         }
         Ok(())
     }
+}
+
+// ── Request boundary (B1 / ADR-4: reject at the outermost layer) ────────────
+//
+// Every dispatch method has exactly one `#[serde(deny_unknown_fields)]`
+// request struct declaring `id` and `method` (the port request object is
+// flat), and every handler consumes that struct rather than a loose
+// `serde_json::Value`. An unknown key, a missing or wrong-typed required
+// field, or an out-of-range numeric is refused here and never reaches a
+// handler body.
+
+/// Maximum accepted request-line length in bytes, excluding the terminating
+/// newline. Matches the Elixir port's `{:line, 10_485_760}` frame cap in
+/// `mcp/lib/agentic_kb_mcp/port_manager.ex`, so neither side accepts a line
+/// the other would refuse.
+const MAX_INPUT_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Bytes of an unparseable line scanned for a best-effort `id`.
+const ID_SCAN_PREFIX_BYTES: usize = 4096;
+
+/// Maximum accepted `query` length in bytes. Caps what reaches the embedder
+/// and the FTS tokenizer.
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Maximum number of seed ids accepted by frontier-expand search. Mirrors the
+/// `MAX_EXPAND_SEEDS` truncation inside `db::expand_entries`, which this
+/// boundary makes unreachable: an over-long array is rejected, never silently
+/// shortened.
+const MAX_EXPAND_IDS: usize = 32;
+
+/// Maximum accepted `max_hops` for peer-federated search.
+const MAX_SEARCH_HOPS: u64 = 8;
+
+/// Maximum accepted `max_chars` for reembed candidate selection. Well above
+/// `db::MAX_ENTRY_CONTENT_CHARS`, so no legitimate request is refused.
+const MAX_REEMBED_MAX_CHARS: u64 = 100_000;
+
+/// A numeric request field captured verbatim.
+///
+/// `serde`'s own type error names neither the field nor its accepted range, so
+/// bounded numerics are captured as raw JSON and validated by
+/// [`NumField::bounded`], which reports both.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(transparent)]
+struct NumField(Value);
+
+impl NumField {
+    /// Validate an optional integer field against an inclusive range.
+    fn bounded(
+        field: &Option<NumField>,
+        name: &str,
+        min: u64,
+        max: u64,
+    ) -> Result<Option<u64>, String> {
+        let Some(NumField(raw)) = field else {
+            return Ok(None);
+        };
+        match raw.as_u64() {
+            Some(n) if n >= min && n <= max => Ok(Some(n)),
+            Some(n) => Err(format!("{name} must be in {min}..={max} (got {n})")),
+            None => Err(format!(
+                "{name} must be an integer in {min}..={max} (got {raw})"
+            )),
+        }
+    }
+
+    /// Validate an optional non-negative integer field whose upper bound is
+    /// the handler's own clamp rather than a boundary rule.
+    fn non_negative(field: &Option<NumField>, name: &str) -> Result<Option<u64>, String> {
+        match field {
+            None => Ok(None),
+            Some(NumField(raw)) => raw
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| format!("{name} must be a non-negative integer")),
+        }
+    }
+}
+
+/// Declare a dispatch-method request struct.
+///
+/// Centralising the header guarantees the three properties B1 requires of
+/// every one of them: `deny_unknown_fields`, a declared `id`, and a declared
+/// `method`.
+macro_rules! request_struct {
+    (
+        $(#[$outer:meta])*
+        $name:ident { $( $(#[$inner:meta])* $field:ident : $ty:ty ),* $(,)? }
+    ) => {
+        $(#[$outer])*
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct $name {
+            /// Echoed on every response envelope for this request.
+            #[serde(default)]
+            id: Value,
+            /// Declared so the flat request object closes under
+            /// `deny_unknown_fields`; dispatch has already matched on it.
+            #[allow(dead_code)]
+            method: String,
+            $( $(#[$inner])* $field: $ty, )*
+        }
+    };
+}
+
+request_struct!(
+    /// `search` — keyword/semantic search, or frontier expand when
+    /// `expand_ids` is present.
+    SearchRequest {
+        query: Option<String>,
+        limit: Option<NumField>,
+        mode: Option<String>,
+        path_prefix: Option<String>,
+        tag: Option<String>,
+        inline_verify_k: Option<NumField>,
+        expand_ids: Option<Vec<String>>,
+        /// Peer-federation parameters: accepted and validated, but federation
+        /// is local-only on the MCP lane, so nothing reads them yet.
+        #[allow(dead_code)]
+        peers: Option<bool>,
+        #[allow(dead_code)]
+        reachable_from: Option<String>,
+        max_hops: Option<NumField>,
+        #[allow(dead_code)]
+        slug: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `add` — write one KB entry. `summary` and `content` are non-`Option`:
+    /// a missing or wrong-typed value is a rejection naming the field, never
+    /// a silently stored empty string.
+    AddRequest {
+        path: String,
+        summary: String,
+        content: String,
+        tags: Option<Value>,
+        permanent: Option<bool>,
+        replace_path: Option<bool>,
+        kind: Option<String>,
+        evidence: Option<Vec<Value>>,
+        cues: Option<Vec<String>>,
+        session_id: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `import` — bulk-load a seed file.
+    ImportRequest {
+        path: String,
+        upsert: Option<bool>,
+    }
+);
+
+request_struct!(
+    /// `expire` — mark one entry stale.
+    ExpireRequest {
+        entry_id: String,
+        reason: Option<String>,
+        force: Option<bool>,
+    }
+);
+
+request_struct!(
+    /// `stale_check` — report entries recorded against changed files/commits.
+    StaleCheckRequest {
+        files: Option<Vec<String>>,
+        commits: Option<Vec<String>>,
+        blame: Option<bool>,
+    }
+);
+
+request_struct!(
+    /// `compact` — squash superseded events.
+    CompactRequest {}
+);
+
+request_struct!(
+    /// `rebuild` — replay the event log into a fresh DB.
+    RebuildRequest {}
+);
+
+request_struct!(
+    /// `reembed` — embed entries missing an embedding.
+    ReembedRequest {
+        dry_run: Option<bool>,
+        max_chars: Option<NumField>,
+    }
+);
+
+request_struct!(
+    /// `run` — record a test-case run result.
+    RunRequest {
+        test_id: String,
+        result: String,
+        adapter: Option<String>,
+        detail: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `test_add` — upsert a test-case definition.
+    TestAddRequest {
+        app: String,
+        name: String,
+        protocol: String,
+        config: String,
+        test_id: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `tests` — list test cases.
+    TestsRequest {
+        app: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `audit_run` — draw an audit sample.
+    AuditRunRequest {
+        sample_size: Option<NumField>,
+        mode: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `audit_record` — record audit verdicts.
+    AuditRecordRequest {
+        run_id: String,
+        verdicts: Option<Vec<Value>>,
+    }
+);
+
+request_struct!(
+    /// `audit_report` — summarise recorded audits.
+    AuditReportRequest {}
+);
+
+request_struct!(
+    /// `provenance` — walk the derived-from graph.
+    ProvenanceRequest {
+        entry_id: String,
+        max_depth: Option<NumField>,
+    }
+);
+
+request_struct!(
+    /// `kb_get` — fetch one entry in full.
+    KbGetRequest {
+        entry_id: String,
+    }
+);
+
+request_struct!(
+    /// `cite` — compute citation fields for a file or byte range.
+    CiteRequest {
+        path: String,
+        start: Option<NumField>,
+        end: Option<NumField>,
+    }
+);
+
+request_struct!(
+    /// `kb_peers_add` — register a peer repository edge.
+    PeersAddRequest {
+        target_repo: String,
+        graph_type: String,
+        epic_slug: Option<String>,
+        ttl_days: Option<NumField>,
+    }
+);
+
+request_struct!(
+    /// `kb_peers_list` — list peer edges.
+    PeersListRequest {
+        graph_type: Option<String>,
+    }
+);
+
+request_struct!(
+    /// `kb_peers_remove` — drop one peer edge.
+    PeersRemoveRequest {
+        peer_id: String,
+    }
+);
+
+/// One line read from the port's stdin.
+enum Frame {
+    /// A complete request line, newline stripped.
+    Line(String),
+    /// The line was refused before parsing; the response is ready to emit.
+    Rejected(Value),
+    /// Clean end of input.
+    Eof,
+}
+
+/// Read one protocol frame, refusing a line longer than `cap` bytes.
+///
+/// The cap is enforced with `read_until` on a `Take`, so an over-long line is
+/// never fully allocated — measuring the `String` yielded by `lines()` would
+/// already have allocated exactly the bytes the cap exists to prevent. The
+/// remainder of a refused line is discarded through the reader's own buffer by
+/// [`discard_to_newline`], so the next frame starts at a real request.
+fn read_frame<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<Frame> {
+    buf.clear();
+    // Reborrow so the `Take` budget applies to this frame only; `reader`
+    // itself stays usable for `discard_to_newline` below.
+    let mut limited = Read::take(&mut *reader, cap as u64 + 1);
+    let read = limited.read_until(b'\n', buf)?;
+    if read == 0 {
+        return Ok(Frame::Eof);
+    }
+
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    } else if read > cap {
+        // Only reachable when the `Take` budget ran out before a newline.
+        let prefix_end = buf.len().min(ID_SCAN_PREFIX_BYTES);
+        let id = String::from_utf8_lossy(&buf[..prefix_end]);
+        let id = shallow_scan_id(&id);
+        discard_to_newline(reader)?;
+        return Ok(Frame::Rejected(json!({
+            "id": id,
+            "type": "error",
+            "code": "line_too_long",
+            "message": format!("request line exceeds {cap} bytes"),
+        })));
+    }
+
+    match std::str::from_utf8(buf) {
+        Ok(line) => Ok(Frame::Line(line.to_string())),
+        Err(e) => Ok(Frame::Rejected(json!({
+            "id": Value::Null,
+            "type": "error",
+            "code": "parse_error",
+            "message": format!("request line is not valid UTF-8: {e}"),
+        }))),
+    }
+}
+
+/// Consume bytes up to and including the next newline without materialising
+/// them, so a refused over-long line cannot be re-read as a request.
+fn discard_to_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let (found, used) = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(idx) => (true, idx + 1),
+                None => (false, chunk.len()),
+            }
+        };
+        reader.consume(used);
+        if found {
+            return Ok(());
+        }
+    }
+}
+
+/// Index just past the closing quote of the JSON string token starting at
+/// `start`, or `None` if the token is unterminated.
+fn scan_string_token(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Best-effort recovery of the request `id` from a line that failed to parse.
+///
+/// Scans the top level only: a nested `"id"` is ignored, and a value that is
+/// neither a JSON string nor a JSON number yields `null`. The parse-error
+/// envelope carries `null` only when no id is recoverable.
+fn shallow_scan_id(line: &str) -> Value {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' => {
+                let Some(end) = scan_string_token(bytes, i) else {
+                    return Value::Null;
+                };
+                let token = &line[i..end];
+                i = end;
+                if depth != 1 || token != "\"id\"" {
+                    continue;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() || bytes[i] != b':' {
+                    continue; // `"id"` was a value, not a key.
+                }
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return Value::Null;
+                }
+                let value_end = if bytes[i] == b'"' {
+                    match scan_string_token(bytes, i) {
+                        Some(end) => end,
+                        None => return Value::Null,
+                    }
+                } else {
+                    let mut j = i;
+                    while j < bytes.len()
+                        && matches!(bytes[j], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                    {
+                        j += 1;
+                    }
+                    j
+                };
+                return match serde_json::from_str::<Value>(&line[i..value_end]) {
+                    Ok(v @ (Value::String(_) | Value::Number(_))) => v,
+                    _ => Value::Null,
+                };
+            }
+            _ => i += 1,
+        }
+    }
+    Value::Null
+}
+
+/// The `parse_error` envelope used for every boundary rejection.
+fn parse_error(id: &Value, message: impl std::fmt::Display) -> Value {
+    json!({
+        "id": id,
+        "type": "error",
+        "code": "parse_error",
+        "message": message.to_string(),
+    })
 }
 
 fn handle_request(
@@ -160,20 +621,43 @@ fn handle_request(
     recency_lambda_default: f32,
     mmr_lambda_default: f32,
 ) -> Value {
-    let req: Value = match serde_json::from_str(line) {
+    let raw: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
-            return json!({"type":"error","code":"parse_error","message":e.to_string()});
+            // B1: the envelope carries a best-effort id recovered from the raw
+            // line, so a client can still correlate a rejected request.
+            let prefix = &line[..line.len().min(ID_SCAN_PREFIX_BYTES)];
+            return json!({
+                "id": shallow_scan_id(prefix),
+                "type": "error",
+                "code": "parse_error",
+                "message": e.to_string()
+            });
         }
     };
 
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let id = raw.get("id").cloned().unwrap_or(Value::Null);
+    let method = raw
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    match method {
+    // Deserialize the flat request object into this method's typed struct,
+    // turning every unknown key, missing required field and wrong-typed field
+    // into a `parse_error` before any handler runs.
+    macro_rules! typed {
+        ($t:ty) => {
+            match serde_json::from_value::<$t>(raw) {
+                Ok(req) => req,
+                Err(e) => return parse_error(&id, e),
+            }
+        };
+    }
+
+    match method.as_str() {
         "search" => handle_search(
-            &id,
-            &req,
+            &typed!(SearchRequest),
             paths,
             emb,
             inline_verify_k_default,
@@ -181,32 +665,33 @@ fn handle_request(
             recency_lambda_default,
             mmr_lambda_default,
         ),
-        "add" => handle_add(&id, &req, paths, emb),
-        "import" => handle_import(&id, &req, paths, emb),
-        "expire" => handle_expire(&id, &req, paths, emb),
-        "stale_check" => handle_stale_check(&id, &req, paths),
+        "add" => handle_add(&typed!(AddRequest), paths, emb),
+        "import" => handle_import(&typed!(ImportRequest), paths, emb),
+        "expire" => handle_expire(&typed!(ExpireRequest), paths, emb),
+        "stale_check" => handle_stale_check(&typed!(StaleCheckRequest), paths),
         "compact" => {
+            let req = typed!(CompactRequest);
             let vacuum_cfg = crate::application::APP
                 .config()
                 .vacuum
                 .clone()
                 .unwrap_or_default();
-            handle_compact(&id, paths, &vacuum_cfg)
+            handle_compact(&req, paths, &vacuum_cfg)
         }
-        "reembed" => handle_reembed(&id, &req, paths, emb),
-        "run" => handle_run(&id, &req, paths, emb),
-        "test_add" => handle_test_add(&id, &req, paths, emb),
-        "tests" => handle_tests(&id, &req, paths),
-        "rebuild" => handle_rebuild(&id, paths, emb),
-        "audit_run" => handle_audit_run(&id, &req, paths),
-        "audit_record" => handle_audit_record(&id, &req, paths, emb),
-        "audit_report" => handle_audit_report(&id, paths),
-        "provenance" => handle_provenance(&id, &req, paths),
-        "kb_get" => handle_kb_get(&id, &req, paths),
-        "kb_peers_add" => handle_kb_peers_add(&id, &req, paths),
-        "kb_peers_list" => handle_kb_peers_list(&id, &req, paths),
-        "kb_peers_remove" => handle_kb_peers_remove(&id, &req, paths),
-        "cite" => handle_cite(&id, &req, paths),
+        "reembed" => handle_reembed(&typed!(ReembedRequest), paths, emb),
+        "run" => handle_run(&typed!(RunRequest), paths, emb),
+        "test_add" => handle_test_add(&typed!(TestAddRequest), paths, emb),
+        "tests" => handle_tests(&typed!(TestsRequest), paths),
+        "rebuild" => handle_rebuild(&typed!(RebuildRequest), paths, emb),
+        "audit_run" => handle_audit_run(&typed!(AuditRunRequest), paths),
+        "audit_record" => handle_audit_record(&typed!(AuditRecordRequest), paths, emb),
+        "audit_report" => handle_audit_report(&typed!(AuditReportRequest), paths),
+        "provenance" => handle_provenance(&typed!(ProvenanceRequest), paths),
+        "kb_get" => handle_kb_get(&typed!(KbGetRequest), paths),
+        "kb_peers_add" => handle_kb_peers_add(&typed!(PeersAddRequest), paths),
+        "kb_peers_list" => handle_kb_peers_list(&typed!(PeersListRequest), paths),
+        "kb_peers_remove" => handle_kb_peers_remove(&typed!(PeersRemoveRequest), paths),
+        "cite" => handle_cite(&typed!(CiteRequest), paths),
         _ => json!({
             "id": id,
             "type": "error",
@@ -217,8 +702,7 @@ fn handle_request(
 }
 
 fn handle_search(
-    id: &Value,
-    req: &Value,
+    req: &SearchRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
     inline_verify_k_default: usize,
@@ -226,18 +710,45 @@ fn handle_search(
     recency_lambda_default: f32,
     mmr_lambda_default: f32,
 ) -> Value {
+    let id = &req.id;
+
+    // Bounded numerics are validated before anything else: an out-of-range or
+    // wrong-typed value is a rejection naming the field and the accepted range.
+    let limit = match NumField::bounded(&req.limit, "limit", 1, db::MAX_LIMIT as u64) {
+        Ok(v) => v.unwrap_or(10) as usize,
+        Err(e) => return parse_error(id, e),
+    };
+    let inline_verify_k = match NumField::bounded(
+        &req.inline_verify_k,
+        "inline_verify_k",
+        0,
+        db::MAX_INLINE_VERIFY_K as u64,
+    ) {
+        Ok(v) => v.map(|k| k as usize).unwrap_or(inline_verify_k_default),
+        Err(e) => return parse_error(id, e),
+    };
+    if let Err(e) = NumField::bounded(&req.max_hops, "max_hops", 1, MAX_SEARCH_HOPS) {
+        return parse_error(id, e);
+    }
+
     // Frontier expand mode (Memora pickup .7): expand_ids present → return
     // facet-overlap neighbors of the given entry ids; no query needed. The
     // calling agent drives the EXPAND / RE_QUERY / STOP loop.
-    if let Some(expand_ids) = req.get("expand_ids").and_then(|v| v.as_array()) {
-        let ids: Vec<String> = expand_ids
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
+    if let Some(ids) = req.expand_ids.as_ref() {
         if ids.is_empty() {
             return json!({"id":id,"type":"error","code":"parse_error","message":"expand_ids must be a non-empty array of entry ids"});
         }
-        let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+        // Rejected, never truncated: a caller must not believe it expanded
+        // seeds the server silently dropped.
+        if ids.len() > MAX_EXPAND_IDS {
+            return parse_error(
+                id,
+                format!(
+                    "expand_ids accepts at most {MAX_EXPAND_IDS} entry ids (got {})",
+                    ids.len()
+                ),
+            );
+        }
         // Pure read: open_ro, never the write lock (ADR-7). An uninitialized
         // repository yields an empty entry list, matching the first-run
         // behaviour of the pre-split read path.
@@ -251,7 +762,7 @@ fn handle_search(
                 return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
             }
         };
-        return match db::expand_entries(&conn, &ids, limit) {
+        return match db::expand_entries(&conn, ids, limit) {
             Ok(results) => {
                 record_query_results(paths, &results);
                 let entries = entries_to_json(results);
@@ -261,43 +772,26 @@ fn handle_search(
         };
     }
 
-    let query = match req.get("query").and_then(|q| q.as_str()) {
-        Some(q) => q.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"})
-        }
+    let Some(query) = req.query.as_deref() else {
+        return json!({"id":id,"type":"error","code":"parse_error","message":"missing query"});
     };
-    let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
-    let mode = req.get("mode").and_then(|m| m.as_str()).unwrap_or("hybrid");
-    let path_prefix = req
-        .get("path_prefix")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let tag_filter = req
-        .get("tag")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    // Peer federation params — parsed and accepted but federation is local-only in MCP for now.
-    let _peers: bool = req.get("peers").and_then(|v| v.as_bool()).unwrap_or(false);
-    let _reachable_from: Option<String> = req
-        .get("reachable_from")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let _max_hops: u8 = req.get("max_hops").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-    let _slug: Option<String> = req
-        .get("slug")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // B1: cap the query before it reaches the embedder or the FTS tokenizer.
+    if query.len() > MAX_QUERY_BYTES {
+        return parse_error(
+            id,
+            format!(
+                "query must be at most {MAX_QUERY_BYTES} bytes (got {})",
+                query.len()
+            ),
+        );
+    }
+    let mode = req.mode.as_deref().unwrap_or("hybrid");
+    let path_prefix = req.path_prefix.clone();
+    let tag_filter = req.tag.clone();
 
-    // br-3gp: request override falls back to KbConfig::inline_verify_k (default
-    // 10) rather than `limit`, so the configured cap is reachable.
-    let inline_verify_k = req
-        .get("inline_verify_k")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(inline_verify_k_default as u64) as usize;
-
-    // br-h9g (security I2): clamp untrusted request inputs to prevent
-    // thread::scope amplification (limit * inline_verify_k * evidence_rows).
+    // br-h9g (security I2): the boundary already rejected limit/inline_verify_k
+    // outside their ranges; the clamp stays as defense in depth against a
+    // direct handler call bypassing handle_request.
     let limit = limit.min(db::MAX_LIMIT);
     let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
 
@@ -327,7 +821,7 @@ fn handle_search(
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    match db::search_entries(&conn, emb, &query, &opts) {
+    match db::search_entries(&conn, emb, query, &opts) {
         Ok(results) => {
             let meta = search_meta(paths, &results);
             record_query_results(paths, &results);
@@ -525,13 +1019,9 @@ fn full_evidence_to_json(evidence: Vec<crate::models::Evidence>) -> Vec<Value> {
         .collect()
 }
 
-fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
-        Some(entry_id) => entry_id,
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"});
-        }
-    };
+fn handle_kb_get(req: &KbGetRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let entry_id = req.entry_id.as_str();
 
     // Pure read (ADR-7). An uninitialized repository produces exactly the
     // response a fresh, empty database produced before the split: the entry is
@@ -580,31 +1070,17 @@ fn handle_kb_get(id: &Value, req: &Value, paths: &config::Paths) -> Value {
     }
 }
 
-fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let path = match req.get("path").and_then(|v| v.as_str()) {
-        Some(path) => path,
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
-        }
-    };
+fn handle_cite(req: &CiteRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let path = req.path.as_str();
 
-    let start = match req.get("start") {
-        Some(v) => match v.as_u64() {
-            Some(n) => Some(n as usize),
-            None => {
-                return json!({"id":id,"type":"error","code":"parse_error","message":"start must be a non-negative integer"});
-            }
-        },
-        None => None,
+    let start = match NumField::non_negative(&req.start, "start") {
+        Ok(v) => v.map(|n| n as usize),
+        Err(e) => return parse_error(id, e),
     };
-    let end = match req.get("end") {
-        Some(v) => match v.as_u64() {
-            Some(n) => Some(n as usize),
-            None => {
-                return json!({"id":id,"type":"error","code":"parse_error","message":"end must be a non-negative integer"});
-            }
-        },
-        None => None,
+    let end = match NumField::non_negative(&req.end, "end") {
+        Ok(v) => v.map(|n| n as usize),
+        Err(e) => return parse_error(id, e),
     };
     let range = match (start, end) {
         (None, None) => None,
@@ -655,62 +1131,23 @@ fn handle_cite(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 ///   "derived_from": null
 /// }
 /// ```
-fn handle_add(
-    id: &Value,
-    req: &Value,
-    paths: &config::Paths,
-    emb: &dyn embedder::Embedder,
-) -> Value {
-    let path = match req.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
-        }
-    };
-    let summary = req
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let content = req
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let tags = req.get("tags").cloned().unwrap_or(Value::Array(vec![]));
-    let permanent = req
-        .get("permanent")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let replace_path = req
-        .get("replace_path")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let kind = req
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("belief")
-        .to_string();
-    let evidence_rows: Vec<Value> = req
-        .get("evidence")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let session_id = req
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let id = &req.id;
+    let path = req.path.clone();
+    // `summary` and `content` are non-Option on AddRequest: a missing or
+    // wrong-typed value was already rejected naming the field, so neither can
+    // silently become an empty string here.
+    let summary = req.summary.clone();
+    let content = req.content.clone();
+    let tags = req.tags.clone().unwrap_or(Value::Array(vec![]));
+    let permanent = req.permanent.unwrap_or(false);
+    let replace_path = req.replace_path.unwrap_or(false);
+    let kind = req.kind.clone().unwrap_or_else(|| "belief".to_string());
+    let evidence_rows: Vec<Value> = req.evidence.clone().unwrap_or_default();
+    let session_id = req.session_id.clone();
     // Cue anchors (Memora pickup .4): "[Main Entity] + [Key Aspect]" strings,
     // e.g. "recency bias decay". Optional; validated/capped in kb_core::add.
-    let cues: Vec<String> = req
-        .get("cues")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let cues: Vec<String> = req.cues.clone().unwrap_or_default();
 
     let entry_id = uuid::Uuid::new_v4().to_string();
 
@@ -762,18 +1199,13 @@ fn handle_add(
 }
 
 fn handle_import(
-    id: &Value,
-    req: &Value,
+    req: &ImportRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
 ) -> Value {
-    let file_path = match req.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing path"})
-        }
-    };
-    let upsert = req.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
+    let id = &req.id;
+    let file_path = req.path.clone();
+    let upsert = req.upsert.unwrap_or(false);
 
     let content = match std::fs::read_to_string(&file_path) {
         Ok(c) => c,
@@ -891,8 +1323,13 @@ fn handle_import(
     json!({"id": id, "type": "ok", "imported": imported, "skipped": skipped})
 }
 
-fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+fn handle_rebuild(
+    req: &RebuildRequest,
+    paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+) -> Value {
     use crate::commands::rebuild::Rebuild;
+    let id = &req.id;
     match (Rebuild).execute_with(paths, emb) {
         Ok(()) => {
             let read = events::read_events(&paths.events).ok();
@@ -912,32 +1349,17 @@ fn handle_rebuild(id: &Value, paths: &config::Paths, emb: &dyn embedder::Embedde
 // user-authored KB content; they carry structured test outcome data.  Routing
 // through kb_core::add is not applicable here because the event targets a
 // different table and schema.  No credential redaction is needed.
-fn handle_run(
-    id: &Value,
-    req: &Value,
-    paths: &config::Paths,
-    emb: &dyn embedder::Embedder,
-) -> Value {
-    let test_id = match req.get("test_id").and_then(|v| v.as_str()) {
-        Some(t) => t.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing test_id"})
-        }
-    };
-    let result = match req.get("result").and_then(|v| v.as_str()) {
-        Some(r) if r == "pass" || r == "fail" => r.to_string(),
+fn handle_run(req: &RunRequest, paths: &config::Paths, emb: &dyn embedder::Embedder) -> Value {
+    let id = &req.id;
+    let test_id = req.test_id.clone();
+    let result = match req.result.as_str() {
+        r @ ("pass" | "fail") => r.to_string(),
         _ => {
             return json!({"id":id,"type":"error","code":"parse_error","message":"result must be 'pass' or 'fail'"})
         }
     };
-    let adapter = req
-        .get("adapter")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let detail = req
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let adapter = req.adapter.clone();
+    let detail = req.detail.clone();
 
     let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -974,38 +1396,19 @@ fn handle_run(
 // not applicable here because the event targets a different table and schema.
 // No credential redaction is needed.
 fn handle_test_add(
-    id: &Value,
-    req: &Value,
+    req: &TestAddRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
 ) -> Value {
-    let app = match req.get("app").and_then(|v| v.as_str()) {
-        Some(a) => a.to_string(),
-        None => return json!({"id":id,"type":"error","code":"parse_error","message":"missing app"}),
-    };
-    let name = match req.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing name"})
-        }
-    };
-    let protocol = match req.get("protocol").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing protocol"})
-        }
-    };
-    let config_str = match req.get("config").and_then(|v| v.as_str()) {
-        Some(c) => c.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing config"})
-        }
-    };
+    let id = &req.id;
+    let app = req.app.clone();
+    let name = req.name.clone();
+    let protocol = req.protocol.clone();
+    let config_str = req.config.clone();
 
     let test_id = req
-        .get("test_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .test_id
+        .clone()
         .unwrap_or_else(|| format!("{}-{}", app, name.replace(' ', "-")));
 
     let lock = match acquire_lock(&paths.lock) {
@@ -1035,7 +1438,8 @@ fn handle_test_add(
     json!({"id": id, "type": "ok", "test_id": test_id})
 }
 
-fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+fn handle_tests(req: &TestsRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
     let lock = match acquire_lock(&paths.lock) {
         Ok(lock) => lock,
         Err(e) => {
@@ -1046,10 +1450,7 @@ fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    let app_filter = req
-        .get("app")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let app_filter = req.app.clone();
 
     let results: Vec<Value> = if let Some(ref app) = app_filter {
         let mut stmt = conn.prepare(
@@ -1083,19 +1484,16 @@ fn handle_tests(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_reembed(
-    id: &Value,
-    req: &Value,
+    req: &ReembedRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
 ) -> Value {
-    let dry_run = req
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let max_chars = req
-        .get("max_chars")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1800) as usize;
+    let id = &req.id;
+    let dry_run = req.dry_run.unwrap_or(false);
+    let max_chars = match NumField::bounded(&req.max_chars, "max_chars", 1, MAX_REEMBED_MAX_CHARS) {
+        Ok(v) => v.unwrap_or(1800) as usize,
+        Err(e) => return parse_error(id, e),
+    };
 
     if emb.is_noop() {
         return json!({"id":id,"type":"ok","embedded":0,"skipped":0,"missing":0,
@@ -1183,7 +1581,12 @@ fn handle_reembed(
     json!({"id":id,"type":"ok","embedded":done,"failed":failed,"skipped":skipped})
 }
 
-fn handle_compact(id: &Value, paths: &config::Paths, vacuum_cfg: &config::VacuumConfig) -> Value {
+fn handle_compact(
+    req: &CompactRequest,
+    paths: &config::Paths,
+    vacuum_cfg: &config::VacuumConfig,
+) -> Value {
+    let id = &req.id;
     let compact_cmd = crate::commands::compact::Compact;
     match compact_cmd.execute_with_paths_and_vacuum(paths, vacuum_cfg) {
         Ok((before, after)) => json!({"id": id, "type": "ok", "before": before, "after": after}),
@@ -1191,30 +1594,13 @@ fn handle_compact(id: &Value, paths: &config::Paths, vacuum_cfg: &config::Vacuum
     }
 }
 
-fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
+fn handle_stale_check(req: &StaleCheckRequest, paths: &config::Paths) -> Value {
     use crate::commands::stale_check::run_stale_check;
 
-    let files: Vec<String> = req
-        .get("files")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let explicit_commits: Vec<String> = req
-        .get("commits")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let blame = req.get("blame").and_then(|v| v.as_bool()).unwrap_or(false);
+    let id = &req.id;
+    let files: Vec<String> = req.files.clone().unwrap_or_default();
+    let explicit_commits: Vec<String> = req.commits.clone().unwrap_or_default();
+    let blame = req.blame.unwrap_or(false);
 
     if files.is_empty() && explicit_commits.is_empty() {
         return json!({"id":id,"type":"error","code":"parse_error","message":"provide files or commits"});
@@ -1294,22 +1680,14 @@ fn handle_stale_check(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_expire(
-    id: &Value,
-    req: &Value,
+    req: &ExpireRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
 ) -> Value {
-    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
-        Some(i) => i.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"})
-        }
-    };
-    let reason = req
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let force = req.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let id = &req.id;
+    let entry_id = req.entry_id.clone();
+    let reason = req.reason.clone();
+    let force = req.force.unwrap_or(false);
 
     let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -1466,13 +1844,13 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
         .unwrap_or_default()
 }
 
-fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let sample_size = req.get("sample_size").and_then(|v| v.as_u64()).unwrap_or(5);
-    let sample_size = sample_size.clamp(1, 50) as usize;
-    let mode = req
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("uniform");
+fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let sample_size = match NumField::non_negative(&req.sample_size, "sample_size") {
+        Ok(v) => v.unwrap_or(5).clamp(1, 50) as usize,
+        Err(e) => return parse_error(id, e),
+    };
+    let mode = req.mode.as_deref().unwrap_or("uniform");
     if mode != "uniform" && mode != "traffic" {
         return json!({"id":id,"type":"error","code":"parse_error","message":"mode must be 'uniform' or 'traffic'"});
     }
@@ -1536,28 +1914,17 @@ fn handle_audit_run(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 }
 
 fn handle_audit_record(
-    id: &Value,
-    req: &Value,
+    req: &AuditRecordRequest,
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
 ) -> Value {
-    let run_id = match req.get("run_id").and_then(|v| v.as_str()) {
-        Some(r) => {
-            if r.is_empty() || r.len() > 128 || r.bytes().any(|b| b < 0x20) {
-                return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
-            }
-            r.to_string()
-        }
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing run_id"})
-        }
-    };
+    let id = &req.id;
+    let run_id = req.run_id.clone();
+    if run_id.is_empty() || run_id.len() > 128 || run_id.bytes().any(|b| b < 0x20) {
+        return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
+    }
 
-    let verdicts: Vec<Value> = req
-        .get("verdicts")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let verdicts: Vec<Value> = req.verdicts.clone().unwrap_or_default();
 
     if verdicts.is_empty() {
         return json!({"id": id, "type": "ok", "recorded": 0, "expired": 0});
@@ -1666,8 +2033,10 @@ fn handle_audit_record(
         // when it exists and, called standalone as it is today, opens SQLite's
         // implicit top-level transaction itself — either way the three
         // statements commit or roll back as one unit.
-        let atomic: Result<(u32, u32)> =
-            db::with_savepoint(&conn, "audit_record", || -> Result<(u32, u32)> {
+        let atomic: Result<(u32, u32)> = db::with_savepoint(
+            &conn,
+            "audit_record",
+            || -> Result<(u32, u32)> {
                 let mut rec = 0u32;
                 let mut exp = 0u32;
 
@@ -1717,7 +2086,8 @@ fn handle_audit_record(
                 }
 
                 Ok((rec, exp))
-            });
+            },
+        );
 
         match atomic {
             Ok((rec, exp)) => {
@@ -1733,7 +2103,8 @@ fn handle_audit_record(
     json!({"id": id, "type": "ok", "recorded": recorded, "expired": expired})
 }
 
-fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
+fn handle_audit_report(req: &AuditReportRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
     let conn = match db::open_db(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -1807,19 +2178,14 @@ fn handle_audit_report(id: &Value, paths: &config::Paths) -> Value {
     report
 }
 
-fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let entry_id = match req.get("entry_id").and_then(|v| v.as_str()) {
-        Some(e) => e.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing entry_id"})
-        }
-    };
+fn handle_provenance(req: &ProvenanceRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let entry_id = req.entry_id.clone();
 
-    let max_depth = req
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(64)
-        .min(1024) as usize;
+    let max_depth = match NumField::non_negative(&req.max_depth, "max_depth") {
+        Ok(v) => v.unwrap_or(64).min(1024) as usize,
+        Err(e) => return parse_error(id, e),
+    };
 
     // Pure read (ADR-7). An uninitialized repository yields the empty graph a
     // fresh database produced before the split.
@@ -1923,30 +2289,18 @@ fn handle_provenance(id: &Value, req: &Value, paths: &config::Paths) -> Value {
 // Peers MCP handlers
 // ---------------------------------------------------------------------------
 
-fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let target_repo = match req.get("target_repo").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing target_repo"})
-        }
-    };
-    let graph_type = match req.get("graph_type").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing graph_type"})
-        }
-    };
+fn handle_kb_peers_add(req: &PeersAddRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let target_repo = req.target_repo.clone();
+    let graph_type = req.graph_type.clone();
     if graph_type != "epic" && graph_type != "dep" {
         return json!({"id":id,"type":"error","code":"validation_error","message":"graph_type must be 'epic' or 'dep'"});
     }
-    let epic_slug: Option<String> = req
-        .get("epic_slug")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let ttl_days: Option<u32> = req
-        .get("ttl_days")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
+    let epic_slug: Option<String> = req.epic_slug.clone();
+    let ttl_days: Option<u32> = match NumField::non_negative(&req.ttl_days, "ttl_days") {
+        Ok(v) => v.map(|n| n as u32),
+        Err(e) => return parse_error(id, e),
+    };
 
     let lock = match acquire_lock(&paths.lock) {
         Ok(lock) => lock,
@@ -2025,11 +2379,9 @@ fn handle_kb_peers_add(id: &Value, req: &Value, paths: &config::Paths) -> Value 
     json!({"id": id, "type": "ok", "peer_id": peer_id})
 }
 
-fn handle_kb_peers_list(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let graph_type_filter: Option<String> = req
-        .get("graph_type")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+fn handle_kb_peers_list(req: &PeersListRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let graph_type_filter: Option<String> = req.graph_type.clone();
 
     let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
@@ -2077,13 +2429,9 @@ fn handle_kb_peers_list(id: &Value, req: &Value, paths: &config::Paths) -> Value
     json!({"id": id, "type": "ok", "result": rows})
 }
 
-fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Value {
-    let peer_id = match req.get("peer_id").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-            return json!({"id":id,"type":"error","code":"parse_error","message":"missing peer_id"})
-        }
-    };
+fn handle_kb_peers_remove(req: &PeersRemoveRequest, paths: &config::Paths) -> Value {
+    let id = &req.id;
+    let peer_id = req.peer_id.clone();
 
     let lock = match acquire_lock(&paths.lock) {
         Ok(lock) => lock,
@@ -2112,6 +2460,22 @@ fn handle_kb_peers_remove(id: &Value, req: &Value, paths: &config::Paths) -> Val
     }
 
     json!({"id": id, "type": "ok"})
+}
+
+/// Build a handler's typed request from a `json!` fixture, the way the
+/// port loop does. `method` is filled in when the fixture omits it, and
+/// `id` is forced to the value the call site passes so responses keep
+/// correlating the way they did before the request structs landed.
+#[cfg(test)]
+fn tr<T: serde::de::DeserializeOwned>(method: &str, id: &Value, req: &Value) -> T {
+    let mut req = req.clone();
+    let obj = req
+        .as_object_mut()
+        .expect("request fixture must be a JSON object");
+    obj.entry("method").or_insert_with(|| json!(method));
+    obj.insert("id".to_string(), id.clone());
+    serde_json::from_value(req.clone())
+        .unwrap_or_else(|e| panic!("request fixture must deserialize: {e} in {req}"))
 }
 
 #[cfg(test)]
@@ -2268,7 +2632,10 @@ mod tests {
         db::apply_event(&conn, &emb, &evidence).unwrap();
         drop(conn);
 
-        let response = handle_kb_get(&json!(1), &json!({"entry_id": "hostile-entry"}), &paths);
+        let response = handle_kb_get(
+            &tr::<KbGetRequest>("kb_get", &json!(1), &json!({"entry_id": "hostile-entry"})),
+            &paths,
+        );
         let wire = response["entry"]["evidence"][0]["citation_excerpt"]
             .as_str()
             .unwrap();
@@ -2283,23 +2650,29 @@ mod tests {
         let id = json!("meta-search");
 
         handle_add(
-            &id,
-            &json!({
-                "method":"add",
-                "id":"meta-add",
-                "path":"src/meta.rs",
-                "kind":"convention",
-                "summary":"meta envelope entry",
-                "content":"body",
-                "tags":[]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "method":"add",
+                    "id":"meta-add",
+                    "path":"src/meta.rs",
+                    "kind":"convention",
+                    "summary":"meta envelope entry",
+                    "content":"body",
+                    "tags":[]
+                }),
+            ),
             &paths,
             &emb,
         );
 
         let resp = handle_search(
-            &id,
-            &json!({"method":"search","id":"meta-search","query":"meta envelope","mode":"fts"}),
+            &tr::<SearchRequest>(
+                "search",
+                &id,
+                &json!({"method":"search","id":"meta-search","query":"meta envelope","mode":"fts"}),
+            ),
             &paths,
             &emb,
             10,
@@ -2341,7 +2714,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let response = handle_kb_peers_list(&json!("req-1"), &json!({}), &paths);
+        let response = handle_kb_peers_list(
+            &tr::<PeersListRequest>("kb_peers_list", &json!("req-1"), &json!({})),
+            &paths,
+        );
         let rows = response["result"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "MCP kb_peers_list must hide expired peers");
         assert_eq!(rows[0]["target_repo"], "repo-live");
@@ -2381,8 +2757,11 @@ mod tests {
         drop(conn);
 
         let resp = handle_provenance(
-            &json!("prov-1"),
-            &json!({"entry_id": "prov-child", "max_depth": 4}),
+            &tr::<ProvenanceRequest>(
+                "provenance",
+                &json!("prov-1"),
+                &json!({"entry_id": "prov-child", "max_depth": 4}),
+            ),
             &paths,
         );
         assert_eq!(resp["type"], "error");
@@ -2480,7 +2859,7 @@ mod tests {
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
         }
-        let resp = handle_add(&id_val, &req, paths, emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id_val, &req), paths, emb);
         let entry_id = resp["entry_id"].as_str().unwrap().to_string();
         seed_audit_candidate(paths, run_id, &entry_id);
         let resolved_sid = session_id.unwrap_or("__GLOBAL__").to_string();
@@ -2523,7 +2902,7 @@ mod tests {
             }
 
             let req = json!({"run_id": run_id, "verdicts": verdict_objs});
-            let resp = handle_audit_record(&id, &req, &paths, &emb);
+            let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok", "handle_audit_record must succeed");
 
             // Verify: for every (kind, session_id) bucket present in source_weights,
@@ -2596,7 +2975,7 @@ mod tests {
             for (eid, v) in named_eids.iter().zip(verdict_named.iter().cycle()) {
                 verdict_objs.push(json!({"entry_id": eid, "verdict": v}));
             }
-            let resp = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": verdict_objs}), &paths, &emb);
+            let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": verdict_objs})), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok");
 
             let conn = db::open_db(&paths.db).unwrap();
@@ -2699,14 +3078,14 @@ mod tests {
             let fwd_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
                 json!({"entry_id": eid, "verdict": v})
             }).collect();
-            let resp_a = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": fwd_verdicts}), &paths_a, &emb_a);
+            let resp_a = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": fwd_verdicts})), &paths_a, &emb_a);
             proptest::prop_assert_eq!(&resp_a["type"], "ok", "forward apply must succeed");
 
             // DB-B: apply in reversed order.
             let rev_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
                 json!({"entry_id": eid, "verdict": v})
             }).collect::<Vec<_>>().into_iter().rev().collect();
-            let resp_b = handle_audit_record(&id, &json!({"run_id": run_id, "verdicts": rev_verdicts}), &paths_b, &emb_b);
+            let resp_b = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": rev_verdicts})), &paths_b, &emb_b);
             proptest::prop_assert_eq!(&resp_b["type"], "ok", "reversed apply must succeed");
 
             // Compare source_weights buckets across both DBs.
@@ -2748,7 +3127,7 @@ mod tests {
 
         // tags is not an array
         let req = json!({"method":"add","id":"bad-tags-1","path":"test/bt","summary":"s","content":"c","tags":"not-an-array"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "validation_error");
         assert!(resp["message"]
@@ -2758,7 +3137,7 @@ mod tests {
 
         // tags contains a non-string element
         let req2 = json!({"method":"add","id":"bad-tags-2","path":"test/bt2","summary":"s","content":"c","tags":["good", 42]});
-        let resp2 = handle_add(&id, &req2, &paths, &emb);
+        let resp2 = handle_add(&tr::<AddRequest>("add", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "error");
         assert_eq!(resp2["code"], "validation_error");
         assert!(resp2["message"]
@@ -2768,7 +3147,7 @@ mod tests {
 
         // tags contains an empty string
         let req3 = json!({"method":"add","id":"bad-tags-3","path":"test/bt3","summary":"s","content":"c","tags":["good",""]});
-        let resp3 = handle_add(&id, &req3, &paths, &emb);
+        let resp3 = handle_add(&tr::<AddRequest>("add", &id, &req3), &paths, &emb);
         assert_eq!(resp3["type"], "error");
         assert_eq!(resp3["code"], "validation_error");
         assert!(resp3["message"]
@@ -2782,7 +3161,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("t1");
         let req = json!({"method":"add","id":"t1","path":"test/a","summary":"sum","content":"body","tags":["t"],"kind":"convention"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["entry_id"].as_str().is_some());
     }
@@ -2792,11 +3171,14 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("get-stale");
         let added = handle_add(
-            &id,
-            &json!({
-                "path":"test/get-stale","summary":"stale","content":"body",
-                "tags":[],"kind":"convention"
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path":"test/get-stale","summary":"stale","content":"body",
+                    "tags":[],"kind":"convention"
+                }),
+            ),
             &paths,
             &emb,
         );
@@ -2810,7 +3192,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let resp = handle_kb_get(&id, &json!({"entry_id":entry_id}), &paths);
+        let resp = handle_kb_get(
+            &tr::<KbGetRequest>("kb_get", &id, &json!({"entry_id":entry_id})),
+            &paths,
+        );
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "entry_not_found");
     }
@@ -2820,7 +3205,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("t2");
         let req = json!({"method":"add","id":"t2","path":"test/b","summary":"s","content":"c","tags":[],"permanent":true,"kind":"convention"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
 
         let conn = db::open_db(&paths.db).unwrap();
@@ -2841,12 +3226,12 @@ mod tests {
         let id = json!("t3");
         // Add first entry
         let req1 = json!({"method":"add","id":"t3","path":"test/c","summary":"old","content":"old","tags":[],"kind":"convention"});
-        let r1 = handle_add(&id, &req1, &paths, &emb);
+        let r1 = handle_add(&tr::<AddRequest>("add", &id, &req1), &paths, &emb);
         let old_id = r1["entry_id"].as_str().unwrap().to_string();
 
         // Replace
         let req2 = json!({"method":"add","id":"t3b","path":"test/c","summary":"new","content":"new","tags":[],"replace_path":true,"kind":"convention"});
-        handle_add(&id, &req2, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req2), &paths, &emb);
 
         let conn = db::open_db(&paths.db).unwrap();
         let stale: i64 = conn
@@ -2865,14 +3250,22 @@ mod tests {
         let id = json!("s1");
         // Add entries
         let req_add = json!({"method":"add","id":"s1","path":"src/auth","summary":"auth mod","content":"jwt","tags":["auth"]});
-        handle_add(&id, &req_add, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         let req_add2 = json!({"method":"add","id":"s2","path":"docs/readme","summary":"docs","content":"readme","tags":["docs"]});
-        handle_add(&id, &req_add2, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req_add2), &paths, &emb);
 
         // Search with path_prefix filter
         let req =
             json!({"method":"search","id":"s3","query":"auth","path_prefix":"src/","mode":"fts"});
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(entries
@@ -2906,10 +3299,13 @@ mod tests {
                 "citation_excerpt":"fn kb_get"
             }]
         });
-        let added = handle_add(&id, &req_add, &paths, &emb);
+        let added = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         let entry_id = added["entry_id"].as_str().unwrap().to_string();
 
-        let resp = handle_kb_get(&id, &json!({"entry_id": entry_id}), &paths);
+        let resp = handle_kb_get(
+            &tr::<KbGetRequest>("kb_get", &id, &json!({"entry_id": entry_id})),
+            &paths,
+        );
         assert_eq!(resp["type"], "result");
         let entry = &resp["entry"];
         assert_eq!(entry["summary"], "kb_get entry");
@@ -2925,7 +3321,10 @@ mod tests {
         let (_dir, paths, _emb) = setup();
         let id = json!("kg-miss");
 
-        let resp = handle_kb_get(&id, &json!({"entry_id": "no-such-entry"}), &paths);
+        let resp = handle_kb_get(
+            &tr::<KbGetRequest>("kb_get", &id, &json!({"entry_id": "no-such-entry"})),
+            &paths,
+        );
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "entry_not_found");
         assert!(resp["message"].as_str().unwrap().contains("no-such-entry"));
@@ -2946,8 +3345,11 @@ mod tests {
         assert!(!paths.db.exists());
 
         let resp = handle_kb_get(
-            &json!("first-run"),
-            &json!({"entry_id": "anything"}),
+            &tr::<KbGetRequest>(
+                "kb_get",
+                &json!("first-run"),
+                &json!({"entry_id": "anything"}),
+            ),
             &paths,
         );
 
@@ -2965,8 +3367,11 @@ mod tests {
         assert!(!paths.db.exists());
 
         let resp = handle_provenance(
-            &json!("first-run"),
-            &json!({"entry_id": "anything"}),
+            &tr::<ProvenanceRequest>(
+                "provenance",
+                &json!("first-run"),
+                &json!({"entry_id": "anything"}),
+            ),
             &paths,
         );
 
@@ -2983,8 +3388,7 @@ mod tests {
         assert!(!paths.db.exists());
 
         let resp = handle_search(
-            &json!("first-run"),
-            &json!({"query": "anything"}),
+            &tr::<SearchRequest>("search", &json!("first-run"), &json!({"query": "anything"})),
             &paths,
             &emb,
             10,
@@ -3003,8 +3407,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
 
         let resp = handle_search(
-            &json!("first-run"),
-            &json!({"expand_ids": ["a"]}),
+            &tr::<SearchRequest>("search", &json!("first-run"), &json!({"expand_ids": ["a"]})),
             &paths,
             &emb,
             10,
@@ -3018,11 +3421,13 @@ mod tests {
         assert!(!paths.db.exists());
     }
 
-    /// br-h9g (security I2): a request with limit far above MAX_LIMIT must be
-    /// clamped so the response contains at most MAX_LIMIT entries, capping
-    /// thread::scope amplification.
+    /// br-h9g (security I2) as re-stated by B1/ADR-4: a `limit` above
+    /// `MAX_LIMIT` is now *rejected* at the boundary naming the field and the
+    /// accepted range, and a request at exactly `MAX_LIMIT` still returns at
+    /// most `MAX_LIMIT` entries. Both together cap thread::scope
+    /// amplification (limit * inline_verify_k * evidence_rows).
     #[test]
-    fn test_search_clamps_limit() {
+    fn test_search_rejects_limit_above_max_and_honours_the_maximum() {
         let (_dir, paths, emb) = setup();
         let id = json!("clamp-limit");
 
@@ -3037,31 +3442,54 @@ mod tests {
                 "content":format!("entry {i} body"),
                 "tags":[]
             });
-            handle_add(&id, &req_add, &paths, &emb);
+            handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         }
 
-        // Request a limit far above MAX_LIMIT.
-        let req = json!({
+        // A limit far above MAX_LIMIT is refused, naming the field and range.
+        let over = json!({
             "method":"search","id":"clamp-limit-search",
             "query":"clamp-limit-needle","mode":"fts","limit":10_000
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let resp = handle_request(&over.to_string(), &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp["type"], "error");
+        assert_eq!(resp["code"], "parse_error");
+        let message = resp["message"].as_str().unwrap();
+        assert!(message.contains("limit"), "message must name the field: {message}");
+        assert!(
+            message.contains(&format!("1..={}", db::MAX_LIMIT)),
+            "message must state the accepted range: {message}"
+        );
+
+        // A limit at exactly MAX_LIMIT is accepted and still bounds the result.
+        let at_max = json!({
+            "method":"search","id":"clamp-limit-search",
+            "query":"clamp-limit-needle","mode":"fts","limit": db::MAX_LIMIT
+        });
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &at_max),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert!(
             entries.len() <= db::MAX_LIMIT,
-            "limit must be clamped to MAX_LIMIT={}, got {}",
+            "limit must bound the result at MAX_LIMIT={}, got {}",
             db::MAX_LIMIT,
             entries.len()
         );
     }
 
-    /// br-h9g (security I2): a request with inline_verify_k far above
-    /// MAX_INLINE_VERIFY_K must be clamped so only the first
-    /// MAX_INLINE_VERIFY_K entries have evidence verified inline; the rest
-    /// return verified=null.
+    /// br-h9g (security I2) as re-stated by B1/ADR-4: an `inline_verify_k`
+    /// above `MAX_INLINE_VERIFY_K` is rejected naming the field and the range,
+    /// and a request at exactly the maximum verifies at most that many
+    /// entries inline; the rest return verified=null.
     #[test]
-    fn test_search_clamps_inline_verify_k() {
+    fn test_search_rejects_inline_verify_k_above_max_and_honours_the_maximum() {
         use sha2::{Digest, Sha256};
 
         let (dir, paths, emb) = setup();
@@ -3100,18 +3528,45 @@ mod tests {
                 "kind":"observation",
                 "evidence":[evidence_json]
             });
-            handle_add(&id, &req_add, &paths, &emb);
+            handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         }
 
-        // Request inline_verify_k far above MAX_INLINE_VERIFY_K and a limit
-        // that returns all of them.
-        let req = json!({
+        // inline_verify_k far above MAX_INLINE_VERIFY_K is refused.
+        let over = json!({
             "method":"search","id":"clamp-ivk-search",
             "query":"clamp-ivk-needle","mode":"fts",
             "limit": n,
             "inline_verify_k": 10_000
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let rejected = handle_request(&over.to_string(), &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(rejected["type"], "error");
+        assert_eq!(rejected["code"], "parse_error");
+        let message = rejected["message"].as_str().unwrap();
+        assert!(
+            message.contains("inline_verify_k"),
+            "message must name the field: {message}"
+        );
+        assert!(
+            message.contains(&format!("0..={}", db::MAX_INLINE_VERIFY_K)),
+            "message must state the accepted range: {message}"
+        );
+
+        // At exactly MAX_INLINE_VERIFY_K, the inline-verification budget holds.
+        let req = json!({
+            "method":"search","id":"clamp-ivk-search",
+            "query":"clamp-ivk-needle","mode":"fts",
+            "limit": n,
+            "inline_verify_k": db::MAX_INLINE_VERIFY_K
+        });
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert_eq!(entries.len(), n, "all entries must be returned");
@@ -3129,7 +3584,7 @@ mod tests {
             .count();
         assert!(
             verified_count <= db::MAX_INLINE_VERIFY_K,
-            "inline_verify_k must be clamped to MAX_INLINE_VERIFY_K={}, got {} verified",
+            "inline_verify_k must bound inline verification at MAX_INLINE_VERIFY_K={}, got {} verified",
             db::MAX_INLINE_VERIFY_K,
             verified_count
         );
@@ -3174,13 +3629,21 @@ mod tests {
             "kind":"observation",
             "evidence":[evidence_json]
         });
-        handle_add(&id, &req_add, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
 
         let req = json!({
             "method":"search","id":"env-search",
             "query":"envelope-needle","mode":"fts","limit":5
         });
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         assert_eq!(resp["type"], "result");
         let entries = resp["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -3206,11 +3669,11 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("e1");
         let req_add = json!({"method":"add","id":"e1","path":"test/x","summary":"s","content":"c","tags":[],"kind":"convention"});
-        let r = handle_add(&id, &req_add, &paths, &emb);
+        let r = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         let entry_id = r["entry_id"].as_str().unwrap();
 
         let req = json!({"method":"expire","id":"e2","entry_id":entry_id});
-        let resp = handle_expire(&id, &req, &paths, &emb);
+        let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["expired"].as_str().unwrap(), entry_id);
     }
@@ -3220,18 +3683,18 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("pg1");
         let req_add = json!({"method":"add","id":"pg1","path":"test/perm","summary":"s","content":"c","tags":[],"permanent":true,"kind":"convention"});
-        let r = handle_add(&id, &req_add, &paths, &emb);
+        let r = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         let entry_id = r["entry_id"].as_str().unwrap();
 
         // Without force → error
         let req = json!({"method":"expire","id":"pg2","entry_id":entry_id});
-        let resp = handle_expire(&id, &req, &paths, &emb);
+        let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "permanent_guard");
 
         // With force → ok
         let req2 = json!({"method":"expire","id":"pg3","entry_id":entry_id,"force":true});
-        let resp2 = handle_expire(&id, &req2, &paths, &emb);
+        let resp2 = handle_expire(&tr::<ExpireRequest>("expire", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "ok");
     }
 
@@ -3247,7 +3710,11 @@ mod tests {
             db::apply_event(&conn, &emb, &ev).unwrap();
         }
 
-        let resp = handle_compact(&id, &paths, &Default::default());
+        let resp = handle_compact(
+            &tr::<CompactRequest>("compact", &id, &json!({})),
+            &paths,
+            &Default::default(),
+        );
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["before"], 3);
         assert_eq!(resp["after"], 1);
@@ -3258,13 +3725,13 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!("ta1");
         let req = json!({"method":"test_add","id":"ta1","app":"myapp","name":"login test","protocol":"browser","config":"{}"});
-        let resp = handle_test_add(&id, &req, &paths, &emb);
+        let resp = handle_test_add(&tr::<TestAddRequest>("test_add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["test_id"].as_str().is_some());
 
         // List tests
         let req2 = json!({"method":"tests","id":"ta2","app":"myapp"});
-        let resp2 = handle_tests(&id, &req2, &paths);
+        let resp2 = handle_tests(&tr::<TestsRequest>("tests", &id, &req2), &paths);
         assert_eq!(resp2["type"], "result");
         assert_eq!(resp2["count"], 1);
     }
@@ -3275,11 +3742,15 @@ mod tests {
         let id = json!("r1");
         // Add test case first
         let req_tc = json!({"method":"test_add","id":"r1","app":"myapp","name":"t1","protocol":"browser","config":"{}"});
-        let tc = handle_test_add(&id, &req_tc, &paths, &emb);
+        let tc = handle_test_add(
+            &tr::<TestAddRequest>("test_add", &id, &req_tc),
+            &paths,
+            &emb,
+        );
         let test_id = tc["test_id"].as_str().unwrap();
 
         let req = json!({"method":"run","id":"r2","test_id":test_id,"result":"pass","detail":"all green"});
-        let resp = handle_run(&id, &req, &paths, &emb);
+        let resp = handle_run(&tr::<RunRequest>("run", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["result"], "pass");
     }
@@ -3291,7 +3762,7 @@ mod tests {
 
         // Add initial entry at path "test/imp"
         let req_add = json!({"method":"add","id":"imp1","path":"test/imp","summary":"v1","content":"c1","tags":["a"],"kind":"convention"});
-        handle_add(&id, &req_add, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
 
         // Write a seeds JSON file with a new entry at same path
         let seeds_path = dir.path().join("seeds.json");
@@ -3300,14 +3771,14 @@ mod tests {
 
         // Import with upsert=false → should skip (path already exists)
         let req = json!({"method":"import","id":"imp2","path":seeds_path.to_str().unwrap()});
-        let resp = handle_import(&id, &req, &paths, &emb);
+        let resp = handle_import(&tr::<ImportRequest>("import", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["skipped"], 1);
         assert_eq!(resp["imported"], 0);
 
         // Import with upsert=true → should import
         let req2 = json!({"method":"import","id":"imp3","path":seeds_path.to_str().unwrap(),"upsert":true});
-        let resp2 = handle_import(&id, &req2, &paths, &emb);
+        let resp2 = handle_import(&tr::<ImportRequest>("import", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "ok");
         assert_eq!(resp2["imported"], 1);
     }
@@ -3319,10 +3790,14 @@ mod tests {
 
         // Add some entries via events
         let req = json!({"method":"add","id":"rb1","path":"test/rb","summary":"s","content":"c","tags":[],"kind":"convention"});
-        handle_add(&id, &req, &paths, &emb);
+        handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
 
         // Rebuild should recreate DB from events
-        let resp = handle_rebuild(&id, &paths, &emb);
+        let resp = handle_rebuild(
+            &tr::<RebuildRequest>("rebuild", &id, &json!({})),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["type"], "ok");
         assert!(resp["rebuilt"].as_u64().unwrap() >= 1);
 
@@ -3356,7 +3831,10 @@ mod tests {
         // stale_check returns "result" type and "stale" + "review" arrays
         // In a tempdir (no git repo), git log fails gracefully → no entries flagged stale
         let req_sc = json!({"method":"stale_check","id":"sc2","files":["src/old.rs"]});
-        let resp = handle_stale_check(&id, &req_sc, &paths);
+        let resp = handle_stale_check(
+            &tr::<StaleCheckRequest>("stale_check", &id, &req_sc),
+            &paths,
+        );
         assert_eq!(resp["type"], "result");
         assert!(resp["stale"].as_array().is_some());
         assert!(resp["review"].as_array().is_some());
@@ -3364,7 +3842,10 @@ mod tests {
 
         // stale_check with no files and no commits → error
         let req_bad = json!({"method":"stale_check","id":"sc3"});
-        let resp_bad = handle_stale_check(&id, &req_bad, &paths);
+        let resp_bad = handle_stale_check(
+            &tr::<StaleCheckRequest>("stale_check", &id, &req_bad),
+            &paths,
+        );
         assert_eq!(resp_bad["type"], "error");
         assert_eq!(resp_bad["code"], "parse_error");
     }
@@ -3394,7 +3875,7 @@ mod tests {
         // in `unreachable`; assert flexibly so the test passes regardless
         // of where cargo is invoked from.
         let req = json!({"method":"stale_check","id":"sc5","commits":[sha]});
-        let resp = handle_stale_check(&id, &req, &paths);
+        let resp = handle_stale_check(&tr::<StaleCheckRequest>("stale_check", &id, &req), &paths);
         assert_eq!(resp["type"], "result");
         let review = resp["review"].as_array().unwrap();
         let unreachable = resp["unreachable"].as_array().unwrap();
@@ -3415,7 +3896,7 @@ mod tests {
         // (the SQL query filters by version_ref IN (...), so no row → no
         // bucket assignment).
         let req2 = json!({"method":"stale_check","id":"sc6","commits":["0000000000000000000000000000000000000000"]});
-        let resp2 = handle_stale_check(&id, &req2, &paths);
+        let resp2 = handle_stale_check(&tr::<StaleCheckRequest>("stale_check", &id, &req2), &paths);
         assert_eq!(resp2["type"], "result");
         assert_eq!(resp2["review"].as_array().unwrap().len(), 0);
         assert_eq!(resp2["unreachable"].as_array().unwrap().len(), 0);
@@ -3473,7 +3954,8 @@ mod tests {
                             "search" | "add" | "import" | "expire" | "stale_check" |
                             "compact" | "reembed" | "run" | "test_add" | "tests" | "rebuild" |
                             "audit_run" | "audit_record" | "audit_report" | "provenance" |
-                            "kb_get" | "cite"
+                            "kb_get" | "cite" |
+                            "kb_peers_add" | "kb_peers_list" | "kb_peers_remove"
                         );
                         if !known {
                             proptest::prop_assert_eq!(
@@ -3505,7 +3987,7 @@ mod tests {
 
         let id = json!("cite1");
         let req = json!({"method":"cite","id":"cite1","path":"src.rs","start":0,"end":2});
-        let resp = handle_cite(&id, &req, &paths);
+        let resp = handle_cite(&tr::<CiteRequest>("cite", &id, &req), &paths);
 
         assert_eq!(resp["type"], "result");
         assert_eq!(resp["citation_path"], "src.rs:0-2");
@@ -3522,7 +4004,7 @@ mod tests {
 
         let id = json!("cite2");
         let req = json!({"method":"cite","id":"cite2","path":"src.rs","start":0});
-        let resp = handle_cite(&id, &req, &paths);
+        let resp = handle_cite(&tr::<CiteRequest>("cite", &id, &req), &paths);
 
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "parse_error");
@@ -3544,7 +4026,7 @@ mod tests {
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
         }
-        let resp = handle_add(&id, &req, paths, emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), paths, emb);
         resp["entry_id"].as_str().unwrap().to_string()
     }
 
@@ -3558,7 +4040,7 @@ mod tests {
         let id = json!(null);
         // sample_size=100 should be clamped to 50 (max) but we only have 3 entries
         let req = json!({"sample_size": 100});
-        let resp = handle_audit_run(&id, &req, &paths);
+        let resp = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req), &paths);
         assert_eq!(resp["type"], "ok");
         let samples = resp["samples"].as_array().unwrap();
         assert!(samples.len() <= 3, "can't sample more than available");
@@ -3570,7 +4052,10 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let _eid = add_live_entry(&paths, &emb, "p/kind-ev", None);
         let id = json!(null);
-        let resp = handle_audit_run(&id, &json!({"sample_size": 10}), &paths);
+        let resp = handle_audit_run(
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
+            &paths,
+        );
         assert_eq!(resp["type"], "ok");
         let samples = resp["samples"].as_array().unwrap();
         assert!(!samples.is_empty());
@@ -3590,7 +4075,10 @@ mod tests {
     fn test_audit_run_absent_mode_remains_uniform() {
         let (_dir, paths, emb) = setup();
         let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
-        let response = handle_audit_run(&json!(null), &json!({"sample_size": 1}), &paths);
+        let response = handle_audit_run(
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
+            &paths,
+        );
         assert_eq!(response["type"], "ok");
         let samples = response["samples"].as_array().unwrap();
         assert_eq!(samples.len(), 1);
@@ -3615,8 +4103,11 @@ mod tests {
         let mut cold_traffic = 0;
         for _ in 0..60 {
             let resp = handle_audit_run(
-                &json!(null),
-                &json!({"sample_size":1,"mode":"traffic"}),
+                &tr::<AuditRunRequest>(
+                    "audit_run",
+                    &json!(null),
+                    &json!({"sample_size":1,"mode":"traffic"}),
+                ),
                 &paths,
             );
             assert_eq!(resp["type"], "ok");
@@ -3655,8 +4146,11 @@ mod tests {
         add_live_entry(&paths, &emb, "p/degrade", None);
         assert!(!paths.query_hits.exists());
         let resp = handle_audit_run(
-            &json!(null),
-            &json!({"sample_size":1,"mode":"traffic"}),
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"sample_size":1,"mode":"traffic"}),
+            ),
             &paths,
         );
         assert_eq!(resp["type"], "ok");
@@ -3670,11 +4164,27 @@ mod tests {
         let (dir, mut paths, emb) = setup();
         add_live_entry(&paths, &emb, "p/search-hit", None);
         let req = json!({"query":"s","mode":"fts"});
-        let expected = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let expected = handle_search(
+            &tr::<SearchRequest>("search", &json!(7), &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         let blocked = dir.path().join("hit-log-is-a-directory");
         fs::create_dir(&blocked).unwrap();
         paths.query_hits = blocked;
-        let actual = handle_search(&json!(7), &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let actual = handle_search(
+            &tr::<SearchRequest>("search", &json!(7), &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         assert_eq!(actual, expected);
     }
 
@@ -3685,10 +4195,10 @@ mod tests {
         // Expire it
         let id = json!(null);
         let req = json!({"entry_id": eid});
-        handle_expire(&id, &req, &paths, &emb);
+        handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
 
         let req2 = json!({"sample_size": 10});
-        let resp = handle_audit_run(&id, &req2, &paths);
+        let resp = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req2), &paths);
         let samples = resp["samples"].as_array().unwrap();
         assert!(
             !samples.iter().any(|s| s["id"] == eid),
@@ -3702,11 +4212,11 @@ mod tests {
         // Add entry with kind=convention (evidence_status='n/a') — audit_run must exclude non-present entries
         let id = json!(null);
         let req = json!({"path": "p/no-ev", "summary": "s", "content": "c", "tags": [], "kind": "convention"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap().to_string();
 
         let req2 = json!({"sample_size": 10});
-        let resp2 = handle_audit_run(&id, &req2, &paths);
+        let resp2 = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req2), &paths);
         let samples = resp2["samples"].as_array().unwrap();
         assert!(
             !samples.iter().any(|s| s["id"] == eid),
@@ -3722,7 +4232,11 @@ mod tests {
         seed_audit_candidate(&paths, run_id, &eid);
         let id = json!(null);
         let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["recorded"], 1);
         assert_eq!(resp["expired"], 0);
@@ -3745,7 +4259,11 @@ mod tests {
         seed_audit_candidate(&paths, "run-002", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["expired"], 1);
 
         let conn = db::open_db(&paths.db).unwrap();
@@ -3766,7 +4284,11 @@ mod tests {
         seed_audit_candidate(&paths, "run-003", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-003", "verdicts": [{"entry_id": eid, "verdict": true}]});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
 
         let conn = db::open_db(&paths.db).unwrap();
         let successes: i64 = conn
@@ -3786,9 +4308,17 @@ mod tests {
         seed_audit_candidate(&paths, "run-idem", &eid);
         let id = json!(null);
         let req = json!({"run_id": "run-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         // Replay same (run_id, entry_id) → no-op
-        let resp2 = handle_audit_record(&id, &req, &paths, &emb);
+        let resp2 = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp2["type"], "ok");
         assert_eq!(resp2["recorded"], 0, "replay must be a no-op");
 
@@ -3812,7 +4342,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(successes, 1, "replay must not double-count the weight delta");
+        assert_eq!(
+            successes, 1,
+            "replay must not double-count the weight delta"
+        );
     }
 
     #[test]
@@ -3841,10 +4374,16 @@ mod tests {
         }
 
         let id = json!(null);
-        let req =
-            json!({"run_id": "run-atomic-weight", "verdicts": [{"entry_id": eid, "verdict": true}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
-        assert_eq!(resp["type"], "error", "weight upsert failure must surface as an error");
+        let req = json!({"run_id": "run-atomic-weight", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
+        assert_eq!(
+            resp["type"], "error",
+            "weight upsert failure must surface as an error"
+        );
 
         let conn = db::open_db(&paths.db).unwrap();
         let n: i64 = conn
@@ -3886,7 +4425,11 @@ mod tests {
 
         let id = json!(null);
         let req = json!({"run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["type"], "error");
 
         let conn = db::open_db(&paths.db).unwrap();
@@ -3897,7 +4440,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 0, "audit_runs insert must roll back on weight-upsert failure");
+        assert_eq!(
+            n, 0,
+            "audit_runs insert must roll back on weight-upsert failure"
+        );
 
         let stale: i64 = conn
             .query_row(
@@ -3920,7 +4466,11 @@ mod tests {
         let emb = NoopEmbedder;
         let id = json!(null);
         let req = json!({"run_id": run_id, "verdicts": [{"entry_id": entry_id, "verdict": true}]});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         panic!("child handle_audit_record returned without hitting the configured kill point");
     }
 
@@ -3985,7 +4535,11 @@ mod tests {
         // halves of the pair together.
         let id = json!(null);
         let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["recorded"], 1);
 
@@ -4016,7 +4570,11 @@ mod tests {
         let id = json!(null);
         let req =
             json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
-        let resp = handle_audit_record(&id, &req, &paths, &emb);
+        let resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "invalid_entry_id");
     }
@@ -4025,7 +4583,10 @@ mod tests {
     fn test_handle_audit_report_empty() {
         let (_dir, paths, _emb) = setup();
         let id = json!(null);
-        let resp = handle_audit_report(&id, &paths);
+        let resp = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &id, &json!({})),
+            &paths,
+        );
         assert_eq!(resp["type"], "result");
         assert_eq!(
             resp["per_kind_session_precision"].as_array().unwrap().len(),
@@ -4053,7 +4614,10 @@ mod tests {
             "report-session",
             br#"{"type":"tool_use","input":{"file_path":"src/a.rs"}}"#,
         );
-        let resp = handle_audit_report(&json!(null), &paths);
+        let resp = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &json!(null), &json!({})),
+            &paths,
+        );
         let telemetry = &resp["injection_telemetry"];
         assert_eq!(telemetry["total_injections"], 2);
         assert_eq!(telemetry["acted_on_rate"], 0.5);
@@ -4079,9 +4643,16 @@ mod tests {
             .map(|(i, eid)| json!({"entry_id": eid, "verdict": i < 3}))
             .collect();
         let req = json!({"run_id": "run-report", "verdicts": verdicts});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
 
-        let resp = handle_audit_report(&id, &paths);
+        let resp = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &id, &json!({})),
+            &paths,
+        );
         assert_eq!(resp["type"], "result");
         let rows = resp["per_kind_session_precision"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
@@ -4117,10 +4688,17 @@ mod tests {
             {"entry_id":uniform,"verdict":true}, {"entry_id":traffic,"verdict":true}
         ]});
         assert_eq!(
-            handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"],
+            handle_audit_record(
+                &tr::<AuditRecordRequest>("audit_record", &json!(null), &req),
+                &paths,
+                &emb
+            )["recorded"],
             2
         );
-        let report = handle_audit_report(&json!(null), &paths);
+        let report = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &json!(null), &json!({})),
+            &paths,
+        );
         let arms = report["per_arm_precision"].as_array().unwrap();
         assert_eq!(arms.len(), 2);
         assert!(arms.iter().any(|r| r["arm"] == "uniform" && r["n"] == 1));
@@ -4139,8 +4717,11 @@ mod tests {
         query_hits::record_hits(&paths.query_hits, &[warm.clone(), cold.clone()], "test");
 
         let run = handle_audit_run(
-            &json!(null),
-            &json!({"sample_size": 2, "mode": "traffic"}),
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"sample_size": 2, "mode": "traffic"}),
+            ),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -4169,11 +4750,18 @@ mod tests {
             .collect();
         let req = json!({"run_id": run["run_id"].as_str().unwrap(), "verdicts": verdicts});
         assert_eq!(
-            handle_audit_record(&json!(null), &req, &paths, &emb)["recorded"],
+            handle_audit_record(
+                &tr::<AuditRecordRequest>("audit_record", &json!(null), &req),
+                &paths,
+                &emb
+            )["recorded"],
             samples.len()
         );
 
-        let report = handle_audit_report(&json!(null), &paths);
+        let report = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &json!(null), &json!({})),
+            &paths,
+        );
         let actual_counts: BTreeMap<String, usize> = report["per_arm_precision"]
             .as_array()
             .unwrap()
@@ -4194,8 +4782,11 @@ mod tests {
         let id = json!(null);
         // Add entry A (root)
         let ra = handle_add(
-            &id,
-            &json!({"path":"p/a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"p/a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
@@ -4203,18 +4794,21 @@ mod tests {
 
         // Add entry B derived from A
         let rb = handle_add(
-            &id,
-            &json!({
-                "path": "p/b", "summary": "b", "content": "b", "tags": [], "kind": "observation",
-                "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:0"}]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path": "p/b", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+                    "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:0"}]
+                }),
+            ),
             &paths,
             &emb,
         );
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
 
         let req = json!({"entry_id": b_id});
-        let resp = handle_provenance(&id, &req, &paths);
+        let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
         assert_eq!(resp["type"], "result");
         let roots: Vec<String> = resp["roots"]
             .as_array()
@@ -4234,19 +4828,25 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
         let root = handle_add(
-            &id,
-            &json!({"path":"p/stale-root","summary":"root","content":"root","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"p/stale-root","summary":"root","content":"root","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
         let root_id = root["entry_id"].as_str().unwrap().to_string();
         let child = handle_add(
-            &id,
-            &json!({
-                "path":"p/live-child","summary":"child","content":"child","tags":[],
-                "kind":"observation",
-                "evidence":[{"kind":"derived","derived_from":root_id,"citation_hash":"sha256:derived"}]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path":"p/live-child","summary":"child","content":"child","tags":[],
+                    "kind":"observation",
+                    "evidence":[{"kind":"derived","derived_from":root_id,"citation_hash":"sha256:derived"}]
+                }),
+            ),
             &paths,
             &emb,
         );
@@ -4260,7 +4860,10 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let resp = handle_provenance(&id, &json!({"entry_id":child_id}), &paths);
+        let resp = handle_provenance(
+            &tr::<ProvenanceRequest>("provenance", &id, &json!({"entry_id":child_id})),
+            &paths,
+        );
         assert_eq!(resp["type"], "result");
         assert_eq!(resp["graph"][0]["from"], child_id);
         assert_eq!(resp["graph"][0]["to"], root_id);
@@ -4272,35 +4875,44 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
         let ra = handle_add(
-            &id,
-            &json!({"path":"p/a2","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"p/a2","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
         let a_id = ra["entry_id"].as_str().unwrap().to_string();
         let rb = handle_add(
-            &id,
-            &json!({
-                "path": "p/b2", "summary": "b", "content": "b", "tags": [], "kind": "observation",
-                "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:1"}]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path": "p/b2", "summary": "b", "content": "b", "tags": [], "kind": "observation",
+                    "evidence": [{"kind": "derived", "derived_from": a_id, "citation_hash": "sha256:1"}]
+                }),
+            ),
             &paths,
             &emb,
         );
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
         let rc = handle_add(
-            &id,
-            &json!({
-                "path": "p/c2", "summary": "c", "content": "c", "tags": [], "kind": "belief",
-                "evidence": [{"kind": "derived", "derived_from": b_id, "citation_hash": "sha256:2"}]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path": "p/c2", "summary": "c", "content": "c", "tags": [], "kind": "belief",
+                    "evidence": [{"kind": "derived", "derived_from": b_id, "citation_hash": "sha256:2"}]
+                }),
+            ),
             &paths,
             &emb,
         );
         let c_id = rc["entry_id"].as_str().unwrap().to_string();
 
         let req = json!({"entry_id": c_id});
-        let resp = handle_provenance(&id, &req, &paths);
+        let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
         assert_eq!(resp["type"], "result");
         let roots: Vec<String> = resp["roots"]
             .as_array()
@@ -4319,15 +4931,21 @@ mod tests {
         // Create A with a derived evidence pointing to a future B_ID
         // Simulate cycle by directly inserting into evidence table
         let ra = handle_add(
-            &id,
-            &json!({"path":"p/cyc-a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"p/cyc-a","summary":"a","content":"a","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
         let a_id = ra["entry_id"].as_str().unwrap().to_string();
         let rb = handle_add(
-            &id,
-            &json!({"path":"p/cyc-b","summary":"b","content":"b","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"p/cyc-b","summary":"b","content":"b","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
@@ -4347,7 +4965,7 @@ mod tests {
         ).unwrap();
 
         let req = json!({"entry_id": a_id});
-        let resp = handle_provenance(&id, &req, &paths);
+        let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "provenance_cycle_detected");
     }
@@ -4359,8 +4977,11 @@ mod tests {
         // Build a chain of 5 entries; cap at depth=2 → truncated=true
         let mut prev_id = {
             let r = handle_add(
-                &id,
-                &json!({"path":"p/d0","summary":"s","content":"c","tags":[],"kind":"convention"}),
+                &tr::<AddRequest>(
+                    "add",
+                    &id,
+                    &json!({"path":"p/d0","summary":"s","content":"c","tags":[],"kind":"convention"}),
+                ),
                 &paths,
                 &emb,
             );
@@ -4368,11 +4989,14 @@ mod tests {
         };
         for i in 1..5 {
             let r = handle_add(
-                &id,
-                &json!({
-                    "path": format!("p/d{}", i), "summary": "s", "content": "c", "tags": [], "kind": "belief",
-                    "evidence": [{"kind": "derived", "derived_from": prev_id, "citation_hash": format!("sha256:{}", i)}]
-                }),
+                &tr::<AddRequest>(
+                    "add",
+                    &id,
+                    &json!({
+                        "path": format!("p/d{}", i), "summary": "s", "content": "c", "tags": [], "kind": "belief",
+                        "evidence": [{"kind": "derived", "derived_from": prev_id, "citation_hash": format!("sha256:{}", i)}]
+                    }),
+                ),
                 &paths,
                 &emb,
             );
@@ -4380,7 +5004,7 @@ mod tests {
         }
 
         let req = json!({"entry_id": prev_id, "max_depth": 2});
-        let resp = handle_provenance(&id, &req, &paths);
+        let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
         assert_eq!(resp["type"], "result");
         assert_eq!(resp["truncated"], true);
     }
@@ -4391,7 +5015,7 @@ mod tests {
         let id = json!(null);
         let req =
             json!({"path":"test/sid","summary":"s","content":"c","tags":[],"kind":"convention"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();
         let sid: Option<String> = conn
@@ -4409,7 +5033,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
         let req = json!({"path":"test/sid2","summary":"s","content":"c","tags":[],"session_id":"abc","kind":"convention"});
-        let resp = handle_add(&id, &req, &paths, &emb);
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
         let conn = db::open_db(&paths.db).unwrap();
         let sid: Option<String> = conn
@@ -4428,7 +5052,15 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/conf0", None);
         let id = json!(null);
         let req = json!({"query": "conf0", "mode": "fts"});
-        let resp = handle_search(&id, &req, &paths, &emb, 10, None, 0.0, 0.0);
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &req),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         let entries = resp["entries"].as_array().unwrap();
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
@@ -4448,10 +5080,22 @@ mod tests {
         let id = json!(null);
         // Record verdict=true
         let req = json!({"run_id": "run-conf1", "verdicts": [{"entry_id": eid, "verdict": true}]});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
 
         let req2 = json!({"query": "conf1", "mode": "fts"});
-        let resp = handle_search(&id, &req2, &paths, &emb, 10, None, 0.0, 0.0);
+        let resp = handle_search(
+            &tr::<SearchRequest>("search", &id, &req2),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
         let entries = resp["entries"].as_array().unwrap();
         let entry = entries.iter().find(|e| e["id"] == eid).unwrap();
         let conf = entry["confidence"].as_f64().unwrap();
@@ -4473,7 +5117,11 @@ mod tests {
         // Record verdict for this entry (uses COALESCE → __GLOBAL__)
         let req =
             json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
-        handle_audit_record(&id, &req, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req),
+            &paths,
+            &emb,
+        );
 
         // The weight should be stored under __GLOBAL__
         let conn = db::open_db(&paths.db).unwrap();
@@ -4539,10 +5187,10 @@ mod tests {
             let id = json!(null);
             let mut entry_ids: Vec<String> = Vec::new();
             for i in 0..10 {
-                let r = handle_add(&id, &json!({
+                let r = handle_add(&tr::<AddRequest>("add", &id, &json!({
                     "path": format!("dag/n{}", i), "summary": "n", "content": "c",
                     "tags": [], "kind": "convention"
-                }), &paths, &emb);
+                })), &paths, &emb);
                 entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
             }
             // Add derived edges (src > dst guarantees DAG)
@@ -4558,7 +5206,7 @@ mod tests {
             // BFS must terminate for all starting entries
             for eid in &entry_ids {
                 let req = json!({"entry_id": eid, "max_depth": 64});
-                let resp = handle_provenance(&id, &req, &paths);
+                let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
                 proptest::prop_assert!(
                     resp["type"] == "result" || resp["code"] == "provenance_cycle_detected",
                     "provenance must not panic; got: {:?}", resp
@@ -4574,9 +5222,9 @@ mod tests {
             let id = json!(null);
             let mut entry_ids: Vec<String> = Vec::new();
             for i in 0..n {
-                let r = handle_add(&id, &json!({
+                let r = handle_add(&tr::<AddRequest>("add", &id, &json!({
                     "path": format!("cyc/n{}", i), "summary": "n", "content": "c", "tags": [], "kind": "convention"
-                }), &paths, &emb);
+                })), &paths, &emb);
                 entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
             }
             // Create a cycle: 0→1→2→...→n-1→0
@@ -4591,7 +5239,7 @@ mod tests {
                 ).unwrap();
             }
             let req = json!({"entry_id": entry_ids[0]});
-            let resp = handle_provenance(&id, &req, &paths);
+            let resp = handle_provenance(&tr::<ProvenanceRequest>("provenance", &id, &req), &paths);
             proptest::prop_assert_eq!(&resp["type"], "error");
             proptest::prop_assert_eq!(&resp["code"], "provenance_cycle_detected");
         }
@@ -4606,10 +5254,10 @@ mod tests {
             let id = json!(null);
             let req = json!({"run_id": "run-prop-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
             // First call
-            handle_audit_record(&id, &req, &paths, &emb);
+            handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
             // Replay n times
             for _ in 0..n_replays {
-                let resp = handle_audit_record(&id, &req, &paths, &emb);
+                let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
                 proptest::prop_assert_eq!(&resp["recorded"], 0);
             }
             let conn = db::open_db(&paths.db).unwrap();
@@ -4632,7 +5280,10 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "e2e/entry", Some("sess-1"));
 
         // Step 2: kb_audit_run — sample live entries
-        let run_resp = handle_audit_run(&id, &json!({"sample_size": 10}), &paths);
+        let run_resp = handle_audit_run(
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
+            &paths,
+        );
         assert_eq!(run_resp["type"], "ok");
         let run_id = run_resp["run_id"].as_str().unwrap().to_string();
         let samples = run_resp["samples"].as_array().unwrap();
@@ -4640,12 +5291,15 @@ mod tests {
 
         // Step 3: kb_audit_record verdict=false → entry gone from kb_search
         let rec_req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false}]});
-        let rec_resp = handle_audit_record(&id, &rec_req, &paths, &emb);
+        let rec_resp = handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &rec_req),
+            &paths,
+            &emb,
+        );
         assert_eq!(rec_resp["expired"], 1);
 
         let search = handle_search(
-            &id,
-            &json!({"query":"e2e entry","mode":"fts"}),
+            &tr::<SearchRequest>("search", &id, &json!({"query":"e2e entry","mode":"fts"})),
             &paths,
             &emb,
             10,
@@ -4660,31 +5314,43 @@ mod tests {
         );
 
         // Step 4: kb_audit_report
-        let report = handle_audit_report(&id, &paths);
+        let report = handle_audit_report(
+            &tr::<AuditReportRequest>("audit_report", &id, &json!({})),
+            &paths,
+        );
         assert_eq!(report["type"], "result");
         assert_eq!(report["total_runs"], 1);
         assert!(report["last_run_at"].as_str().is_some());
 
         // Step 5: kb_add with derived evidence + kb_provenance
         let r_root = handle_add(
-            &id,
-            &json!({"path":"e2e/root","summary":"root","content":"r","tags":[],"kind":"convention"}),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({"path":"e2e/root","summary":"root","content":"r","tags":[],"kind":"convention"}),
+            ),
             &paths,
             &emb,
         );
         let root_id = r_root["entry_id"].as_str().unwrap().to_string();
         let r_child = handle_add(
-            &id,
-            &json!({
-                "path": "e2e/child", "summary": "child", "content": "ch", "tags": [], "kind": "belief",
-                "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:e2e"}]
-            }),
+            &tr::<AddRequest>(
+                "add",
+                &id,
+                &json!({
+                    "path": "e2e/child", "summary": "child", "content": "ch", "tags": [], "kind": "belief",
+                    "evidence": [{"kind": "derived", "derived_from": root_id, "citation_hash": "sha256:e2e"}]
+                }),
+            ),
             &paths,
             &emb,
         );
         let child_id = r_child["entry_id"].as_str().unwrap().to_string();
 
-        let prov = handle_provenance(&id, &json!({"entry_id": child_id}), &paths);
+        let prov = handle_provenance(
+            &tr::<ProvenanceRequest>("provenance", &id, &json!({"entry_id": child_id})),
+            &paths,
+        );
         assert_eq!(prov["type"], "result");
         let roots: Vec<&str> = prov["roots"]
             .as_array()
@@ -4701,10 +5367,13 @@ mod tests {
         seed_audit_candidate(&paths, "run-conf-e2e", &e2);
         let req_true =
             json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
-        handle_audit_record(&id, &req_true, &paths, &emb);
+        handle_audit_record(
+            &tr::<AuditRecordRequest>("audit_record", &id, &req_true),
+            &paths,
+            &emb,
+        );
         let search2 = handle_search(
-            &id,
-            &json!({"query":"e2e conf","mode":"fts"}),
+            &tr::<SearchRequest>("search", &id, &json!({"query":"e2e conf","mode":"fts"})),
             &paths,
             &emb,
             10,
@@ -4735,6 +5404,6 @@ pub mod tests_api {
         paths: &config::Paths,
         emb: &dyn embedder::Embedder,
     ) -> Value {
-        handle_add(id, req, paths, emb)
+        handle_add(&tr::<AddRequest>("add", id, req), paths, emb)
     }
 }
