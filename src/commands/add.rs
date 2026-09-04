@@ -764,6 +764,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        // add_locked resolves + re-verifies citation_path against a real repo
+        // file under the flock, so the cited files must actually exist.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/foo.rs"), b"fn foo() {}\nfn foo2() {}\n").unwrap();
+        fs::write(root.join("src/bar.rs"), b"fn bar() {}\nfn bar2() {}\n").unwrap();
         let paths = Paths::from_root(root);
         let embedder = NoopEmbedder;
 
@@ -778,8 +783,8 @@ mod tests {
             replace_path: false,
             kind: "observation".to_string(),
             evidence: vec![
-                r#"{"kind":"code","citation_path":"src/foo.rs:1-10","citation_sha":"abc","citation_hash":"sha256:aaa","citation_excerpt":"fn foo() {}"}"#.to_string(),
-                r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_sha":"abc","citation_hash":"sha256:bbb","citation_excerpt":"fn bar() {}"}"#.to_string(),
+                r#"{"kind":"code","citation_path":"src/foo.rs:1-10","citation_excerpt":"fn foo() {}"}"#.to_string(),
+                r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_excerpt":"fn bar() {}"}"#.to_string(),
             ],
             evidence_file: None,
             cues: vec![],

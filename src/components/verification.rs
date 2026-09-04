@@ -52,7 +52,14 @@ pub const MIN_EXCERPT_BYTES: usize = 64;
 pub const MIN_EXCERPT_LINES: usize = 2;
 
 /// Directory names never descended into during a repo-wide relocation search.
-const EXCLUDED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+///
+/// `.state` holds the KB's own managed files (`agent-kb.db`,
+/// `agent-kb-events.jsonl`, ...), which store every recorded
+/// `citation_excerpt` verbatim as row/event data. Without this exclusion a
+/// repo-wide scan matches its own database as a second "candidate" location
+/// for any excerpt the KB has ever recorded, turning a legitimate unique
+/// relocation into a false `NonUnique`.
+const EXCLUDED_DIRS: [&str; 4] = [".git", "target", "node_modules", ".state"];
 
 /// How hard to look for a citation whose hash no longer matches.
 ///

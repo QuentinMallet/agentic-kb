@@ -9,10 +9,12 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
 use crate::components::events;
-use crate::components::verification::{compute_citation_hash_and_size, parse_citation_path};
+use crate::components::verification::{
+    compute_citation_hash_and_size, parse_citation_path, FileIdentity,
+};
 use crate::config;
 use abscissa_core::{Command, Runnable};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Component, Path, PathBuf};
@@ -173,7 +175,9 @@ fn classify_row(row: &EvidenceCitationRow, repo_root: &Path, events_path: &Path)
             reason: SKIP_NON_LEGACY_REASON,
         };
     }
-    if citation_targets_events_log(file_rel, repo_root, events_path) {
+    if citation_targets_events_log(file_rel, repo_root, events_path)
+        || citation_aliases_events_log(file_rel, repo_root, events_path).unwrap_or(false)
+    {
         return PlannedAction::Fail {
             reason: SELF_REFERENTIAL_LOG_REASON.to_string(),
         };
@@ -238,6 +242,15 @@ fn citation_targets_events_log(file_rel: &str, repo_root: &Path, events_path: &P
     normalize_repo_relative(configured_rel).as_ref() == Some(&citation_rel)
 }
 
+fn citation_aliases_events_log(file_rel: &str, repo_root: &Path, events_path: &Path) -> Result<bool> {
+    let cited = repo_root.join(file_rel);
+    match (FileIdentity::of(&cited), FileIdentity::of(events_path)) {
+        (Ok(cited), Ok(events)) => Ok(cited == events),
+        (Err(error), _) => Err(error).with_context(|| format!("stat cited file {}", cited.display())),
+        (_, Err(error)) => Err(error).with_context(|| format!("stat event log {}", events_path.display())),
+    }
+}
+
 /// Apply the planned heals under the write lock.
 ///
 /// Opens its own mutating connection rather than reusing the planning read
@@ -295,8 +308,40 @@ fn apply_heals(
             reason: None,
         };
 
+        let (file_rel, _) = parse_citation_path(&verify_row.citation_path)?;
+        let cited_path = repo_root.join(file_rel);
+        let identity_before_hash = FileIdentity::of(&cited_path)
+            .with_context(|| format!("stat cited file {}", cited_path.display()))?;
+        let events_identity = FileIdentity::of(&paths.events)
+            .with_context(|| format!("stat event log {}", paths.events.display()))?;
+        if identity_before_hash == events_identity {
+            report.failed.push(MigrationRow {
+                reason: Some(SELF_REFERENTIAL_LOG_REASON.to_string()),
+                ..current_view
+            });
+            continue;
+        }
         match classify_row(&verify_row, repo_root, &paths.events) {
             PlannedAction::WouldHeal { new_path } => {
+                // Recheck identity immediately before append as the path may
+                // have been replaced by a non-kb writer after classification.
+                let identity_before_append = FileIdentity::of(&cited_path)
+                    .with_context(|| format!("stat cited file {}", cited_path.display()))?;
+                let events_identity_before_append = FileIdentity::of(&paths.events)
+                    .with_context(|| format!("stat event log {}", paths.events.display()))?;
+                if identity_before_append != identity_before_hash
+                    || identity_before_append == events_identity_before_append
+                {
+                    report.failed.push(MigrationRow {
+                        reason: Some(if identity_before_append == events_identity_before_append {
+                            SELF_REFERENTIAL_LOG_REASON.to_string()
+                        } else {
+                            "citation file changed before append".to_string()
+                        }),
+                        ..current_view
+                    });
+                    continue;
+                }
                 let event = events::citation_healed_event(
                     &row.entry_id,
                     &row.evidence_id,
@@ -699,6 +744,31 @@ mod tests {
             report.failed[0].reason.as_deref(),
             Some(SELF_REFERENTIAL_LOG_REASON)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_migrate_citations_rejects_hard_link_alias_of_events_log() {
+        let (_dir, paths, conn) = setup_repo();
+        let root = repo_root_from_paths(&paths).unwrap();
+        fs::create_dir_all(root.join("fixtures")).unwrap();
+        // events.jsonl is only created lazily on first append, so seed an
+        // entry first — hard_link needs the target file to already exist.
+        seed_live_entry(&paths, &conn, "entry-1");
+        let alias = root.join("fixtures/events-alias.jsonl");
+        fs::hard_link(&paths.events, &alias).unwrap();
+        let end = fs::metadata(&alias).unwrap().len() as usize;
+        seed_evidence(
+            &paths, &conn, "entry-1", "ev-1",
+            &format!("fixtures/events-alias.jsonl:0-{end}"), "sha256:deadbeef",
+        );
+
+        let report = MigrateCitations { dry_run: false }
+            .execute_with_paths(&paths).unwrap();
+
+        assert_eq!(report.emitted_events, 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].reason.as_deref(), Some(SELF_REFERENTIAL_LOG_REASON));
     }
 
     #[test]

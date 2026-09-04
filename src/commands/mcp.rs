@@ -2508,13 +2508,26 @@ mod tests {
         // Override kind: add_live_entry hard-codes kind="observation"; we patch via
         // the low-level event path so the kind column is correct for bucket matching.
         let id_val = json!(null);
+        // add_locked now resolves + re-verifies citation_path against a real
+        // repo file under the flock, so the cited file must actually exist.
+        let repo_root = paths
+            .db
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .unwrap();
+        let citation_file = repo_root.join("src/foo.rs");
+        if !citation_file.exists() {
+            fs::create_dir_all(citation_file.parent().unwrap()).unwrap();
+            fs::write(&citation_file, b"12345\n").unwrap();
+        }
         let mut req = json!({
             "path": path,
             "summary": "s",
             "content": "c",
             "tags": [],
             "kind": kind,
-            "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]
+            "evidence": [{"kind":"code","citation_path":"src/foo.rs:1-5"}]
         });
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
@@ -2941,7 +2954,6 @@ mod tests {
                 "kind":"code",
                 "citation_path":"src/get.rs:0-10",
                 "citation_sha":null,
-                "citation_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "citation_excerpt":"fn kb_get"
             }]
         });
@@ -3646,8 +3658,21 @@ mod tests {
         session_id: Option<&str>,
     ) -> String {
         let id = json!(null);
+        // add_locked now resolves + re-verifies citation_path against a real
+        // repo file under the flock, so the cited file must actually exist.
+        let repo_root = paths
+            .db
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .unwrap();
+        let citation_file = repo_root.join("src/foo.rs");
+        if !citation_file.exists() {
+            fs::create_dir_all(citation_file.parent().unwrap()).unwrap();
+            fs::write(&citation_file, b"12345\n").unwrap();
+        }
         let mut req = json!({"path": path, "summary": "s", "content": "c", "tags": [], "kind": "observation",
-                              "evidence": [{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
+                              "evidence": [{"kind":"code","citation_path":"src/foo.rs:1-5"}]});
         if let Some(sid) = session_id {
             req["session_id"] = json!(sid);
         }
