@@ -1180,13 +1180,13 @@ mod tests {
     #[test]
     fn heal_relocations_skips_missing_evidence_rows_and_keeps_renderable_report() {
         use crate::components::events;
-        use crate::config::Paths;
         use rusqlite::params;
 
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(dir.path());
-        let conn = db::open_db_memory().unwrap();
+        // On disk, not in memory: heal_relocations opens its own mutating
+        // connection under the write lock, so the seed rows must live in the
+        // repository's real database rather than a private handle.
+        let (paths, conn) = db::test_db(dir.path());
 
         conn.execute(
             "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)

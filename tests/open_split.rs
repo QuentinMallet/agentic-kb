@@ -283,26 +283,28 @@ fn open_or_init_releases_the_lock() {
 // acquire_lock re-entrancy registry
 // ---------------------------------------------------------------------------
 
+/// The self-deadlock ADR-1 targets: one call chain acquires a lock it already
+/// holds. Both acquires run on the worker thread; the main thread's bounded
+/// wait turns a regression into a failing test rather than a wedged process.
 #[test]
-fn second_in_process_acquire_errors_instead_of_blocking() {
+fn second_acquire_on_the_same_thread_errors_instead_of_blocking() {
     let dir = tempfile::tempdir().unwrap();
     let paths = repo(dir.path());
-    let first_site = line!() + 1;
-    let first = acquire_lock(&paths.lock).unwrap();
 
     let (tx, rx) = mpsc::channel();
     let lock_path = paths.lock.clone();
     thread::spawn(move || {
-        let _ = tx.send(
-            acquire_lock(&lock_path)
-                .map(|_| ())
-                .map_err(|e| format!("{e:#}")),
-        );
+        let first_site = line!() + 1;
+        let _first = acquire_lock(&lock_path).expect("first acquire");
+        let second = acquire_lock(&lock_path)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send((first_site, second));
     });
 
-    let outcome = rx
-        .recv_timeout(DEADLOCK_TIMEOUT)
-        .expect("a second in-process acquire must return an error, not block on the flock forever");
+    let (first_site, outcome) = rx.recv_timeout(DEADLOCK_TIMEOUT).expect(
+        "a second acquire on the same thread must return an error, not block on the flock forever",
+    );
     let err = outcome.expect_err("the second acquire must fail");
     // The FIRST acquisition's file:line, not the second's — that is what makes
     // the error actionable when the two live in different modules.
@@ -311,17 +313,47 @@ fn second_in_process_acquire_errors_instead_of_blocking() {
         err.contains(&expected_site),
         "the error must name the first acquisition site ({expected_site}), got: {err}"
     );
+}
+
+/// The registry must NOT reject a different thread: two threads contending for
+/// one flock is ordinary mutual exclusion, and `rebuild`'s schema-upgrade
+/// single-flight and its Phase 2 concurrent-writer guarantee both depend on it.
+/// The second thread blocks while the first holds the lock, then succeeds.
+#[test]
+fn a_second_thread_blocks_on_the_flock_rather_than_being_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = repo(dir.path());
+    let first = acquire_lock(&paths.lock).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let lock_path = paths.lock.clone();
+    let waiter = thread::spawn(move || {
+        let guard = acquire_lock(&lock_path);
+        let _ = tx.send(guard.map(|_| ()).map_err(|e| format!("{e:#}")));
+    });
+
+    // While the first guard lives the waiter must be blocked, not rejected.
+    match rx.recv_timeout(Duration::from_millis(500)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(other) => panic!("waiter thread died: {other:?}"),
+        Ok(early) => panic!("a second thread must block on the flock, got: {early:?}"),
+    }
+
     drop(first);
+    let outcome = rx
+        .recv_timeout(DEADLOCK_TIMEOUT)
+        .expect("the waiter must acquire once the first guard is released");
+    assert!(outcome.is_ok(), "waiter acquire: {outcome:?}");
+    waiter.join().unwrap();
 }
 
 /// Waiver row "process-local re-entrancy": the registry keys on the
-/// CANONICALIZED path, so a second acquire spelled differently is still
-/// recognized as re-entrant rather than silently deadlocking.
+/// CANONICALIZED path, so a re-acquire spelled differently is still recognized
+/// as re-entrant rather than silently deadlocking.
 #[test]
 fn registry_canonicalizes_two_spellings_of_one_lock_file() {
     let dir = tempfile::tempdir().unwrap();
     let paths = repo(dir.path());
-    let first = acquire_lock(&paths.lock).unwrap();
 
     // Same file, different spelling: `<root>/.state/agent-kb/../.lock`.
     let aliased = dir
@@ -334,20 +366,23 @@ fn registry_canonicalizes_two_spellings_of_one_lock_file() {
         aliased, paths.lock,
         "the two spellings must differ textually"
     );
-    assert_eq!(
-        std::fs::canonicalize(&aliased).unwrap(),
-        std::fs::canonicalize(&paths.lock).unwrap(),
-        "precondition: both spellings name one file"
-    );
 
     let (tx, rx) = mpsc::channel();
+    let lock_path = paths.lock.clone();
     thread::spawn(move || {
+        let _first = acquire_lock(&lock_path).expect("first acquire");
+        assert_eq!(
+            std::fs::canonicalize(&aliased).unwrap(),
+            std::fs::canonicalize(&lock_path).unwrap(),
+            "precondition: both spellings name one file"
+        );
         let _ = tx.send(
             acquire_lock(&aliased)
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}")),
         );
     });
+
     let outcome = rx
         .recv_timeout(DEADLOCK_TIMEOUT)
         .expect("an aliased re-acquire must error, not block");
@@ -355,7 +390,6 @@ fn registry_canonicalizes_two_spellings_of_one_lock_file() {
         outcome.is_err(),
         "an aliased second acquire must be recognized as re-entrant"
     );
-    drop(first);
 }
 
 #[test]

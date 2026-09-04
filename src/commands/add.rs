@@ -205,27 +205,36 @@ pub fn make_embedder_with_opts(
     }
 }
 
-/// Lock files this process currently holds, keyed on the CANONICALIZED path
-/// and valued by the source location that acquired each one.
+/// Lock files each thread currently holds, keyed on `(ThreadId, CANONICAL path)`
+/// and valued by the source location that acquired the lock.
 ///
-/// `fs2::lock_exclusive` is `flock(2)`, which is associated with the open file
-/// description: a second `acquire_lock` for the same file from anywhere in this
-/// process opens a second description and blocks on itself forever. The type
-/// system cannot see that — `&Lock` proves a live guard exists at a mutating
-/// open, not that the process did not try to take the same lock twice — so the
-/// registry converts a self-deadlock into an immediate error naming the first
-/// acquisition site.
+/// `fs2::lock_exclusive` is `flock(2)`, associated with the open file
+/// description: a thread that acquires a lock it already holds opens a second
+/// description and blocks on itself forever. The type system cannot see that —
+/// `&Lock` proves a live guard exists at a mutating open, not that the same
+/// call chain did not take the lock twice — so the registry converts that
+/// self-deadlock into an immediate error naming the first acquisition site.
+///
+/// **Scoped to the acquiring thread, not the process.** A *different* thread
+/// waiting on the same flock is ordinary mutual exclusion, not a deadlock, and
+/// the codebase depends on it: `rebuild`'s schema-upgrade single-flight and its
+/// Phase 2 concurrent-writer guarantee are both exercised by in-process threads
+/// that must serialize on the flock rather than fail. Every self-deadlock ADR-1
+/// names — `rebuild.rs`'s documented case, `handle_import` under `L2` — is one
+/// thread re-entering its own lock.
 ///
 /// Keying on the canonical path is load-bearing: two spellings of one lock file
 /// (a relative path, a `..` component, a symlinked repo root) must collapse to
 /// one entry or a re-entrant acquire slips through under an alias and hangs.
 /// See `.state/agent-kb/tla/decisions/lock-contract-no-spec.md`, re-entrancy row.
+type LockRegistryKey = (std::thread::ThreadId, std::path::PathBuf);
+
 static HELD_LOCKS: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    std::sync::Mutex<std::collections::HashMap<LockRegistryKey, String>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-fn held_locks(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, String>> {
+fn held_locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<LockRegistryKey, String>>
+{
     // A panic while the registry is held would otherwise poison every later
     // acquire; the map itself is always left consistent, so recover in place.
     HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
@@ -234,9 +243,10 @@ fn held_locks(
 /// Acquire the agentic lock.
 ///
 /// Blocking and exclusive, released when the returned [`Lock`] is dropped.
-/// A second acquire of the same file *from this process* is rejected rather
+/// A second acquire of the same file *on the same thread* is rejected rather
 /// than deadlocked — callers that already hold the lock must pass the guard
-/// down (see [`crate::components::kb_core::add_locked`]).
+/// down (see [`crate::components::kb_core::add_locked`]). Other threads still
+/// block on the flock, which is real mutual exclusion.
 #[track_caller]
 pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
     use anyhow::Context;
@@ -259,26 +269,29 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
     let canonical = fs::canonicalize(lock_path)
         .with_context(|| format!("canonicalize lock {}", lock_path.display()))?;
 
+    let owner = std::thread::current().id();
+    let key: LockRegistryKey = (owner, canonical.clone());
     {
         let mut held = held_locks();
-        if let Some(first) = held.get(&canonical) {
+        if let Some(first) = held.get(&key) {
             anyhow::bail!(
-                "re-entrant acquire of {}: this process already holds it (acquired at {first}). \
+                "re-entrant acquire of {}: this thread already holds it (acquired at {first}). \
                  Pass the existing Lock down instead of re-acquiring — e.g. kb_core::add_locked \
                  or db::open_rw(&paths, &lock).",
                 canonical.display()
             );
         }
-        held.insert(canonical.clone(), site);
+        held.insert(key.clone(), site);
     }
 
     if let Err(e) = f.lock_exclusive() {
-        held_locks().remove(&canonical);
+        held_locks().remove(&key);
         return Err(anyhow::Error::new(e).context(format!("acquire lock {}", lock_path.display())));
     }
     Ok(Lock {
         file: f,
         path: canonical,
+        owner,
     })
 }
 
@@ -290,6 +303,9 @@ pub struct Lock {
     #[allow(dead_code)]
     file: std::fs::File,
     path: std::path::PathBuf,
+    /// Thread that acquired it. Recorded so the registry entry is cleared
+    /// under its owner's key even when the guard is dropped on another thread.
+    owner: std::thread::ThreadId,
 }
 
 impl Lock {
@@ -301,7 +317,7 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        held_locks().remove(&self.path);
+        held_locks().remove(&(self.owner, self.path.clone()));
     }
 }
 
