@@ -42,7 +42,7 @@ defmodule AgenticKbMcp.McpServer do
           "inline_verify_k" => %{
             "type" => "integer",
             "description" =>
-              "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`), clamped to 20. Results beyond this budget have `verified=null`."
+              "How many top results to inline-verify (byte-hash check vs HEAD). Default 10 (from kb.toml `inline_verify_k`), clamped to MAX_INLINE_VERIFY_K (=100). Results beyond this budget have `verified=null`."
           },
           "expand_ids" => %{
             "type" => "array",
