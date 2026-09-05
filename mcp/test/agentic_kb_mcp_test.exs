@@ -504,6 +504,30 @@ defmodule AgenticKbMcpTest do
       end
     end
 
+    # Every bound B1 enforces on the Rust side must be visible in the schema,
+    # so a client validates before calling instead of learning the cap from an
+    # error. inline_verify_k shipped with a minimum and no maximum.
+    test "every bounded numeric argument advertises both of its bounds" do
+      expected = %{
+        {"kb_search", "limit"} => {1, 100},
+        {"kb_search", "inline_verify_k"} => {0, 20},
+        {"kb_reembed", "max_chars"} => {1, 100_000}
+      }
+
+      for {{tool_name, field}, {min, max}} <- expected do
+        schema =
+          McpServer.tools()
+          |> Enum.find(&(&1["name"] == tool_name))
+          |> get_in(["inputSchema", "properties", field])
+
+        assert schema["minimum"] == min, "#{tool_name}.#{field} minimum"
+        assert schema["maximum"] == max, "#{tool_name}.#{field} maximum"
+
+        assert schema["description"] =~ to_string(max),
+               "#{tool_name}.#{field} description must name its cap"
+      end
+    end
+
     test "every tool in the registry has a validated argument allow-list" do
       registered = McpServer.tools() |> Enum.map(& &1["name"]) |> Enum.sort()
       assert registered == Enum.sort(Map.keys(@deployed_pin_args))
