@@ -833,6 +833,14 @@ defmodule AgenticKbMcp.McpServer do
       %{"type" => "result", "entry" => entry} ->
         %{"content" => [%{"type" => "text", "text" => format_full_entry(entry)}]}
 
+      %{"type" => "result", "citation_path" => path, "citation_sha" => sha,
+        "citation_hash" => hash, "file_size" => size} ->
+        text =
+          "citation_path=#{path}\ncitation_sha=#{render_scalar(sha)}\n" <>
+            "citation_hash=#{hash}\nfile_size=#{size}"
+
+        %{"content" => [%{"type" => "text", "text" => text}]}
+
       %{"type" => "ok", "imported" => imported, "skipped" => skipped} ->
         %{
           "content" => [
