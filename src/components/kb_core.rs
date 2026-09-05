@@ -49,7 +49,6 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -64,25 +63,31 @@ thread_local! {
     static CITATION_HASH_RESOLUTION_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Hash an already-open, resolver-vetted citation descriptor.
+///
+/// Takes `file` rather than `repo_root`/`file_rel` so callers open once via
+/// [`open_citation_descriptor`] (which rejects a symlinked `citation_path`
+/// before touching its target) and reuse that descriptor for both identity
+/// (`FileIdentity::of_file`) and hashing -- a second, unguarded open here
+/// would reintroduce the write-path symlink oracle this function exists to
+/// avoid.
 fn resolve_citation_hash(
-    repo_root: &std::path::Path,
+    file: &std::fs::File,
     file_rel: &str,
     range: Option<(usize, usize)>,
 ) -> Result<String> {
     #[cfg(test)]
     CITATION_HASH_RESOLUTION_CALLS.with(|c| c.set(c.get() + 1));
 
-    let file = open_citation_descriptor(repo_root, file_rel)?;
     Ok(format!(
         "sha256:{}",
-        compute_citation_hash_and_size_from(&file, file_rel, range)?.sha256_hex
+        compute_citation_hash_and_size_from(file, file_rel, range)?.sha256_hex
     ))
 }
 
 #[derive(Clone)]
 struct ResolvedCitation {
     citation_path: String,
-    absolute_path: PathBuf,
     identity: FileIdentity,
     hash: String,
 }
@@ -250,14 +255,24 @@ pub fn add_locked(
         let (file_rel, range) = parse_citation_path(&citation_path)
             .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
         let absolute_path = repo_root.join(file_rel);
-        let identity = FileIdentity::of(&absolute_path)
+        // Open before deriving identity: `open_citation_descriptor` rejects
+        // a symlinked `citation_path` (any component, any target) before
+        // anything touches what it points to. Deriving identity from the
+        // open descriptor (`of_file`, an fstat) rather than from
+        // `FileIdentity::of(&absolute_path)` (a pathname `stat` that
+        // follows symlinks) keeps that rejection first on this write path
+        // too, not only on verification's read path.
+        let citation_file = open_citation_descriptor(repo_root, file_rel)
+            .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
+        let identity = FileIdentity::of_file(&citation_file)
             .with_context(|| format!("resolve citation_path {citation_path:?}"))?;
         let citation_hash = if let Some(existing) = resolved_hashes.get(&(identity, range)) {
             existing.clone()
         } else {
-            let resolved = resolve_citation_hash(repo_root, file_rel, range).map_err(|error| {
-                anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
-            })?;
+            let resolved =
+                resolve_citation_hash(&citation_file, file_rel, range).map_err(|error| {
+                    anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
+                })?;
             resolved_hashes.insert((identity, range), resolved.clone());
             resolved
         };
@@ -285,7 +300,6 @@ pub fn add_locked(
         }
         resolved_citations.push(ResolvedCitation {
             citation_path,
-            absolute_path,
             identity,
             hash: citation_hash,
         });
@@ -399,7 +413,12 @@ pub fn add_locked(
         HashMap::new();
     for resolved in &resolved_citations {
         let (file_rel, range) = parse_citation_path(&resolved.citation_path)?;
-        let current_identity = FileIdentity::of(&resolved.absolute_path)
+        // Same reasoning as the resolve loop above: open first so a
+        // citation_path that has been swapped for a symlink since the
+        // first pass is rejected by the resolver, not stat'd by path.
+        let citation_file = open_citation_descriptor(repo_root, file_rel)
+            .with_context(|| format!("re-verify citation_path {:?}", resolved.citation_path))?;
+        let current_identity = FileIdentity::of_file(&citation_file)
             .with_context(|| format!("re-verify citation_path {:?}", resolved.citation_path))?;
         if current_identity != resolved.identity {
             anyhow::bail!(
@@ -410,7 +429,7 @@ pub fn add_locked(
         let current_hash = if let Some(hash) = verified_identities.get(&(current_identity, range)) {
             hash.clone()
         } else {
-            let hash = resolve_citation_hash(repo_root, file_rel, range)?;
+            let hash = resolve_citation_hash(&citation_file, file_rel, range)?;
             verified_identities.insert((current_identity, range), hash.clone());
             hash
         };
@@ -852,6 +871,62 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("missing.txt"), "{err}");
         assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_kb_core_add_symlinked_citation_error_does_not_disclose_target_existence() {
+        use std::os::unix::fs::symlink;
+
+        // Important 3 / write-path oracle: `FileIdentity::of` used to stat
+        // `citation_path` by pathname (following symlinks) before
+        // `resolve_citation_hash` ever rejected the link, so a symlinked
+        // `citation_path` stat'd its target -- including targets outside
+        // the repository -- and the error differed depending on whether
+        // that target existed. The fix opens through
+        // `open_citation_descriptor` (which rejects any symlink component
+        // before touching the target) first, for identity too, so both
+        // cases below must fail with the exact same shape of error.
+        let (dir, paths) = setup();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("real.txt"), b"outside content").unwrap();
+
+        symlink(
+            outside.path().join("real.txt"),
+            dir.path().join("link-to-real.txt"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("does-not-exist.txt"),
+            dir.path().join("link-to-missing.txt"),
+        )
+        .unwrap();
+
+        let err_existing_target = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "link-to-real.txt"
+            })]),
+        )
+        .unwrap_err();
+        let err_missing_target = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "link-to-missing.txt"
+            })]),
+        )
+        .unwrap_err();
+
+        let normalize = |citation_path: &str, message: String| -> String {
+            message.replace(citation_path, "<citation_path>")
+        };
+        assert_eq!(
+            normalize("link-to-real.txt", err_existing_target.to_string()),
+            normalize("link-to-missing.txt", err_missing_target.to_string()),
+            "existing target: {err_existing_target:?}; missing target: {err_missing_target:?}"
+        );
     }
 
     // -------------------------------------------------------------------------

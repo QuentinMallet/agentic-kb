@@ -1290,8 +1290,29 @@ pub(crate) struct FileIdentity {
 #[cfg(unix)]
 impl FileIdentity {
     /// Resolve `path` and return its `(st_dev, st_ino)` identity.
+    ///
+    /// Follows symlinks (`std::fs::metadata`), so callers on a citation
+    /// write/re-verify path must not call this on a raw path derived from
+    /// `citation_path` before the path has been rejected as a symlink --
+    /// use [`FileIdentity::of_file`] on an already-open, resolver-vetted
+    /// descriptor instead.
     pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
         let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Identity of an already-open file descriptor.
+    ///
+    /// This is an `fstat`, not a pathname lookup, so it is safe to call
+    /// after opening through a symlink-rejecting resolver (e.g.
+    /// [`open_citation_descriptor`]): unlike [`FileIdentity::of`], it can
+    /// never re-resolve a symlink the open already refused, so it never
+    /// stats a target the open path rejected.
+    pub(crate) fn of_file(file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
         Ok(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
