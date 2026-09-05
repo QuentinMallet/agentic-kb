@@ -172,6 +172,47 @@ defmodule AgenticKbMcpTest do
         end
       )
     end
+
+    test "a bare .state marker wins over a legacy db mid-migration" do
+      root = Path.join(System.tmp_dir!(), "kb-db-discovery-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      # `.state/` exists (the canonical marker) but nothing has been written
+      # to the canonical db yet; a legacy db already exists at this root.
+      File.mkdir_p!(Path.join(root, ".state"))
+      legacy = Path.join([root, "agent-kb", "agent-kb.db"])
+      File.mkdir_p!(Path.dirname(legacy))
+      File.write!(legacy, "")
+
+      assert {:ok, Path.join([root, ".state", "agent-kb", "agent-kb.db"])} ==
+               AgenticKbMcp.DbDiscovery.discover(root)
+    end
+
+    test "a nested .state marker stops the walk before an outer ancestor's real db" do
+      outer =
+        Path.join(
+          System.tmp_dir!(),
+          "kb-db-discovery-outer-#{System.unique_integer([:positive])}"
+        )
+
+      on_exit(fn -> File.rm_rf!(outer) end)
+
+      outer_db = Path.join([outer, ".state", "agent-kb", "agent-kb.db"])
+      File.mkdir_p!(Path.dirname(outer_db))
+      File.write!(outer_db, "")
+
+      # A nested directory has its own bare `.state/` marker (e.g. an
+      # in-progress `kb init`) but no db file of its own yet. Discovery must
+      # stop here — matching Rust Paths::discover — rather than continue up
+      # to the outer repo's real db, or the MCP port (this module) and the
+      # CLI (Rust) would silently serve two different stores for one nested
+      # checkout. See the matching Rust test in src/config.rs.
+      nested = Path.join(outer, "nested")
+      File.mkdir_p!(Path.join(nested, ".state"))
+
+      assert {:ok, Path.join([nested, ".state", "agent-kb", "agent-kb.db"])} ==
+               AgenticKbMcp.DbDiscovery.discover(nested)
+    end
   end
 
   @documented_omissions MapSet.new([
