@@ -141,6 +141,39 @@ defmodule AgenticKbMcpTest do
   alias AgenticKbMcp.McpServer
   alias AgenticKbMcp.RenderFixture
 
+  describe "DbDiscovery layout precedence" do
+    test "selects canonical, legacy, then canonical when both exist" do
+      Enum.each(
+        [
+          {true, false, ".state/agent-kb/agent-kb.db"},
+          {false, true, "agent-kb/agent-kb.db"},
+          {true, true, ".state/agent-kb/agent-kb.db"}
+        ],
+        fn {canonical?, legacy?, expected_relative} ->
+          root =
+            Path.join(System.tmp_dir!(), "kb-db-discovery-#{System.unique_integer([:positive])}")
+
+          on_exit(fn -> File.rm_rf!(root) end)
+          canonical = Path.join([root, ".state", "agent-kb", "agent-kb.db"])
+          legacy = Path.join([root, "agent-kb", "agent-kb.db"])
+
+          if canonical? do
+            File.mkdir_p!(Path.dirname(canonical))
+            File.write!(canonical, "")
+          end
+
+          if legacy? do
+            File.mkdir_p!(Path.dirname(legacy))
+            File.write!(legacy, "")
+          end
+
+          assert {:ok, Path.join(root, expected_relative)} ==
+                   AgenticKbMcp.DbDiscovery.discover(root)
+        end
+      )
+    end
+  end
+
   @documented_omissions MapSet.new([
                           "origin_repo",
                           "score_kind",
