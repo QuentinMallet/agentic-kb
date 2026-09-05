@@ -37,10 +37,10 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
-use crate::crash_sim::{kill_point, KillPoint};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
 use crate::components::{db, embedder, events, redactor};
 use crate::config;
+use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -449,10 +449,10 @@ pub fn add_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crash_sim::KillPoint;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events as ev_mod;
     use crate::config::Paths;
+    use crate::crash_sim::KillPoint;
     use rusqlite::Connection;
     use std::fs;
     use std::process::Command;
