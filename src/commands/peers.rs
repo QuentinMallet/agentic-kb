@@ -1015,7 +1015,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let target_repo = "/tmp/peer-live";
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         insert_peer_row(
             &conn,
@@ -1072,7 +1072,7 @@ mod tests {
             .to_string();
         let _cwd = CwdGuard::set(root);
         db::open_or_init(&paths).unwrap();
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         insert_peer_row(
             &conn,
@@ -1107,7 +1107,7 @@ mod tests {
         .execute()
         .unwrap();
 
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM peers WHERE target_repo='/tmp/existing-peer'",

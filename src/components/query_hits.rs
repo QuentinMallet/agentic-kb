@@ -291,7 +291,7 @@ fn open(path: &Path, create: bool) -> rusqlite::Result<Connection> {
             let _ = fs::create_dir_all(parent);
         }
     }
-    let conn = Connection::open(path)?;
+    let conn = crate::components::db::open_auxiliary(path)?;
     configure(&conn)?;
     Ok(conn)
 }
@@ -380,7 +380,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hits.db");
         record_hits(&path, &["new".into()], "mcp");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         conn.execute("INSERT INTO hits(entry_id,queried_at) VALUES('old',0)", [])
             .unwrap();
         conn.execute(
@@ -391,7 +391,7 @@ mod tests {
         .unwrap();
         drop(conn);
         record_hits(&path, &["last".into()], "test");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM hits", [], |r| r.get(0))
             .unwrap();
@@ -440,7 +440,7 @@ mod tests {
         drop(lock_conn);
 
         assert!(path.is_file());
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let ids: Vec<String> = conn
             .prepare("SELECT entry_id FROM hits ORDER BY id")
             .unwrap()
@@ -461,14 +461,14 @@ mod tests {
             &[("new".into(), Some("src/lib.rs".into()))],
             "cli",
         );
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         conn.execute(
             "INSERT INTO injections(session_id,entry_id,surface,injected_at) VALUES('s1','old','cli',0)",
             [],
         ).unwrap();
         drop(conn);
         record_injection(&path, "s1", &[("last".into(), None)], "cli");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let rows: Vec<(String, Option<String>)> = conn
             .prepare("SELECT entry_id,cited_file FROM injections ORDER BY id")
             .unwrap()
@@ -507,7 +507,7 @@ mod tests {
             "s1",
             br#"{"type":"tool_use","name":"Read","input":{"file_path":"other.rs"}}"#,
         );
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let flags: Vec<i64> = conn
             .prepare("SELECT acted_on FROM injections ORDER BY id")
             .unwrap()
@@ -548,7 +548,7 @@ mod tests {
         record_injection(&path, &session, &[(entry.clone(), Some(cited))], &surface);
         record_hits(&path, &[entry], &surface);
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let injection_lengths: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT length(CAST(session_id AS BLOB)), length(CAST(entry_id AS BLOB)), \

@@ -2769,7 +2769,7 @@ mod tests {
     fn test_handle_kb_peers_list_filters_expired_rows_without_deleting_them() {
         let (_dir, paths, _emb) = setup();
         db::open_or_init(&paths).unwrap();
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
              VALUES('mcp-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', NULL)",
@@ -2795,7 +2795,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "MCP kb_peers_list must hide expired peers");
         assert_eq!(rows[0]["target_repo"], "repo-live");
 
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let physical_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
             .unwrap();

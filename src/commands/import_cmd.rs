@@ -165,9 +165,9 @@ pub fn stamp_path_for(file: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::commands::add::Add;
+    use crate::components::db;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
 
@@ -236,7 +236,7 @@ mod tests {
         fs::write(&stamp, &hash).unwrap();
 
         // Verify DB has entries
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
                 r.get(0)

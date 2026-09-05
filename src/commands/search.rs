@@ -591,7 +591,7 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         db::open_or_init(&paths).unwrap();
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         insert_peer_edge(&conn, "repo-a", "repo-expired", Some("2000-01-01 00:00:00"));
         insert_peer_edge(&conn, "repo-a", "repo-live", None);
