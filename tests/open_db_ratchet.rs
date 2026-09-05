@@ -16,14 +16,18 @@ use std::path::Path;
 /// 3 new `db::open_db(&paths.db)` test-fixture call sites in
 /// `src/commands/rebuild.rs`, pushing the real count to 73.
 ///
-/// Stays at 74 through C1's D1/T3/D3 work: the real count moves between 70
+/// Stayed at 74 through C1's D1/T3/D3 work: the real count moved between 70
 /// and 74 across that range (D1's crash-recovery test in
-/// `src/components/kb_core.rs` adds one; C1's D3 write helper
-/// (`cursor::append_and_apply`) migrates several production and test call
-/// sites off `open_db` as it lands) without ever exceeding 74, so this
-/// ratchet needs no touch of its own here. See the commit that lowers it to
-/// 69 once that migration is complete.
-const OPEN_DB_CALLSITE_RATCHET: usize = 74;
+/// `src/components/kb_core.rs` added one; C1's D3 write helper
+/// (`cursor::append_and_apply`) migrated several production and test call
+/// sites off `open_db` as it landed) without ever exceeding 74.
+///
+/// Lowered 74 -> 69 here: this commit's own convergence-gate fix is the last
+/// piece of C1's D3 write-helper migration to land, and the real count has
+/// settled at 69 by this point — the same net drop from L1b's 72 that C1's
+/// rebase produces overall, once D3's migration off `open_db` outweighs the
+/// D4/D1 test fixtures that pushed the ceiling up in the first place.
+const OPEN_DB_CALLSITE_RATCHET: usize = 69;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();

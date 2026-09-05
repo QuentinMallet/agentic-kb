@@ -10,10 +10,13 @@
 //! functions and are covered by unit tests in `src/commands/mcp.rs`.
 
 use kb::commands::cited_by::CitedBy;
+use kb::commands::compact::Compact;
 use kb::commands::context::Context;
 use kb::commands::search::Search;
 use kb::components::embedder::NoopEmbedder;
+use kb::components::events;
 use kb::config::Paths;
+use serde_json::{json, Value};
 
 /// A repository whose `.state/agent-kb/` exists but holds no database.
 fn fresh_repo(root: &std::path::Path) -> Paths {
@@ -21,6 +24,16 @@ fn fresh_repo(root: &std::path::Path) -> Paths {
     let paths = Paths::from_root(root);
     assert!(!paths.db.exists());
     paths
+}
+
+fn upsert(id: &str, summary: &str) -> Value {
+    json!({
+        "action": "upsert", "table": "entries",
+        "id": id, "path": format!("p/{id}"), "summary": summary,
+        "content": format!("content of {id}"), "tags": ["t"],
+        "kind": "belief", "evidence_status": "n/a",
+        "ts": "2026-09-05T00:00:00Z",
+    })
 }
 
 #[test]
@@ -111,4 +124,33 @@ fn kb_context_on_a_fresh_repo_is_empty_and_succeeds() {
         String::from_utf8_lossy(&out)
     );
     assert!(!paths.db.exists());
+}
+
+/// C1's convergence gate (compact.rs) must not fall through to `open_rw` when
+/// no database exists — `open_rw` creates the schema on an absent DB, and the
+/// locked peer sweep it exists for is a side effect compact must not have on
+/// a fresh clone's log. Compacting before the first local build must stay a
+/// pure log rewrite: the log is rewritten as it always is, but no database is
+/// spontaneously materialized.
+#[test]
+fn kb_compact_on_a_fresh_repo_stays_a_pure_log_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+
+    // A log with one superseded event, as if cloned before ever being built
+    // locally (no database, nothing materialized from it yet).
+    events::append_event(&paths.events, &upsert("e1", "first")).unwrap();
+    events::append_event(&paths.events, &upsert("e1", "second")).unwrap();
+
+    let (before, after) = Compact
+        .execute_with_paths(&paths)
+        .expect("compact must succeed on a fresh clone's log with no local database");
+
+    assert_eq!(before, 2, "both events were present before compaction");
+    assert_eq!(after, 1, "compact must still squash the superseded event");
+    assert!(
+        !paths.db.exists(),
+        "compact must not materialize a database as a side effect of the \
+         locked peer sweep when nothing has been built locally yet"
+    );
 }

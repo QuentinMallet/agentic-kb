@@ -83,9 +83,51 @@ impl Compact {
         vacuum_cfg: &VacuumConfig,
     ) -> anyhow::Result<(usize, usize)> {
         let lock = acquire_lock(&paths.lock)?;
-        {
-            let conn = crate::components::db::open_rw(paths, &lock)?;
-            crate::components::db::sweep_expired_peers(&conn)?;
+        // Compaction rewrites the log of record and bumps its generation, so it
+        // is a write and takes the same gate as one (C1/D3). Proceeding while
+        // the database is not converged would turn a deferral into a generation
+        // mismatch: the deferral says nobody can tell what the log holds, and
+        // the bump would then assert that whatever survived the rewrite is the
+        // whole truth and force a full rebuild from it.
+        //
+        // Asymmetry with `kb add` (C1 notes): `kb add` and the other MCP
+        // mutating methods auto-recover first (`recover_if_needed`), so a
+        // database that is merely behind the log (D3 row 7, ReplayTail) is
+        // caught up and the write proceeds. `kb compact` does not go through
+        // `open_or_init`/`recover_if_needed` at entry, so the same row 7
+        // refuses here with "the database is behind the event log" instead of
+        // self-healing. Deliberate: compact is destructive to the log itself,
+        // so refusing and asking the caller to recover first (or run `kb
+        // rebuild`) is the safer default for this one write surface.
+        //
+        // `read_events` below only catches one of the four Defer causes, and
+        // only after the lock is held; this catches all four plus a missing log.
+        // Also gates the locked peer sweep below: that sweep is itself a
+        // write, and must not proceed while the database is not converged.
+        //
+        // No database is the exemption both share: nothing has been
+        // materialized from this log yet, so a rewrite cannot orphan
+        // anything, and there is nothing to sweep. Critically, this must NOT
+        // fall through to `open_rw` in that case — `open_rw` creates the
+        // schema when absent, and compact must stay a pure log rewrite when
+        // no database exists (a fresh clone's log, compacted before its first
+        // build, must not spontaneously materialize a database as a
+        // side effect of the peer sweep).
+        match crate::components::db::open_ro(&paths.db) {
+            Ok(conn) => {
+                let decision = crate::components::cursor::inspect(&conn, paths);
+                if decision.blocks_writes() {
+                    return Err(crate::components::cursor::NotConverged {
+                        reason: decision.describe(),
+                    }
+                    .into());
+                }
+                drop(conn);
+                let conn = crate::components::db::open_rw(paths, &lock)?;
+                crate::components::db::sweep_expired_peers(&conn)?;
+            }
+            Err(e) if crate::components::db::is_db_uninitialized(&e) => {}
+            Err(e) => return Err(e),
         }
         let read = events::read_events(&paths.events)?;
         let original_count = read.events.len();
@@ -1661,6 +1703,10 @@ mod tests {
         use crate::components::{db, embedder::NoopEmbedder};
         let (paths, conn) = db::test_db(root);
         let embedder = NoopEmbedder;
+        // Through the applied-cursor writer: compaction now takes the same
+        // convergence gate as any other write, so a fixture that seeded the log
+        // and the database separately would be refused.
+        let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
 
         // Insert N entries with padded content each so that expiring them all
         // leaves at least 1024 SQLite free pages (see vacuum_fixture_size).
@@ -1676,8 +1722,8 @@ mod tests {
                 "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            db::apply_event(&conn, &embedder, &ev).unwrap();
-            append_event(&paths.events, &ev).unwrap();
+            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[ev])
+                .unwrap();
         }
         // Expire all entries to populate the SQLite freelist.
         for i in 0..n_entries {
@@ -1686,10 +1732,11 @@ mod tests {
                 "id": format!("bulk{i}"),
                 "ts": "2024-01-02T00:00:00Z"
             });
-            db::apply_event(&conn, &embedder, &ev).unwrap();
-            append_event(&paths.events, &ev).unwrap();
+            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[ev])
+                .unwrap();
         }
         drop(conn); // close before compact opens it
+        drop(lock);
         paths
     }
 
@@ -1717,6 +1764,38 @@ mod tests {
 
     /// AC1 + AC4: after exactly 8 compacts with >=1024 free pages, VACUUM fires
     /// and the counter resets to 0.
+    /// Append and apply through the applied-cursor writer, so the repository
+    /// stays converged and compaction's gate is satisfied.
+    ///
+    /// A preceding compaction leaves the cursor's generation stale. In
+    /// production the next write recovers first, and the generation mismatch
+    /// means a full rebuild; here the database already equals the compacted
+    /// log's materialization — that is compaction's own invariant, checked by
+    /// its own tests — so only the cursor needs restamping, and doing it that
+    /// way keeps these already-slow vacuum fixtures from replaying their whole
+    /// corpus once per iteration.
+    fn seed_through_cursor(paths: &Paths, event: &serde_json::Value) {
+        use crate::components::cursor::{self, Decision, RebuildReason};
+        use crate::components::{db, embedder::NoopEmbedder};
+        let lock = crate::commands::add::acquire_lock(paths.lock.as_path()).unwrap();
+        let conn = db::open_rw(paths, &lock).unwrap();
+        if cursor::inspect(&conn, paths)
+            == Decision::FullRebuild(RebuildReason::GenerationMismatch)
+        {
+            let committed_len = crate::components::events::committed_len(&paths.events).unwrap();
+            cursor::write(
+                &conn,
+                &cursor::Cursor {
+                    generation: cursor::read_generation(&paths.events),
+                    offset: committed_len,
+                    tail_sha: cursor::tail_sha(&paths.events, committed_len).unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event.clone()]).unwrap();
+    }
+
     #[test]
     fn test_vacuum_fires_after_n_compacts_and_counter_resets() {
         let dir = tempdir().unwrap();
@@ -1736,7 +1815,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();
@@ -1754,7 +1833,7 @@ mod tests {
             "summary": "s", "content": "c", "tags": [],
             "ts": "2024-01-01T00:00:00Z"
         });
-        append_event(&paths.events, &ev).unwrap();
+        seed_through_cursor(&paths, &ev);
         Compact
             .execute_with_paths_and_vacuum(&paths, &vcfg)
             .unwrap();
@@ -1821,7 +1900,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();
@@ -1865,7 +1944,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();

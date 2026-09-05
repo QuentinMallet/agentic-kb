@@ -671,6 +671,83 @@ fn test_repairing_the_damaged_line_lets_recovery_converge() {
     );
 }
 
+/// Compaction rewrites the log of record and bumps its generation, so it is a
+/// write and takes the same gate. Proceeding while the database is not converged
+/// would turn a deferral into a generation mismatch: the deferral says nobody
+/// can tell what the log holds, and the bump would then assert that whatever
+/// survived the rewrite is the whole truth.
+///
+/// All four Defer causes, plus a missing log, enumerated.
+#[test]
+fn test_compact_refuses_unless_the_database_is_converged() {
+    type Damage = Box<dyn Fn(&Paths)>;
+    let cases: Vec<(&str, Damage)> = vec![
+        (
+            "cause 1: the cursor row is unreadable",
+            Box::new(|paths: &Paths| {
+                let conn = open_db(&paths.db).unwrap();
+                conn.execute("DROP TABLE kb_meta", []).unwrap();
+            }),
+        ),
+        (
+            "cause 2: the log's committed length cannot be read",
+            Box::new(|paths: &Paths| {
+                let mut raw = fs::read_to_string(&paths.events).unwrap();
+                raw.push_str("{ not json at all }\n");
+                fs::write(&paths.events, raw).unwrap();
+            }),
+        ),
+        (
+            "cause 3: the prefix cannot be hashed",
+            Box::new(|paths: &Paths| {
+                // Truncate to a byte the cursor still claims, so hashing the
+                // prefix it names runs off the end of the file.
+                let conn = open_db(&paths.db).unwrap();
+                let mut fabricated = cursor::read(&conn).unwrap().unwrap();
+                fabricated.offset += 4096;
+                cursor::write(&conn, &fabricated).unwrap();
+            }),
+        ),
+        (
+            "cause 4: a line past the cursor is unreadable",
+            Box::new(damage_log_past_the_cursor),
+        ),
+        (
+            "the log is missing",
+            Box::new(|paths: &Paths| {
+                fs::remove_file(&paths.events).unwrap();
+            }),
+        ),
+    ];
+
+    for (name, damage) in cases {
+        let (_dir, paths) = repo();
+        kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+        damage(&paths);
+
+        let log_before = fs::read(&paths.events).ok();
+        let generation_before = cursor::read_generation(&paths.events);
+
+        let error = kb::commands::compact::Compact
+            .execute_with_paths(&paths)
+            .unwrap_err();
+        assert!(
+            cursor::is_not_converged(&error),
+            "{name}: compact must refuse with the convergence error, got {error:#}"
+        );
+        assert_eq!(
+            fs::read(&paths.events).ok(),
+            log_before,
+            "{name}: a refused compact must leave the log untouched"
+        );
+        assert_eq!(
+            cursor::read_generation(&paths.events),
+            generation_before,
+            "{name}: a refused compact must not bump the generation"
+        );
+    }
+}
+
 /// A deferral that coexists with a stale generation: the committed-length read
 /// fails before the generation is ever compared, so the deferral wins and the
 /// write is still refused. Once the log reads again, the generation row takes

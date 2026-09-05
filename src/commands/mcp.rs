@@ -3969,9 +3969,11 @@ mod tests {
         // Add 3 entries with same id → compact should squash
         for i in 0..3 {
             let ev = json!({"action":"upsert","table":"entries","id":"dup","path":"a","summary":format!("v{i}"),"content":"c","tags":[],"ts":"2024-01-01T00:00:00Z"});
-            events::append_event(&paths.events, &ev).unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
-            db::apply_event(&conn, &emb, &ev).unwrap();
+            // Through the applied-cursor writer: compaction takes the same
+            // convergence gate as any other write.
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[ev]).unwrap();
         }
 
         let resp = handle_compact(
