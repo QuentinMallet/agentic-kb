@@ -18,6 +18,9 @@ exec 2>/dev/null
 
 set -uo pipefail
 
+audit_state=$(mktemp "${TMPDIR:-/tmp}/agentic-kb-audit.XXXXXX")
+trap 'rm -f "$audit_state"' EXIT
+
 field() { # field <name> <json-line> -> the string value of "<name>":"..."
   echo "$2" | grep -o "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
 }
@@ -61,13 +64,30 @@ while IFS= read -r line; do
       while IFS= read -r _unused; do :; done
       ;;
     audit_run)
-      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[]}\n' "$id"
+      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[{"id":"audit-e1","path":"audit/e1","summary":"first","kind":"belief","evidence_status":"present","arm":"uniform","evidence":[]},{"id":"audit-e2","path":"audit/e2","summary":"second","kind":"belief","evidence_status":"present","arm":"uniform","evidence":[]}]}\n' "$id"
       ;;
     audit_record)
-      printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      if echo "$line" | grep -q '"verdict":false'; then
+        printf 'false\n' >> "$audit_state"
+        printf '{"id":"%s","type":"ok","recorded":1,"expired":1}\n' "$id"
+      elif echo "$line" | grep -q '"verdict":true'; then
+        printf 'true\n' >> "$audit_state"
+        printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      else
+        # Preserve the simple port-path fixture used by the existing empty
+        # verdict test; composition calls always carry a typed verdict.
+        printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      fi
       ;;
     audit_report)
-      printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      total=$(wc -l < "$audit_state" | tr -d ' ')
+      supported=$(grep -c '^true$' "$audit_state" || true)
+      if [ "$total" -eq 0 ]; then
+        printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      else
+        precision=$(awk -v yes="$supported" -v all="$total" 'BEGIN { printf "%.1f", yes / all }')
+        printf '{"id":"%s","type":"result","per_kind_session_precision":[{"kind":"belief","session_id":"__GLOBAL__","precision":%s,"n":%s}],"last_run_at":"2026-09-05T00:00:00Z","total_runs":%s,"per_arm_precision":[{"arm":"uniform","n":%s,"precision":%s}]}\n' "$id" "$precision" "$total" "$total" "$total" "$precision"
+      fi
       ;;
     provenance)
       printf '{"id":"%s","type":"result","roots":["root-1"],"graph":[],"truncated":false}\n' "$id"

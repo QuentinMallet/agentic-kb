@@ -1020,6 +1020,70 @@ defmodule AgenticKbMcpTest do
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit report: 0"
     end
 
+    test "audit run, verdict recording, and report compose through tools/call" do
+      start_fake_port()
+
+      run =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"uniform"}}}),
+          @with_db
+        )
+
+      run_text = get_in(run, ["result", "content", Access.at(0), "text"])
+      assert run_text =~ "Audit run audit-1: 2 sample(s)"
+      assert run_text =~ "id=audit-e1"
+      assert run_text =~ "id=audit-e2"
+
+      true_record =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e1","verdict":true}]}}}),
+          @with_db
+        )
+
+      assert get_in(true_record, ["result", "content", Access.at(0), "text"]) =~
+               "Recorded 1 audit verdict(s); expired 0"
+
+      false_record =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e2","verdict":false,"note":"unsupported evidence"}]}}}),
+          @with_db
+        )
+
+      assert get_in(false_record, ["result", "content", Access.at(0), "text"]) =~
+               "Recorded 1 audit verdict(s); expired 1"
+
+      unknown =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[],"surprise":true}}}),
+          @with_db
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => unknown_text}]}} = unknown
+      assert unknown_text =~ "surprise"
+      assert unknown_text =~ "unknown argument"
+
+      note_less =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e2","verdict":false}]}}}),
+          @with_db
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => refusal}]}} = note_less
+      assert refusal =~ "audit-e2"
+      assert refusal =~ "requires a non-empty note"
+
+      report =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"kb_audit_report","arguments":{}}}),
+          @with_db
+        )
+
+      report_text = get_in(report, ["result", "content", Access.at(0), "text"])
+      assert report_text =~ "Audit report: 2 recorded verdict(s)"
+      assert report_text =~ ~s("precision":0.5)
+      assert report_text =~ ~s("n":2)
+    end
+
     test "kb_provenance dispatches through the real tools/call and port paths" do
       start_fake_port()
       response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_provenance","arguments":{"entry_id":"entry-1","max_depth":64}}}), @with_db)
