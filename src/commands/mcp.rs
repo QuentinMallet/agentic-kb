@@ -7007,17 +7007,103 @@ mod tests {
     }
 }
 
-/// Test-only re-exports for integration tests in other modules (e.g. kb_core tests).
-#[cfg(test)]
+/// Narrow public seam for integration tests which need to exercise the same
+/// typed request parsing and dispatcher as the line-oriented MCP server.
+#[doc(hidden)]
 pub mod tests_api {
-    use super::*;
+    use crate::{components::embedder, config};
+    use serde_json::Value;
 
+    #[derive(serde::Serialize)]
+    pub struct AuditRunRequest {
+        pub id: Value,
+        method: &'static str,
+        pub sample_size: Option<u64>,
+        pub mode: Option<String>,
+    }
+
+    impl AuditRunRequest {
+        pub fn new(id: Value, sample_size: Option<u64>, mode: Option<&str>) -> Self {
+            Self {
+                id,
+                method: "audit_run",
+                sample_size,
+                mode: mode.map(str::to_owned),
+            }
+        }
+    }
+
+    #[derive(Clone, serde::Serialize)]
+    pub struct AuditVerdict {
+        pub entry_id: String,
+        pub verdict: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub note: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct AuditRecordRequest {
+        pub id: Value,
+        method: &'static str,
+        pub run_id: String,
+        pub verdicts: Vec<AuditVerdict>,
+    }
+
+    impl AuditRecordRequest {
+        pub fn new(id: Value, run_id: impl Into<String>, verdicts: Vec<AuditVerdict>) -> Self {
+            Self {
+                id,
+                method: "audit_record",
+                run_id: run_id.into(),
+                verdicts,
+            }
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct AuditReportRequest {
+        pub id: Value,
+        method: &'static str,
+    }
+
+    impl AuditReportRequest {
+        pub fn new(id: Value) -> Self {
+            Self {
+                id,
+                method: "audit_report",
+            }
+        }
+    }
+
+    pub fn dispatch_for_test(
+        paths: &config::Paths,
+        emb: &dyn embedder::Embedder,
+        request: &impl serde::Serialize,
+    ) -> Value {
+        let request = serde_json::to_string(request).expect("test request must serialize");
+        super::handle_request(&request, paths, emb, 10, None, 0.0, 0.0)
+    }
+
+    pub fn dispatch_value_for_test(
+        paths: &config::Paths,
+        emb: &dyn embedder::Embedder,
+        request: &Value,
+    ) -> Value {
+        super::handle_request(&request.to_string(), paths, emb, 10, None, 0.0, 0.0)
+    }
+
+    // `tr` is `#[cfg(test)]`-only (a unit-test fixture helper), so this
+    // re-export must stay behind the same gate — unlike the dispatch
+    // helpers above, which call only always-compiled production functions
+    // and so are safe to expose to the non-cfg(test) build integration
+    // tests link against.
+    #[cfg(test)]
     pub fn handle_add_for_test(
         id: &Value,
         req: &Value,
         paths: &config::Paths,
         emb: &dyn embedder::Embedder,
     ) -> Value {
-        handle_add(&tr::<AddRequest>("add", id, req), paths, emb)
+        super::handle_add(&super::tr::<super::AddRequest>("add", id, req), paths, emb)
     }
 }
