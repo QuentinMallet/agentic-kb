@@ -1,42 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-/// L1b/L2/L3/L1c: lower this as each migrated call site stops using `open_db`.
-///
-/// Bumped 82 -> 87 when L1a rebased onto bd-21ef.2 (B2/P1/A1): those commits
-/// added 5 unmigrated `db::open_db(&paths.db)` call sites in
-/// `src/commands/mcp.rs` test helpers, ahead of L1a's own migration work.
-/// Not new legacy debt introduced by L1a itself.
-///
-/// Lowered 87 -> 72 by L1b: peers.rs and mcp.rs's kb_peers_* handlers moved
-/// their remaining production `open_db` call sites to `open_ro`/`open_rw`
-/// (peer TTL read-time filter + locked sweep).
-///
-/// Bumped 72 -> 74 by T5a's D4 swap-sequence crash tests (see that commit):
-/// 3 new `db::open_db(&paths.db)` test-fixture call sites in
-/// `src/commands/rebuild.rs`, pushing the real count to 73.
-///
-/// Stayed at 74 through C1's D1/T3/D3 work: the real count moved between 70
-/// and 74 across that range (D1's crash-recovery test in
-/// `src/components/kb_core.rs` added one; C1's D3 write helper
-/// (`cursor::append_and_apply`) migrated several production and test call
-/// sites off `open_db` as it landed) without ever exceeding 74.
-///
-/// Lowered 74 -> 69 by C1's convergence-gate fix, the last piece of C1's D3
-/// write-helper migration to land — the same net drop from L1b's 72 that
-/// C1's rebase produces overall, once D3's migration off `open_db`
-/// outweighs the D4/D1 test fixtures that pushed the ceiling up in the
-/// first place.
-///
-/// Bumped 69 -> 70 when bd-21ef.3 (C3) rebased onto that aggregator tip:
-/// S3a's new
-/// `test_handle_provenance_is_deterministic_across_parent_insertion_order`
-/// test fixture in `src/commands/mcp.rs` opens its temp db with
-/// `db::open_db(&paths.db)`, matching every other test fixture in that file
-/// (only production handlers were migrated to `open_ro`/`open_rw`). Test
-/// convention, not new legacy debt in production code paths. Recounted
-/// directly against the post-rebase tree (70 call sites).
-const OPEN_DB_CALLSITE_RATCHET: usize = 70;
+/// L1c removed the legacy opener; keep this gate at zero permanently.
+const OPEN_DB_CALLSITE_RATCHET: usize = 0;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
@@ -60,13 +26,6 @@ fn open_db_callsites_do_not_increase() {
     for path in src_rs_files(&src_root) {
         for line in fs::read_to_string(&path).unwrap().lines() {
             if !line.contains("open_db(") {
-                continue;
-            }
-            let trimmed = line.trim();
-            if trimmed.starts_with("fn legacy_open_db(")
-                || trimmed.starts_with("pub fn open_db(")
-                || trimmed.contains("legacy_open_db(db_path)")
-            {
                 continue;
             }
             count += 1;
