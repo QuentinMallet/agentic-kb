@@ -21,7 +21,8 @@ Resolution can fail at write time if:
 |-----------|--------|----------|
 | Malformed `citation_path` | Path syntax invalid (e.g., range end before start) | Write rejected with parse error |
 | File not found | `citation_path` refers to a path that does not exist in the working tree | Write rejected with FileMissing |
-| Not a regular file | Path is a directory, symlink, or device file | Write rejected with FileMissing |
+| Symbolic-link component | Any path component is a symlink, whether its target is inside or outside the repository | Write rejected with SymlinkPathRejected |
+| Not a regular file | Path is a directory or device file | Write rejected with FileMissing |
 | Byte range outside bounds | Explicit range exceeds file size | Write rejected with RangeError |
 | File too large | Whole-file citation exceeds `MAX_FILE_BYTES` (64 MiB); range citation exceeds `MAX_RANGE_BYTES` (4 MiB) | Write rejected with FileTooLarge |
 | I/O errors | Filesystem errors during read | Write rejected with I/O error |
