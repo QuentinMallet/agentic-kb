@@ -1503,7 +1503,7 @@ pub struct SearchOptions {
     /// Preferred for MCP and other long-running contexts where the process CWD
     /// is not the repo (e.g. the MCP port is typically spawned with CWD `/`,
     /// causing the CWD-based `find_repo_root()` walk to fail). MCP callers
-    /// derive this via `root_from_db()` (see `src/commands/mcp.rs:40-45`).
+    /// obtain this from `config::Paths::root`.
     ///
     /// When `None`, `search_entries` falls back to walking up from CWD via
     /// `find_repo_root()`. CLI invocations may leave this `None` because the
