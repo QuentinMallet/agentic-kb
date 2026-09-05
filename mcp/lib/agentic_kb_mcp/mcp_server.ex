@@ -401,6 +401,7 @@ defmodule AgenticKbMcp.McpServer do
             "type" => "string",
             "minLength" => 1,
             "maxLength" => 128,
+            "pattern" => "^[^\\x00-\\x1F]*$",
             "description" => "Audit run id (1..128 printable characters)"
           },
           "verdicts" => %{
