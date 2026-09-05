@@ -145,9 +145,12 @@ where
 
 /// `before_batch(batch_index, batch)` fires right before a batch's write
 /// lock is acquired; `after_batch(batch_index)` fires right after that
-/// batch's connection is dropped (commit already applied, lock released).
-/// Tests use these to observe batching (which ids land in which batch) and
-/// to time the real lock-hold window from the outside.
+/// batch's connection is dropped (commit already applied), but the lock
+/// itself is still held until the enclosing loop iteration ends right
+/// after the hook returns — so `after_batch` runs just before, not after,
+/// the lock is released. Tests use these to observe batching (which ids
+/// land in which batch) and to time the real lock-hold window from the
+/// outside.
 fn run_reembed_with_hooks<B, A>(
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
