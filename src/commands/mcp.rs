@@ -52,47 +52,11 @@ impl Runnable for Mcp {
     }
 }
 
-/// Derive the repo root from the db path.
-///
-/// The fleet-ratified canonical form is `<root>/.state/agent-kb/agent-kb.db`.
-/// `<root>/agent-kb/agent-kb.db` remains tolerated as a legacy read path.
-fn root_from_db(db: &Path) -> PathBuf {
-    let Some(db_dir) = db.parent() else {
-        return Path::new(".").to_path_buf();
-    };
-
-    let is_state_agent_kb = db_dir.file_name().is_some_and(|name| name == "agent-kb")
-        && db_dir
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|name| name == ".state");
-
-    if is_state_agent_kb {
-        return db_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-    }
-
-    db_dir.parent().unwrap_or(Path::new(".")).to_path_buf()
-}
-
 impl Mcp {
     pub fn execute(&self) -> Result<()> {
-        let root = root_from_db(&self.db);
-        let paths = config::Paths::from_root(&root);
-        // Override db path with the explicitly passed one (handles cases where
-        // the symlink .state/agent-kb/agent-kb.db differs from the canonical path).
-        let mut paths = config::Paths {
-            db: self.db.clone(),
-            ..paths
-        };
-        // Layout-proof fallback: events/lock always live NEXT TO the db file
-        // in every supported layout (<root>/agent-kb/ and <root>/.state/agent-kb/).
-        // root_from_db assumes the former; when handed the latter the derived
-        // sibling paths point nowhere and the schema-upgrade gate (and event
-        // appends!) would target the wrong location.
+        let mut paths = config::Paths::from_db(&self.db);
+        // Compatibility fallback for stores whose event/lock files live next
+        // to the explicitly selected database.
         if let Some(dir) = self.db.parent() {
             if !paths.events.exists() && dir.join("agent-kb-events.jsonl").exists() {
                 paths.events = dir.join("agent-kb-events.jsonl");
@@ -883,9 +847,9 @@ fn handle_search(
     let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
 
     // br-bhg: MCP port is typically spawned with CWD=`/` (Elixir PortManager), so
-    // CWD-based `find_repo_root()` discovery fails. Pass the repo root derived
-    // from the explicitly-provided db path (`<root>/agent-kb/agent-kb.db`).
-    let repo_root = Some(root_from_db(&paths.db));
+    // CWD-based `find_repo_root()` discovery fails. Pass the repository root
+    // retained when the explicitly-provided db path was resolved.
+    let repo_root = Some(paths.root.clone());
     let opts = db::SearchOptions {
         limit,
         do_fts: mode == "fts" || mode == "hybrid",
@@ -1047,7 +1011,7 @@ fn citation_file_rel(citation_path: &str) -> &str {
 }
 
 fn returned_entries_stale_warning(paths: &config::Paths, results: &[db::SearchEntry]) -> bool {
-    let local_repo_root = root_from_db(&paths.db);
+    let local_repo_root = paths.root.clone();
     results.iter().any(|entry| {
         let Some(updated_at) = parse_entry_updated_at(&entry.updated_at) else {
             return false;
@@ -1182,8 +1146,7 @@ fn handle_cite(req: &CiteRequest, paths: &config::Paths) -> Value {
         }
     };
 
-    let repo_root = root_from_db(&paths.db);
-    match compute_citation_fields(&repo_root, path, range) {
+    match compute_citation_fields(&paths.root, path, range) {
         Ok(fields) => json!({
             "id": id,
             "type": "result",
@@ -2444,7 +2407,7 @@ fn handle_kb_peers_add(req: &PeersAddRequest, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let source_repo = root_from_db(&paths.db).to_string_lossy().to_string();
+    let source_repo = paths.root.to_string_lossy().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
     let expires_at: Option<String> = if let Some(days) = ttl_days {
