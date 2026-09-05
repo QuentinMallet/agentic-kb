@@ -1,6 +1,5 @@
 //! `rebuild` subcommand
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
 use crate::components::{cursor, db, events, fsync::sync_parent_dir};
@@ -197,11 +196,10 @@ fn full_rebuild_for(
     let upgrade_lock = paths.lock.with_extension("schema-upgrade.lock");
     let _flight = acquire_lock(&upgrade_lock)?;
     {
-        // Still the deprecated opener: this block also STAMPS schema_version
-        // below, and that write is governed by the schema-upgrade lock rather
-        // than paths.lock. Putting it under the write lock is C2/L2's job — a
-        // nested acquire here would invert the two locks' order.
-        let conn = db::open_db(&paths.db)?;
+        // This block may stamp schema_version, so it holds the repository write
+        // lock as well as the schema-upgrade single-flight lock.
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &lock)?;
         // Re-check under the single-flight lock: the loser of the race finds
         // the winner's work already done.
         if !matches!(
@@ -608,8 +606,7 @@ impl Rebuild {
             // if a reader opened just before the lock was acquired. fs::rename then
             // atomically replaces the DB file in one syscall.
             //
-            // Safety, re-derived now that C2/L2 has landed on this branch but
-            // L1c has not: MCP's read entry points (`src/commands/mcp.rs`'s
+            // Safety, re-derived after C2/L1c: MCP's read entry points (`src/commands/mcp.rs`'s
             // `handle_search`, `handle_kb_get`, and similar) open through
             // `db::open_ro`, which is genuinely read-only (`PRAGMA
             // query_only=ON`, no `ensure_schema` ALTERs, no peer sweep) and
@@ -618,21 +615,11 @@ impl Rebuild {
             // through `open_rw` and serializes on that same lock, which
             // rebuild holds across this step.
             //
-            // Still load-bearing: `db::open_db` (`open_conn_rw` plus
-            // `ensure_schema_and_stamp`, no lock of its own) remains the CLI
-            // opener for several commands until L1c (bd-21ef.2.13) migrates
-            // them — `compress.rs` (:58, :168), `digest.rs` (:224),
-            // `stale_check.rs` (:208), `eval.rs` (:123), `older_than.rs`
-            // (:37), `migrate_citations.rs` (:84), `tests.rs` (:31). A
-            // concurrent `kb compress` or `kb digest` can open the live DB
-            // unlocked and hold WAL read or write marks against this
-            // checkpoint. `checkpoint_live_db`'s bounded 5x50ms retry is what
-            // keeps the swap safe meanwhile: a transient hold clears within
-            // the retry window, and a persistently busy live DB — from one of
-            // these unlocked CLI paths or an ordinary in-flight `open_ro`
-            // reader alike — aborts the rebuild rather than proceeding
-            // unsafely. That remains a liveness cost, never a safety one, but
-            // L1c is what will make the busy case rare instead of reachable.
+            // CLI readers now follow that same `open_ro` contract, and CLI
+            // mutations initialize or open under `paths.lock`. The bounded
+            // checkpoint retry remains necessary for an ordinary in-flight
+            // reader; a persistently busy DB aborts rather than swapping
+            // unsafely.
             kill_point(KillPoint::SwapPreCheckpoint);
 
             // Step 1: drain the live WAL under the flock, with a bounded retry.
@@ -981,7 +968,7 @@ mod tests {
         let paths = Paths::from_root(Path::new(&root));
         match role.as_str() {
             "seed" => {
-                let conn = db::open_db(&paths.db).unwrap();
+                let (_, conn) = db::test_db(Path::new(&root));
                 for event in &events::read_events(&paths.events).unwrap().events {
                     db::apply_event(&conn, &NoopEmbedder, event).unwrap();
                 }
@@ -1179,7 +1166,7 @@ mod tests {
         for idx in 0..SWAP_SEEDED {
             events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
         }
-        let live = db::open_db(&paths.db).unwrap();
+        let (_, live) = db::test_db(&paths.root);
         for event in &events::read_events(&paths.events).unwrap().events {
             db::apply_event(&live, &NoopEmbedder, event).unwrap();
         }
@@ -1276,11 +1263,12 @@ mod tests {
     fn test_rebuild_restores_cleared_db() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..10u32 {
             let e = upsert(&format!("id{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
         assert_eq!(count_entries(&paths), 10);
 
@@ -1457,6 +1445,7 @@ mod tests {
     fn test_rebuild_with_concurrent_evidence_writes_converges() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         // Seed: 5 entries with explicit kind='observation' so evidence_add
         // triggers evidence_status updates (status != 'n/a').
@@ -1469,7 +1458,7 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path_a = paths.events.clone();
@@ -1512,7 +1501,7 @@ mod tests {
             db::apply_event(&ref_conn, &emb, ev).unwrap();
         }
 
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<(String, String)> = live_conn
             .prepare("SELECT id, COALESCE(evidence_status,'n/a') FROM entries ORDER BY id")
@@ -1580,11 +1569,12 @@ mod tests {
     fn test_rebuild_concurrent_writes_converge() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..20u32 {
             let e = upsert(&format!("base{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path = paths.events.clone();
@@ -1942,7 +1932,7 @@ mod tests {
         for ev in &all_events.events {
             db::apply_event(&ref_conn, emb.as_ref(), ev).unwrap();
         }
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<String> = live_conn
             .prepare("SELECT id FROM entries ORDER BY id")

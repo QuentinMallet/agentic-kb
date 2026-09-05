@@ -5,7 +5,6 @@
 //! stdout; the MCP handler serialises it to JSON.  No SQL or git subprocess
 //! invocation should be duplicated between the two call sites.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::cursor;
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
@@ -205,9 +204,20 @@ impl StaleCheck {
             anyhow::bail!("provide at least one file path or --commits");
         }
 
-        let conn = db::open_db(&paths.db)?;
-        let repo_root = Some(paths.root.clone());
         let policy: RelocationPolicy = self.relocate.into();
+        let cfg = config::KbConfig::from_paths(paths);
+        // A read: an uninitialized repository has nothing stale to report,
+        // never an error (ADR-1's read-surface contract, `open_ro` never
+        // creates the database).
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                db::open_db_memory()?
+            }
+            Err(e) => return Err(e),
+        };
+        let repo_root = Some(paths.root.clone());
 
         let mut report = run_stale_check(
             &conn,
@@ -221,7 +231,6 @@ impl StaleCheck {
         // P4: relocation computes and reports by default.  Rewriting a citation
         // is a separate, off-by-default decision, and even then it writes the
         // path only — never the stored hash.
-        let cfg = config::KbConfig::from_paths(paths);
         if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
             heal_relocations(paths, &mut report, policy)?;
         }
@@ -237,6 +246,12 @@ impl StaleCheck {
 /// Opens its own mutating connection rather than reusing the caller's read
 /// connection: a mutation must be performed on a handle obtained with the lock
 /// in hand (ADR-1, principle 2).
+///
+/// Bails out before touching the database at all when there is nothing to
+/// heal: `execute_with` calls this whenever autoheal is configured on, not
+/// only when a relocation was actually found, so initializing here would
+/// otherwise make a report-only `kb stale-check` on a fresh repository
+/// materialize the database as a side effect.
 fn heal_relocations(
     paths: &config::Paths,
     report: &mut StaleCheckReport,
@@ -245,6 +260,11 @@ fn heal_relocations(
     use crate::commands::add::acquire_lock;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events;
+
+    if report.relocation.is_empty() {
+        return Ok(());
+    }
+    db::open_or_init(paths)?;
 
     let repo_root = paths.root.as_path();
     let version_ref = config::git_head_sha_at(repo_root);
@@ -815,7 +835,7 @@ mod tests {
             query_hits: state_dir.join("query-hits.db"),
         };
         db::open_or_init(&paths).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let excerpt = concat!(
             "fn uniquely_relocated_for_stale_check_repo_root_regression_test() {\n",

@@ -4,8 +4,7 @@
 //! new bare whole-file form `path`, but only when the current file still hashes
 //! to the stored `citation_hash` and still has size `N`.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
-use crate::commands::add::{acquire_lock, make_embedder};
+use crate::commands::add::acquire_lock;
 use crate::components::cursor;
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
@@ -76,14 +75,13 @@ enum PlannedAction {
 impl MigrateCitations {
     pub fn execute(&self) -> Result<()> {
         let paths = config::Paths::discover()?;
-        let embedder = make_embedder(&paths);
-        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
+        db::open_or_init(&paths)?;
         self.execute_with_paths(&paths)?;
         Ok(())
     }
 
     pub fn execute_with_paths(&self, paths: &config::Paths) -> Result<MigrationReport> {
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         let repo_root = &paths.root;
         let mut report = plan_migration(&conn, repo_root.as_path(), &paths.events)?;
         if !self.dry_run {
@@ -450,8 +448,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let paths = Paths::from_root(root);
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(root);
         (dir, paths, conn)
     }
 

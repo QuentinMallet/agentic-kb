@@ -55,8 +55,7 @@ fn template_state_dir() -> &'static Path {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-            let paths = config::Paths::from_root(root);
-            let conn = db::open_db(&paths.db).unwrap();
+            let (_paths, conn) = db::test_db(root);
             let emb = BenchEmbedder::new(DEFAULT_SEED);
             seed_db(&conn, &emb, FIXTURE_SIZE, DEFAULT_SEED).unwrap();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -140,7 +139,7 @@ fn setup_event_fixture() -> EventFixture {
 
 fn setup_apply_fixture() -> ApplyFixture {
     let (dir, paths) = seeded_repo();
-    let conn = db::open_db(&paths.db).unwrap();
+    let conn = db::open_unchecked_for_test(&paths.db).unwrap();
     ApplyFixture {
         _dir: dir,
         conn,

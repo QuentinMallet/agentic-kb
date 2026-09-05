@@ -15,9 +15,10 @@
 //!   8. End-to-end: kb rebuild over a log containing an oversized event
 //!      succeeds and stores the clamped entry.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use kb::commands::rebuild::{recover_if_needed, Rebuild};
-use kb::components::db::{apply_event, open_db, open_db_memory, schema_is_current, SCHEMA_VERSION};
+use kb::components::db::{
+    apply_event, open_db_memory, open_unchecked_for_test, schema_is_current, SCHEMA_VERSION,
+};
 use kb::components::embedder::{Embedder, NoopEmbedder};
 use kb::components::events;
 use kb::components::kb_core::{add, AddArgs};
@@ -138,7 +139,7 @@ fn test_kb_core_add_rejects_oversized() {
 #[test]
 fn test_fresh_db_is_current() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = open_db(&dir.path().join("fresh.db")).unwrap();
+    let conn = kb::components::db::open_scratch(&dir.path().join("fresh.db")).unwrap();
     assert!(
         schema_is_current(&conn),
         "fresh DB must carry the current schema_version stamp"
@@ -158,7 +159,7 @@ fn test_obsolete_schema_forces_one_rebuild() {
 
     // Simulate a legacy DB: strip the stamp (pre-stamp binaries never wrote one).
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
         assert!(
@@ -172,7 +173,7 @@ fn test_obsolete_schema_forces_one_rebuild() {
     let deferred = recover_if_needed(&paths, &NoopEmbedder).unwrap();
     assert!(!deferred, "noop embedder must defer the upgrade");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(!schema_is_current(&conn), "deferral must not stamp");
     }
 
@@ -180,7 +181,7 @@ fn test_obsolete_schema_forces_one_rebuild() {
     let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(rebuilt, "obsolete schema must trigger a rebuild");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(
             schema_is_current(&conn),
             "rebuilt DB must be stamped current"
@@ -213,7 +214,7 @@ fn test_missing_log_does_not_disarm_upgrade() {
 
     add(&paths, &NoopEmbedder, base_args("orphaned")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
@@ -223,7 +224,7 @@ fn test_missing_log_does_not_disarm_upgrade() {
     let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt, "no log -> no rebuild");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(
             !schema_is_current(&conn),
             "populated DB without its log must NOT be stamped — the upgrade must retry"
@@ -234,14 +235,18 @@ fn test_missing_log_does_not_disarm_upgrade() {
     let dir2 = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir2.path().join(".state/agent-kb")).unwrap();
     let paths2 = Paths::from_root(dir2.path());
+    // paths2.db is the live path, so it must be schema-initialized through
+    // open_or_init (open_scratch refuses live db names) before the raw
+    // fixture connection below can touch kb_meta.
+    kb::components::db::open_or_init(&paths2).unwrap();
     {
-        let conn = open_db(&paths2.db).unwrap();
+        let conn = open_unchecked_for_test(&paths2.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
     let rebuilt2 = recover_if_needed(&paths2, &FixedEmbedder).unwrap();
     assert!(!rebuilt2);
-    let conn = open_db(&paths2.db).unwrap();
+    let conn = open_unchecked_for_test(&paths2.db).unwrap();
     assert!(
         schema_is_current(&conn),
         "empty DB with no log may stamp without rebuild"
@@ -261,7 +266,7 @@ fn test_partial_log_refuses_auto_rebuild() {
     add(&paths, &NoopEmbedder, base_args("legacy-a")).unwrap();
     add(&paths, &NoopEmbedder, base_args("legacy-b")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
@@ -277,14 +282,14 @@ fn test_partial_log_refuses_auto_rebuild() {
     });
     events::append_event(&paths.events, &new_event).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         apply_event(&conn, &NoopEmbedder, &new_event).unwrap();
     }
 
     let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt, "partial log must refuse auto-rebuild");
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "refusal must not stamp");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
@@ -306,7 +311,7 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
 
     add(&paths, &NoopEmbedder, base_args("rolled")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "UPDATE entries SET content='NEW db payload' WHERE id='rolled'",
             [],
@@ -323,7 +328,7 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
     );
 
     // Live DB now reflects the log (rolled back to 'ok') and is stamped.
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let content: String = conn
         .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| {
@@ -368,7 +373,7 @@ fn test_upgrade_aborts_when_backup_fails() {
 
     add(&paths, &NoopEmbedder, base_args("keep")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
@@ -384,7 +389,7 @@ fn test_upgrade_aborts_when_backup_fails() {
     assert!(res.is_err(), "backup failure must abort the upgrade");
 
     // DB is untouched: obsolete, entry intact.
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "aborted upgrade must not stamp");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
@@ -405,7 +410,7 @@ fn test_concurrent_upgrade_single_flight() {
 
     add(&paths, &NoopEmbedder, base_args("cc-1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
@@ -426,7 +431,7 @@ fn test_concurrent_upgrade_single_flight() {
         "exactly one of the racers must rebuild, got {results:?}"
     );
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {

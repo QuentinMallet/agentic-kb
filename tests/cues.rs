@@ -16,7 +16,6 @@
 //!   5. Events without cues field (legacy) behave exactly as before.
 //!   6. kb_core::add propagates cues into the upsert event and the DB.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use kb::components::db::{apply_event, open_db_memory, search_entries, SearchOptions};
 use kb::components::embedder::Embedder;
 use serde_json::json;
@@ -226,7 +225,7 @@ fn test_rebuild_replays_cue_rows() {
     .unwrap();
     add(&paths, &emb, mk("r2", vec!["doomed anchor".into()])).unwrap();
     {
-        let conn = kb::components::db::open_db(&paths.db).unwrap();
+        let conn = kb::components::db::open_unchecked_for_test(&paths.db).unwrap();
         apply_event(
             &conn,
             &emb,

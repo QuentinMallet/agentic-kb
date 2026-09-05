@@ -1,6 +1,5 @@
 //! `compact` subcommand
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::acquire_lock;
 use crate::components::{events, fsync::sync_parent_dir};
 use crate::config::{self, VacuumConfig};
@@ -1672,7 +1671,7 @@ mod tests {
         if !paths.db.exists() {
             return 0;
         }
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0)
     }
@@ -1859,7 +1858,7 @@ mod tests {
             "AC1+AC4: counter must reset to 0 after VACUUM fires on the 8th compact"
         );
 
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap();
@@ -1939,7 +1938,7 @@ mod tests {
         // Create a minimal DB: schema only, very few free pages (< 1024).
         {
             use crate::components::db;
-            let _conn = db::open_db(&paths.db).unwrap();
+            let _conn = db::open_unchecked_for_test(&paths.db).unwrap();
         }
         let free = freelist_count(&paths);
         assert!(
@@ -2031,7 +2030,7 @@ mod tests {
         let _ = child.wait();
 
         // DB must still be openable and queryable after SIGKILL.
-        let conn = crate::components::db::open_db(&paths.db)
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db)
             .expect("AC5: DB must be openable after SIGKILL during VACUUM");
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))

@@ -1,6 +1,5 @@
 //! `eval` subcommand — run the retrieval golden-set benchmark.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::db;
 use crate::components::embedder;
 use crate::components::retrieval_eval::{
@@ -120,9 +119,24 @@ impl Eval {
             mmr_lambda: kb_config.mmr_lambda,
         };
 
-        let conn = db::open_db(&paths.db)?;
-        // A read: detect and warn, never recover (C2/ADR-7).
-        crate::components::cursor::warn_if_behind(&conn, paths);
+        // A read: an uninitialized repository behaves exactly like an
+        // initialized-but-empty one (zero entries either way), so evaluate
+        // against a throwaway empty in-memory schema instead of erroring —
+        // never create the repository's own database from a read. The
+        // cursor/log staleness check below only makes sense against the
+        // repository's own database, so it is skipped for the substitute.
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => {
+                // A read: detect and warn, never recover (C2/ADR-7).
+                crate::components::cursor::warn_if_behind(&conn, paths);
+                conn
+            }
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                db::open_db_memory()?
+            }
+            Err(e) => return Err(e),
+        };
         let report = evaluate_split(&conn, embedder, &cases, &opts, requested)?;
         let recall = report.recall_at_k();
         let mrr = report.mrr();

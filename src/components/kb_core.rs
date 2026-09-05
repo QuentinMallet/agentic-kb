@@ -35,7 +35,6 @@
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
 use crate::components::verification::{
     compute_citation_hash, compute_citation_hash_and_size_from, open_citation_descriptor,
@@ -560,7 +559,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(&root);
+        let (paths, _conn) = db::test_db(&root);
         (dir, paths)
     }
 
@@ -1244,7 +1243,7 @@ mod tests {
     fn test_kb_core_add_replace_path_propagates_existing_id_decode_failure() {
         let (_dir, paths) = setup();
         let emb = NoopEmbedder;
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO entries(
                 id, path, summary, content, tags, version_ref, permanent, is_stale,

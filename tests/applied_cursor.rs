@@ -8,14 +8,12 @@
 //! to a no-op outside `cfg(test)` of the library itself, so an integration
 //! test could never reach one.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — the fixtures follow the repo default
-
 use kb::commands::add::acquire_lock;
 use kb::commands::rebuild::{recover_if_needed, Rebuild};
 use kb::components::cursor::{
     self, Cursor, DeadLetter, Decision, RebuildReason, POISON_MAX_ATTEMPTS,
 };
-use kb::components::db::{self, open_db, open_ro};
+use kb::components::db::{self, open_ro, open_unchecked_for_test};
 use kb::components::embedder::{Embedder, NoopEmbedder};
 use kb::components::events;
 use kb::components::kb_core::{self, AddArgs};
@@ -77,12 +75,12 @@ fn add_args(id: &str) -> AddArgs {
 }
 
 fn cursor_of(paths: &Paths) -> Option<Cursor> {
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     cursor::read(&conn).unwrap()
 }
 
 fn live_ids(paths: &Paths) -> Vec<String> {
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let mut stmt = conn
         .prepare("SELECT id FROM entries WHERE is_stale=0 ORDER BY id")
         .unwrap();
@@ -250,7 +248,7 @@ fn test_every_writer_leaves_the_cursor_caught_up() {
         kb_core::add(&paths, &NoopEmbedder, add_args("w-add")).unwrap();
         writer(&paths);
 
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::NoOp,
@@ -276,7 +274,7 @@ fn test_write_refuses_when_the_cursor_says_a_rebuild_is_due() {
     // An external `kb compact` in another process bumps the generation.
     cursor::bump_generation(&paths.events).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let lock = acquire_lock(&paths.lock).unwrap();
     let error =
         cursor::append_and_apply(&lock, &conn, &paths, &FixedEmbedder, &[upsert("e2", "two")])
@@ -310,7 +308,7 @@ fn test_write_refuses_when_the_cursor_is_behind_the_log() {
     events::append_event(&paths.events, &upsert("orphan", "unapplied")).unwrap();
     let before_len = fs::metadata(&paths.events).unwrap().len();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let lock = acquire_lock(&paths.lock).unwrap();
     let error =
         cursor::append_and_apply(&lock, &conn, &paths, &FixedEmbedder, &[upsert("e2", "two")])
@@ -326,7 +324,7 @@ fn test_write_refuses_when_the_cursor_is_behind_the_log() {
     // Recovery converges it, and the write then succeeds.
     recover_if_needed(&paths, &FixedEmbedder).unwrap();
     kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap();
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     assert_eq!(
         live_ids(&paths),
@@ -351,7 +349,7 @@ fn test_write_refuses_after_a_deferred_rebuild_under_a_noop_embedder() {
         "unexpected error: {error:#}"
     );
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::FullRebuild(RebuildReason::GenerationMismatch),
@@ -368,7 +366,7 @@ fn test_empty_batch_write_takes_the_guard() {
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     cursor::bump_generation(&paths.events).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let lock = acquire_lock(&paths.lock).unwrap();
     let error =
         cursor::append_and_apply_with(&lock, &conn, &paths, &FixedEmbedder, &[], |_| Ok(()))
@@ -395,7 +393,7 @@ fn test_write_refuses_when_the_log_file_is_missing() {
 
     fs::remove_file(&paths.events).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::LogMissing(paths.events.clone())
@@ -420,7 +418,7 @@ fn test_write_refuses_when_the_log_file_is_missing() {
         "a refused write must not resurrect the log"
     );
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::read(&conn).unwrap().unwrap(),
         before_cursor,
@@ -475,7 +473,7 @@ fn test_missing_log_end_to_end() {
     // Automatic recovery: declines, and drops nothing.
     assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
     assert_eq!(live_ids(&paths), vec!["e1".to_string(), "e2".to_string()]);
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::LogMissing(paths.events.clone())
@@ -491,13 +489,13 @@ fn test_missing_log_outranks_an_obsolete_schema_stamp() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
     fs::remove_file(&paths.events).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::LogMissing(paths.events.clone()),
@@ -522,7 +520,7 @@ fn test_missing_log_blocks_a_populated_database_with_an_offset_zero_cursor() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         cursor::write(
             &conn,
             &Cursor {
@@ -536,7 +534,7 @@ fn test_missing_log_blocks_a_populated_database_with_an_offset_zero_cursor() {
     fs::remove_file(&paths.events).unwrap();
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::LogMissing(paths.events.clone())
@@ -560,13 +558,13 @@ fn test_cursorless_populated_database_without_a_log_stays_row_one() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key LIKE 'applied_log_%'", [])
             .unwrap();
     }
     fs::remove_file(&paths.events).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::FullRebuild(RebuildReason::CursorMissing),
@@ -583,12 +581,12 @@ fn test_first_write_in_an_empty_repository_is_not_blocked() {
     assert!(!paths.events.exists());
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     }
     kb_core::add(&paths, &FixedEmbedder, add_args("first")).unwrap();
     assert_eq!(live_ids(&paths), vec!["first".to_string()]);
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
@@ -609,7 +607,7 @@ fn test_unreadable_tail_defers_and_refuses_writes() {
     damage_log_past_the_cursor(&paths);
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         let decision = cursor::inspect(&conn, &paths);
         assert!(
             matches!(decision, Decision::Defer(_)),
@@ -646,7 +644,7 @@ fn test_unreadable_tail_defers_and_refuses_writes() {
         "unexpected error: {error:#}"
     );
     assert_eq!(fs::read(&paths.events).unwrap(), before_log);
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::read(&conn).unwrap().unwrap(), cursor_before);
     assert_eq!(live_ids(&paths), vec!["applied".to_string()]);
 }
@@ -671,7 +669,7 @@ fn test_repairing_the_damaged_line_lets_recovery_converge() {
 
     recover_if_needed(&paths, &FixedEmbedder).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     assert_eq!(
         cursor::read(&conn).unwrap().unwrap().offset,
@@ -704,7 +702,7 @@ fn test_compact_refuses_unless_the_database_is_converged() {
         (
             "cause 1: the cursor row is unreadable",
             Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
+                let conn = open_unchecked_for_test(&paths.db).unwrap();
                 conn.execute("DROP TABLE kb_meta", []).unwrap();
             }),
         ),
@@ -721,7 +719,7 @@ fn test_compact_refuses_unless_the_database_is_converged() {
             Box::new(|paths: &Paths| {
                 // Truncate to a byte the cursor still claims, so hashing the
                 // prefix it names runs off the end of the file.
-                let conn = open_db(&paths.db).unwrap();
+                let conn = open_unchecked_for_test(&paths.db).unwrap();
                 let mut fabricated = cursor::read(&conn).unwrap().unwrap();
                 fabricated.offset += 4096;
                 cursor::write(&conn, &fabricated).unwrap();
@@ -782,7 +780,7 @@ fn test_a_deferral_outranks_a_stale_generation_until_the_log_reads_again() {
     fs::write(&paths.events, format!("{intact}{{ not json at all }}\n")).unwrap();
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         let decision = cursor::inspect(&conn, &paths);
         assert!(
             matches!(decision, Decision::Defer(_)),
@@ -799,14 +797,14 @@ fn test_a_deferral_outranks_a_stale_generation_until_the_log_reads_again() {
     // Repair only the log. The generation mismatch is now visible and repairs.
     fs::write(&paths.events, &intact).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::FullRebuild(RebuildReason::GenerationMismatch)
         );
     }
     assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     assert_eq!(live_ids(&paths), vec!["e1".to_string()]);
 }
@@ -1041,10 +1039,10 @@ fn test_replaying_the_same_tail_twice_through_recovery_is_a_no_op() {
     .unwrap();
     recover_if_needed(&paths, &FixedEmbedder).unwrap();
     let after_first = {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         materialized(&conn)
     };
-    let runs: i64 = open_db(&paths.db)
+    let runs: i64 = open_unchecked_for_test(&paths.db)
         .unwrap()
         .query_row("SELECT COUNT(*) FROM run_history", [], |r| r.get(0))
         .unwrap();
@@ -1052,7 +1050,7 @@ fn test_replaying_the_same_tail_twice_through_recovery_is_a_no_op() {
 
     // Rewind the cursor to before the batch: the whole tail replays again.
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         cursor::write(
             &conn,
             &Cursor {
@@ -1065,7 +1063,7 @@ fn test_replaying_the_same_tail_twice_through_recovery_is_a_no_op() {
     }
     recover_if_needed(&paths, &FixedEmbedder).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         materialized(&conn),
         after_first,
@@ -1175,7 +1173,7 @@ fn test_compaction_bumps_the_generation_and_forces_a_full_rebuild() {
     // Reopen. The generation check — not the tail hash, and not a crash —
     // is what makes this a full rebuild.
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::FullRebuild(RebuildReason::GenerationMismatch),
@@ -1190,7 +1188,7 @@ fn test_compaction_bumps_the_generation_and_forces_a_full_rebuild() {
     // Without the generation check, recovery would have replayed the compacted
     // tail onto a database that already held A, and B would be missing.
     assert_eq!(live_ids(&paths), vec!["A".to_string(), "B".to_string()]);
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
@@ -1209,7 +1207,7 @@ fn test_generation_mismatch_alone_forces_a_full_rebuild() {
         "log bytes unchanged"
     );
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::FullRebuild(RebuildReason::GenerationMismatch)
@@ -1225,7 +1223,7 @@ fn test_cursorless_database_takes_the_full_rebuild_row() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key LIKE 'applied_log_%'", [])
             .unwrap();
         assert_eq!(
@@ -1234,7 +1232,7 @@ fn test_cursorless_database_takes_the_full_rebuild_row() {
         );
     }
     assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     assert!(
         cursor::read(&conn).unwrap().is_some(),
@@ -1246,7 +1244,7 @@ fn test_cursorless_database_takes_the_full_rebuild_row() {
 fn test_obsolete_schema_stamp_takes_the_full_rebuild_row() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     conn.execute(
         "UPDATE kb_meta SET value='1' WHERE key='schema_version'",
         [],
@@ -1265,7 +1263,7 @@ fn test_offset_beyond_the_log_takes_the_full_rebuild_row() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         let mut fabricated = cursor::read(&conn).unwrap().unwrap();
         fabricated.offset += 4096;
         cursor::write(&conn, &fabricated).unwrap();
@@ -1275,7 +1273,7 @@ fn test_offset_beyond_the_log_takes_the_full_rebuild_row() {
         );
     }
     assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
@@ -1283,7 +1281,7 @@ fn test_offset_beyond_the_log_takes_the_full_rebuild_row() {
 fn test_rewritten_bytes_at_the_offset_take_the_full_rebuild_row() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let mut fabricated = cursor::read(&conn).unwrap().unwrap();
     fabricated.tail_sha = "0".repeat(64);
     cursor::write(&conn, &fabricated).unwrap();
@@ -1305,7 +1303,7 @@ fn test_unreadable_log_defers_with_a_warning() {
     fs::write(&paths.events, raw).unwrap();
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(
             matches!(cursor::inspect(&conn, &paths), Decision::Defer(_)),
             "an unreadable log must defer, not fail"
@@ -1324,12 +1322,12 @@ fn test_cursor_at_offset_zero_against_a_populated_database() {
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap();
     let expected = {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         materialized(&conn)
     };
 
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         cursor::write(
             &conn,
             &Cursor {
@@ -1342,7 +1340,7 @@ fn test_cursor_at_offset_zero_against_a_populated_database() {
     }
     recover_if_needed(&paths, &FixedEmbedder).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
     assert_eq!(
         materialized(&conn),
@@ -1360,7 +1358,7 @@ fn test_rebuild_over_an_empty_log_leaves_a_current_cursor() {
     db::open_or_init(&paths).unwrap();
     (Rebuild).execute_with(&paths, &FixedEmbedder).unwrap();
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
@@ -1410,7 +1408,7 @@ fn test_poison_record_is_quarantined_after_k_attempts_and_the_cursor_advances() 
     );
 
     // And every entry point stays alive rather than replaying the poison.
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
