@@ -54,11 +54,31 @@ fn open_db_callsites_do_not_increase() {
     );
 }
 
+/// Strip a `//` line comment from `line`, so a mention of the raw
+/// constructor in prose (a doc comment explaining what a call site used to
+/// do, say) does not itself trip the gate. A `//` immediately preceded by
+/// `:` is treated as part of a `scheme://` URL rather than a comment
+/// introducer, so doc comments that link to something don't get truncated.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' && (i == 0 || bytes[i - 1] != b':') {
+            return &line[..i];
+        }
+    }
+    line
+}
+
 #[test]
 fn connection_open_is_confined_to_the_db_component() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let db_component = src_root.join("components/db.rs");
     let mut offenders = Vec::new();
+    const RAW_CONSTRUCTORS: &[&str] = &[
+        "Connection::open(",
+        "Connection::open_with_flags(",
+        "Connection::open_in_memory(",
+    ];
 
     for path in src_rs_files(&src_root) {
         if path == db_component {
@@ -66,7 +86,8 @@ fn connection_open_is_confined_to_the_db_component() {
         }
         let source = fs::read_to_string(&path).unwrap();
         for (index, line) in source.lines().enumerate() {
-            if line.contains("Connection::open(") {
+            let code = strip_line_comment(line);
+            if RAW_CONSTRUCTORS.iter().any(|ctor| code.contains(ctor)) {
                 offenders.push(format!("{}:{}", path.display(), index + 1));
             }
         }
@@ -74,7 +95,7 @@ fn connection_open_is_confined_to_the_db_component() {
 
     assert!(
         offenders.is_empty(),
-        "Connection::open sites outside components/db.rs: {}",
+        "raw rusqlite Connection constructor sites outside components/db.rs: {}",
         offenders.join(", ")
     );
 }
