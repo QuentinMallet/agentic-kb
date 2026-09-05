@@ -9,7 +9,6 @@
 //! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
 //! The `expire_reason` is `"replaced by --replace-path"`.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
 use crate::components::embedder;
 use crate::components::kb_core;

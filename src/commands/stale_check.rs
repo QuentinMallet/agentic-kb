@@ -5,7 +5,6 @@
 //! stdout; the MCP handler serialises it to JSON.  No SQL or git subprocess
 //! invocation should be duplicated between the two call sites.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::cursor;
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy};
@@ -205,9 +204,13 @@ impl StaleCheck {
             anyhow::bail!("provide at least one file path or --commits");
         }
 
-        let conn = db::open_db(&paths.db)?;
-        let repo_root = Some(paths.root.clone());
         let policy: RelocationPolicy = self.relocate.into();
+        let cfg = config::KbConfig::from_paths(paths);
+        if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
+            db::open_or_init(paths)?;
+        }
+        let conn = db::open_ro(&paths.db)?;
+        let repo_root = Some(paths.root.clone());
 
         let mut report = run_stale_check(
             &conn,
@@ -221,7 +224,6 @@ impl StaleCheck {
         // P4: relocation computes and reports by default.  Rewriting a citation
         // is a separate, off-by-default decision, and even then it writes the
         // path only — never the stored hash.
-        let cfg = config::KbConfig::from_paths(paths);
         if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
             heal_relocations(paths, &mut report, policy)?;
         }
