@@ -189,12 +189,7 @@ pub fn add_locked(
         );
     }
 
-    let repo_root = paths
-        .db
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("cannot determine repository root from KB database path"))?;
+    let repo_root = &paths.root;
 
     // Normalize path-only evidence before constructing any events. Explicit
     // assertions are authoritative and are never replaced, even when wrong.
