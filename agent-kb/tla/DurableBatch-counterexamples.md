@@ -118,8 +118,8 @@ breadth-first search was used throughout, including for the two temporal configs
 | `DurableBatch_CE8_Fixed.cfg` | " under the K-retry dead-letter policy | PASS | `No error has been found` · 64 / 34 · 03s |
 | `DurableBatch_Deferred_Current.cfg` | withdrawn design: a write proceeds while damaged and materializes a non-prefix | VIOLATED (deferred-state gates around `CursorAgreesWithDB`, `DBNotAheadOfDurable`, and `CursorNeverAheadOfDB`) | `Error: Invariant DeferredCursorAgreesWithDB is violated` · 58 distinct · 03s |
 | `DurableBatch_Deferred_Fixed.cfg` | unreadable tail blocks writes; repair then replays from `cursor.off` | PASS | `No error has been found` · 83 distinct · 03s |
-| `DurableBatch_LogMissing_Current.cfg` | withdrawn design resurrects an absent non-trivial log and writes against an empty durable prefix | VIOLATED (`DBNotAheadOfDurable` and `CursorAgreesWithDB`; `CursorNeverAheadOfDB` is also checked) | TLC run: pending caller-side |
-| `DurableBatch_LogMissing_Fixed.cfg` | row 9 serves reads but blocks writes, recovery, rebuild, and compaction | PASS | TLC run: pending caller-side |
+| `DurableBatch_LogMissing_Current.cfg` | withdrawn design resurrects an absent non-trivial log and writes against an empty durable prefix | VIOLATED (`DBNotAheadOfDurable` and `CursorAgreesWithDB`; `CursorNeverAheadOfDB` is also checked) | `Error: Invariant DBNotAheadOfDurable is violated` · 13 gen / 10 distinct · depth 5 · 01s — **see caveat below: this trace does not exercise `LogVanishes`/`UnsafeWriteWhileLogMissing`** |
+| `DurableBatch_LogMissing_Fixed.cfg` | row 9 serves reads but blocks writes, recovery, rebuild, and compaction | PASS | `No error has been found` · 163 gen / 83 distinct · depth 30 · 00s (includes `LogMissingBlocksWrites` and `LogMissingDoesNotStart`) |
 | `DurableBatch_Safety_Fixed.cfg` | **unpinned**, all seven invariants plus the truncation action property | PASS | `No error has been found` · 537 / 259 · 02s |
 | `DurableBatch_Safety_Fixed_Poison.cfg` | same, with the poison record and quarantine live | PASS | `No error has been found` · 766 / 374 · 02s |
 | `DurableBatch_Refinement_Fixed.cfg` | refines `InnerGap` over the **full** Next relation | PASS | `No error has been found` · 448 / 216 · 03s |
@@ -323,10 +323,94 @@ checks all three cursor/durability invariants, `LogMissingBlocksWrites` (the
 state stays idle), and the action property `LogMissingDoesNotStart` (no
 transition from a missing-log state can increase `nstarted`).
 
-- `DurableBatch_LogMissing_Current.cfg`: expected **VIOLATED**. TLC run:
-  pending caller-side.
-- `DurableBatch_LogMissing_Fixed.cfg`: expected **PASS**. TLC run: pending
-  caller-side.
+- `DurableBatch_LogMissing_Current.cfg`: **VIOLATED** — `DBNotAheadOfDurable`
+  (and, at the same state, `CursorAgreesWithDB`; `cursor.gen = generation = 0`,
+  `log_durable = <<>>`, so `Materialize(Prefix(log_durable, cursor.off), {}) = {}`
+  while `db_committed = {"A"}`), 13 states generated / 10 distinct, depth 5,
+  01s.
+- `DurableBatch_LogMissing_Fixed.cfg`: **PASS** — 163 states generated / 83
+  distinct, depth 30, 00s. `LogMissingBlocksWrites` and
+  `LogMissingDoesNotStart` both hold over the full, exhaustively-searched
+  state space.
+
+**Caveat on the `Current` trace.** The counterexample TLC actually finds does
+**not** traverse `LogVanishes` or `UnsafeWriteWhileLogMissing` — it is the
+pre-existing, LogMissing-unrelated bug already isolated by
+`DurableBatch_CE2_Current.cfg`: `ApplyEvent` sets `db_committed' = nd`
+unconditionally whenever `~(Fixed /\ ~last)`, i.e. whenever `Fixed = FALSE`,
+regardless of whether the log has ever gone missing. The 4-transition trace is
+`Init → StartBatch → AppendLine → ApplyEvent`, reaching `db_committed = {"A"}`
+against `log_durable = <<>>` at depth 5 — well before `LogVanishes` could ever
+fire (that action additionally requires `phase = "idle"` after non-trivial
+durable history). `CE1_Current.cfg`, `CE3_Current.cfg`, and
+`Cursor_Current.cfg` avoid this same shallow pre-emption by omitting
+`DBNotAheadOfDurable` from their own `INVARIANT` lists (each checks only its
+own scenario's invariant); `DurableBatch_LogMissing_Current.cfg` includes
+`DBNotAheadOfDurable`, so TLC's breadth-first search reports this shallower,
+unrelated violation first. The invariant names in the result match this
+document's prediction, but the mechanism does not match the prose above (row
+9 resurrection via `UnsafeWriteWhileLogMissing`) — that specific pathway
+remains unexercised by this cfg as currently constituted. Full trace:
+`tlc-logmissing-current.txt` (caller scratchpad). No `.tla`/`.cfg` edits were
+made to address this — flagged for the spec owner to decide whether the
+`Current` cfg should drop `DBNotAheadOfDurable` (mirroring `CE1`/`CE3`/
+`Cursor`) so the LogVanishes-specific counterexample surfaces instead.
+
+### Regression: the `AllowLogMissing = FALSE` amendment changes no other verdict
+
+Every pre-existing `DurableBatch_*.cfg` (26 files) picked up the new
+`AllowLogMissing = FALSE` constant with this amendment. Re-run in full,
+against the amended `DurableBatch.tla`, to confirm no other cfg's verdict
+moved. `AllowLogMissing = FALSE` keeps `log_present` permanently `TRUE`
+(only `LogVanishes` can clear it, and it requires `AllowLogMissing`), so
+`LogMissing` is vacuously `FALSE` throughout and the new `~LogMissing` guards
+added to `StartBatch`, `Compact`, `Recovery`, `RecoverIdle`, and `RebuildAll`
+are non-restrictive for every one of these configs — consistent with the
+observation below that every cfg whose full state space is exhaustively
+searched (a `PASS` verdict) reproduces the exact same distinct-state count as
+the pre-amendment run recorded elsewhere in this document. Counts for
+`VIOLATED`/witness cfgs differ slightly run-to-run (TLC's multi-worker
+breadth-first search stops as soon as any worker reaches a violating state,
+and which worker gets there first is not deterministic) — the invariant or
+property name violated is the only stable signal, and it is unchanged in
+every case below.
+
+| cfg | expected | observed | states (gen/distinct) | time |
+|---|---|---|---|---|
+| `DurableBatch_CE1_Current.cfg` | VIOLATED `NoHalfBatch` | VIOLATED `NoHalfBatch` | 38 / (early-stop) | 2s |
+| `DurableBatch_CE1_Fixed.cfg` | PASS | PASS | 448 / 216 | 2s |
+| `DurableBatch_CE2_Current.cfg` | VIOLATED `DBNotAheadOfDurable` | VIOLATED `DBNotAheadOfDurable` | / 61 (early-stop) | 2s |
+| `DurableBatch_CE2_Fixed.cfg` | PASS | PASS | 448 / 216 | 1s |
+| `DurableBatch_CE3_Current.cfg` | VIOLATED `OpenRestores` | VIOLATED `OpenRestores` | / 59 (early-stop) | 2s |
+| `DurableBatch_CE3_Fixed.cfg` | PASS | PASS | 448 / 216 | 2s |
+| `DurableBatch_CE8_Current.cfg` | VIOLATED (temporal property) | VIOLATED (temporal property) | / 27 (early-stop) | 1s |
+| `DurableBatch_CE8_Fixed.cfg` | PASS | PASS | 64 / 34 | 2s |
+| `DurableBatch_Cursor_Current.cfg` | VIOLATED `CursorAgreesWithDB` | VIOLATED `CursorAgreesWithDB` | / 36 (early-stop) | 1s |
+| `DurableBatch_Cursor_Fixed.cfg` | PASS | PASS | 537 / 259 | 1s |
+| `DurableBatch_Deferred_Current.cfg` | VIOLATED `DeferredCursorAgreesWithDB` | VIOLATED `DeferredCursorAgreesWithDB` | / 59 (early-stop) | 2s |
+| `DurableBatch_Deferred_Fixed.cfg` | PASS | PASS | / 83 | 2s |
+| `DurableBatch_NV_Truncate.cfg` | VIOLATED `TruncationPreservesAccepted` | VIOLATED `TruncationPreservesAccepted` (action property) | / 83 (early-stop) | 2s |
+| `DurableBatch_NV_TypeOK.cfg` | VIOLATED `TypeOK` (initial state) | VIOLATED `TypeOK` (initial state) | — | 4s |
+| `DurableBatch_Refinement_Current.cfg` | VIOLATED (`InnerGap` line 143) | VIOLATED (`InnerGap` line 143, col 6 to col 75 — identical location) | / 23 (early-stop) | 7s |
+| `DurableBatch_Refinement_Fixed.cfg` | PASS | PASS | 448 / 216 | 7s |
+| `DurableBatch_Safety_Fixed.cfg` | PASS | PASS | 537 / 259 | 5s |
+| `DurableBatch_Safety_Fixed_Poison.cfg` | PASS | PASS | 766 / 374 | 6s |
+| `DurableBatch_WIT_W_Inner_Applying.cfg` | VIOLATED `W_Inner_Applying` (witness) | VIOLATED `W_Inner_Applying` | / 61 (early-stop) | 5s |
+| `DurableBatch_WIT_W_Inner_Crashed.cfg` | VIOLATED `W_Inner_Crashed` (witness) | VIOLATED `W_Inner_Crashed` | / 15 (early-stop) | 2s |
+| `DurableBatch_WIT_W_Inner_Done.cfg` | VIOLATED `W_Inner_Done` (witness) | VIOLATED `W_Inner_Done` | / 85 (early-stop) | 3s |
+| `DurableBatch_WIT_W_Inner_JsonlGrows.cfg` | VIOLATED `W_Inner_JsonlGrows` (witness) | VIOLATED `W_Inner_JsonlGrows` | / 43 (early-stop) | 3s |
+| `DurableBatch_WIT_W_Rec_FullRebuild.cfg` | VIOLATED `W_Rec_FullRebuild` (witness) | VIOLATED `W_Rec_FullRebuild` | / 209 (early-stop) | 2s |
+| `DurableBatch_WIT_W_Rec_NoOp.cfg` | VIOLATED `W_Rec_NoOp` (witness) | VIOLATED `W_Rec_NoOp` | / 23 (early-stop) | 2s |
+| `DurableBatch_WIT_W_Rec_TailReplay.cfg` | VIOLATED `W_Rec_TailReplay` (witness) | VIOLATED `W_Rec_TailReplay` | / 53 (early-stop) | 1s |
+| `DurableBatch_WIT_W_ScheduleCompletes.cfg` | VIOLATED `W_ScheduleCompletes` (witness) | VIOLATED `W_ScheduleCompletes` | / 181 (early-stop) | 2s |
+
+Result: **every regression verdict matched** — same invariant/property name
+violated (or same PASS), for all 26 pre-existing cfgs. The small
+distinct-state deltas on early-stopped (`VIOLATED`) runs versus prior
+recordings elsewhere in this document (e.g. CE2 55→61, CE3 61→59) are the
+early-stop non-determinism described above, not a behavioral change — every
+`PASS` cfg (full state-space search, therefore deterministic) reproduces its
+prior distinct-state count exactly.
 
 ### Refinement — the current design does not refine `InnerGap`
 
