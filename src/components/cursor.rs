@@ -20,12 +20,23 @@
 //!   validates against a compacted log and would replay the compacted tail onto
 //!   a DB that already holds the original tail. The generation makes that
 //!   detection O(1) and total.
-//! * `applied_log_tail_sha` covers the last [`TAIL_SHA_WINDOW`] bytes before
-//!   the offset. It is deliberately a *bounded* hash: the generation counter,
-//!   not a longer window, is what makes detection total. **If the generation
-//!   counter is ever dropped, its replacement is a whole-prefix hash over
-//!   `[0, offset)` — never a longer tail hash**, which is strictly weaker than
-//!   the whole-prefix hash `rebuild` already uses and misses compaction.
+//! * `applied_log_tail_sha` is a bounded fingerprint of the prefix
+//!   `[0, offset)`: the prefix length, the first [`TAIL_SHA_WINDOW`] bytes, and
+//!   the last [`TAIL_SHA_WINDOW`] bytes. Two anchored windows rather than one,
+//!   because a rewrite that removes lines shifts everything after it — anchoring
+//!   at byte 0 catches an early rewrite that a tail-only window would miss — and
+//!   the length is folded in so a rewrite that changes it cannot match on
+//!   coincidentally identical window bytes. It stays *bounded* on purpose: the
+//!   generation counter, not a longer window, is what makes detection total.
+//!   **If the generation counter is ever dropped, its replacement is a
+//!   whole-prefix hash over `[0, offset)` — never a wider window**, which is
+//!   strictly weaker than the whole-prefix hash `rebuild` already uses and
+//!   misses compaction.
+//!
+//!   Residual: a log rewritten by an older pinned binary that leaves no
+//!   generation sidecar, keeps the length, and reproduces both windows byte for
+//!   byte would still validate. Closing that needs the generation inside the
+//!   log, which D7 rules out for this epic.
 //!
 //! # The single write path
 //!
@@ -65,10 +76,10 @@ pub const APPLIED_LOG_OFFSET: &str = "applied_log_offset";
 /// `kb_meta` key holding the bounded tail hash at that boundary.
 pub const APPLIED_LOG_TAIL_SHA: &str = "applied_log_tail_sha";
 
-/// Bytes before the cursor offset covered by `applied_log_tail_sha`.
+/// Size of each of the two anchored windows in `applied_log_tail_sha`.
 ///
-/// Bounded on purpose — see the module docs on why lengthening this is never
-/// the right answer to a dropped generation counter.
+/// Bounded on purpose — see the module docs on why widening this is never the
+/// right answer to a dropped generation counter.
 pub const TAIL_SHA_WINDOW: u64 = 64 * 1024;
 
 /// `K` from `.state/agent-kb/tla/DurableBatch.tla`: apply attempts on one
@@ -317,7 +328,13 @@ fn empty_tail_sha() -> String {
     hex(Sha256::digest([]))
 }
 
-/// Hash the last [`TAIL_SHA_WINDOW`] bytes before `offset`.
+/// Bounded fingerprint of the log prefix `[0, offset)`.
+///
+/// Covers the prefix length plus two anchored [`TAIL_SHA_WINDOW`] windows, one
+/// at byte 0 and one ending at `offset`. Both anchors matter: a rewrite that
+/// removes lines early shifts every byte after it, so the head window catches
+/// what a tail-only window would sail past, and binding the length in means a
+/// length-changing rewrite cannot match on coincidentally identical windows.
 ///
 /// Errors when the log is shorter than `offset`; callers classify that as
 /// [`RebuildReason::OffsetBeyondLog`] before ever reaching here.
@@ -326,7 +343,7 @@ pub fn tail_sha(events_path: &Path, offset: u64) -> Result<String> {
         return Ok(empty_tail_sha());
     }
     let mut file = fs::File::open(events_path)
-        .with_context(|| format!("open events {} for tail hash", events_path.display()))?;
+        .with_context(|| format!("open events {} for the prefix fingerprint", events_path.display()))?;
     let len = file.metadata()?.len();
     anyhow::ensure!(
         len >= offset,
@@ -334,10 +351,15 @@ pub fn tail_sha(events_path: &Path, offset: u64) -> Result<String> {
         events_path.display()
     );
     let window = offset.min(TAIL_SHA_WINDOW);
-    file.seek(SeekFrom::Start(offset - window))?;
-    let mut buf = vec![0_u8; window as usize];
-    file.read_exact(&mut buf)?;
-    Ok(hex(Sha256::digest(&buf)))
+    let mut hasher = Sha256::new();
+    hasher.update(offset.to_le_bytes());
+    for start in [0, offset - window] {
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0_u8; window as usize];
+        file.read_exact(&mut buf)?;
+        hasher.update(&buf);
+    }
+    Ok(hex(hasher.finalize()))
 }
 
 // ---------------------------------------------------------------------------
@@ -788,24 +810,36 @@ mod tests {
     }
 
     #[test]
-    fn test_tail_sha_is_bounded_by_the_window() {
+    fn test_prefix_fingerprint_anchors_at_both_ends_and_binds_the_length() {
         let dir = tempdir().unwrap();
         let events = dir.path().join("agent-kb-events.jsonl");
-        let body = vec![b'a'; (TAIL_SHA_WINDOW + 4096) as usize];
+        // Long enough that the two windows do not overlap.
+        let body = vec![b'a'; (TAIL_SHA_WINDOW * 3) as usize];
         fs::write(&events, &body).unwrap();
         let full = tail_sha(&events, body.len() as u64).unwrap();
-        // Changing a byte OUTSIDE the window leaves the tail hash alone — the
-        // generation counter, not a bigger window, is what covers a rewrite.
+
+        for index in [0_usize, body.len() - 1] {
+            let mut mutated = body.clone();
+            mutated[index] = b'b';
+            fs::write(&events, &mutated).unwrap();
+            assert_ne!(
+                tail_sha(&events, mutated.len() as u64).unwrap(),
+                full,
+                "a change at byte {index} must move the fingerprint"
+            );
+        }
+
+        // A length change alone moves it, even though both windows still read
+        // as an unbroken run of the same byte.
+        fs::write(&events, vec![b'a'; body.len() - 1]).unwrap();
+        assert_ne!(tail_sha(&events, (body.len() - 1) as u64).unwrap(), full);
+
+        // The middle stays uncovered on purpose: that is the generation
+        // counter's job, and widening the windows is never the answer.
         let mut mutated = body.clone();
-        mutated[0] = b'b';
+        mutated[(TAIL_SHA_WINDOW + 16) as usize] = b'b';
         fs::write(&events, &mutated).unwrap();
         assert_eq!(tail_sha(&events, mutated.len() as u64).unwrap(), full);
-        // Changing a byte inside the window does move it.
-        let mut mutated = body.clone();
-        let last = mutated.len() - 1;
-        mutated[last] = b'b';
-        fs::write(&events, &mutated).unwrap();
-        assert_ne!(tail_sha(&events, mutated.len() as u64).unwrap(), full);
     }
 
     #[test]
