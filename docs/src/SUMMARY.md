@@ -9,6 +9,7 @@
 - [Evidence Resolution](./evidence-resolution.md)
 - [Peer Graph (kb peers)](./peer-graph-cli.md)
 - [Lock Contract](./lock-contract.md)
+- [First-run Behavior](./first-run.md)
 - [MCP Surfaces](./mcp.md)
 - [Search Tuning](./search-tuning.md)
 - [Performance Baselines](./performance-baselines.md)
