@@ -62,6 +62,15 @@ The limit and `inline_verify_k` boundary cases are pinned by
 `test_search_rejects_limit_above_max_and_honours_the_maximum` and
 `test_search_rejects_inline_verify_k_above_max_and_honours_the_maximum`.
 
+**MCP-visible change:** `inline_verify_k`'s accepted maximum rose from `20` to
+`100`. `db::MAX_INLINE_VERIFY_K` is now defined as `db::MAX_LIMIT`, matching the
+CLI's existing `--limit <= 100` verify-all contract instead of capping MCP
+verification below it. This was ruling O1 of the
+[S5 search caps decision packet](../decisions/s5-search-caps-packet.md): a
+caller that previously had `inline_verify_k` rejected above 20 can now request
+verification up to 100, at the cost of a worst-case bounded fan-out of
+`100 * 200 = 20,000` scheduled verification tasks.
+
 Rendered search context is capped at 32,000 bytes by
 `@format_entries_max_bytes`. `format_entries` retains whole entries only and
 appends `…(N more entries omitted)` when the cap omits results; the behavior is
