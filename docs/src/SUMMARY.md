@@ -2,6 +2,8 @@
 
 - [Introduction](./introduction.md)
 - [Event Log Format](./event-log-format.md)
+  - [Recovery Protocol](./recovery-protocol.md)
+  - [Downgrade Procedure](./downgrade-procedure.md)
 - [Evidence Storage](./evidence-storage.md)
 - [Citation Semantics](./citation-semantics.md)
 - [Evidence Resolution](./evidence-resolution.md)
