@@ -1236,3 +1236,37 @@ symlink-traversing rows (entry_id, citation_path, currently_verified):
 
 sample flip candidates (entry_id, citation_path):
 ```
+
+---
+
+## V1 budget decision (recorded 2026-09-05)
+
+V1's acceptance criterion (§V1) requires "the budget decision is recorded in this plan file with
+both branches named." The decision was implemented and documented only as a code comment on
+`search_for_excerpt` in `src/components/verification.rs` (the production method at line 917 and
+its `#[cfg(test)]` harness wrapper of the same name, whose doc comment carries the decision text,
+at lines 1338–1344 of the `storage-correctness-2` aggregator worktree). It is restated here
+verbatim so the decision lives in the plan as required; the code comment remains the canonical
+record and must be kept in sync with this section if either changes.
+
+**Decision.** Budget exhaustion (`MAX_RELOCATION_SCAN_BYTES` reached, `ExcerptSearch::CapExceeded`)
+is handled identically regardless of when it occurs, covering both branches:
+
+- **Branch 1 — cap hit before any candidate is found.** The scan exhausts its budget with zero
+  matches seen. Returns `ExcerptSearch::CapExceeded`.
+- **Branch 2 — cap hit after one candidate is already found.** The in-file short-circuit found one
+  match, the repo-wide walk continues (per V1's unconditional-walk change), and the budget is
+  exhausted before a second match can be confirmed or ruled out. Returns
+  `ExcerptSearch::CapExceeded` — **not** a degraded `Unique`.
+
+Both branches map to the same `VerificationOutcome::unverified(UnverifiedReason::ScanCapExceeded)`
+outcome. Branch 2 must never degrade to `Unique`: doing so would be exactly the false-positive
+uniqueness result V1 exists to eliminate. In the TLA+ refinement, `candidates` is the saturating
+`min(actual repo-wide overlapping match locations, MaxCandidates)`; `CapExceeded` has no single
+`candidates` image because the unscanned bytes leave the true repo-wide count unknown — its model
+image is the set of such unverified states, not any particular `candidates` value (see also
+`CitationRelocation-planheal-trace.md §Bounds and the search-image note`).
+
+Canonical source: `src/components/verification.rs:1338-1344` (doc comment on `search_for_excerpt`),
+`storage-correctness-2` aggregator worktree, function `Verifier::search_for_excerpt` /
+`search_for_excerpt` (test harness).
