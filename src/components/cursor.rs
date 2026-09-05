@@ -380,13 +380,25 @@ impl DeadLetter {
             .unwrap_or_default()
     }
 
+    /// Durably: the attempt counter is what bounds a poison record's retries
+    /// across process restarts, so it has to survive the crash that a retry
+    /// loop is most likely to hit. Same tmp, sync, rename, sync-parent order as
+    /// [`bump_generation`].
     pub fn save(&self, events_path: &Path) -> Result<()> {
         let path = dead_letter_path(events_path);
         let tmp = sidecar(events_path, "deadletter.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("write dead-letter sidecar {}", tmp.display()))?;
+        {
+            let mut file = fs::File::create(&tmp)
+                .with_context(|| format!("create dead-letter sidecar {}", tmp.display()))?;
+            use std::io::Write;
+            file.write_all(&serde_json::to_vec_pretty(self)?)
+                .with_context(|| format!("write dead-letter sidecar {}", tmp.display()))?;
+            file.sync_data()
+                .with_context(|| format!("sync dead-letter sidecar {}", tmp.display()))?;
+        }
         fs::rename(&tmp, &path)
             .with_context(|| format!("install dead-letter sidecar {}", path.display()))?;
+        sync_parent_dir(&path)?;
         Ok(())
     }
 
@@ -801,6 +813,53 @@ mod tests {
         let event = serde_json::json!({"action":"upsert","table":"entries","id":"x"});
         let round_tripped: Value = serde_json::from_str(&event.to_string()).unwrap();
         assert_eq!(fingerprint(&event), fingerprint(&round_tripped));
+    }
+
+    /// The attempt counter is what bounds a poison record's retries across
+    /// process restarts, so it has to be on disk before the process that wrote
+    /// it can end. The child exits abruptly the instant save returns.
+    #[test]
+    fn test_dead_letter_survives_an_abrupt_exit_after_save() {
+        use std::process::Command;
+
+        if let Ok(root) = std::env::var("KB_DEADLETTER_CHILD_ROOT") {
+            let events = Path::new(&root).join("agent-kb-events.jsonl");
+            let mut ledger = DeadLetter::default();
+            ledger.records.insert(
+                "poison".to_string(),
+                DeadLetterRecord {
+                    attempts: POISON_MAX_ATTEMPTS,
+                    quarantined: true,
+                    last_error: "embedder is down".to_string(),
+                    ..Default::default()
+                },
+            );
+            ledger.save(&events).unwrap();
+            std::process::exit(137);
+        }
+
+        let dir = tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("test_dead_letter_survives_an_abrupt_exit_after_save")
+            .arg("--nocapture")
+            .env("KB_DEADLETTER_CHILD_ROOT", dir.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(137));
+
+        let events = dir.path().join("agent-kb-events.jsonl");
+        let loaded = DeadLetter::load(&events);
+        let record = loaded
+            .records
+            .get("poison")
+            .expect("the ledger must survive the child's exit");
+        assert_eq!(record.attempts, POISON_MAX_ATTEMPTS);
+        assert!(record.quarantined);
+        assert!(
+            !dead_letter_path(&events).with_extension("").exists()
+                || !sidecar(&events, "deadletter.tmp").exists(),
+            "the staging file must not be left behind"
+        );
     }
 
     #[test]
