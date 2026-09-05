@@ -59,7 +59,7 @@ modelled here; the code-side disposition is the quarantine-the-unparseable
 ***************************************************************************)
 
 CONSTANTS EntryIds, MaxLogLen, MaxBatches, MaxGen, K, PoisonBatch,
-          AllowCrash, InnerMaxLog, Fixed
+          AllowCrash, AllowDeferred, InnerMaxLog, Fixed
 
 VARIABLES log_written,    \* lines handed to write(2); may not be durable
           log_durable,    \* lines on stable storage; a prefix of log_written
@@ -92,6 +92,7 @@ ASSUME Bounds ==
   /\ MaxGen \in 0..1
   /\ K >= 1
   /\ PoisonBatch \in 0..MaxBatches
+  /\ AllowDeferred \in BOOLEAN
   /\ InnerMaxLog >= 5
 
 NoId == "-"
@@ -222,6 +223,7 @@ LinesOfCur == Len(SelectSeq(log_written, LAMBDA l : l.b = cur))
 
 StartBatch ==
   /\ phase = "idle"
+  /\ ~deferred
   /\ nstarted < MaxBatches
   /\ CursorCurrent
   /\ nstarted' = nstarted + 1
@@ -260,6 +262,70 @@ SyncLog ==
   /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
                  nstarted, cur, aidx, attempts, quarantined, deferred,
                  damage_repaired>>
+
+\* `inspect` finds an unreadable durable line beyond the applied cursor.
+\* Taking Damage from ready makes the already-written batch durable, but
+\* abandons its apply; thus the pre-Damage DB still agrees with the cursor.
+Damage ==
+  /\ Fixed
+  /\ AllowDeferred
+  /\ ~deferred
+  /\ phase = "ready"
+  /\ cursor.gen = generation
+  /\ cursor.off < Len(log_written)
+  /\ log_durable' = log_written
+  /\ deferred' = TRUE
+  /\ damage_repaired' = FALSE
+  /\ phase' = "idle"
+  /\ cur' = 0
+  /\ aidx' = 0
+  /\ attempts' = 0
+  /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
+                 nstarted, quarantined>>
+
+\* While inspection returns Defer, a write fsyncs its complete envelope and
+\* applies that batch idempotently, but deliberately leaves the cursor alone.
+DeferredWrite ==
+  /\ Fixed
+  /\ deferred
+  /\ ~damage_repaired
+  /\ phase = "idle"
+  /\ nstarted < MaxBatches
+  /\ Len(log_written) + Len(BatchLines(nstarted + 1)) <= MaxLogLen
+  /\ LET b == nstarted + 1
+         nl == log_written \o BatchLines(b)
+         nd == FoldEvents(BatchEvents(b), db_committed)
+     IN /\ log_written' = nl
+        /\ log_durable' = nl
+        /\ db' = nd
+        /\ db_committed' = nd
+        /\ nstarted' = b
+  /\ UNCHANGED <<cursor, generation, phase, cur, aidx, attempts,
+                 quarantined, deferred, damage_repaired>>
+
+\* Repair rewrites the malformed line in place.  The deferral remains
+\* outstanding until Recovery has replayed from the old cursor to EOF.
+Repair ==
+  /\ phase = "idle"
+  /\ deferred
+  /\ ~damage_repaired
+  /\ damage_repaired' = TRUE
+  /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
+                 generation, phase, nstarted, cur, aidx, attempts,
+                 quarantined, deferred>>
+
+Recovery ==
+  /\ phase = "idle"
+  /\ Fixed
+  /\ deferred
+  /\ damage_repaired
+  /\ db' = RecTarget.d
+  /\ db_committed' = RecTarget.d
+  /\ cursor' = RecTarget.c
+  /\ deferred' = FALSE
+  /\ damage_repaired' = FALSE
+  /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
+                 cur, aidx, attempts, quarantined>>
 
 \* The fixed design applies only from "synced" and only behind a durable
 \* commit marker.  The current design may apply straight from "ready", so
@@ -376,6 +442,7 @@ Compacted(s) == LET dead == DeadOf(s) IN SelectSeq(s, LAMBDA l : l.b \notin dead
 
 Compact ==
   /\ phase = "idle"
+  /\ ~deferred
   /\ generation < MaxGen
   /\ log_written = log_durable
   /\ Compacted(log_durable) # log_durable
@@ -383,12 +450,13 @@ Compact ==
   /\ log_durable' = Compacted(log_durable)
   /\ generation' = generation + 1
   /\ UNCHANGED <<db, db_committed, cursor, phase, nstarted, cur, aidx,
-                 attempts, quarantined>>
+                 attempts, quarantined, deferred, damage_repaired>>
 
 \* recover_if_needed, called from open_or_init before every write path.
 RecoverIdle ==
   /\ phase = "idle"
   /\ Fixed
+  /\ ~deferred
   /\ ~CursorCurrent
   /\ db' = RecTarget.d
   /\ db_committed' = RecTarget.d
@@ -400,6 +468,7 @@ RecoverIdle ==
 RebuildAll ==
   /\ phase = "idle"
   /\ Fixed
+  /\ ~deferred
   /\ \/ ~CursorCurrent
      \/ db # Materialize(log_durable, quarantined)
   /\ db' = Materialize(log_durable, quarantined)
@@ -410,12 +479,14 @@ RebuildAll ==
 
 Next ==
   \/ StartBatch \/ AppendLine \/ PartialFlush \/ SyncLog
+  \/ Damage \/ DeferredWrite \/ Repair \/ Recovery
   \/ ApplyEvent \/ ApplyFail \/ Quarantine \/ FinishBatch
   \/ Crash \/ Open \/ TruncateUncommittedTail
   \/ Compact \/ RecoverIdle \/ RebuildAll
 
 Spec == Init /\ [][Next]_vars
 FairSpec == Init /\ [][Next]_vars /\ WF_vars(Next)
+DeferredFairSpec == Spec /\ WF_vars(Repair) /\ WF_vars(Recovery)
 
 ---------------------------------------------------------------------------
 (* Invariants                                                              *)
@@ -436,10 +507,43 @@ DBNotAheadOfDurable ==
 \* CE3.  Recovery restores the invariant at open time without a schema bump.
 OpenRestores == phase = "opened" => db = Materialize(log_durable, quarantined)
 
-\* D3.  A valid cursor describes exactly the committed DB state.
+\* Historical D3 invariant, retained so Deferred_Current can exhibit the
+\* reviewed counterexample: DeferredWrite changes the DB but not the cursor.
 CursorAgreesWithDB ==
   cursor.gen = generation =>
     db_committed = Materialize(Prefix(log_durable, cursor.off), quarantined)
+
+\* The equality is required only when no deferred recovery is outstanding.
+CursorAgreesWhenNotDeferred ==
+  \/ ~Fixed
+  \/ ~deferred => CursorAgreesWithDB
+
+\* When generation/offset are comparable, replaying everything after the
+\* cursor over the current DB converges to the durable log's materialization.
+\* This is the operational meaning of the cursor never being ahead of DB.
+CursorNeverAheadOfDB ==
+  \/ ~Fixed
+  \/ cursor.gen # generation
+  \/ cursor.off > DurCommittedLen
+  \/ FoldEvents(TailEvents, db_committed) =
+       Materialize(log_durable, quarantined)
+
+\* Witness that reapplying an already-applied durable tail has no further
+\* effect.  The fixed schedule consists of idempotent upsert/expire arms.
+TailReplayIsIdempotent ==
+  \/ ~Fixed
+  \/ cursor.gen # generation
+  \/ cursor.off > DurCommittedLen
+  \/ LET once == FoldEvents(TailEvents, db_committed)
+     IN FoldEvents(TailEvents, once) = once
+
+CursorCaughtUp ==
+  /\ cursor.gen = generation
+  /\ cursor.off = Len(log_durable)
+  /\ db_committed = Materialize(log_durable, quarantined)
+
+\* Repair leaves `deferred` set until fair Recovery replays from cursor.off.
+DeferredConverges == damage_repaired ~> CursorCaughtUp
 
 DurableIsPrefix == IsPrefix(log_durable, log_written)
 
@@ -481,7 +585,7 @@ BadTruncate ==
   /\ log_durable' = << >>
   /\ phase' = "idle"
   /\ UNCHANGED <<db, db_committed, cursor, generation, nstarted, cur,
-                 aidx, attempts, quarantined>>
+                 aidx, attempts, quarantined, deferred, damage_repaired>>
 
 SpecBadTruncate == Init /\ [][Next \/ BadTruncate]_vars
 
@@ -491,6 +595,7 @@ BadTypeInit ==
   /\ cursor = [gen |-> 0, off |-> MaxLogLen + 7]
   /\ generation = 0 /\ phase = "idle" /\ nstarted = 0 /\ cur = 0
   /\ aidx = 0 /\ attempts = 0 /\ quarantined = {}
+  /\ deferred = FALSE /\ damage_repaired = FALSE
 
 SpecBadType == BadTypeInit /\ [][Next]_vars
 
