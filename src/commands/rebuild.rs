@@ -1052,6 +1052,7 @@ mod tests {
 
         fn clone_paths(paths: &Paths) -> Paths {
             Paths {
+                root: paths.root.clone(),
                 lock: paths.lock.clone(),
                 events: paths.events.clone(),
                 db: paths.db.clone(),
