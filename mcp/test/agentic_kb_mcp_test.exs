@@ -607,6 +607,32 @@ defmodule AgenticKbMcpTest do
       assert text == "Added entry new-1."
     end
 
+    # L3 gating fix: raced (rows dropped by the exclusion-correct reembed
+    # write path — see src/commands/reembed.rs ReembedReport.raced) and the
+    # per-id failure causes were both present on the wire but silently
+    # dropped by this renderer, leaving an operator with no way to tell
+    # from the rendered text alone why embedded + failed < missing, or
+    # which entry failed and how.
+    test "kb_reembed renders the raced count and each failure's cause" do
+      response = %{
+        "type" => "ok",
+        "embedded" => 2,
+        "failed" => 1,
+        "failures" => [%{"id" => "bad", "cause" => "fixture embedding failure"}],
+        "skipped" => 1,
+        "missing" => 4,
+        "raced" => 1,
+        "dry_run" => false,
+        "noop_embedder" => false
+      }
+
+      %{"content" => [%{"text" => text}]} = McpServer.render_result(response)
+
+      assert text =~ "1 raced"
+      assert text =~ "bad"
+      assert text =~ "fixture embedding failure"
+    end
+
     test "every dispatched Rust success shape has a specific renderer" do
       for {method, shapes} <- @response_shapes,
           {shape, index} <- Enum.with_index(shapes) do
@@ -919,6 +945,19 @@ defmodule AgenticKbMcpTest do
       start_fake_port()
       response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_provenance","arguments":{"entry_id":"entry-1","max_depth":64}}}), @with_db)
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Provenance roots: root-1"
+    end
+
+    # L3 gating fix: with KB_NO_EMBED set, run_reembed returns early with no
+    # writes attempted at all — the noop_embedder flag alone does not reach
+    # a human, only resp["message"] rendered into the tool's text output
+    # does. This drives the real dispatch -> port -> render_result path
+    # end to end, rather than calling render_result directly, so a future
+    # regression in the wiring between them (not just the renderer itself)
+    # is caught here too.
+    test "kb_reembed dispatches through the real tools/call and port paths and surfaces the noop message" do
+      start_fake_port()
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_reembed","arguments":{}}}), @with_db)
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "KB_NO_EMBED is set"
     end
 
     test "an explicit null arguments does not crash the server" do

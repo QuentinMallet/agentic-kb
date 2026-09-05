@@ -921,6 +921,20 @@ defmodule AgenticKbMcp.McpServer do
         parts =
           if resp["missing"], do: parts ++ ["#{resp["missing"]} missing embeddings."], else: parts
 
+        parts = if resp["raced"], do: parts ++ ["#{resp["raced"]} raced."], else: parts
+
+        parts =
+          case resp["failures"] do
+            [_ | _] = failures ->
+              causes =
+                Enum.map_join(failures, ", ", fn f -> "#{f["id"]}: #{f["cause"]}" end)
+
+              parts ++ ["Causes: #{causes}."]
+
+            _ ->
+              parts
+          end
+
         parts = if resp["dry_run"], do: ["[dry-run] " | parts], else: parts
         parts = if resp["message"], do: parts ++ [resp["message"]], else: parts
         %{"content" => [%{"type" => "text", "text" => Enum.join(parts, " ")}]}

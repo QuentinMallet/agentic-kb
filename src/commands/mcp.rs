@@ -1609,10 +1609,18 @@ fn handle_reembed(
             // returns early after selection (embedded:0, missing:N) with no
             // writes attempted at all — without this flag that response is
             // indistinguishable from a run that tried and embedded nothing
-            // (review finding).
-            json!({"id":id,"type":"ok","embedded":report.embedded,"failed":report.failed,
-                   "failures":failures,"skipped":report.skipped,"missing":report.missing,
-                   "raced":report.raced,"dry_run":dry_run,"noop_embedder":emb.is_noop()})
+            // (review finding). The renderer on the other end only surfaces
+            // resp["message"], not noop_embedder itself, so the noop case
+            // also needs an explicit message or it reaches a human looking
+            // identical to a stalled run that tried and embedded nothing.
+            let mut response = json!({"id":id,"type":"ok","embedded":report.embedded,
+                   "failed":report.failed,"failures":failures,"skipped":report.skipped,
+                   "missing":report.missing,"raced":report.raced,"dry_run":dry_run,
+                   "noop_embedder":emb.is_noop()});
+            if emb.is_noop() {
+                response["message"] = json!("KB_NO_EMBED is set — no embedder available");
+            }
+            response
         }
         Err(error) => json!({"id":id,"type":"error","code":"db_error","message":error.to_string()}),
     }
@@ -6405,6 +6413,17 @@ mod tests {
         assert_eq!(response["embedded"], 0);
         assert_eq!(response["missing"], 1);
         assert_eq!(response["noop_embedder"], true);
+        // The noop signal alone does not reach a human at the other end of
+        // the MCP renderer, which only surfaces resp["message"] — without
+        // this key the noop case renders identically to a run that tried
+        // and genuinely embedded nothing (review finding, same class as
+        // the one noop_embedder itself was added to fix).
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("KB_NO_EMBED")),
+            "the noop-embedder response must explain why nothing was embedded: {response}"
+        );
     }
 }
 

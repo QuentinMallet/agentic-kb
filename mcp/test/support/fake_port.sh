@@ -72,6 +72,9 @@ while IFS= read -r line; do
     provenance)
       printf '{"id":"%s","type":"result","roots":["root-1"],"graph":[],"truncated":false}\n' "$id"
       ;;
+    reembed)
+      printf '{"id":"%s","type":"ok","embedded":0,"failed":0,"failures":[],"skipped":0,"missing":1,"raced":0,"dry_run":false,"noop_embedder":true,"message":"KB_NO_EMBED is set — no embedder available"}\n' "$id"
+      ;;
     *)
       printf '{"id":"%s","type":"result"}\n' "$id"
       ;;
