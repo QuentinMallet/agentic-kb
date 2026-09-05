@@ -968,7 +968,7 @@ mod tests {
         let paths = Paths::from_root(Path::new(&root));
         match role.as_str() {
             "seed" => {
-                let conn = db::open_db(&paths.db).unwrap();
+                let (_, conn) = db::test_db(Path::new(&root));
                 for event in &events::read_events(&paths.events).unwrap().events {
                     db::apply_event(&conn, &NoopEmbedder, event).unwrap();
                 }
@@ -1166,7 +1166,7 @@ mod tests {
         for idx in 0..SWAP_SEEDED {
             events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
         }
-        let live = db::open_db(&paths.db).unwrap();
+        let (_, live) = db::test_db(&paths.root);
         for event in &events::read_events(&paths.events).unwrap().events {
             db::apply_event(&live, &NoopEmbedder, event).unwrap();
         }
@@ -1263,11 +1263,12 @@ mod tests {
     fn test_rebuild_restores_cleared_db() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..10u32 {
             let e = upsert(&format!("id{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
         assert_eq!(count_entries(&paths), 10);
 
@@ -1444,6 +1445,7 @@ mod tests {
     fn test_rebuild_with_concurrent_evidence_writes_converges() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         // Seed: 5 entries with explicit kind='observation' so evidence_add
         // triggers evidence_status updates (status != 'n/a').
@@ -1456,7 +1458,7 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path_a = paths.events.clone();
@@ -1499,7 +1501,7 @@ mod tests {
             db::apply_event(&ref_conn, &emb, ev).unwrap();
         }
 
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<(String, String)> = live_conn
             .prepare("SELECT id, COALESCE(evidence_status,'n/a') FROM entries ORDER BY id")
@@ -1567,11 +1569,12 @@ mod tests {
     fn test_rebuild_concurrent_writes_converge() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..20u32 {
             let e = upsert(&format!("base{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path = paths.events.clone();
@@ -1929,7 +1932,7 @@ mod tests {
         for ev in &all_events.events {
             db::apply_event(&ref_conn, emb.as_ref(), ev).unwrap();
         }
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<String> = live_conn
             .prepare("SELECT id FROM entries ORDER BY id")

@@ -337,8 +337,8 @@ pub(crate) fn open_live_for_checkpoint(db_path: &Path) -> rusqlite::Result<Conne
 
 /// Raw file opener for tests that intentionally bypass production policy to
 /// inspect or manufacture database states.
-#[cfg(test)]
-pub(crate) fn open_unchecked_for_test(db_path: &Path) -> rusqlite::Result<Connection> {
+#[doc(hidden)]
+pub fn open_unchecked_for_test(db_path: &Path) -> rusqlite::Result<Connection> {
     Connection::open(db_path)
 }
 

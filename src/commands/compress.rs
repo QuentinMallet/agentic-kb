@@ -447,7 +447,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), b"12345\n").unwrap();
         let paths = make_paths(dir.path());
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let emb = NoopEmbedder;
         let content = "paragraph one\n\nparagraph two\n\nparagraph three".repeat(80);
         let upsert = serde_json::json!({
@@ -499,7 +499,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let stranded: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evidence WHERE entry_id='compress-old'",

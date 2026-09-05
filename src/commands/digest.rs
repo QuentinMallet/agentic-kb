@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(outcome.turns_processed, 5);
         assert!(!outcome.skipped_no_change);
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='sessions/test-sess-basic/digest' AND is_stale=0",
