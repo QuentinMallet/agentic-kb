@@ -1083,4 +1083,76 @@ mod tests {
         }
         assert!(!peer_results.is_empty(), "peer FTS must return the entry");
     }
+
+    #[test]
+    fn test_federated_search_does_not_modify_peer_database() {
+        use crate::commands::add::acquire_lock;
+
+        let peer_dir = tempdir().unwrap();
+        let peer_paths = Paths::from_root(peer_dir.path());
+        let embedder = NoopEmbedder;
+        Add {
+            path: "peer/immutable.rs".to_string(),
+            summary: "immutable peer database marker".to_string(),
+            content: "federated read only".to_string(),
+            tags: "peer".to_string(),
+            version_ref: None,
+            id: Some("immutable-peer-entry".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
+        }
+        .execute_with(&peer_paths, &embedder)
+        .unwrap();
+
+        // Finish any recovery/checkpoint work before taking the snapshot.
+        drop(db::open_ro(&peer_paths.db).unwrap());
+        let bytes_before = fs::read(&peer_paths.db).unwrap();
+        let modified_before = fs::metadata(&peer_paths.db).unwrap().modified().unwrap();
+
+        let local_dir = tempdir().unwrap();
+        let local_paths = Paths::from_root(local_dir.path());
+        let lock = acquire_lock(&local_paths.lock).unwrap();
+        let local_conn = db::open_rw(&local_paths, &lock).unwrap();
+        local_conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo) VALUES('immutable-g', 'dep', 'local')",
+            [],
+        ).unwrap();
+        local_conn
+            .execute(
+                "INSERT INTO peers(id, graph_id, source_repo, target_repo, edge_type) \
+             VALUES('immutable-p', 'immutable-g', 'local', ?1, 'dep')",
+                rusqlite::params![peer_dir.path().to_string_lossy()],
+            )
+            .unwrap();
+        drop(local_conn);
+        drop(lock);
+
+        Search {
+            query: "immutable".to_string(),
+            fts: true,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            content: false,
+            path_prefix: None,
+            tag: None,
+            local_only: false,
+            peers: true,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        }
+        .execute_with(&local_paths, &embedder)
+        .unwrap();
+
+        assert_eq!(fs::read(&peer_paths.db).unwrap(), bytes_before);
+        assert_eq!(
+            fs::metadata(&peer_paths.db).unwrap().modified().unwrap(),
+            modified_before
+        );
+    }
 }
