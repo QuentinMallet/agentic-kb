@@ -472,6 +472,29 @@ fn test_missing_log_blocks_a_populated_database_with_an_offset_zero_cursor() {
     assert_eq!(live_ids(&paths), vec!["e1".to_string()]);
 }
 
+/// A database with no cursor rows at all is row 1, a full rebuild, whatever
+/// the log is doing. The missing-log refusal is about a cursor that makes a
+/// claim; where there is no claim there is nothing to protect, and fixtures
+/// that materialize a database directly and never write a log depend on it.
+#[test]
+fn test_cursorless_populated_database_without_a_log_stays_row_one() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key LIKE 'applied_log_%'", [])
+            .unwrap();
+    }
+    fs::remove_file(&paths.events).unwrap();
+
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::inspect(&conn, &paths),
+        Decision::FullRebuild(RebuildReason::CursorMissing),
+        "no cursor row means row 1, not a vanished log"
+    );
+}
+
 /// The first write in an empty repository must still be allowed: no log yet is
 /// the normal condition there, not a vanished one.
 #[test]

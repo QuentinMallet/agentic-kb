@@ -537,6 +537,9 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
     // block writes, so classifying a missing log behind it would leave the
     // destructive path reachable on any database whose stamp is stale.
     if !paths.events.exists() && (cursor.offset > 0 || has_entries(conn)) {
+        // Reached only with a cursor row in hand: `read` above returns early
+        // when there is none, and a cursorless database is row 1 — a full
+        // rebuild — which is what a database that never had a cursor needs.
         // The log is not there to compare against. Recovery must not rebuild —
         // that is the unreachable-layout hazard `rebuild` already refuses to
         // auto-repair, because it would drop every entry the vanished log
