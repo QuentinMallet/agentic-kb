@@ -15,8 +15,8 @@ no `Scenario` constant any more and **no crash point is pinned**: `Crash` is
 enabled at every phase of a batch from the first line through the last apply, in
 every config that sets `AllowCrash = TRUE`.
 
-The six knobs are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`,
-`MaxGen`, and `MaxBatches`.
+The seven knobs are `Fixed`, `AllowCrash`, `AllowDeferred`, `AllowLogMissing`,
+`PoisonBatch`, `MaxGen`, and `MaxBatches`.
 
 | Action | Models |
 |---|---|
@@ -26,6 +26,8 @@ The six knobs are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`,
 | `SyncLog` | D2 `sync_data` of the whole written log |
 | `Damage` | inspection finds an unreadable committed tail beyond `cursor.off`; writes become blocked |
 | `UnsafeWriteWhileDeferred` | `Fixed = FALSE` only: the withdrawn alternative writes while damaged |
+| `LogVanishes` | external loss of a non-trivial log, retaining the DB and cursor for reads |
+| `UnsafeWriteWhileLogMissing` | `Fixed = FALSE` only: the withdrawn alternative resurrects the missing log by writing to a new empty file |
 | `Repair` | the damaged tail becomes readable in place; deferral remains outstanding |
 | `Recovery` | after repair, replay from `cursor.off` to `DurCommittedLen` and clear deferral |
 | `ApplyEvent` | one `db::apply_event`; the last one also writes the D3 cursor **in the same transaction** |
@@ -68,6 +70,7 @@ next `StartBatch` writes the next batch in the schedule.
 | `K` | 2 | apply retries before dead-lettering |
 | `InnerMaxLog` | 5 | `InnerGap.MaxLog`; must be ≥ the schedule's total event count (1+2+2) or `InnerGap.Start` is disabled and the refinement fails for a bookkeeping reason |
 | `PoisonBatch` | 0 or 2 | 0 = no poison record |
+| `AllowLogMissing` | `FALSE` except in the two LogMissing configs | enables external loss of a non-trivial log |
 
 `ASSUME OutOfScope_InteriorDamage` carries the D2 prefix-adequacy argument
 required by plan §5: `log_durable` is modelled as a *prefix* of `log_written`,
@@ -76,6 +79,12 @@ before the first `db::apply_event`, so no interior region is ever trusted while
 unsynced. Interior zero-fill damage (a garbage **middle** line) is out of model
 scope; the code-side disposition is the quarantine-the-unparseable-line policy
 (plan Q4).
+
+Log absence is no longer a model boundary. `log_present` distinguishes a fresh,
+present empty log from an absent log, and `LogMissing` additionally requires
+evidence of non-trivial prior state (`cursor.off > 0` or a non-empty committed
+DB). D3 row 9 is represented as a read-only state: reads continue from `db`,
+while writes, automatic recovery, rebuild, and compaction are declined.
 
 ## 2. Run matrix
 
@@ -109,6 +118,8 @@ breadth-first search was used throughout, including for the two temporal configs
 | `DurableBatch_CE8_Fixed.cfg` | " under the K-retry dead-letter policy | PASS | `No error has been found` · 64 / 34 · 03s |
 | `DurableBatch_Deferred_Current.cfg` | withdrawn design: a write proceeds while damaged and materializes a non-prefix | VIOLATED (deferred-state gates around `CursorAgreesWithDB`, `DBNotAheadOfDurable`, and `CursorNeverAheadOfDB`) | `Error: Invariant DeferredCursorAgreesWithDB is violated` · 58 distinct · 03s |
 | `DurableBatch_Deferred_Fixed.cfg` | unreadable tail blocks writes; repair then replays from `cursor.off` | PASS | `No error has been found` · 83 distinct · 03s |
+| `DurableBatch_LogMissing_Current.cfg` | withdrawn design resurrects an absent non-trivial log and writes against an empty durable prefix | VIOLATED (`DBNotAheadOfDurable` and `CursorAgreesWithDB`; `CursorNeverAheadOfDB` is also checked) | TLC run: pending caller-side |
+| `DurableBatch_LogMissing_Fixed.cfg` | row 9 serves reads but blocks writes, recovery, rebuild, and compaction | PASS | TLC run: pending caller-side |
 | `DurableBatch_Safety_Fixed.cfg` | **unpinned**, all seven invariants plus the truncation action property | PASS | `No error has been found` · 537 / 259 · 02s |
 | `DurableBatch_Safety_Fixed_Poison.cfg` | same, with the poison record and quarantine live | PASS | `No error has been found` · 766 / 374 · 02s |
 | `DurableBatch_Refinement_Fixed.cfg` | refines `InnerGap` over the **full** Next relation | PASS | `No error has been found` · 448 / 216 · 03s |
@@ -289,6 +300,33 @@ Success is **not** hardcoded on the second attempt: under `Fixed = TRUE`,
 `ApplyFail` is disabled once `attempts ≥ K`, `Quarantine` becomes the only
 enabled action, and it dead-letters batch 2, advances the cursor past it and
 reaches `idle` — 34 distinct states, no violation.
+
+### LogMissing — row 9 refuses resurrection
+
+Both LogMissing configs enable `LogVanishes` only from `phase = "idle"` after
+the model has non-trivial durable history. The action sets `log_present = FALSE`
+and clears both log sequences while deliberately retaining `db`,
+`db_committed`, and `cursor`. `LogMissing` is therefore true, whereas a fresh
+empty log in `Init` is not missing.
+
+In `DurableBatch_LogMissing_Current.cfg`, `UnsafeWriteWhileLogMissing` models
+the withdrawn alternative: it creates a new present file, appends the next
+batch to that empty file, applies the batch to the retained DB, and leaves the
+durable sequence empty. Once the file is present again the temporary
+LogMissing exception no longer applies, so `DBNotAheadOfDurable` and
+`CursorAgreesWithDB` expose the resurrected-log inconsistency.
+
+In `DurableBatch_LogMissing_Fixed.cfg`, `StartBatch`, `Compact`, `Recovery`,
+`RecoverIdle`, and `RebuildAll` are guarded by `~LogMissing`. Reads are not
+actions in this model and remain available from the unchanged DB. The config
+checks all three cursor/durability invariants, `LogMissingBlocksWrites` (the
+state stays idle), and the action property `LogMissingDoesNotStart` (no
+transition from a missing-log state can increase `nstarted`).
+
+- `DurableBatch_LogMissing_Current.cfg`: expected **VIOLATED**. TLC run:
+  pending caller-side.
+- `DurableBatch_LogMissing_Fixed.cfg`: expected **PASS**. TLC run: pending
+  caller-side.
 
 ### Refinement — the current design does not refine `InnerGap`
 
