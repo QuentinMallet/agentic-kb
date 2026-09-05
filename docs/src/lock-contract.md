@@ -2,6 +2,20 @@
 
 This table records the current opener discipline in `src/` after C2/L1c landed.
 
+ADR-1 divides repository access among seven named openers:
+`db::open_ro`, `db::open_rw`, `db::open_scratch`, `db::open_or_init`,
+`db::open_live_for_checkpoint`, `db::open_unchecked_for_test`, and
+`db::test_db`. The table below assigns every CLI command and Rust MCP handler
+to one or more of those classes and anchors the assignment to its calling
+function. The former `open_db` production opener no longer exists, and three
+gates in `tests/open_db_ratchet.rs` keep it that way:
+`open_db_callsites_do_not_increase` fixes its call-site ratchet at zero,
+`open_unchecked_for_test_is_confined_to_test_modules` prevents the test-only
+escape hatch from reaching production code, and
+`connection_open_is_confined_to_the_db_component` forbids any raw
+`rusqlite::Connection` constructor outside `components/db.rs`, so no new
+opener can bypass ADR-1's policy either.
+
 `read-only` means `db::open_ro(...)` and therefore `PRAGMA query_only=ON`.
 `write-under-lock` means `db::open_rw(paths, &lock)` with a live `paths.lock`
 guard. `init` means `db::open_or_init(...)`. `scratch` means
@@ -47,7 +61,7 @@ function name would be ambiguous on its own.
 | `query_hits` telemetry exemption | out of scope: separate DB, not the KB DB | `src/commands/search.rs` and `src/commands/context.rs` (both via `query_hits::record_injection`), and `src/commands/mcp.rs` (via `query_hits::record_hits` and `query_hits::counts`) write `paths.query_hits`, which is a different SQLite file rooted by the `query_hits` field on `config::Paths` (`src/config.rs`). |
 | `check_embed_mode_vintage` | write to `kb_meta`, contract deferred to L3 | `src/components/db.rs` writes via the caller's connection; the primary call site is inside `apply_event` itself, exercised by every non-noop write path (`cursor::append_and_apply`, `kb_core::add`, MCP handlers) that funnels through it; `reembed.rs`'s `write_batches` also calls it directly rather than by individual command call sites; L3 moves the write under the lock. |
 | rebuild schema stamp | write-under-lock + schema-upgrade lock | `full_rebuild_for` acquires `schema-upgrade.lock` for single-flight and `paths.lock` before opening with `open_rw` and stamping. |
-| rebuild swap precondition | invariant row | In `Rebuild::execute_with`, MCP and CLI reads use `open_ro` without `paths.lock`, while every mutation uses `open_rw` directly or through a locked writer, serializing on the lock rebuild holds across the swap. |
+| rebuild swap precondition | invariant row | `Rebuild::execute_with` holds `paths.lock` across the load-bearing sequence: `checkpoint_live_db` checkpoints the live WAL, `verify_live_wal_drained` proves the resulting `-wal` file is zero-length, `drop(live_conn)` closes the live connection, `fs::rename` atomically installs the scratch DB, and `fs::remove_file` unlinks stale `-wal`/`-shm` sidecars. MCP and CLI reads use `open_ro` without `paths.lock`, while every mutation uses `open_rw` directly or through a locked writer, serializing on the lock held across that checkpoint → verify → close → rename → unlink sequence. |
 | read-path temp DB constraint | standing constraint | `db::open_ro` sets `PRAGMA query_only=ON` inside its own body, so no read path may rely on `CREATE TEMP TABLE` or any temp-database write. |
 | ADR-7 rebuild `kb_meta` survival | rebuild swap invariant | Rebuild's scratch DB becomes the live DB (the final rename) inside `Rebuild::execute_with`; per ADR-7 (now T5b), keys other than `schema_version` and `embed_text_mode` do not survive that swap, and C1/D3 writes the fresh cursor row itself in that same method immediately after catch-up so recovery does not loop on a cursorless post-rebuild database. |
 | C1/D3 recovery vs. `kb compact` asymmetry | observation, not a defect | `kb add` and the other MCP mutating methods auto-recover first (`recover_if_needed`), so a database that is merely behind the log (D3 row 7, `ReplayTail`) is caught up and the write proceeds. `kb compact` (`Compact::run`) does not go through `open_or_init`/`recover_if_needed` at entry, so the same row 7 refuses with "the database is behind the event log" instead of self-healing — deliberate, since compact is destructive to the log itself. |

@@ -22,13 +22,16 @@ be found at <https://hexdocs.pm/agentic_kb_mcp>.
 ## Internal peer-graph port methods
 
 The Rust line-JSON port implements `kb_peers_add`, `kb_peers_list`, and
-`kb_peers_remove` for CLI parity, but the Elixir MCP server deliberately does
-not expose them as agent tools. Peer-graph setup is an operator and lifecycle-hook
-action, not an agent action. Revisit this boundary only when a concrete agent
-workflow needs to edit the peer graph directly.
+`kb_peers_remove` for CLI parity, but `AgenticKbMcp.McpServer.tools/0`
+deliberately does not expose them as agent tools. Peer-graph setup is an
+operator and lifecycle-hook action, not an agent action. The port's
+`audit_run`, `audit_record`, `audit_report`, and `provenance` methods are MCP
+tools (`kb_audit_run`, `kb_audit_record`, `kb_audit_report`, and
+`kb_provenance`); their declarations live in `McpServer.tools/0`.
 
-Controls from the threat model
-(`KB security/threat-models/mcp-audit-surface`) bound audit verdict batches,
-require notes for destructive verdicts, and preserve permanent entries. Caller
-identity, rate limits, and OPA policy enforcement remain deferred follow-ups in
-beads `bd-1orr`.
+`handle_audit_run` and `handle_audit_record` bound audit samples and verdict
+batches to `MAX_AUDIT_VERDICTS` (50). Typed `AuditVerdict` rows require a
+boolean verdict, `handle_audit_record` requires a non-empty note when it is
+false, and `db::expire_guard` preserves permanent entries. Caller identity,
+rate limits, and OPA policy enforcement remain deferred follow-ups in beads
+`bd-1orr`.
