@@ -503,6 +503,26 @@ defmodule AgenticKbMcpTest do
     "kb_provenance" => ["entry_id", "max_depth"]
   }
 
+  describe "S1 response rendering" do
+    test "kb_add renders near-duplicate details" do
+      response = %{
+        "type" => "ok",
+        "entry_id" => "new-1",
+        "similar_existing" => [
+          %{"id" => "old-1", "path" => "p", "summary" => "s", "score" => 0.91}
+        ]
+      }
+
+      %{"content" => [%{"text" => text}]} = McpServer.render_result(response)
+
+      assert text =~ "Similar existing entries"
+      assert text =~ "id=old-1"
+      assert text =~ "path=p"
+      assert text =~ "summary=s"
+      assert text =~ "score=0.91"
+    end
+  end
+
   describe "tool schema closure (B1)" do
     test "every tool schema sets additionalProperties: false" do
       for tool <- McpServer.tools() do

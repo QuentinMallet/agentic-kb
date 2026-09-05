@@ -866,8 +866,20 @@ defmodule AgenticKbMcp.McpServer do
       %{"type" => "ok", "rebuilt" => rebuilt} ->
         %{"content" => [%{"type" => "text", "text" => "Rebuilt #{rebuilt} entries."}]}
 
-      %{"type" => "ok", "entry_id" => entry_id} ->
-        %{"content" => [%{"type" => "text", "text" => "Added entry #{entry_id}."}]}
+      %{"type" => "ok", "entry_id" => entry_id} = resp ->
+        similar =
+          resp
+          |> Map.get("similar_existing", [])
+          |> Enum.map_join("\n", fn entry ->
+            "- id=#{entry["id"]} path=#{entry["path"]} summary=#{entry["summary"]} score=#{entry["score"]}"
+          end)
+
+        text =
+          if similar == "",
+            do: "Added entry #{entry_id}.",
+            else: "Added entry #{entry_id}.\n\nSimilar existing entries:\n#{similar}"
+
+        %{"content" => [%{"type" => "text", "text" => text}]}
 
       %{"type" => "ok", "run_id" => run_id, "samples" => samples} ->
         text =
