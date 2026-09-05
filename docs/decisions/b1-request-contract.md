@@ -87,8 +87,25 @@ reachable only by a direct port client.
    answered.
 6. **A `query` over 8 KiB is an error** before it reaches the embedder or FTS.
 
-Changes 1 and 4 are the ones an existing agent could plausibly trip. Neither is
-silent: both name what was wrong.
+7. **A non-array `evidence`, `files`, `commits` or `cues` is now an error.** Each
+   was previously read with `as_array()` and *ignored* when it was not one, so
+   `kb_add` with `"evidence": {...}` stored an entry with no evidence and said
+   nothing. Non-string members of `files`, `commits` and `cues` were likewise
+   filtered out; they are now rejected.
+8. **A non-array `expand_ids` is now an error.** It was previously ignored, and
+   the request fell through to an ordinary query search — which failed with
+   "missing query" if no `query` was supplied, and otherwise silently answered a
+   different question than the caller asked.
+9. **`limit: 0` is now an error.** The accepted range starts at 1. It previously
+   reached `search_entries` and returned an empty result set.
+
+Two things the closure did *not* change, checked against the base commit so the
+table is not read as broader than it is: an **empty** `expand_ids` array was
+already rejected before B1 (`expand_ids must be a non-empty array of entry ids`),
+and a non-array `tags` was already rejected by `validate_kb_add_inputs`.
+
+Changes 1, 4 and 7 are the ones an existing agent could plausibly trip. None is
+silent: each names what was wrong.
 
 ## Cross-repo obligation
 
