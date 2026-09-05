@@ -1554,84 +1554,19 @@ fn handle_reembed(
         Err(e) => return parse_error(id, e),
     };
 
-    if emb.is_noop() {
-        return json!({"id":id,"type":"ok","embedded":0,"skipped":0,"missing":0,
-                       "message":"KB_NO_EMBED is set — no embedder available"});
-    }
-
-    let conn = match db::open_db(&paths.db) {
-        Ok(c) => c,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let mut stmt = match conn.prepare(
-        "SELECT e.rowid, e.id, e.path, e.summary, e.content, e.tags
-         FROM entries e
-         WHERE e.is_stale = 0
-           AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
-    ) {
-        Ok(s) => s,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
-    let candidates: Vec<(i64, String, String, String, String, String)> =
-        match stmt.query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e) => {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
-            }
-        };
-
-    let total_missing = candidates.len();
-    // Filter on the actual embed text for the active mode (review finding).
-    let mode = crate::components::db::EmbedTextMode::from_env();
-    let to_embed: Vec<_> = candidates
-        .iter()
-        .filter(|(_, _, path, summary, content, tags)| {
-            crate::components::db::entry_embed_text(mode, path, summary, content, tags).len()
-                <= max_chars
-        })
-        .collect();
-    let skipped = total_missing - to_embed.len();
-
-    if dry_run {
-        return json!({"id":id,"type":"ok","embedded":0,"skipped":skipped,"missing":to_embed.len(),
-                       "dry_run":true});
-    }
-
-    let mut done = 0u32;
-    let mut failed = 0u32;
-    crate::components::db::check_embed_mode_vintage(&conn, mode);
-    for (rowid, _id, path, summary, content, tags) in &to_embed {
-        let text = crate::components::db::entry_embed_text(mode, path, summary, content, tags);
-        match emb.embed(&text) {
-            Ok(emb_vec) => {
-                // f16 is the canonical wire format (models.rs); the CLI reembed
-                // path writes f16 — this handler previously wrote legacy f32
-                // blobs, creating mixed-vintage rows.
-                let blob = crate::models::f32s_to_f16_blob(&emb_vec);
-                let _ = conn.execute(
-                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
-                    params![rowid, blob],
-                );
-                done += 1;
-            }
-            Err(_) => {
-                failed += 1;
-            }
+    match crate::commands::reembed::run_reembed(paths, emb, dry_run, max_chars) {
+        Ok(report) => {
+            let failures: Vec<_> = report
+                .failures
+                .iter()
+                .map(|failure| json!({"id":failure.id,"cause":failure.cause}))
+                .collect();
+            json!({"id":id,"type":"ok","embedded":report.embedded,"failed":report.failed,
+                   "failures":failures,"skipped":report.skipped,"missing":report.missing,
+                   "dry_run":dry_run})
         }
+        Err(error) => json!({"id":id,"type":"error","code":"db_error","message":error.to_string()}),
     }
-
-    json!({"id":id,"type":"ok","embedded":done,"failed":failed,"skipped":skipped})
 }
 
 fn handle_compact(
@@ -5893,6 +5828,62 @@ mod tests {
                 proptest::prop_assert_eq!(&resp["type"], "result", "{} -> {}", req, resp);
             }
         }
+    }
+
+    #[test]
+    fn test_cli_and_mcp_reembed_report_same_counts_and_failure_causes() {
+        struct ParityEmbedder;
+        impl embedder::Embedder for ParityEmbedder {
+            fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                if text.contains("fail") {
+                    anyhow::bail!("parity failure")
+                }
+                Ok(vec![0.5; 384])
+            }
+        }
+        fn fixture() -> (tempfile::TempDir, config::Paths) {
+            let dir = tempdir().unwrap();
+            let paths = config::Paths::from_root(dir.path());
+            db::open_or_init(&paths).unwrap();
+            for (id, summary) in [("good", "good"), ("bad", "fail")] {
+                crate::commands::add::Add {
+                    path: format!("docs/{id}"),
+                    summary: summary.to_string(),
+                    content: "body".to_string(),
+                    tags: "test".to_string(),
+                    version_ref: None,
+                    id: Some(id.to_string()),
+                    permanent: false,
+                    replace_path: false,
+                    kind: "convention".to_string(),
+                    evidence: vec![],
+                    evidence_file: None,
+                    cues: vec![],
+                }
+                .execute_with(&paths, &NoopEmbedder)
+                .unwrap();
+            }
+            (dir, paths)
+        }
+        let (_cli_dir, cli_paths) = fixture();
+        let cli = crate::commands::reembed::run_reembed(&cli_paths, &ParityEmbedder, false, 1800)
+            .unwrap();
+        let (_mcp_dir, mcp_paths) = fixture();
+        let response = handle_reembed(
+            &ReembedRequest {
+                method: "reembed".to_string(),
+                id: json!("parity"),
+                dry_run: Some(false),
+                max_chars: None,
+            },
+            &mcp_paths,
+            &ParityEmbedder,
+        );
+        assert_eq!(response["embedded"], cli.embedded);
+        assert_eq!(response["failed"], cli.failed);
+        assert_eq!(response["skipped"], cli.skipped);
+        assert_eq!(response["failures"][0]["id"], cli.failures[0].id);
+        assert_eq!(response["failures"][0]["cause"], cli.failures[0].cause);
     }
 }
 
