@@ -5,7 +5,7 @@
 //! `rebuild`. Hits are operational telemetry only; they produce no JSONL events
 //! and are neither a rebuild input nor part of backups.
 
-use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -291,7 +291,20 @@ fn open(path: &Path, create: bool) -> rusqlite::Result<Connection> {
             let _ = fs::create_dir_all(parent);
         }
     }
-    let conn = crate::components::db::open_auxiliary(path)?;
+    let conn = crate::components::db::open_auxiliary(path).map_err(|err| {
+        // open_auxiliary refuses a genuine repository db path outright; that
+        // is a caller bug (telemetry is meant to open only its own
+        // query-hits.db), not an ordinary operational failure, so it must
+        // not vanish into the generic best-effort swallow below.
+        if crate::components::db::is_live_db_path(path) {
+            eprintln!(
+                "kb: warn: query-hit telemetry refused to open a live repository database at {} \
+                 (this is a caller bug, not an operational failure)",
+                path.display()
+            );
+        }
+        err
+    })?;
     configure(&conn)?;
     Ok(conn)
 }
@@ -425,11 +438,7 @@ mod tests {
         let path = dir.path().join("hits.db");
         record_hits(&path, &["seed".into()], "test");
 
-        let lock_conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap();
+        let lock_conn = crate::components::db::open_auxiliary(&path).unwrap();
         lock_conn
             .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
             .unwrap();
