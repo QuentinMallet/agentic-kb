@@ -72,10 +72,13 @@ VARIABLES log_written,    \* lines handed to write(2); may not be durable
           cur,            \* batch id most recently started (0 = none ever)
           aidx,           \* events of `cur` applied inside the current txn
           attempts,       \* consecutive failed apply attempts on `cur`
-          quarantined     \* batch ids dead-lettered by the poison policy
+          quarantined,    \* batch ids dead-lettered by the poison policy
+          deferred,       \* recovery is outstanding after unreadable tail
+          damage_repaired \* the unreadable line has been repaired in place
 
 vars == <<log_written, log_durable, db, db_committed, cursor, generation,
-          phase, nstarted, cur, aidx, attempts, quarantined>>
+          phase, nstarted, cur, aidx, attempts, quarantined, deferred,
+          damage_repaired>>
 
 ASSUME OutOfScope_InteriorDamage == TRUE
   (* See "OUT OF MODEL SCOPE -- D2 prefix adequacy" above.  This ASSUME is
@@ -195,6 +198,9 @@ TypeOK ==
   /\ aidx \in 0..2
   /\ attempts \in 0..K
   /\ quarantined \subseteq (1..MaxBatches)
+  /\ deferred \in BOOLEAN
+  /\ damage_repaired \in BOOLEAN
+  /\ damage_repaired => deferred
 
 Init ==
   /\ log_written = << >>
@@ -209,6 +215,8 @@ Init ==
   /\ aidx = 0
   /\ attempts = 0
   /\ quarantined = {}
+  /\ deferred = FALSE
+  /\ damage_repaired = FALSE
 
 LinesOfCur == Len(SelectSeq(log_written, LAMBDA l : l.b = cur))
 
@@ -222,7 +230,7 @@ StartBatch ==
   /\ attempts' = 0
   /\ phase' = "writing"
   /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
-                 generation, quarantined>>
+                 generation, quarantined, deferred, damage_repaired>>
 
 AppendLine ==
   /\ phase = "writing"
@@ -231,7 +239,8 @@ AppendLine ==
   /\ log_written' = Append(log_written, BatchLines(cur)[LinesOfCur + 1])
   /\ phase' = IF LinesOfCur + 1 = Len(BatchLines(cur)) THEN "ready" ELSE "writing"
   /\ UNCHANGED <<log_durable, db, db_committed, cursor, generation,
-                 nstarted, cur, aidx, attempts, quarantined>>
+                 nstarted, cur, aidx, attempts, quarantined, deferred,
+                 damage_repaired>>
 
 \* Environment writeback: the OS may make an arbitrary prefix durable at any
 \* time.  This is what exposes an unframed partial batch to a reader.
@@ -240,7 +249,8 @@ PartialFlush ==
   /\ \E n \in (Len(log_durable) + 1)..Len(log_written) :
         log_durable' = Prefix(log_written, n)
   /\ UNCHANGED <<log_written, db, db_committed, cursor, generation, phase,
-                 nstarted, cur, aidx, attempts, quarantined>>
+                 nstarted, cur, aidx, attempts, quarantined, deferred,
+                 damage_repaired>>
 
 \* D2: explicit sync_data of the whole written log.
 SyncLog ==
@@ -248,7 +258,8 @@ SyncLog ==
   /\ log_durable' = log_written
   /\ phase' = "synced"
   /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
-                 nstarted, cur, aidx, attempts, quarantined>>
+                 nstarted, cur, aidx, attempts, quarantined, deferred,
+                 damage_repaired>>
 
 \* The fixed design applies only from "synced" and only behind a durable
 \* commit marker.  The current design may apply straight from "ready", so
@@ -278,7 +289,7 @@ ApplyEvent ==
         \* the current design has N independent top-level savepoints
         /\ db_committed' = IF Fixed /\ ~last THEN db_committed ELSE nd
   /\ UNCHANGED <<log_written, log_durable, generation, nstarted, cur,
-                 attempts, quarantined>>
+                 attempts, quarantined, deferred, damage_repaired>>
 
 \* A deterministically failing record (down embedder, malformed event).
 ApplyFail ==
@@ -291,7 +302,8 @@ ApplyFail ==
   /\ attempts' = attempts + 1
   /\ phase' = "applying"
   /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
-                 generation, nstarted, cur, aidx, quarantined>>
+                 generation, nstarted, cur, aidx, quarantined, deferred,
+                 damage_repaired>>
 
 \* D3 poison policy: after K attempts, dead-letter and advance past it.
 Quarantine ==
@@ -304,7 +316,7 @@ Quarantine ==
   /\ aidx' = BatchLen(cur)
   /\ phase' = "applied"
   /\ UNCHANGED <<log_written, log_durable, db, db_committed, generation,
-                 nstarted, cur, attempts>>
+                 nstarted, cur, attempts, deferred, damage_repaired>>
 
 FinishBatch ==
   /\ phase = "applied"
@@ -313,7 +325,7 @@ FinishBatch ==
   /\ aidx' = 0
   /\ attempts' = 0
   /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
-                 generation, nstarted, quarantined>>
+                 generation, nstarted, quarantined, deferred, damage_repaired>>
 
 \* Power loss.  Everything not yet durable is gone; the in-flight SQLite
 \* transaction is left dirty and is rolled back at open time, not here.
@@ -325,7 +337,8 @@ Crash ==
   /\ log_written' = log_durable
   /\ phase' = "crashed"
   /\ UNCHANGED <<log_durable, db, db_committed, cursor, generation,
-                 nstarted, cur, aidx, attempts, quarantined>>
+                 nstarted, cur, aidx, attempts, quarantined, deferred,
+                 damage_repaired>>
 
 Open ==
   /\ phase = "crashed"
@@ -337,7 +350,7 @@ Open ==
           /\ cursor' = RecTarget.c
      ELSE UNCHANGED <<db, db_committed, cursor>>
   /\ UNCHANGED <<log_written, log_durable, generation, nstarted, cur,
-                 attempts, quarantined>>
+                 attempts, quarantined, deferred, damage_repaired>>
 
 \* D1 repair: truncate to the committed length.  Under the current design
 \* every complete line is reader-accepted, so this removes nothing.
@@ -349,7 +362,7 @@ TruncateUncommittedTail ==
                            THEN CommittedLen(log_written) ELSE Len(log_durable))
   /\ phase' = "idle"
   /\ UNCHANGED <<db, db_committed, cursor, generation, nstarted, cur,
-                 aidx, attempts, quarantined>>
+                 aidx, attempts, quarantined, deferred, damage_repaired>>
 
 \* Compaction drops every line of a batch whose events are all dead, and
 \* bumps the generation without touching the cursor -- so a generation
@@ -381,7 +394,7 @@ RecoverIdle ==
   /\ db_committed' = RecTarget.d
   /\ cursor' = RecTarget.c
   /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
-                 cur, aidx, attempts, quarantined>>
+                 cur, aidx, attempts, quarantined, deferred, damage_repaired>>
 
 \* Operator-invoked `kb rebuild`.
 RebuildAll ==
@@ -393,7 +406,7 @@ RebuildAll ==
   /\ db_committed' = Materialize(log_durable, quarantined)
   /\ cursor' = [gen |-> generation, off |-> DurCommittedLen]
   /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
-                 cur, aidx, attempts, quarantined>>
+                 cur, aidx, attempts, quarantined, deferred, damage_repaired>>
 
 Next ==
   \/ StartBatch \/ AppendLine \/ PartialFlush \/ SyncLog
