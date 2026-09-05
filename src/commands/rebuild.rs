@@ -771,9 +771,14 @@ fn checkpoint_live_db(db_path: &Path) -> anyhow::Result<Option<rusqlite::Connect
     if !db_path.exists() {
         return Ok(None);
     }
-    // Deliberately NOT db::open_db: that runs ensure_schema's ALTERs and
-    // sweep_expired_peers' DELETE, which would write fresh frames into the very
-    // WAL this is trying to drain.
+    // `open_live_for_checkpoint` is a bare `Connection::open` with no
+    // `ensure_schema` ALTERs and no peer sweep — it must stay that way to
+    // satisfy the "rebuild swap precondition" invariant row in
+    // docs/src/lock-contract.md: while `paths.lock` is held across this
+    // connection (from here through `Rebuild::execute_with`'s rename), no
+    // other opener may write a WAL frame or take a second lock against the
+    // live DB, so the live database has no uncheckpointed frames at the
+    // rename step.
     let conn = db::open_live_for_checkpoint(db_path)
         .with_context(|| format!("open live DB {} for checkpoint", db_path.display()))?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
