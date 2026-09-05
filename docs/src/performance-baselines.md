@@ -79,6 +79,7 @@ What the harness does:
 
 - Builds `kb` and `kb-bench-fixture`.
 - Seeds fresh `10k` and `100k` fixture repos with seed `42`.
+- Since bd-21ef.1.19, fixtures are seeded in framed batches through the event-log writer so the log and applied cursor remain converged.
 - Runs Hyperfine on `search-verify-on`, `search-verify-off`, `context`, `cited-by`, and `search-hybrid-embed`.
 - Writes raw Hyperfine JSON to `"$BENCH_WORK_DIR"/raw-<date>-<mode>/`.
 - Writes the stable consolidated artifact to `.omc/benches/<date>-interactive-cli-<cold|warm>.json`.
