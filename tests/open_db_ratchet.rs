@@ -1,42 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-/// L1b/L2/L3/L1c: lower this as each migrated call site stops using `open_db`.
-///
-/// Bumped 82 -> 87 when L1a rebased onto bd-21ef.2 (B2/P1/A1): those commits
-/// added 5 unmigrated `db::open_db(&paths.db)` call sites in
-/// `src/commands/mcp.rs` test helpers, ahead of L1a's own migration work.
-/// Not new legacy debt introduced by L1a itself.
-///
-/// Lowered 87 -> 72 by L1b: peers.rs and mcp.rs's kb_peers_* handlers moved
-/// their remaining production `open_db` call sites to `open_ro`/`open_rw`
-/// (peer TTL read-time filter + locked sweep).
-///
-/// Bumped 72 -> 74 by T5a's D4 swap-sequence crash tests (see that commit):
-/// 3 new `db::open_db(&paths.db)` test-fixture call sites in
-/// `src/commands/rebuild.rs`, pushing the real count to 73.
-///
-/// Stayed at 74 through C1's D1/T3/D3 work: the real count moved between 70
-/// and 74 across that range (D1's crash-recovery test in
-/// `src/components/kb_core.rs` added one; C1's D3 write helper
-/// (`cursor::append_and_apply`) migrated several production and test call
-/// sites off `open_db` as it landed) without ever exceeding 74.
-///
-/// Lowered 74 -> 69 by C1's convergence-gate fix, the last piece of C1's D3
-/// write-helper migration to land — the same net drop from L1b's 72 that
-/// C1's rebase produces overall, once D3's migration off `open_db`
-/// outweighs the D4/D1 test fixtures that pushed the ceiling up in the
-/// first place.
-///
-/// Bumped 69 -> 70 when bd-21ef.3 (C3) rebased onto that aggregator tip:
-/// S3a's new
-/// `test_handle_provenance_is_deterministic_across_parent_insertion_order`
-/// test fixture in `src/commands/mcp.rs` opens its temp db with
-/// `db::open_db(&paths.db)`, matching every other test fixture in that file
-/// (only production handlers were migrated to `open_ro`/`open_rw`). Test
-/// convention, not new legacy debt in production code paths. Recounted
-/// directly against the post-rebase tree (70 call sites).
-const OPEN_DB_CALLSITE_RATCHET: usize = 70;
+/// L1c removed the legacy opener; keep this gate at zero permanently.
+const OPEN_DB_CALLSITE_RATCHET: usize = 0;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
@@ -52,36 +18,9 @@ fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-#[test]
-fn open_db_callsites_do_not_increase() {
-    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut count = 0usize;
-
-    for path in src_rs_files(&src_root) {
-        for line in fs::read_to_string(&path).unwrap().lines() {
-            if !line.contains("open_db(") {
-                continue;
-            }
-            let trimmed = line.trim();
-            if trimmed.starts_with("fn legacy_open_db(")
-                || trimmed.starts_with("pub fn open_db(")
-                || trimmed.contains("legacy_open_db(db_path)")
-            {
-                continue;
-            }
-            count += 1;
-        }
-    }
-
-    assert!(
-        count <= OPEN_DB_CALLSITE_RATCHET,
-        "open_db call sites increased: found {count}, ratchet is {OPEN_DB_CALLSITE_RATCHET}"
-    );
-}
-
 /// Strip a `//` line comment from `line`, so a mention of the raw
 /// constructor in prose (a doc comment explaining what a call site used to
-/// do, say) does not itself trip the gate. A `//` immediately preceded by
+/// do, say) does not itself trip a gate. A `//` immediately preceded by
 /// `:` is treated as part of a `scheme://` URL rather than a comment
 /// introducer, so doc comments that link to something don't get truncated.
 ///
@@ -98,6 +37,109 @@ fn strip_line_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+/// For each line of `source`, whether it falls inside (at any nesting depth)
+/// a `#[cfg(test)] mod <name> { ... }` block — the crate's unit-test modules
+/// are not all named `tests` (`components/cursor.rs` also has a
+/// `crash_tests`, `commands/mcp.rs` a `tests_api`), so this matches the
+/// `#[cfg(test)]` attribute on the immediately preceding line rather than a
+/// fixed module name. Brace-counting on the comment-stripped line, not a
+/// parser: the same line-based limitation `strip_line_comment` above
+/// already accepts.
+fn lines_inside_cfg_test_module(source: &str) -> Vec<bool> {
+    let mut inside = Vec::with_capacity(source.lines().count());
+    let mut depth: i32 = 0;
+    let mut test_mod_start_depth: Option<i32> = None;
+    let mut prev_line_was_cfg_test = false;
+
+    for line in source.lines() {
+        let code = strip_line_comment(line);
+        let trimmed = code.trim();
+        let after_vis = trimmed
+            .strip_prefix("pub(crate) ")
+            .or_else(|| trimmed.strip_prefix("pub "))
+            .unwrap_or(trimmed);
+        let is_mod_open = after_vis.starts_with("mod ") && after_vis.ends_with('{');
+
+        if test_mod_start_depth.is_none() && is_mod_open && prev_line_was_cfg_test {
+            test_mod_start_depth = Some(depth);
+        }
+
+        inside.push(test_mod_start_depth.is_some());
+
+        let opens = code.matches('{').count() as i32;
+        let closes = code.matches('}').count() as i32;
+        depth += opens - closes;
+
+        if let Some(start) = test_mod_start_depth {
+            if depth <= start {
+                test_mod_start_depth = None;
+            }
+        }
+
+        prev_line_was_cfg_test = trimmed == "#[cfg(test)]";
+    }
+
+    inside
+}
+
+#[test]
+fn open_db_callsites_do_not_increase() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut count = 0usize;
+
+    for path in src_rs_files(&src_root) {
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            if !strip_line_comment(line).contains("open_db(") {
+                continue;
+            }
+            count += 1;
+        }
+    }
+
+    assert!(
+        count <= OPEN_DB_CALLSITE_RATCHET,
+        "open_db call sites increased: found {count}, ratchet is {OPEN_DB_CALLSITE_RATCHET}"
+    );
+}
+
+/// `db::open_unchecked_for_test` is a bare `Connection::open` with none of
+/// ADR-1's policy (no lock, no `query_only`, no `DbUninitialized` mapping) —
+/// it is `#[doc(hidden)] pub` only so integration-test crates can reach it,
+/// never for production use. A production call site would bypass every
+/// opener contract in the crate while leaving both this file's other gates
+/// green, so it gets its own confinement: forbidden everywhere in `src/`
+/// except inside a `mod tests { ... }` block or `components/db.rs` itself
+/// (the opener's own definition).
+#[test]
+fn open_unchecked_for_test_is_confined_to_test_modules() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let db_component = src_root.join("components/db.rs");
+    let mut offenders = Vec::new();
+
+    for path in src_rs_files(&src_root) {
+        if path == db_component {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
+        let test_flags = lines_inside_cfg_test_module(&source);
+        for (index, line) in source.lines().enumerate() {
+            if test_flags[index] {
+                continue;
+            }
+            let code = strip_line_comment(line);
+            if code.contains("open_unchecked_for_test(") {
+                offenders.push(format!("{}:{}", path.display(), index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "open_unchecked_for_test called outside a test module: {}",
+        offenders.join(", ")
+    );
 }
 
 #[test]

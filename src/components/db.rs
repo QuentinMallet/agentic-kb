@@ -1,7 +1,5 @@
 //! Database operations
 
-#![allow(deprecated)] // open_db (ADR-1) still used by unmigrated call sites; removed in C2/L1c
-
 use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
 use crate::config;
@@ -223,7 +221,7 @@ pub const SCHEMA_VERSION: i64 = 3;
 
 /// True when the DB carries the current schema_version stamp.
 ///
-/// Only fresh DBs (created by `open_db`/`open_db_memory` from nothing) and
+/// Only fresh DBs (created by the initializing openers from nothing) and
 /// rebuild outputs are stamped — a pre-existing DB opened by a newer binary
 /// gets missing TABLES from `ensure_schema` but keeps reading as obsolete
 /// until a rebuild replays the log into them.
@@ -311,7 +309,7 @@ pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// D4 swap step 1's opener: a raw connection against the *live* DB path, with
-/// none of `open_db`/`open_rw`'s side effects. `ensure_schema`'s ALTERs and
+/// none of `open_rw`'s side effects. `ensure_schema`'s ALTERs and
 /// `sweep_expired_peers`' DELETE would each write fresh frames into the very
 /// WAL this connection exists to drain via `wal_checkpoint(TRUNCATE)` — this
 /// opener is the only place in the crate the checkpoint may start from. The
@@ -637,31 +635,6 @@ fn init_locked(paths: &config::Paths) -> Result<()> {
     drop(conn);
     drop(lock);
     Ok(())
-}
-
-/// Legacy open: create, WAL, schema, stamp — all without a lock.
-/// The body of the pre-split `open_db`, retained verbatim behind the
-/// deprecated wrapper so unmigrated call sites keep behaving as they did.
-fn legacy_open_db(db_path: &Path) -> Result<Connection> {
-    let conn = open_conn_rw(db_path)?;
-    ensure_schema_and_stamp(&conn)?;
-    Ok(conn)
-}
-
-/// Open (or create) the SQLite database at the given path.
-///
-/// Deprecated by ADR-1. Behaviour is unchanged so that C1 and C3 get a rebase
-/// window instead of a detonation mid-task; `L1c` deletes it once both have
-/// rebased. Every remaining caller is either a pure read that has not moved to
-/// [`open_ro`] yet, an unlocked mutation that `L2`/`L3` will put under the lock,
-/// or a test fixture that should use [`test_db`].
-#[deprecated(
-    note = "ADR-1: use open_ro (pure reads), open_rw (mutation under the write lock), \
-            open_scratch (rebuild's tmp DB), or open_or_init (initialization). \
-            Removed by C2/L1c."
-)]
-pub fn open_db(db_path: &Path) -> Result<Connection> {
-    legacy_open_db(db_path)
 }
 
 /// Test fixture: an initialized repository plus a writable connection to it.
