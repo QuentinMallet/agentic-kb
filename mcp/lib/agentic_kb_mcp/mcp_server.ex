@@ -515,11 +515,17 @@ defmodule AgenticKbMcp.McpServer do
     # B1 / ADR-4: normalise, then validate, before dispatch_tool/3 builds the
     # port request — so neither a missing `arguments` nor an undeclared
     # argument reaches the Rust boundary.
+    #
+    # With no database there is nothing to call, and "run kb init" is the only
+    # actionable answer — so that hint wins over an argument complaint the
+    # caller cannot act on yet.
     result =
-      with {:ok, args} <- tool_args(params),
+      with false <- match?(%{db_path: nil}, state),
+           {:ok, args} <- tool_args(params),
            :ok <- validate_tool_args(tool, args) do
         dispatch_tool(tool, args, state)
       else
+        true -> dispatch_tool(tool, %{}, state)
         {:error, message} -> text_error(message)
       end
 
