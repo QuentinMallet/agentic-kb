@@ -49,3 +49,28 @@ fn open_db_callsites_do_not_increase() {
         "open_db call sites increased: found {count}, ratchet is {OPEN_DB_CALLSITE_RATCHET}"
     );
 }
+
+#[test]
+fn connection_open_is_confined_to_the_db_component() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let db_component = src_root.join("components/db.rs");
+    let mut offenders = Vec::new();
+
+    for path in src_rs_files(&src_root) {
+        if path == db_component {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
+        for (index, line) in source.lines().enumerate() {
+            if line.contains("Connection::open(") {
+                offenders.push(format!("{}:{}", path.display(), index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "Connection::open sites outside components/db.rs: {}",
+        offenders.join(", ")
+    );
+}
