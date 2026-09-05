@@ -47,10 +47,14 @@ Recency bias adds a single batch SELECT on ≤ `limit` IDs after RRF. Measured o
 ### Federation (Multi-Peer Search)
 
 Under federation, `--limit` is a global cap across the local repository and all
-peers, not a per-repository cap. `merge_federated_results` deduplicates on the
-pair `(origin_repo, id)` and performs the one federated truncation. If the same
-entry ID occurs locally and in a peer, the local row wins; peer/peer collisions
-use the normal deterministic ordering. These cases are pinned by
+peers, not a per-repository cap. `merge_federated_results` collides candidates
+on `id` alone, so there is exactly one surviving row per id across all
+origins: a local row and a peer row sharing an id collide, and the local row
+always wins; two peer rows sharing an id collide too, resolved by the normal
+deterministic ordering (`compare_federated_rows`). The surviving row is then
+stored under the pair `(origin_repo, id)` — that pair is the storage key of
+the row that won the collision, not the collision test itself. Exactly one
+federated truncation follows. These cases are pinned by
 `test_federated_global_limit_dedup_and_local_collision_contract`.
 
 Cross-repository ordering is by within-repository rank position with a
