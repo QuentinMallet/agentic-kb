@@ -36,6 +36,13 @@ pub(crate) struct ReembedReport {
     pub failed: usize,
     pub skipped: usize,
     pub missing: usize,
+    /// Rows whose write did not apply because the entry raced away between
+    /// selection and the batch: it already had an embedding (a concurrent
+    /// writer got there first) or it no longer resolves live (deleted or
+    /// marked stale). Neither is a failure of this run; without this
+    /// counter these rows silently vanished — embedded + failed + skipped
+    /// could be less than missing with no explanation (review finding).
+    pub raced: usize,
     pub failures: Vec<ReembedFailure>,
 }
 
@@ -93,8 +100,8 @@ impl Reembed {
                 eprintln!("  skip {}: {}", failure.id, failure.cause);
             }
             println!(
-                "reembed: {} embedded, {} failed, {} skipped (too large)",
-                report.embedded, report.failed, report.skipped
+                "reembed: {} embedded, {} failed, {} skipped (too large), {} raced",
+                report.embedded, report.failed, report.skipped, report.raced
             );
         }
         if report.failed > 0 {
@@ -265,6 +272,7 @@ fn write_batches<F>(
         };
         let mut successes = Vec::new();
         let mut stmt_failures = Vec::new();
+        let mut raced = 0usize;
         for write in batch {
             match txn.execute(
                 "INSERT OR IGNORE INTO entries_emb(rowid, embedding)
@@ -273,7 +281,7 @@ fn write_batches<F>(
                 params![write.id, write.blob],
             ) {
                 Ok(1) => successes.push(write.id.clone()),
-                Ok(_) => {}
+                Ok(_) => raced += 1,
                 Err(error) => stmt_failures.push((write.id.clone(), error.to_string())),
             }
         }
@@ -286,6 +294,7 @@ fn write_batches<F>(
                 report.embedded += 1;
             }
         }
+        report.raced += raced;
         for (id, cause) in stmt_failures {
             record_failure(report, id, cause);
         }
@@ -374,6 +383,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report.embedded, 0);
+        assert_eq!(
+            report.raced, 1,
+            "the raced-away write must be accounted for, not silently dropped"
+        );
         let conn = db::open_ro(&paths.db).unwrap();
         let blob: Vec<u8> = conn.query_row(
             "SELECT emb.embedding FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id='race'",
