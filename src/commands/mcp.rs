@@ -25,6 +25,9 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+// Keep audit_record batches bounded to audit_run's maximum sample size.
+const MAX_AUDIT_VERDICTS: usize = 50;
+
 /// Run MCP port protocol server (line-delimited JSON over stdio)
 #[derive(Command, Debug, Parser)]
 pub struct Mcp {
@@ -1918,7 +1921,7 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
 fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let id = &req.id;
     let sample_size = match NumField::non_negative(&req.sample_size, "sample_size") {
-        Ok(v) => v.unwrap_or(5).clamp(1, 50) as usize,
+        Ok(v) => v.unwrap_or(5).clamp(1, MAX_AUDIT_VERDICTS as u64) as usize,
         Err(e) => return parse_error(id, e),
     };
     let mode = req.mode.as_deref().unwrap_or("uniform");
@@ -1996,6 +1999,11 @@ fn handle_audit_record(
     }
 
     let verdicts: Vec<Value> = req.verdicts.clone().unwrap_or_default();
+
+    if verdicts.len() > MAX_AUDIT_VERDICTS {
+        return json!({"id":id,"type":"error","code":"parse_error",
+            "message":format!("verdicts must contain at most {} items", MAX_AUDIT_VERDICTS)});
+    }
 
     if verdicts.is_empty() {
         return json!({"id": id, "type": "ok", "recorded": 0, "expired": 0});
@@ -4426,6 +4434,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_caps_verdicts_at_50() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        let entry_id = add_live_entry(&paths, &emb, "p/cap", None);
+        seed_audit_candidate(&paths, "run-cap", &entry_id);
+        let fifty = vec![json!({"entry_id":&entry_id,"verdict":true}); MAX_AUDIT_VERDICTS];
+        let accepted = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-cap","verdicts":fifty}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(accepted["type"], "ok");
+
+        let fifty_one = vec![json!({"entry_id":&entry_id,"verdict":true}); MAX_AUDIT_VERDICTS + 1];
+        let rejected = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-cap","verdicts":fifty_one}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(rejected["type"], "error");
+        assert!(rejected["message"].as_str().unwrap().contains("50"));
     }
 
     #[test]

@@ -405,6 +405,7 @@ defmodule AgenticKbMcp.McpServer do
           },
           "verdicts" => %{
             "type" => "array",
+            "maxItems" => 50,
             "description" => "Verdicts shaped as {entry_id, verdict, note?}",
             "items" => %{
               "type" => "object",
@@ -502,7 +503,7 @@ defmodule AgenticKbMcp.McpServer do
       {_tool, allowed} ->
         case args |> Map.keys() |> Enum.reject(&(&1 in allowed)) |> Enum.sort() do
           [] ->
-            :ok
+            validate_tool_values(tool, args)
 
           unknown ->
             {:error,
@@ -512,6 +513,13 @@ defmodule AgenticKbMcp.McpServer do
         end
     end
   end
+
+  defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts})
+       when is_list(verdicts) and length(verdicts) > 50 do
+    {:error, "verdicts must contain at most 50 items"}
+  end
+
+  defp validate_tool_values(_tool, _args), do: :ok
 
   # ---------------------------------------------------------------------------
   # Public API

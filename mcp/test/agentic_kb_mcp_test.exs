@@ -605,6 +605,22 @@ defmodule AgenticKbMcpTest do
   end
 
   describe "validate_tool_args/2 (B1)" do
+    test "kb_audit_record accepts 50 verdicts and rejects 51" do
+      assert :ok ==
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => List.duplicate(%{"entry_id" => "entry", "verdict" => true}, 50)
+               })
+
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => List.duplicate(%{"entry_id" => "entry", "verdict" => true}, 51)
+               })
+
+      assert message =~ "50"
+    end
+
     test "an unknown argument is rejected, not silently dropped by put_if_present" do
       assert {:error, message} =
                McpServer.validate_tool_args("kb_add", %{
