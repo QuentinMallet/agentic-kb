@@ -247,21 +247,47 @@ fn write_batches<F>(
             }
         };
         db::check_embed_mode_vintage(&conn, mode);
+
+        // One transaction per batch: without it, each INSERT is its own
+        // implicit commit — REEMBED_WRITE_BATCH_SIZE fsync-durable WAL
+        // commits under the exclusive lock instead of one, which measured
+        // as the dominant cost of the lock-hold time (review finding).
+        // Per-row error handling still works inside the transaction:
+        // SQLite's RAISE(ABORT) in a trigger rolls back only the failing
+        // statement, not the whole transaction, so earlier rows in the
+        // batch survive a later row's failure.
+        let txn = match conn.unchecked_transaction() {
+            Ok(txn) => txn,
+            Err(error) => {
+                record_batch_failure(report, batch, format!("begin transaction: {error}"));
+                continue;
+            }
+        };
+        let mut successes = Vec::new();
+        let mut stmt_failures = Vec::new();
         for write in batch {
-            match conn.execute(
+            match txn.execute(
                 "INSERT OR IGNORE INTO entries_emb(rowid, embedding)
                  SELECT e.rowid, ?2 FROM entries e WHERE e.id = ?1 AND e.is_stale = 0
                  AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
                 params![write.id, write.blob],
             ) {
-                Ok(1) => {
-                    if embedded_ids.insert(write.id.clone()) {
-                        report.embedded += 1;
-                    }
-                }
+                Ok(1) => successes.push(write.id.clone()),
                 Ok(_) => {}
-                Err(error) => record_failure(report, write.id.clone(), error.to_string()),
+                Err(error) => stmt_failures.push((write.id.clone(), error.to_string())),
             }
+        }
+        if let Err(error) = txn.commit() {
+            record_batch_failure(report, batch, format!("commit batch: {error}"));
+            continue;
+        }
+        for id in successes {
+            if embedded_ids.insert(id) {
+                report.embedded += 1;
+            }
+        }
+        for (id, cause) in stmt_failures {
+            record_failure(report, id, cause);
         }
     }
 }
@@ -419,6 +445,47 @@ mod tests {
         assert_eq!((report.embedded, report.failed), (0, 1));
         assert_eq!(report.failures[0].id, "write-fails");
         assert!(report.failures[0].cause.contains("fixture write rejected"));
+    }
+
+    #[test]
+    fn test_reembed_batch_runs_in_one_transaction_surviving_a_mid_batch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        seed(&paths, "before", "good");
+        seed(&paths, "middle", "good");
+        seed(&paths, "after", "good");
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_middle BEFORE INSERT ON entries_emb
+                 WHEN (SELECT id FROM entries WHERE rowid = NEW.rowid) = 'middle'
+                 BEGIN SELECT RAISE(ABORT, 'fixture reject middle'); END",
+            )
+            .unwrap();
+        }
+        let report = run_reembed(&paths, &FixedEmbedder(0.5), false, 1800).unwrap();
+        assert_eq!(
+            report.embedded, 2,
+            "before and after must both survive middle's failure in the same batch/transaction"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].id, "middle");
+        let conn = db::open_ro(&paths.db).unwrap();
+        for ok_id in ["before", "after"] {
+            let has: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id=?1)",
+                    [ok_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                has,
+                "{ok_id} must survive a mid-batch failure in the same transaction"
+            );
+        }
     }
 
     /// Measures the wall-clock lock-hold time of one write batch against the
