@@ -307,6 +307,11 @@ fn ensure_schema_and_stamp(conn: &Connection) -> Result<()> {
     ensure_schema(conn)?;
     if is_fresh {
         stamp_schema_version(conn)?;
+        // A brand-new database has applied nothing, so offset 0 is the truthful
+        // applied cursor (C1/D3). Seeding it here keeps a fresh database off the
+        // cursorless full-rebuild row: recovery replays the log incrementally
+        // instead, which is the same materialization for a fraction of the work.
+        crate::components::cursor::seed_fresh(conn)?;
     }
     Ok(())
 }
@@ -564,6 +569,24 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 /// escapes the split. Must not be called while this process already holds the
 /// write lock; the re-entrancy registry rejects that rather than deadlocking.
 pub fn open_or_init(paths: &config::Paths) -> Result<()> {
+    init_locked(paths)?; // released before recovery: its repairs take the lock
+    // C1/D3 + C2/ADR-7: recovery fires at process entry, never on a read path.
+    // `recover_if_needed` re-acquires the lock only when there is something to
+    // repair, so the steady-state cost here is one cursor comparison.
+    let embedder = crate::commands::add::make_embedder(paths);
+    crate::commands::rebuild::recover_if_needed(paths, embedder.as_ref())?;
+    Ok(())
+}
+
+/// The initialization half of [`open_or_init`]: parent dirs, schema, stamp,
+/// and the seeded cursor. Separated so test fixtures can initialize a
+/// repository without dragging in recovery's production embedder.
+///
+/// Deliberately does NOT sweep expired peers: L1b's contract is that
+/// deletion happens only in locked writers (`tests/open_split.rs::
+/// open_or_init_does_not_sweep_expired_peers`), so init/recovery must leave
+/// them physically present.
+fn init_locked(paths: &config::Paths) -> Result<()> {
     let lock = crate::commands::add::acquire_lock(&paths.lock)?;
     let conn = open_rw(paths, &lock)?;
     drop(conn);
@@ -605,7 +628,7 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
 #[doc(hidden)]
 pub fn test_db(root: &Path) -> (config::Paths, Connection) {
     let paths = config::Paths::from_root(root);
-    open_or_init(&paths).expect("test_db: initialize the knowledge base");
+    init_locked(&paths).expect("test_db: initialize the knowledge base");
     let conn = open_conn_rw(&paths.db).expect("test_db: open the knowledge base");
     (paths, conn)
 }
@@ -1178,6 +1201,53 @@ pub fn entry_embed_text(
     }
 }
 
+/// Every text [`apply_event`] will hand to the embedder for one event.
+///
+/// The single source of truth for the D3 prefetch: it must mirror the
+/// `("upsert", "entries")` arm exactly, or a text the arm needs would miss the
+/// sealed cache and fail loudly inside the transaction. That loud failure is
+/// the intended feedback if the two ever drift.
+pub fn embed_texts_for_event(event: &serde_json::Value) -> Vec<String> {
+    if event["action"] != "upsert" || event["table"] != "entries" {
+        return Vec::new();
+    }
+    let (Some(id), Some(path), Some(summary), Some(content)) = (
+        event["id"].as_str(),
+        event["path"].as_str(),
+        event["summary"].as_str(),
+        event["content"].as_str(),
+    ) else {
+        return Vec::new();
+    };
+    let summary = clamp_chars(summary, MAX_SUMMARY_CHARS, "summary", id);
+    let content = clamp_chars(content, MAX_ENTRY_CONTENT_CHARS, "content", id);
+    let tags = event["tags"].to_string();
+    let mode = EmbedTextMode::from_env();
+    let mut texts = vec![entry_embed_text(
+        mode,
+        path,
+        summary.as_ref(),
+        content.as_ref(),
+        &tags,
+    )];
+    if let Some(cues) = event["cues"].as_array() {
+        texts.extend(cues.iter().filter_map(|c| c.as_str()).map(str::to_string));
+    }
+    texts
+}
+
+/// [`embed_texts_for_event`] over a batch.
+pub fn embed_texts_for_batch(batch: &[serde_json::Value]) -> Vec<String> {
+    batch.iter().flat_map(embed_texts_for_event).collect()
+}
+
+/// [`embed_texts_for_batch`] for a borrowed iterator (the recovery tail).
+pub fn embed_texts_for_batch_refs<'a>(
+    batch: impl Iterator<Item = &'a serde_json::Value>,
+) -> Vec<String> {
+    batch.flat_map(embed_texts_for_event).collect()
+}
+
 fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
     conn.execute_batch("SAVEPOINT apply_evt")?;
     match f() {
@@ -1255,47 +1325,60 @@ fn event_ts(event: &serde_json::Value) -> Option<&str> {
     event["ts"].as_str().filter(|s| !s.is_empty())
 }
 
-/// Deterministic synthetic key for a `run_history` event that predates
-/// `run_id` (real writers — `run.rs`, `mcp.rs` — have always minted a uuid
-/// `run_id`, so this only serves pre-existing/legacy log data).
+/// Content hash of a `run_history` event that predates `run_id`.
 ///
-/// The key is a function of the event's content plus its ordinal among rows
-/// already sharing that content hash, so replaying the same log into a fresh
-/// DB reassigns the identical key to the identical event every time: two
-/// full replays of one log produce a row-for-row identical `run_history`
-/// table. The ordinal is read back from the DB rather than threaded through
-/// `apply_event`'s signature (which would require a log-position parameter
-/// on every one of its ~15 call sites, well beyond this task's scope) —
-/// within T3's scope every caller that reaches this arm with a run_id-less
-/// event does so via a full materialization starting from an empty table
-/// (`kb rebuild` / `kb compact`'s replay-and-compare paths); the
-/// applied-cursor incremental replay onto an already-populated DB is T4.
+/// `None` for anything else — a real writer's event (`run.rs`, `mcp.rs` have
+/// always minted a uuid `run_id`) or a different action entirely. Callers use
+/// this to decide whether an event needs a log occurrence index at all.
+pub fn legacy_run_content_hash(event: &serde_json::Value) -> Option<String> {
+    if event["action"] != "insert" || event["table"] != "run_history" {
+        return None;
+    }
+    if event["run_id"].as_str().is_some() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for field in ["test_id", "result", "adapter", "detail", "ts"] {
+        hasher.update(event[field].as_str().unwrap_or("").as_bytes());
+        hasher.update([0u8]);
+    }
+    // Hex digest: only [0-9a-f], so the LIKE pattern below needs no escaping.
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Deterministic synthetic key for a `run_history` event that predates
+/// `run_id`.
+///
+/// The key is the event's content hash plus an ordinal, so two events with
+/// byte-identical content do not collapse into one row. Where the ordinal
+/// comes from decides whether replay is idempotent:
+///
+/// * `occurrence = Some(n)` — `n` is the event's index among identical-content
+///   events **in the log**, supplied by the replay driver. Re-applying an
+///   already-applied event then recomputes the same key and
+///   `ON CONFLICT DO NOTHING` makes it a no-op. This is what the applied-cursor
+///   tail replay passes (C1/T4), and it is the only ordinal that is a function
+///   of the log rather than of the replay boundary.
+/// * `occurrence = None` — fall back to counting rows already sharing the
+///   content hash. Correct for a materialization that starts from an empty
+///   table, which is every direct `apply_event` caller: `kb rebuild`'s replay,
+///   its catch-up onto the prefix it just replayed, and `kb compact`'s
+///   replay-and-compare. It is NOT idempotent against an already-populated
+///   table, which is exactly why the tail replay supplies the log index.
 fn synthetic_run_key(
     conn: &Connection,
-    test_id: &str,
-    result: &str,
-    adapter: Option<&str>,
-    detail: Option<&str>,
-    ts: &str,
+    content_hash: &str,
+    occurrence: Option<u64>,
 ) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(test_id.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(result.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(adapter.unwrap_or("").as_bytes());
-    hasher.update([0u8]);
-    hasher.update(detail.unwrap_or("").as_bytes());
-    hasher.update([0u8]);
-    hasher.update(ts.as_bytes());
-    // Hex digest: only [0-9a-f], so the LIKE pattern below needs no escaping.
-    let content_hash = format!("{:x}", hasher.finalize());
     let prefix = format!("legacy:{content_hash}:");
-    let ordinal: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM run_history WHERE run_id LIKE ?1",
-        params![format!("{prefix}%")],
-        |r| r.get(0),
-    )?;
+    let ordinal = match occurrence {
+        Some(n) => n as i64,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM run_history WHERE run_id LIKE ?1",
+            params![format!("{prefix}%")],
+            |r| r.get(0),
+        )?,
+    };
     Ok(format!("{prefix}{ordinal}"))
 }
 
@@ -1307,6 +1390,20 @@ pub fn apply_event(
     conn: &Connection,
     embedder: &dyn Embedder,
     event: &serde_json::Value,
+) -> Result<()> {
+    apply_event_at(conn, embedder, event, None)
+}
+
+/// [`apply_event`], with the event's occurrence index in the log.
+///
+/// Only the run_id-less `run_history` arm reads it; see [`synthetic_run_key`]
+/// for why an incremental replay must supply it and a from-empty
+/// materialization need not.
+pub fn apply_event_at(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    event: &serde_json::Value,
+    occurrence: Option<u64>,
 ) -> Result<()> {
     let action = event["action"].as_str().unwrap_or("");
     let table = event["table"].as_str().unwrap_or("");
@@ -1560,7 +1657,11 @@ pub fn apply_event(
             // the same event any number of times a no-op after the first.
             let key = match event["run_id"].as_str() {
                 Some(id) => id.to_string(),
-                None => synthetic_run_key(conn, test_id, result, adapter, detail, ts)?,
+                None => {
+                    let content_hash = legacy_run_content_hash(event)
+                        .context("run_history: cannot derive a synthetic key")?;
+                    synthetic_run_key(conn, &content_hash, occurrence)?
+                }
             };
             conn.execute(
                 "INSERT INTO run_history(test_id,result,adapter,detail,ts,run_id)

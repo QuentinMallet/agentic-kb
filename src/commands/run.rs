@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::Embedder;
-use crate::components::{db, events};
+use crate::components::{cursor, db};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use anyhow::bail;
@@ -68,9 +68,9 @@ impl Run {
             "session_id": omc_session_id,
         });
 
-        events::append_event(&paths.events, &event)?;
+        // Writer 3 of 10.
         let conn = db::open_rw(paths, &lock)?;
-        db::apply_event(&conn, embedder, &event)?;
+        cursor::append_and_apply(&lock, &conn, paths, embedder, &[event])?;
 
         println!(
             "recorded run {}  {} -> {}",
@@ -85,6 +85,7 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::events;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
     use std::fs;

@@ -123,7 +123,7 @@ impl Ingest {
         // Construct embedder without env::set_var.
         // Directive: env::set_var is unsafe in Rust 2024 — never reintroduce.
         let embedder = add::make_embedder_with_opts(&paths, self.no_embed);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with(&paths, embedder.as_ref())
     }
 }

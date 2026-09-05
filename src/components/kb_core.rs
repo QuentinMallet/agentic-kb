@@ -38,7 +38,7 @@
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
-use crate::components::{db, embedder, events, redactor};
+use crate::components::{cursor, db, embedder, events, redactor};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
@@ -156,8 +156,8 @@ pub fn add(
 /// 1. Validates, redacts, and caps the inputs.
 /// 2. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
 /// 3. Builds expire events + the upsert event + evidence-add events.
-/// 4. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
-/// 5. Applies each event to the DB in order, all under the caller's flock.
+/// 4. Appends ALL events in ONE span and applies them under the caller's flock,
+///    through the single applied-cursor writer (`cursor::append_and_apply`).
 ///
 /// Input preparation runs inside the critical section rather than ahead of it,
 /// which is a deliberate trade: one code path for both entry points is worth
@@ -419,13 +419,9 @@ pub fn add_locked(
     let mut batch: Vec<Value> = expire_events;
     batch.push(add_event);
     batch.extend(evidence_events);
-    events::append_events_batch(&paths.events, &batch)?;
-    kill_point(KillPoint::AfterLogBatch);
-    kill_point(KillPoint::BeforeApply);
-
-    for ev in &batch {
-        db::apply_event(&conn, embedder, ev)?;
-    }
+    // Writer 1 of 10. Append + sync + apply + cursor as one unit (C1/D3): the
+    // helper owns the kill points, the embedding prefetch, and the transaction.
+    cursor::append_and_apply(lock, conn, paths, embedder, &batch)?;
 
     if args.evidence_status == "missing"
         && matches!(args.kind.as_str(), "observation" | "belief" | "procedure")

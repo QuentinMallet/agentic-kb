@@ -3,7 +3,7 @@
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
-use crate::components::{db, events, fsync::sync_parent_dir};
+use crate::components::{cursor, db, events, fsync::sync_parent_dir};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
@@ -102,35 +102,68 @@ struct Phase3Timing {
     lock_released: std::time::Instant,
 }
 
-/// Force a one-time rebuild when the DB predates the current schema
-/// generation (br-23b-handoff-tomorrow-uob).
+/// Converge the database with the event log (C1/D3, renamed from
+/// `rebuild_if_schema_obsolete`).
 ///
-/// Legacy DBs (created before the `schema_version` stamp existed) have their
-/// missing tables created empty by `ensure_schema`, but rows that only
-/// materialize through `apply_event` (cue rows, embedding vintages) stay
-/// absent until the log is replayed. Entry points (MCP startup, CLI
-/// search/add/eval) call this once per interaction; it is a cheap stamp read
-/// in the steady state.
+/// Implements the D3 recovery table in full. The obsolete-schema rebuild it
+/// grew out of is now one of its eight rows; the other seven are the applied
+/// cursor's. Called at process entry (MCP startup, CLI dispatch of a mutating
+/// subcommand) and before every write path. **Never from a read path**: reads
+/// detect the same condition and warn, but never take the write lock and never
+/// change content (C2/ADR-7, `crate::components::cursor::warn_if_behind`).
 ///
-/// Returns `Ok(true)` when a rebuild was performed.
-pub fn rebuild_if_schema_obsolete(
+/// | Condition | Action |
+/// |---|---|
+/// | no cursor rows present | full rebuild (the D3 migration path) |
+/// | schema stamp obsolete | full rebuild |
+/// | generation ≠ the log's generation | full rebuild (compacted or rewritten) |
+/// | tail hash mismatches the log at that offset | full rebuild |
+/// | offset > `committed_len` | full rebuild |
+/// | log unreadable | defer with a warning |
+/// | `committed_len` > offset | replay the tail, then advance the cursor |
+/// | `committed_len` == offset | no-op |
+///
+/// Returns `Ok(true)` when a full rebuild was performed.
+pub fn recover_if_needed(paths: &config::Paths, embedder: &dyn Embedder) -> anyhow::Result<bool> {
+    // Detection is lock-free and read-only. A repository whose database has
+    // never been created has nothing to converge — open_ro no longer creates
+    // it, so DbUninitialized is "nothing to do", not an error.
+    let decision = match db::open_ro(&paths.db) {
+        Ok(conn) => cursor::inspect(&conn, paths),
+        Err(e) if db::is_db_uninitialized(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match decision {
+        cursor::Decision::NoOp => Ok(false),
+        cursor::Decision::Defer(message) => {
+            // Row 6. Deferring keeps every entry point alive; failing here
+            // would take all of them down over one malformed middle line.
+            eprintln!("kb: WARNING deferring event-log recovery — {message}");
+            Ok(false)
+        }
+        cursor::Decision::ReplayTail { from, to } => {
+            eprintln!(
+                "kb: applying {} event-log byte(s) the database is missing \
+                 (applied cursor at {from}, log committed to {to})...",
+                to - from
+            );
+            let lock = acquire_lock(&paths.lock)?;
+            let conn = db::open_rw(paths, &lock)?;
+            let applied = cursor::replay_tail_locked(&lock, &conn, paths, embedder)?;
+            eprintln!("kb: recovery applied {applied} event(s).");
+            Ok(false)
+        }
+        cursor::Decision::FullRebuild(reason) => full_rebuild_for(paths, embedder, reason),
+    }
+}
+
+/// The full-rebuild rows of the D3 table, with the guards the schema-upgrade
+/// rebuild has always carried.
+fn full_rebuild_for(
     paths: &config::Paths,
     embedder: &dyn Embedder,
+    reason: cursor::RebuildReason,
 ) -> anyhow::Result<bool> {
-    // Fast path: no lock for the steady-state stamp read. A repository whose
-    // database has never been created has nothing to upgrade — open_ro no
-    // longer creates it, so DbUninitialized is "nothing to do", not an error.
-    {
-        match db::open_ro(&paths.db) {
-            Ok(conn) => {
-                if db::schema_is_current(&conn) {
-                    return Ok(false);
-                }
-            }
-            Err(e) if db::is_db_uninitialized(&e) => return Ok(false),
-            Err(e) => return Err(e),
-        }
-    }
     // Single-flight (codex review finding): concurrent first interactions
     // serialize on a dedicated upgrade lock — distinct from the write flock,
     // which Rebuild's phases acquire and release internally (holding THAT
@@ -144,7 +177,12 @@ pub fn rebuild_if_schema_obsolete(
         // than paths.lock. Putting it under the write lock is C2/L2's job — a
         // nested acquire here would invert the two locks' order.
         let conn = db::open_db(&paths.db)?;
-        if db::schema_is_current(&conn) {
+        // Re-check under the single-flight lock: the loser of the race finds
+        // the winner's work already done.
+        if !matches!(
+            cursor::inspect(&conn, paths),
+            cursor::Decision::FullRebuild(_)
+        ) {
             return Ok(false);
         }
         // Missing/empty event log: only a DB with ZERO entries is genuinely
@@ -162,6 +200,17 @@ pub fn rebuild_if_schema_obsolete(
                 conn.execute(
                     "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
                     rusqlite::params![db::SCHEMA_VERSION.to_string()],
+                )?;
+                // Nothing to materialize, so the empty database IS current with
+                // the (empty or unreachable) log: give it a cursor rather than
+                // leaving it on the cursorless full-rebuild row forever.
+                cursor::write(
+                    &conn,
+                    &cursor::Cursor {
+                        generation: cursor::read_generation(&paths.events),
+                        offset: 0,
+                        tail_sha: cursor::tail_sha(&paths.events, 0)?,
+                    },
                 )?;
             } else {
                 eprintln!(
@@ -239,16 +288,15 @@ pub fn rebuild_if_schema_obsolete(
     // interaction with a real embedder comes along.
     if embedder.is_noop() {
         eprintln!(
-            "kb: DB schema predates v{} but KB_NO_EMBED is set — deferring the \
-             upgrade rebuild to avoid dropping embeddings",
-            db::SCHEMA_VERSION
+            "kb: a full rebuild is due ({}) but KB_NO_EMBED is set — deferring it \
+             to avoid dropping embeddings; rerun with an embedder or `kb rebuild`",
+            reason.as_str()
         );
         return Ok(false);
     }
     eprintln!(
-        "kb: DB schema predates v{} — replaying the event log once to \
-         materialize new derived state (cue rows, embedding vintage stamp)...",
-        db::SCHEMA_VERSION
+        "kb: rebuilding the database from the event log — {}.",
+        reason.as_str()
     );
     // Non-destructive by construction: snapshot the pre-upgrade DB before the
     // rebuild swap. Even if the log is subtly stale in a way coverage cannot
@@ -281,7 +329,7 @@ pub fn rebuild_if_schema_obsolete(
     } // release the write flock — Rebuild re-acquires it per phase
     eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
     (Rebuild).execute_with(paths, embedder)?;
-    eprintln!("kb: schema upgrade rebuild complete.");
+    eprintln!("kb: rebuild complete.");
     Ok(true)
 }
 
@@ -405,8 +453,25 @@ impl Rebuild {
                         torn_tail.bytes.len()
                     );
                 }
-                eprintln!("replaying {} events...", evts.events.len());
-                for event in &evts.events {
+                // Materialization skips quarantined records (D3 poison policy,
+                // `DurableBatch.tla` Materialize(log, quarantined)): a rebuild
+                // that re-applied a dead-lettered event would fail on exactly
+                // the record recovery already gave up on.
+                let quarantined = cursor::DeadLetter::load(&paths.events).quarantined();
+                let live: Vec<&serde_json::Value> = evts
+                    .events
+                    .iter()
+                    .filter(|event| !quarantined.contains(&cursor::fingerprint(event)))
+                    .collect();
+                if live.len() != evts.events.len() {
+                    eprintln!(
+                        "kb: skipping {} quarantined event(s) — see {}",
+                        evts.events.len() - live.len(),
+                        cursor::dead_letter_path(&paths.events).display()
+                    );
+                }
+                eprintln!("replaying {} events...", live.len());
+                for event in live {
                     db::apply_event(&conn, embedder, event)
                         .with_context(|| format!("apply event: {}", event))?;
                 }
@@ -454,13 +519,35 @@ impl Rebuild {
                      the swapped-in DB must be WAL-headered because C2's open_ro \
                      no longer self-heals the journal mode after the rename"
                 );
-                if !catchup.events.is_empty() {
-                    eprintln!("catching up {} new event(s)...", catchup.events.len());
-                    for event in &catchup.events {
+                let quarantined = cursor::DeadLetter::load(&paths.events).quarantined();
+                let live: Vec<&serde_json::Value> = catchup
+                    .events
+                    .iter()
+                    .filter(|event| !quarantined.contains(&cursor::fingerprint(event)))
+                    .collect();
+                if !live.is_empty() {
+                    eprintln!("catching up {} new event(s)...", live.len());
+                    for event in live {
                         db::apply_event(&conn, embedder, event)
                             .with_context(|| format!("apply event (catch-up): {}", event))?;
                     }
                 }
+                // T5b: `kb_meta` keys do NOT survive the rename — the tmp DB is
+                // fresh and receives only `schema_version` and
+                // `embed_text_mode`. Without writing the D3 cursor rows here,
+                // the first `recover_if_needed` after any rebuild takes the
+                // cursorless full-rebuild row and loops forever. The generation
+                // is read under this Phase-3 lock, which is the same lock
+                // compaction bumps it under.
+                let converged_len = catchup.committed_len.max(snapshot_byte_len);
+                cursor::write(
+                    &conn,
+                    &cursor::Cursor {
+                        generation: cursor::read_generation(&paths.events),
+                        offset: converged_len,
+                        tail_sha: cursor::tail_sha(&paths.events, converged_len)?,
+                    },
+                )?;
             }
             #[cfg(test)]
             let phase3_catchup_finished = std::time::Instant::now();

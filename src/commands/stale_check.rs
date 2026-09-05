@@ -6,6 +6,7 @@
 //! invocation should be duplicated between the two call sites.
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
+use crate::components::cursor;
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy};
 use crate::config;
@@ -270,8 +271,8 @@ fn heal_relocations(paths: &config::Paths, report: &mut StaleCheckReport) -> any
             &citation_hash,
             version_ref.as_deref(),
         );
-        events::append_event(&paths.events, &event)?;
-        db::apply_event(conn, &NoopEmbedder, &event)?;
+        // Writer 5 of 10.
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event])?;
         r.healed = true;
     }
     Ok(())

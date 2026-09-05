@@ -75,7 +75,7 @@ impl Add {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
         let embedder = make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with(&paths, embedder.as_ref())
     }
 

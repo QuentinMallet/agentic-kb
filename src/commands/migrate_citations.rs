@@ -6,6 +6,7 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
+use crate::components::cursor;
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
 use crate::components::events;
@@ -74,7 +75,7 @@ impl MigrateCitations {
     pub fn execute(&self) -> Result<()> {
         let paths = config::Paths::discover()?;
         let embedder = make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with_paths(&paths)?;
         Ok(())
     }
@@ -295,11 +296,11 @@ fn apply_heals(
                     &verify_row.citation_hash,
                     version_ref.as_deref(),
                 );
-                events::append_event(&paths.events, &event)?;
-                // If append succeeds but apply fails, a rerun may append a
-                // second citation_healed event. Applying the same target is a
-                // state-idempotent no-op; deterministic op IDs are deferred.
-                db::apply_event(conn, &NoopEmbedder, &event)?;
+                // Writer 6 of 10. If append succeeds but apply fails, a rerun
+                // may append a second citation_healed event. Applying the same
+                // target is a state-idempotent no-op; deterministic op IDs are
+                // deferred.
+                cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event])?;
                 report.emitted_events += 1;
                 report.would_heal.push(MigrationRow {
                     new_path: Some(new_path),

@@ -11,7 +11,7 @@ use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
 use crate::commands::cite::compute_citation_fields;
-use crate::components::{db, embedder, events, kb_core, query_hits};
+use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Application, Command, Runnable};
@@ -84,8 +84,11 @@ impl Mcp {
         // interaction with a pre-v2 DB replays the log once so new derived
         // state (cue rows, vintage stamp) materializes. Steady state: one
         // stamp read. Best-effort — a failed upgrade must not kill the port.
-        if let Err(e) = crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref()) {
-            eprintln!("warn: schema upgrade rebuild failed (serving current DB): {e}");
+        // C1/D3 + C2/ADR-7: recovery fires at MCP startup, through the same
+        // initialization entry point the CLI uses. Best-effort — a failed
+        // recovery must not kill the port.
+        if let Err(e) = db::open_or_init(&paths) {
+            eprintln!("warn: event-log recovery failed (serving current DB): {e}");
         }
 
         let ready = json!({
@@ -1441,14 +1444,12 @@ fn handle_run(req: &RunRequest, paths: &config::Paths, emb: &dyn embedder::Embed
         "ts": ts, "run_id": run_id, "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 7 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1490,14 +1491,12 @@ fn handle_test_add(
         "version_ref": null, "ts": ts, "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 8 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1728,10 +1727,8 @@ fn handle_expire(
         "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 9 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -2039,27 +2036,20 @@ fn handle_audit_record(
         let verdict = verdict_obj.verdict;
         let note = verdict_obj.note.clone();
 
-        // The expire event, if any, is appended to the JSONL log here, before
-        // the transactional boundary below. That append is the one part of
-        // this operation A1 does NOT claim atomicity over: a crash between
-        // this append and the savepoint below leaves the log ahead of the DB.
-        // Closing that residual window is C1's fsync-ordering work (ADR-5's
-        // D2, bd-21ef.1.7) — A1 only guarantees that apply_event, the
-        // audit_runs row and the source_weights delta land or roll back
-        // together, never that the append itself is crash-atomic.
-        let expire_event = if !verdict {
-            let ev = json!({
+        // Writer 10 of 10. The expire event, if any, rides the D3 write helper:
+        // append + sync + apply + cursor. Once C1/D2 landed, this append is
+        // durable before any DB write, and the residual "log ahead of DB"
+        // window ADR-5 documented is closed by the applied cursor.
+        let batch: Vec<Value> = if !verdict {
+            vec![json!({
                 "action": "expire", "table": "entries",
                 "id": entry_id, "reason": "audit verdict=false",
                 "ts": ts, "session": "mcp",
-            });
-            if let Err(e) = events::append_event(&paths.events, &ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            Some(ev)
+            })]
         } else {
-            None
+            vec![]
         };
+        let exp = batch.len() as u32;
 
         // ADR-5 / A1: apply_event(expire) + the audit_runs insert + the
         // source_weights upsert run inside one SAVEPOINT, so a failure
@@ -2068,22 +2058,19 @@ fn handle_audit_record(
         // because both happened or neither did.
         //
         // Transaction ownership (Q2, settled 2026-09-04): C1's D3 owns the
-        // outer transaction that will wrap append+sync+apply+cursor once its
-        // helper (bd-21ef.1.9) lands; this SAVEPOINT joins that transaction
-        // when it exists and, called standalone as it is today, opens SQLite's
-        // implicit top-level transaction itself — either way the three
-        // statements commit or roll back as one unit.
-        let atomic: Result<(u32, u32)> = db::with_savepoint(
+        // outer transaction that wraps append+sync+apply+cursor, and this
+        // SAVEPOINT joins it. `unchecked_transaction` issues BEGIN DEFERRED
+        // and SQLite rejects a nested transaction, so A1 must nest as a
+        // savepoint rather than open its own.
+        let atomic: Result<(u32, u32)> = cursor::append_and_apply_with(
+            &lock,
             &conn,
-            "audit_record",
-            || -> Result<(u32, u32)> {
+            paths,
+            emb,
+            &batch,
+            |conn| -> Result<(u32, u32)> {
+            db::with_savepoint(conn, "audit_record", || -> Result<(u32, u32)> {
                 let mut rec = 0u32;
-                let mut exp = 0u32;
-
-                if let Some(ev) = &expire_event {
-                    db::apply_event(&conn, emb, ev)?;
-                    exp = 1;
-                }
 
                 // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
                 let inserted = conn.execute(
@@ -2126,6 +2113,7 @@ fn handle_audit_record(
                 }
 
                 Ok((rec, exp))
+            })
             },
         );
 
