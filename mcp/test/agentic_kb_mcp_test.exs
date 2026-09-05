@@ -136,7 +136,7 @@ defmodule AgenticKbMcp.RenderFixture do
 end
 
 defmodule AgenticKbMcpTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias AgenticKbMcp.McpServer
   alias AgenticKbMcp.RenderFixture
@@ -496,6 +496,13 @@ defmodule AgenticKbMcpTest do
     "kb_get" => ["entry_id"]
   }
 
+  @s1_tool_args %{
+    "kb_audit_run" => ["sample_size", "mode"],
+    "kb_audit_record" => ["run_id", "verdicts"],
+    "kb_audit_report" => [],
+    "kb_provenance" => ["entry_id", "max_depth"]
+  }
+
   describe "tool schema closure (B1)" do
     test "every tool schema sets additionalProperties: false" do
       for tool <- McpServer.tools() do
@@ -530,7 +537,8 @@ defmodule AgenticKbMcpTest do
 
     test "every tool in the registry has a validated argument allow-list" do
       registered = McpServer.tools() |> Enum.map(& &1["name"]) |> Enum.sort()
-      assert registered == Enum.sort(Map.keys(@deployed_pin_args))
+      expected = Map.keys(@deployed_pin_args) ++ Map.keys(@s1_tool_args)
+      assert registered == Enum.sort(expected)
     end
   end
 
@@ -572,6 +580,12 @@ defmodule AgenticKbMcpTest do
 
         assert :ok == McpServer.validate_tool_args(tool, args),
                "#{tool} must accept the deployed pin field set #{inspect(fields)}"
+      end
+    end
+
+    test "every S1 audit and provenance field is accepted" do
+      for {tool, fields} <- @s1_tool_args do
+        assert :ok == McpServer.validate_tool_args(tool, Map.new(fields, &{&1, nil}))
       end
     end
 
@@ -617,6 +631,39 @@ defmodule AgenticKbMcpTest do
         end)
 
       output |> String.trim() |> :json.decode()
+    end
+
+    defp start_fake_port do
+      fake = Path.expand("support/fake_port.sh", __DIR__)
+
+      start_supervised!(
+        {AgenticKbMcp.PortManager,
+         db_path: "unused", kb_bin: fake, name: AgenticKbMcp.PortManager}
+      )
+    end
+
+    test "kb_audit_run dispatches through the real tools/call and port paths" do
+      start_fake_port()
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}), @with_db)
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
+    end
+
+    test "kb_audit_record dispatches through the real tools/call and port paths" do
+      start_fake_port()
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}), @with_db)
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Recorded 1 audit verdict"
+    end
+
+    test "kb_audit_report dispatches through the real tools/call and port paths" do
+      start_fake_port()
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_report","arguments":{}}}), @with_db)
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit report: 0"
+    end
+
+    test "kb_provenance dispatches through the real tools/call and port paths" do
+      start_fake_port()
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_provenance","arguments":{"entry_id":"entry-1","max_depth":64}}}), @with_db)
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Provenance roots: root-1"
     end
 
     test "an explicit null arguments does not crash the server" do
