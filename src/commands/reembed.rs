@@ -243,10 +243,13 @@ where
     // Reconcile once against the live pathname. If rebuild atomically replaced
     // the database between batches, rows committed to the old inode are
     // restored here without overwriting embeddings already in the new DB.
-    // Pass one's failed/failures reflect that stale database, not the live
-    // one, so they are discarded rather than kept alongside pass two's
-    // results — otherwise a real failure (e.g. a rejecting trigger still in
-    // place) would be recorded twice for the same id (review finding).
+    // Pass one's failed/failures/raced all reflect that stale database, not
+    // the live one, so they are discarded rather than kept alongside pass
+    // two's results — otherwise a real failure (e.g. a rejecting trigger
+    // still in place) would be recorded twice for the same id, and a row
+    // that raced against the old inode but writes cleanly against the new
+    // one would still be reported as raced even though nothing about it is
+    // actually still contested (review finding).
     // embedded_ids is NOT reset here: an id can already be live on the
     // CURRENT path before the swap is even detected (a later batch that
     // landed on the replacement file before this check runs), and resetting
@@ -255,6 +258,7 @@ where
     if db_identity(&paths.db) != initial_db_identity {
         report.failed = 0;
         report.failures.clear();
+        report.raced = 0;
         let mut no_before = |_: usize, _: &[PendingWrite]| {};
         let mut no_after = |_: usize| {};
         write_batches(
@@ -639,6 +643,84 @@ mod tests {
         assert_eq!(
             count, report.embedded as i64,
             "report.embedded must equal the rows actually present in the live db, not overcount a vanished id"
+        );
+    }
+
+    #[test]
+    fn test_reembed_raced_count_from_pass_one_is_discarded_after_a_swap_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = REEMBED_WRITE_BATCH_SIZE; // exactly one batch
+        for index in 0..total {
+            seed(&paths, &format!("raced-swap-{index}"), "seed");
+        }
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        // Snapshot taken before the concurrent write below and before pass
+        // one's own batch commits, so the swapped-in replacement carries
+        // none of pass one's writes at all — including no embedding for
+        // raced-swap-0, whose only race in this test is against the db
+        // pass one actually wrote to.
+        let replacement = paths.db.with_extension("replacement");
+        std::fs::copy(&paths.db, &replacement).unwrap();
+        let fresh = FixedEmbedder(0.75);
+        let report = run_reembed_with_hooks(
+            &paths,
+            &FixedEmbedder(0.25),
+            false,
+            1800,
+            |batch, _| {
+                if batch == 0 {
+                    // A concurrent writer embeds raced-swap-0 against the
+                    // still-live original db before pass one's only batch
+                    // writes it, so pass one legitimately races on this id
+                    // (mirrors
+                    // test_reembed_does_not_clobber_fresh_embedding_added_after_selection).
+                    Add {
+                        path: "docs/raced-swap-0".to_string(),
+                        summary: "fresh".to_string(),
+                        content: "body".to_string(),
+                        tags: "test".to_string(),
+                        version_ref: None,
+                        id: Some("raced-swap-0".to_string()),
+                        permanent: false,
+                        replace_path: false,
+                        kind: "convention".to_string(),
+                        evidence: vec![],
+                        evidence_file: None,
+                        cues: vec![],
+                    }
+                    .execute_with(&paths, &fresh)
+                    .unwrap();
+                }
+            },
+            |batch| {
+                if batch == 0 {
+                    // Swap in the pre-write snapshot only after pass one's
+                    // batch has fully committed against the original db, so
+                    // the reconcile pass starts from a live db with none
+                    // of pass one's writes already present in it.
+                    std::fs::rename(&replacement, &paths.db).unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.embedded, total,
+            "every id, including the one pass one raced on, ends up embedded in the live db"
+        );
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.raced, 0,
+            "pass one's raced count reflects the stale pre-swap db; pass two starts from an \
+             empty live db and re-embeds everything cleanly, so pass one's count must not carry \
+             forward (same reasoning already applied to failed/failures)"
         );
     }
 
