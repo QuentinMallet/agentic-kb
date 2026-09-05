@@ -285,6 +285,15 @@ impl Compact {
         }
         fs::rename(&tmp, &paths.events)?;
         sync_parent_dir(&paths.events)?;
+        // C1/D3: the log generation is bumped under the SAME lock as the
+        // rename. Compaction only removes lines, so a cursor whose bytes all
+        // survive still validates against the rewritten log and would replay
+        // the compacted tail onto a database that already holds the original
+        // tail — dropped orphan expires never re-applied, entries that should
+        // be stale staying live, no error. The generation makes that detection
+        // O(1) and total (CompactMaterialize.tla CE7).
+        let generation = crate::components::cursor::bump_generation(&paths.events)?;
+        eprintln!("compact: event log generation is now {generation}");
 
         // Optional VACUUM: fires AFTER the atomic rename so a crash during VACUUM
         // still leaves the compacted DB (already renamed into place) intact and readable.
