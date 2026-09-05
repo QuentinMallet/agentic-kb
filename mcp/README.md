@@ -19,3 +19,10 @@ Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_do
 and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
 be found at <https://hexdocs.pm/agentic_kb_mcp>.
 
+## Internal peer-graph port methods
+
+The Rust line-JSON port implements `kb_peers_add`, `kb_peers_list`, and
+`kb_peers_remove` for CLI parity, but the Elixir MCP server deliberately does
+not expose them as agent tools. Peer-graph setup is an operator and lifecycle-hook
+action, not an agent action. Revisit this boundary only when a concrete agent
+workflow needs to edit the peer graph directly.
