@@ -448,8 +448,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let paths = Paths::from_root(root);
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(root);
         (dir, paths, conn)
     }
 

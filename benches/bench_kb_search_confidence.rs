@@ -1,4 +1,3 @@
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use criterion::{criterion_group, criterion_main, Criterion};
 use kb::components::{db, embedder::NoopEmbedder};
 use kb::config;
@@ -11,10 +10,8 @@ fn setup_bench_db() -> (tempfile::TempDir, config::Paths) {
     let dir = tempdir().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-    let paths = config::Paths::from_root(root);
+    let (paths, conn) = db::test_db(root);
     let emb = NoopEmbedder;
-
-    let conn = db::open_db(&paths.db).unwrap();
 
     // Seed 50 entries via apply_event
     for i in 0..50 {
@@ -53,7 +50,7 @@ fn setup_bench_db() -> (tempfile::TempDir, config::Paths) {
 fn bench_search_confidence(c: &mut Criterion) {
     let (_dir, paths) = setup_bench_db();
     let emb = NoopEmbedder;
-    let conn = db::open_db(&paths.db).unwrap();
+    let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
     let opts_with = db::SearchOptions {
         limit: 20,

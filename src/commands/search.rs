@@ -1050,7 +1050,7 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
 
         // repo_root is left None here (this test drives db::search_entries
         // directly rather than through Search::build_search_options), so
@@ -1133,7 +1133,7 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
             &conn,
             &embedder,
@@ -1224,7 +1224,7 @@ mod tests {
                 add_cmd.execute_with(&paths, &embedder).unwrap();
 
                 // Connect to DB and search with adversarial query
-                let conn = crate::components::db::open_db(&paths.db).unwrap();
+                let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
                 let opts = crate::components::db::SearchOptions {
                     limit: 10,
                     do_fts: true,
@@ -1288,9 +1288,7 @@ mod tests {
         let local_dir = tempdir().unwrap();
         let local_root = local_dir.path();
         fs::create_dir_all(local_root.join(".state/agent-kb")).unwrap();
-        let local_paths = Paths::from_root(local_root);
-
-        let local_conn = crate::components::db::open_db(&local_paths.db).unwrap();
+        let (_local_paths, local_conn) = crate::components::db::test_db(local_root);
         let peer_root_str = peer_root.to_str().unwrap().to_string();
         local_conn
             .execute(
@@ -1320,7 +1318,7 @@ mod tests {
         };
 
         let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;
-        let peer_conn = crate::components::db::open_db(&peer_db).unwrap();
+        let peer_conn = crate::components::db::open_unchecked_for_test(&peer_db).unwrap();
         let peer_opts = crate::components::db::SearchOptions {
             repo_root: Some(std::path::PathBuf::from(&peer_root_str)),
             ..opts.clone()

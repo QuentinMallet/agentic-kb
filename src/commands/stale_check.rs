@@ -797,7 +797,7 @@ mod tests {
             query_hits: state_dir.join("query-hits.db"),
         };
         db::open_or_init(&paths).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let excerpt = concat!(
             "fn uniquely_relocated_for_stale_check_repo_root_regression_test() {\n",

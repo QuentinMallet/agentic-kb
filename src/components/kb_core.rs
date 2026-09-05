@@ -540,7 +540,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(&root);
+        let (paths, _conn) = db::test_db(&root);
         (dir, paths)
     }
 
@@ -1168,7 +1168,7 @@ mod tests {
     fn test_kb_core_add_replace_path_propagates_existing_id_decode_failure() {
         let (_dir, paths) = setup();
         let emb = NoopEmbedder;
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO entries(
                 id, path, summary, content, tags, version_ref, permanent, is_stale,

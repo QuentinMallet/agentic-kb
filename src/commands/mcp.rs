@@ -2634,6 +2634,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let (paths, _conn) = db::test_db(root);
+        (dir, paths, NoopEmbedder)
+    }
+
+    /// Like [`setup`], but leaves the database file untouched — for tests
+    /// pinning the first-run contract (a read must never create the DB).
+    fn setup_uninitialized() -> (tempfile::TempDir, config::Paths, NoopEmbedder) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = config::Paths::from_root(root);
         (dir, paths, NoopEmbedder)
     }
@@ -2716,7 +2726,7 @@ mod tests {
     #[test]
     fn test_search_meta_includes_all_keys() {
         let (_dir, paths, _emb) = setup();
-        db::open_db(&paths.db).unwrap();
+        db::open_unchecked_for_test(&paths.db).unwrap();
         fs::write(&paths.events, "").unwrap();
 
         let meta = search_meta(&paths, &[search_entry_with_statuses()]);
@@ -2745,7 +2755,7 @@ mod tests {
     #[test]
     fn test_event_replay_hostile_excerpt_is_safe_on_kb_get_wire() {
         let (_dir, paths, emb) = setup();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let upsert = json!({
             "action": "upsert", "table": "entries", "id": "hostile-entry",
             "path": "security/hostile", "summary": "hostile replay",
@@ -2869,7 +2879,7 @@ mod tests {
     #[test]
     fn test_handle_provenance_returns_db_error_on_parent_decode_failure() {
         let (_dir, paths, emb) = setup();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let upsert = json!({
             "action": "upsert", "table": "entries", "id": "prov-child",
             "path": "prov/child", "summary": "child", "content": "body", "tags": [],
@@ -2910,7 +2920,7 @@ mod tests {
     #[test]
     fn test_search_meta_stale_warning_true_when_citation_newer_than_entry() {
         let (dir, paths, _emb) = setup();
-        db::open_db(&paths.db).unwrap();
+        db::open_unchecked_for_test(&paths.db).unwrap();
         fs::write(&paths.events, "").unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
@@ -2926,7 +2936,7 @@ mod tests {
     #[test]
     fn test_search_meta_stale_warning_false_when_citation_not_newer_than_entry() {
         let (dir, paths, _emb) = setup();
-        db::open_db(&paths.db).unwrap();
+        db::open_unchecked_for_test(&paths.db).unwrap();
         fs::write(&paths.events, "").unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/example.rs"), "fn current() {}\n").unwrap();
@@ -3064,7 +3074,7 @@ mod tests {
 
             // Verify: for every (kind, session_id) bucket present in source_weights,
             // successes + failures == direct count from audit_runs.
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let buckets: Vec<(String, String, i64, i64)> = conn
                 .prepare("SELECT kind, session_id, successes, failures FROM source_weights")
                 .unwrap()
@@ -3135,7 +3145,7 @@ mod tests {
             let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": verdict_objs})), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok");
 
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
             // __GLOBAL__ bucket total must equal only the null-session entries' audit_runs count.
             let global_total: i64 = conn.query_row(
@@ -3247,8 +3257,8 @@ mod tests {
 
             // Compare source_weights buckets across both DBs.
             // They must be identical (same set of rows, same successes/failures per row).
-            let conn_a = db::open_db(&paths_a.db).unwrap();
-            let conn_b = db::open_db(&paths_b.db).unwrap();
+            let conn_a = db::open_unchecked_for_test(&paths_a.db).unwrap();
+            let conn_b = db::open_unchecked_for_test(&paths_b.db).unwrap();
 
             let mut rows_a: Vec<(String, String, i64, i64)> = conn_a
                 .prepare("SELECT kind, session_id, successes, failures FROM source_weights ORDER BY kind, session_id")
@@ -3340,7 +3350,7 @@ mod tests {
             &emb,
         );
         let entry_id = added["entry_id"].as_str().unwrap().to_string();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         db::apply_event(
             &conn,
             &emb,
@@ -3365,7 +3375,7 @@ mod tests {
         let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let entry_id = resp["entry_id"].as_str().unwrap();
         let perm: i64 = conn
             .query_row(
@@ -3390,7 +3400,7 @@ mod tests {
         let req2 = json!({"method":"add","id":"t3b","path":"test/c","summary":"new","content":"new","tags":[],"replace_path":true,"kind":"convention"});
         handle_add(&tr::<AddRequest>("add", &id, &req2), &paths, &emb);
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let stale: i64 = conn
             .query_row(
                 &format!("SELECT is_stale FROM entries WHERE id='{}'", old_id),
@@ -3497,7 +3507,7 @@ mod tests {
 
     #[test]
     fn handle_kb_get_on_uninitialized_db_reports_not_found_without_creating_it() {
-        let (_dir, paths, _emb) = setup();
+        let (_dir, paths, _emb) = setup_uninitialized();
         assert!(!paths.db.exists());
 
         let resp = handle_kb_get(
@@ -3519,7 +3529,7 @@ mod tests {
 
     #[test]
     fn handle_provenance_on_uninitialized_db_returns_an_empty_graph() {
-        let (_dir, paths, _emb) = setup();
+        let (_dir, paths, _emb) = setup_uninitialized();
         assert!(!paths.db.exists());
 
         let resp = handle_provenance(
@@ -3540,7 +3550,7 @@ mod tests {
 
     #[test]
     fn handle_search_on_uninitialized_db_returns_no_entries() {
-        let (_dir, paths, emb) = setup();
+        let (_dir, paths, emb) = setup_uninitialized();
         assert!(!paths.db.exists());
 
         let resp = handle_search(
@@ -3560,7 +3570,7 @@ mod tests {
 
     #[test]
     fn handle_search_expand_on_uninitialized_db_returns_no_entries() {
-        let (_dir, paths, emb) = setup();
+        let (_dir, paths, emb) = setup_uninitialized();
 
         let resp = handle_search(
             &tr::<SearchRequest>("search", &json!("first-run"), &json!({"expand_ids": ["a"]})),
@@ -4232,7 +4242,7 @@ mod tests {
         assert!(resp["rebuilt"].as_u64().unwrap() >= 1);
 
         // Verify entry still exists after rebuild
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='test/rb'",
@@ -4255,7 +4265,7 @@ mod tests {
             "version_ref":"abc123","ts":"2024-01-01T00:00:00Z","session":"test"
         });
         events::append_event(&paths.events, &ev).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         db::apply_event(&conn, &emb, &ev).unwrap();
 
         // stale_check returns "result" type and "stale" + "review" arrays
@@ -4293,7 +4303,7 @@ mod tests {
             "version_ref":sha,"ts":"2024-01-01T00:00:00Z","session":"test"
         });
         events::append_event(&paths.events, &ev).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         db::apply_event(&conn, &emb, &ev).unwrap();
 
         // Query by exact commit SHA → entry surfaces somewhere.
@@ -4403,7 +4413,7 @@ mod tests {
     // ── br-ei2.12: unit tests for new handlers ──────────────────────────────
 
     fn seed_audit_candidate(paths: &config::Paths, run_id: &str, entry_id: &str) {
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,datetime('now'))",
             rusqlite::params![run_id, entry_id],
@@ -4764,7 +4774,7 @@ mod tests {
         assert_eq!(resp["expired"], 0);
         assert_cursor_converged(&paths, "handle_audit_record");
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
@@ -4789,7 +4799,7 @@ mod tests {
         );
         assert_eq!(resp["expired"], 1);
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let stale: i64 = conn
             .query_row(
                 "SELECT is_stale FROM entries WHERE id=?1",
@@ -4981,7 +4991,7 @@ mod tests {
             &emb,
         );
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let successes: i64 = conn
             .query_row(
                 "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
@@ -5013,7 +5023,7 @@ mod tests {
         assert_eq!(resp2["type"], "ok");
         assert_eq!(resp2["recorded"], 0, "replay must be a no-op");
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-idem'",
@@ -5055,7 +5065,7 @@ mod tests {
             // handle_audit_record, so the failure is injected with a trigger
             // instead — it survives re-open and fires deterministically on the
             // weight upsert's INSERT.
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS test_fail_weight_insert
                  BEFORE INSERT ON source_weights
@@ -5076,7 +5086,7 @@ mod tests {
             "weight upsert failure must surface as an error"
         );
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-atomic-weight'",
@@ -5105,7 +5115,7 @@ mod tests {
             // handle_audit_record, so the failure is injected with a trigger
             // instead — it survives re-open and fires deterministically on the
             // weight upsert's INSERT.
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS test_fail_weight_insert
                  BEFORE INSERT ON source_weights
@@ -5123,7 +5133,7 @@ mod tests {
         );
         assert_eq!(resp["type"], "error");
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-atomic-expire'",
@@ -5198,7 +5208,7 @@ mod tests {
         // the kill point fires strictly between the audit_runs insert and the
         // source_weights upsert, so a crash there must roll the insert back
         // too rather than leave it standing alone.
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let audit_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
@@ -5369,7 +5379,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let uniform = add_live_entry(&paths, &emb, "p/report-uniform", None);
         let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
             [&uniform],
@@ -5616,7 +5626,7 @@ mod tests {
             &emb,
         );
         let child_id = child["entry_id"].as_str().unwrap().to_string();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         db::apply_event(
             &conn,
             &emb,
@@ -5640,7 +5650,7 @@ mod tests {
         fn build_fixture(inserted_parents: [&str; 2]) -> (tempfile::TempDir, config::Paths, Value) {
             let (_dir, paths, emb) = setup();
             let id = json!("prov-deterministic");
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
             for (entry_id, path) in [
                 ("prov-root-a", "prov/root-a"),
@@ -5854,7 +5864,7 @@ mod tests {
         let b_id = rb["entry_id"].as_str().unwrap().to_string();
 
         // Manually inject cycle: evidence row on A pointing to B, and on B pointing to A
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let ev_id1 = uuid::Uuid::new_v4().to_string();
         let ev_id2 = uuid::Uuid::new_v4().to_string();
         conn.execute(
@@ -5919,7 +5929,7 @@ mod tests {
             json!({"path":"test/sid","summary":"s","content":"c","tags":[],"kind":"convention"});
         let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let sid: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id=?1",
@@ -5937,7 +5947,7 @@ mod tests {
         let req = json!({"path":"test/sid2","summary":"s","content":"c","tags":[],"session_id":"abc","kind":"convention"});
         let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let sid: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id=?1",
@@ -6026,7 +6036,7 @@ mod tests {
         );
 
         // The weight should be stored under __GLOBAL__
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let s: i64 = conn
             .query_row(
                 "SELECT successes FROM source_weights WHERE session_id='__GLOBAL__'",
@@ -6096,7 +6106,7 @@ mod tests {
                 entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
             }
             // Add derived edges (src > dst guarantees DAG)
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             for (src, dst) in &edges {
                 if src == dst { continue; }
                 let ev_id = uuid::Uuid::new_v4().to_string();
@@ -6130,7 +6140,7 @@ mod tests {
                 entry_ids.push(r["entry_id"].as_str().unwrap().to_string());
             }
             // Create a cycle: 0→1→2→...→n-1→0
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             for i in 0..n {
                 let src = &entry_ids[i];
                 let dst = &entry_ids[(i + 1) % n];
@@ -6162,7 +6172,7 @@ mod tests {
                 let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
                 proptest::prop_assert_eq!(&resp["recorded"], 0);
             }
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM audit_runs WHERE run_id='run-prop-idem'",
                 [], |r| r.get(0),

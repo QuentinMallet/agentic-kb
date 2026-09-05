@@ -418,7 +418,7 @@ mod tests {
         assert!(events_content.contains("test-id-1"));
 
         // Verify DB row
-        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let (_fixture_paths, conn) = db::test_db(root);
         let (path, summary): (String, String) = conn
             .query_row(
                 "SELECT path, summary FROM entries WHERE id='test-id-1'",
@@ -519,7 +519,7 @@ mod tests {
         });
         events::append_event(&paths.events, &old_event).unwrap();
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let (_paths, conn) = db::test_db(root);
         db::apply_event(&conn, &embedder, &old_event).unwrap();
 
         let permanent: i64 = conn
@@ -750,7 +750,7 @@ mod tests {
             };
             cmd.execute_with(&paths, &embedder).unwrap();
 
-            let conn = crate::components::db::open_db(&paths.db).unwrap();
+            let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
             let stored_status: String = conn
                 .query_row(
                     "SELECT evidence_status FROM entries WHERE id = ?1",
