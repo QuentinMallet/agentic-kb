@@ -2207,7 +2207,7 @@ fn handle_audit_record(
 
 fn handle_audit_report(req: &AuditReportRequest, paths: &config::Paths) -> Value {
     let id = &req.id;
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };

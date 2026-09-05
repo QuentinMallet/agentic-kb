@@ -120,7 +120,7 @@ impl Eval {
             mmr_lambda: kb_config.mmr_lambda,
         };
 
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         // A read: detect and warn, never recover (C2/ADR-7).
         crate::components::cursor::warn_if_behind(&conn, paths);
         let report = evaluate_split(&conn, embedder, &cases, &opts, requested)?;
