@@ -264,7 +264,7 @@ Under the flock:
 | generation ≠ current log generation | full rebuild (log was compacted or rewritten) |
 | tail_sha mismatches the log at that offset | full rebuild |
 | offset > `committed_len` | full rebuild (legacy pre-fix state, external truncation, or a log restored from backup — **not**, after D2, a reachable power-loss state; revision 1 mislabelled it) |
-| log unreadable (`read_events` hard-errors on a malformed *middle* line, `events.rs:307-318`) | warn and defer recovery; refuse writes, decline rebuild, and serve read-only requests from the current DB |
+| log unreadable (`read_events` hard-errors on: malformed *middle* line at `events.rs:307-318`, unreadable cursor row, `committed_len` read failure, or tail-hash read failure) | warn and defer recovery; refuse writes and compaction, serve reads, decline rebuild |
 | `committed_len` > offset | replay the tail from the cursor, then advance it |
 | `committed_len` == offset | no-op |
 | `LogMissing` while `offset > 0` or the entries table is non-empty | warn and defer recovery; refuse writes, decline rebuild, and serve read-only requests from the current DB |
