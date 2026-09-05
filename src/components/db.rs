@@ -15,6 +15,35 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpireRefusal {
+    Permanent,
+}
+
+/// Refuse expiration of protected entries unless the caller explicitly forces it.
+pub fn expire_guard(
+    conn: &Connection,
+    entry_id: &str,
+    force: bool,
+) -> std::result::Result<(), ExpireRefusal> {
+    if force {
+        return Ok(());
+    }
+
+    let permanent: Option<i64> = conn
+        .query_row(
+            "SELECT permanent FROM entries WHERE id=?1",
+            params![entry_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if permanent == Some(1) {
+        Err(ExpireRefusal::Permanent)
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resource caps (br-h9g, security I2)
 // ---------------------------------------------------------------------------
