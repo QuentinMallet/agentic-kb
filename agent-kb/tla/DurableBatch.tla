@@ -18,13 +18,15 @@ Two designs share one state machine, selected by the constant `Fixed`:
                   written inside the apply transaction).
 
 Nothing in this module pins a crash point or a step ordering.  The knobs
-are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`, `MaxGen`,
-`MaxBatches`; every config exercises the full `Next` relation under those
-bounds.
+are `Fixed`, `AllowCrash`, `AllowDeferred`, `AllowLogMissing`, `PoisonBatch`,
+`MaxGen`, `MaxBatches`; every config exercises the full `Next` relation under
+those bounds.
 
 Reads are intentionally not state transitions in this write/recovery model.
-During `deferred` they remain available against the current `db`; only writes,
-automatic recovery, rebuild, and compaction are represented and blocked.
+During `deferred` or `LogMissing` they remain available against the current
+`db`; only writes, automatic recovery, rebuild, and compaction are represented
+and blocked.  This is the D3 row-9 disposition: serve reads, refuse writes,
+and decline a rebuild when a non-trivial DB has lost its log.
 
 WRITE SCHEDULE.  Batch contents are fixed so the refinement to InnerGap is
 total: InnerGap can only produce a 1-event upsert batch (StartNoReplace) or
@@ -64,9 +66,10 @@ modelled here; the code-side disposition is the quarantine-the-unparseable
 ***************************************************************************)
 
 CONSTANTS EntryIds, MaxLogLen, MaxBatches, MaxGen, K, PoisonBatch,
-          AllowCrash, AllowDeferred, InnerMaxLog, Fixed
+          AllowCrash, AllowDeferred, AllowLogMissing, InnerMaxLog, Fixed
 
-VARIABLES log_written,    \* lines handed to write(2); may not be durable
+VARIABLES log_present,    \* distinguishes a fresh empty log from a missing one
+          log_written,    \* lines handed to write(2); may not be durable
           log_durable,    \* lines on stable storage; a prefix of log_written
           db,             \* live entry set as the DB currently shows it
           db_committed,   \* live entry set at the last committed SQLite txn
@@ -81,7 +84,7 @@ VARIABLES log_written,    \* lines handed to write(2); may not be durable
           deferred,       \* recovery is outstanding after unreadable tail
           damage_repaired \* the unreadable line has been repaired in place
 
-vars == <<log_written, log_durable, db, db_committed, cursor, generation,
+vars == <<log_present, log_written, log_durable, db, db_committed, cursor, generation,
           phase, nstarted, cur, aidx, attempts, quarantined, deferred,
           damage_repaired>>
 
@@ -89,13 +92,6 @@ ASSUME OutOfScope_InteriorDamage == TRUE
   (* See "OUT OF MODEL SCOPE -- D2 prefix adequacy" above.  This ASSUME is
      the named carrier the plan's section 5 requires; its justification is
      the paragraph above, not a machine-checked fact. *)
-
-ASSUME OutOfScope_LogMissing == TRUE
-  (* This model represents the log as a sequence and has no file-existence
-     state.  Treating absence as <<>> would lose the decision-row distinction
-     between a genuinely empty log and LogMissing with cursor.off > 0 or a
-     non-empty entries table.  The latter's refused writes, allowed reads,
-     and declined rebuild therefore remain an explicit model boundary. *)
 
 ASSUME Bounds ==
   /\ EntryIds = {"A", "B", "C"}
@@ -105,9 +101,11 @@ ASSUME Bounds ==
   /\ K >= 1
   /\ PoisonBatch \in 0..MaxBatches
   /\ AllowDeferred \in BOOLEAN
+  /\ AllowLogMissing \in BOOLEAN
   /\ InnerMaxLog >= 5
 
 NoId == "-"
+EmptyDB == {}
 Ln(a, i, b) == [act |-> a, id |-> i, b |-> b]
 
 BatchEvents(b) ==
@@ -167,6 +165,10 @@ CommittedLen(s) == IF Fixed THEN LastCommitIdx(s) ELSE Len(s)
 
 DurCommittedLen == CommittedLen(log_durable)
 
+\* D3 row 9: absence is unsafe only when durable state was previously
+\* non-trivial.  A present-but-empty fresh log is deliberately distinct.
+LogMissing == ~log_present /\ (cursor.off > 0 \/ db_committed /= EmptyDB)
+
 \* Events of the durable committed log that the cursor has not yet covered.
 TailEvents ==
   LET all  == AcceptedLive(log_durable, quarantined)
@@ -198,6 +200,7 @@ LineOK(l) ==
   /\ l.b \in 1..MaxBatches
 
 TypeOK ==
+  /\ log_present \in BOOLEAN
   /\ \A i \in 1..Len(log_written) : LineOK(log_written[i])
   /\ \A i \in 1..Len(log_durable) : LineOK(log_durable[i])
   /\ Len(log_written) <= MaxLogLen
@@ -216,6 +219,7 @@ TypeOK ==
   /\ damage_repaired => deferred
 
 Init ==
+  /\ log_present = TRUE
   /\ log_written = << >>
   /\ log_durable = << >>
   /\ db = {}
@@ -236,6 +240,7 @@ LinesOfCur == Len(SelectSeq(log_written, LAMBDA l : l.b = cur))
 StartBatch ==
   /\ phase = "idle"
   /\ ~deferred
+  /\ ~LogMissing
   /\ nstarted < MaxBatches
   /\ CursorCurrent
   /\ nstarted' = nstarted + 1
@@ -243,7 +248,7 @@ StartBatch ==
   /\ aidx' = 0
   /\ attempts' = 0
   /\ phase' = "writing"
-  /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
+  /\ UNCHANGED <<log_present, log_written, log_durable, db, db_committed, cursor,
                  generation, quarantined, deferred, damage_repaired>>
 
 AppendLine ==
@@ -252,7 +257,7 @@ AppendLine ==
   /\ Len(log_written) < MaxLogLen
   /\ log_written' = Append(log_written, BatchLines(cur)[LinesOfCur + 1])
   /\ phase' = IF LinesOfCur + 1 = Len(BatchLines(cur)) THEN "ready" ELSE "writing"
-  /\ UNCHANGED <<log_durable, db, db_committed, cursor, generation,
+  /\ UNCHANGED <<log_present, log_durable, db, db_committed, cursor, generation,
                  nstarted, cur, aidx, attempts, quarantined, deferred,
                  damage_repaired>>
 
@@ -262,7 +267,7 @@ PartialFlush ==
   /\ Len(log_durable) < Len(log_written)
   /\ \E n \in (Len(log_durable) + 1)..Len(log_written) :
         log_durable' = Prefix(log_written, n)
-  /\ UNCHANGED <<log_written, db, db_committed, cursor, generation, phase,
+  /\ UNCHANGED <<log_present, log_written, db, db_committed, cursor, generation, phase,
                  nstarted, cur, aidx, attempts, quarantined, deferred,
                  damage_repaired>>
 
@@ -271,7 +276,7 @@ SyncLog ==
   /\ phase = "ready"
   /\ log_durable' = log_written
   /\ phase' = "synced"
-  /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
+  /\ UNCHANGED <<log_present, log_written, db, db_committed, cursor, generation,
                  nstarted, cur, aidx, attempts, quarantined, deferred,
                  damage_repaired>>
 
@@ -292,7 +297,7 @@ Damage ==
   /\ cur' = 0
   /\ aidx' = 0
   /\ attempts' = 0
-  /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
+  /\ UNCHANGED <<log_present, log_written, db, db_committed, cursor, generation,
                  nstarted, quarantined>>
 
 \* Counterexample for the withdrawn alternative.  The old design proceeds
@@ -314,6 +319,40 @@ UnsafeWriteWhileDeferred ==
         /\ db' = nd
         /\ db_committed' = nd
         /\ nstarted' = b
+  /\ UNCHANGED <<log_present, cursor, generation, phase, cur, aidx, attempts,
+                 quarantined, deferred, damage_repaired>>
+
+\* External loss of a non-trivial log.  The DB and its applied cursor remain
+\* available for reads, while both in-memory views of the vanished file empty.
+LogVanishes ==
+  /\ AllowLogMissing
+  /\ log_present
+  /\ phase = "idle"
+  /\ (cursor.off > 0 \/ db_committed /= EmptyDB)
+  /\ log_present' = FALSE
+  /\ log_written' = << >>
+  /\ log_durable' = << >>
+  /\ UNCHANGED <<db, db_committed, cursor, generation, phase, nstarted,
+                 cur, aidx, attempts, quarantined, deferred, damage_repaired>>
+
+\* Withdrawn alternative: treating a missing log as fresh lets a write
+\* recreate it from empty.  The old DB state is then neither supported by a
+\* durable prefix nor by the cursor-named prefix.
+UnsafeWriteWhileLogMissing ==
+  /\ ~Fixed
+  /\ LogMissing
+  /\ phase = "idle"
+  /\ nstarted < MaxBatches
+  /\ Len(BatchLines(nstarted + 1)) <= MaxLogLen
+  /\ LET b == nstarted + 1
+         nl == BatchLines(b)
+         nd == FoldEvents(BatchEvents(b), db_committed)
+     IN /\ log_present' = TRUE
+        /\ log_written' = nl
+        /\ log_durable' = << >>
+        /\ db' = nd
+        /\ db_committed' = nd
+        /\ nstarted' = b
   /\ UNCHANGED <<cursor, generation, phase, cur, aidx, attempts,
                  quarantined, deferred, damage_repaired>>
 
@@ -324,7 +363,7 @@ Repair ==
   /\ deferred
   /\ ~damage_repaired
   /\ damage_repaired' = TRUE
-  /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
+  /\ UNCHANGED <<log_present, log_written, log_durable, db, db_committed, cursor,
                  generation, phase, nstarted, cur, aidx, attempts,
                  quarantined, deferred>>
 
@@ -333,12 +372,13 @@ Recovery ==
   /\ Fixed
   /\ deferred
   /\ damage_repaired
+  /\ ~LogMissing
   /\ db' = RecTarget.d
   /\ db_committed' = RecTarget.d
   /\ cursor' = RecTarget.c
   /\ deferred' = FALSE
   /\ damage_repaired' = FALSE
-  /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
+  /\ UNCHANGED <<log_present, log_written, log_durable, generation, phase, nstarted,
                  cur, aidx, attempts, quarantined>>
 
 \* The fixed design applies only from "synced" and only behind a durable
@@ -368,7 +408,7 @@ ApplyEvent ==
                      ELSE cursor
         \* the current design has N independent top-level savepoints
         /\ db_committed' = IF Fixed /\ ~last THEN db_committed ELSE nd
-  /\ UNCHANGED <<log_written, log_durable, generation, nstarted, cur,
+  /\ UNCHANGED <<log_present, log_written, log_durable, generation, nstarted, cur,
                  attempts, quarantined, deferred, damage_repaired>>
 
 \* A deterministically failing record (down embedder, malformed event).
@@ -381,7 +421,7 @@ ApplyFail ==
   /\ attempts < K
   /\ attempts' = attempts + 1
   /\ phase' = "applying"
-  /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
+  /\ UNCHANGED <<log_present, log_written, log_durable, db, db_committed, cursor,
                  generation, nstarted, cur, aidx, quarantined, deferred,
                  damage_repaired>>
 
@@ -395,7 +435,7 @@ Quarantine ==
   /\ cursor' = [gen |-> generation, off |-> DurCommittedLen]
   /\ aidx' = BatchLen(cur)
   /\ phase' = "applied"
-  /\ UNCHANGED <<log_written, log_durable, db, db_committed, generation,
+  /\ UNCHANGED <<log_present, log_written, log_durable, db, db_committed, generation,
                  nstarted, cur, attempts, deferred, damage_repaired>>
 
 FinishBatch ==
@@ -404,7 +444,7 @@ FinishBatch ==
   /\ cur' = 0
   /\ aidx' = 0
   /\ attempts' = 0
-  /\ UNCHANGED <<log_written, log_durable, db, db_committed, cursor,
+  /\ UNCHANGED <<log_present, log_written, log_durable, db, db_committed, cursor,
                  generation, nstarted, quarantined, deferred, damage_repaired>>
 
 \* Power loss.  Everything not yet durable is gone; the in-flight SQLite
@@ -416,7 +456,7 @@ Crash ==
   /\ phase \in {"writing", "ready", "synced", "applying"}
   /\ log_written' = log_durable
   /\ phase' = "crashed"
-  /\ UNCHANGED <<log_durable, db, db_committed, cursor, generation,
+  /\ UNCHANGED <<log_present, log_durable, db, db_committed, cursor, generation,
                  nstarted, cur, aidx, attempts, quarantined, deferred,
                  damage_repaired>>
 
@@ -429,7 +469,7 @@ Open ==
           /\ db_committed' = RecTarget.d
           /\ cursor' = RecTarget.c
      ELSE UNCHANGED <<db, db_committed, cursor>>
-  /\ UNCHANGED <<log_written, log_durable, generation, nstarted, cur,
+  /\ UNCHANGED <<log_present, log_written, log_durable, generation, nstarted, cur,
                  attempts, quarantined, deferred, damage_repaired>>
 
 \* D1 repair: truncate to the committed length.  Under the current design
@@ -441,7 +481,7 @@ TruncateUncommittedTail ==
                            IF CommittedLen(log_written) < Len(log_durable)
                            THEN CommittedLen(log_written) ELSE Len(log_durable))
   /\ phase' = "idle"
-  /\ UNCHANGED <<db, db_committed, cursor, generation, nstarted, cur,
+  /\ UNCHANGED <<log_present, db, db_committed, cursor, generation, nstarted, cur,
                  aidx, attempts, quarantined, deferred, damage_repaired>>
 
 \* Compaction drops every line of a batch whose events are all dead, and
@@ -457,13 +497,14 @@ Compacted(s) == LET dead == DeadOf(s) IN SelectSeq(s, LAMBDA l : l.b \notin dead
 Compact ==
   /\ phase = "idle"
   /\ ~deferred
+  /\ ~LogMissing
   /\ generation < MaxGen
   /\ log_written = log_durable
   /\ Compacted(log_durable) # log_durable
   /\ log_written' = Compacted(log_durable)
   /\ log_durable' = Compacted(log_durable)
   /\ generation' = generation + 1
-  /\ UNCHANGED <<db, db_committed, cursor, phase, nstarted, cur, aidx,
+  /\ UNCHANGED <<log_present, db, db_committed, cursor, phase, nstarted, cur, aidx,
                  attempts, quarantined, deferred, damage_repaired>>
 
 \* recover_if_needed, called from open_or_init before every write path.
@@ -471,11 +512,12 @@ RecoverIdle ==
   /\ phase = "idle"
   /\ Fixed
   /\ ~deferred
+  /\ ~LogMissing
   /\ ~CursorCurrent
   /\ db' = RecTarget.d
   /\ db_committed' = RecTarget.d
   /\ cursor' = RecTarget.c
-  /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
+  /\ UNCHANGED <<log_present, log_written, log_durable, generation, phase, nstarted,
                  cur, aidx, attempts, quarantined, deferred, damage_repaired>>
 
 \* Operator-invoked `kb rebuild`.
@@ -483,17 +525,19 @@ RebuildAll ==
   /\ phase = "idle"
   /\ Fixed
   /\ ~deferred
+  /\ ~LogMissing
   /\ \/ ~CursorCurrent
      \/ db # Materialize(log_durable, quarantined)
   /\ db' = Materialize(log_durable, quarantined)
   /\ db_committed' = Materialize(log_durable, quarantined)
   /\ cursor' = [gen |-> generation, off |-> DurCommittedLen]
-  /\ UNCHANGED <<log_written, log_durable, generation, phase, nstarted,
+  /\ UNCHANGED <<log_present, log_written, log_durable, generation, phase, nstarted,
                  cur, aidx, attempts, quarantined, deferred, damage_repaired>>
 
 Next ==
   \/ StartBatch \/ AppendLine \/ PartialFlush \/ SyncLog
-  \/ Damage \/ UnsafeWriteWhileDeferred \/ Repair \/ Recovery
+  \/ Damage \/ UnsafeWriteWhileDeferred \/ LogVanishes
+  \/ UnsafeWriteWhileLogMissing \/ Repair \/ Recovery
   \/ ApplyEvent \/ ApplyFail \/ Quarantine \/ FinishBatch
   \/ Crash \/ Open \/ TruncateUncommittedTail
   \/ Compact \/ RecoverIdle \/ RebuildAll
@@ -516,20 +560,24 @@ NoHalfBatch ==
 \* always the materialization of SOME prefix of the durable committed log,
 \* i.e. the DB is never ahead of the log.
 DBNotAheadOfDurable ==
-  \E n \in 0..DurCommittedLen : db_committed = Materialize(Prefix(log_durable, n), quarantined)
+  \/ LogMissing
+  \/ \E n \in 0..DurCommittedLen :
+       db_committed = Materialize(Prefix(log_durable, n), quarantined)
 
 \* CE3.  Recovery restores the invariant at open time without a schema bump.
 OpenRestores == phase = "opened" => db = Materialize(log_durable, quarantined)
 
 \* D3 invariant: the cursor and the DB prefix it names always agree.
 CursorAgreesWithDB ==
-  cursor.gen = generation =>
-    db_committed = Materialize(Prefix(log_durable, cursor.off), quarantined)
+  \/ LogMissing
+  \/ (cursor.gen = generation =>
+       db_committed = Materialize(Prefix(log_durable, cursor.off), quarantined))
 
 \* When generation/offset are comparable, replaying everything after the
 \* cursor over the current DB converges to the durable log's materialization.
 \* This is the operational meaning of the cursor never being ahead of DB.
 CursorNeverAheadOfDB ==
+  \/ LogMissing
   \/ cursor.gen # generation
   \/ cursor.off > DurCommittedLen
   \/ FoldEvents(TailEvents, db_committed) =
@@ -539,6 +587,12 @@ CursorCaughtUp ==
   /\ cursor.gen = generation
   /\ cursor.off = DurCommittedLen
   /\ db_committed = Materialize(log_durable, quarantined)
+
+\* Row 9 is a stable read-only state in the fixed design.  The state
+\* invariant rules out any in-flight write; the action property separately
+\* proves that no transition can start another scheduled batch.
+LogMissingBlocksWrites == LogMissing => phase = "idle"
+LogMissingDoesNotStart == [][LogMissing => nstarted' = nstarted]_vars
 
 \* Repair leaves `deferred` set until fair Recovery replays from cursor.off.
 DeferredConverges == damage_repaired ~> CursorCaughtUp
@@ -590,7 +644,7 @@ BadTruncate ==
   /\ log_written' = << >>
   /\ log_durable' = << >>
   /\ phase' = "idle"
-  /\ UNCHANGED <<db, db_committed, cursor, generation, nstarted, cur,
+  /\ UNCHANGED <<log_present, db, db_committed, cursor, generation, nstarted, cur,
                  aidx, attempts, quarantined, deferred, damage_repaired>>
 
 SpecBadTruncate == Init /\ [][Next \/ BadTruncate]_vars
