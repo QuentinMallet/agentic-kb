@@ -1305,25 +1305,37 @@ mod tests {
         // repository's real database rather than a private handle.
         let (paths, conn) = db::test_db(dir.path());
 
-        conn.execute(
-            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params!["e1", "seed.rs", "test entry", "body", "[]", "deadbeef"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO evidence(
-                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
-             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
-            params![
-                "ev-live",
-                "e1",
-                "seed.rs:0-10",
-                "sha256:live",
-                Some("strong excerpt")
-            ],
-        )
-        .unwrap();
+        // Seeded through the applied-cursor writer, so the log exists and
+        // matches: a populated database with no log at all is refused by the
+        // write guard, which is the state C1/T4 exists to stop.
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "e1",
+            "path": "seed.rs", "summary": "test entry", "content": "body",
+            "tags": [], "version_ref": "deadbeef", "kind": "belief",
+            "ts": "2024-01-01T00:00:00Z",
+        });
+        let live = crate::models::Evidence {
+            id: "ev-live".to_string(),
+            entry_id: "e1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("seed.rs:0-10".to_string()),
+            citation_sha: None,
+            citation_hash: "sha256:live".to_string(),
+            citation_excerpt: Some("strong excerpt".to_string()),
+            derived_from: None,
+            recorded_at: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+        {
+            let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+            crate::components::cursor::append_and_apply(
+                &lock,
+                &conn,
+                &paths,
+                &crate::components::embedder::NoopEmbedder,
+                &[upsert, events::evidence_add_event("e1", &live, None)],
+            )
+            .unwrap();
+        }
 
         let mut report = StaleCheckReport {
             relocation: vec![
@@ -1362,12 +1374,13 @@ mod tests {
             .iter()
             .any(|l| l.contains("seed.rs:0-10") && l.ends_with("(healed)")));
 
-        let events = events::read_events(&paths.events).unwrap();
-        assert_eq!(
-            events.events.len(),
-            1,
-            "only the surviving heal is appended"
-        );
+        let healed_events = events::read_events(&paths.events)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|e| e["action"] == "citation_healed")
+            .count();
+        assert_eq!(healed_events, 1, "only the surviving heal is appended");
 
         let healed_path: String = conn
             .query_row(

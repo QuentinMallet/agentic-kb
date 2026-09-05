@@ -237,6 +237,18 @@ impl Decision {
 // kb_meta rows
 // ---------------------------------------------------------------------------
 
+/// Whether the database holds any entry rows.
+///
+/// Conservative on error: an unreadable `entries` table reads as empty, which
+/// only ever admits a write that the write itself would fail on anyway.
+fn has_entries(conn: &Connection) -> bool {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM entries)", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
+        > 0
+}
+
 fn meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM kb_meta WHERE key=?1", params![key], |r| {
@@ -490,13 +502,20 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
     // Ahead of the schema row on purpose. SchemaObsolete deliberately does not
     // block writes, so classifying a missing log behind it would leave the
     // destructive path reachable on any database whose stamp is stale.
-    if cursor.offset > 0 && !paths.events.exists() {
+    if !paths.events.exists() && (cursor.offset > 0 || has_entries(conn)) {
         // The log is not there to compare against. Recovery must not rebuild —
         // that is the unreachable-layout hazard `rebuild` already refuses to
         // auto-repair, because it would drop every entry the vanished log
         // covered — but a write must not proceed either: the append path
         // recreates a missing log, and stamping the cursor against a one-batch
         // log orphans everything that came before.
+        //
+        // The offset alone is not enough to spot that. An offset-zero cursor on
+        // a populated database is a real shape — a fresh database seeded before
+        // its first replay, or one written by a binary that predates the cursor
+        // — and it is exactly the state with the most to lose. What must stay
+        // permitted is the genuinely first write in an empty repository, where
+        // no log yet is the normal condition rather than a vanished one.
         return Decision::LogMissing(paths.events.clone());
     }
     if !db::schema_is_current(conn) {

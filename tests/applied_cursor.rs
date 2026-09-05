@@ -437,6 +437,59 @@ fn test_missing_log_outranks_an_obsolete_schema_stamp() {
     assert!(!paths.events.exists(), "the log must not be resurrected");
 }
 
+/// An offset-zero cursor on a populated database is a real shape: a database
+/// seeded before its first replay, or one written by a binary that predates the
+/// cursor. It is also the shape with the most to lose, so the offset alone
+/// cannot decide whether a missing log is a vanished one.
+#[test]
+fn test_missing_log_blocks_a_populated_database_with_an_offset_zero_cursor() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        cursor::write(
+            &conn,
+            &Cursor {
+                generation: cursor::read_generation(&paths.events),
+                offset: 0,
+                tail_sha: cursor::tail_sha(&paths.events, 0).unwrap(),
+            },
+        )
+        .unwrap();
+    }
+    fs::remove_file(&paths.events).unwrap();
+
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, &paths),
+            Decision::LogMissing(paths.events.clone())
+        );
+    }
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(!paths.events.exists(), "the log must not be resurrected");
+    assert_eq!(live_ids(&paths), vec!["e1".to_string()]);
+}
+
+/// The first write in an empty repository must still be allowed: no log yet is
+/// the normal condition there, not a vanished one.
+#[test]
+fn test_first_write_in_an_empty_repository_is_not_blocked() {
+    let (_dir, paths) = repo();
+    fs::remove_file(&paths.events).ok();
+    assert!(!paths.events.exists());
+
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
+    }
+    kb_core::add(&paths, &FixedEmbedder, add_args("first")).unwrap();
+    assert_eq!(live_ids(&paths), vec!["first".to_string()]);
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
+}
+
 /// A malformed line PAST the cursor. `committed_len` takes an intact-span
 /// shortcut, so without a tail read this classifies as a replay, and the replay
 /// then hard-errors out of every write entry point — exactly what row 6 exists
