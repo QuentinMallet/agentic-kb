@@ -1,6 +1,5 @@
 //! `digest` — read unread transcript turns, synthesize a KB entry, advance offset.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::read_omc_session;
 use crate::commands::add_validation::compute_evidence_status_write;
 use crate::components::{

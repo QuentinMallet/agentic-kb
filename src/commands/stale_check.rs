@@ -5,7 +5,6 @@
 //! stdout; the MCP handler serialises it to JSON.  No SQL or git subprocess
 //! invocation should be duplicated between the two call sites.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::cursor;
 use crate::components::db;
 use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
@@ -261,6 +260,11 @@ fn heal_relocations(
     use crate::commands::add::acquire_lock;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events;
+
+    if report.relocation.is_empty() {
+        return Ok(());
+    }
+    db::open_or_init(paths)?;
 
     let repo_root = paths.root.as_path();
     let version_ref = config::git_head_sha_at(repo_root);

@@ -35,7 +35,6 @@
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
 use crate::components::verification::{
     compute_citation_hash, compute_citation_hash_and_size_from, open_citation_descriptor,
