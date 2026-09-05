@@ -61,7 +61,11 @@ fn write_raw(path: &Path, contents: &[u8]) {
 }
 
 fn append_raw(path: &Path, contents: &[u8]) {
-    let mut f = OpenOptions::new().append(true).create(true).open(path).unwrap();
+    let mut f = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .unwrap();
     f.write_all(contents).unwrap();
 }
 
@@ -114,7 +118,10 @@ fn test_single_append_is_wrapped_in_a_commit_envelope() {
 
     append_event(&path, &event).unwrap();
 
-    assert_eq!(actions(&path), vec!["batch_begin", "upsert", "batch_commit"]);
+    assert_eq!(
+        actions(&path),
+        vec!["batch_begin", "upsert", "batch_commit"]
+    );
     let raw = lines(&path);
     assert_eq!(raw[0]["n"], 1);
     assert_eq!(raw[2]["n"], 1);
@@ -181,7 +188,12 @@ fn test_dangling_begin_at_eof_is_dropped_by_the_reader() {
     let (_dir, path) = log_dir();
     let committed = format!("{}\n", upsert("kept"));
     let mut raw = committed.clone();
-    raw.push_str(&format!("{}\n{}\n{}\n", begin("b1", 3), upsert("x"), upsert("y")));
+    raw.push_str(&format!(
+        "{}\n{}\n{}\n",
+        begin("b1", 3),
+        upsert("x"),
+        upsert("y")
+    ));
     write_raw(&path, raw.as_bytes());
 
     let read = read_events(&path).unwrap();
@@ -194,7 +206,12 @@ fn test_span_without_a_newline_terminated_commit_is_uncommitted() {
     let (_dir, path) = log_dir();
     let committed = format!("{}\n", upsert("kept"));
     let mut raw = committed.clone();
-    raw.push_str(&format!("{}\n{}\n{}", begin("b1", 1), upsert("x"), commit("b1", 1)));
+    raw.push_str(&format!(
+        "{}\n{}\n{}",
+        begin("b1", 1),
+        upsert("x"),
+        commit("b1", 1)
+    ));
     write_raw(&path, raw.as_bytes());
 
     let read = read_events(&path).unwrap();
@@ -240,16 +257,14 @@ fn test_commit_marker_without_a_begin_is_a_hard_error() {
 #[test]
 fn test_commit_n_disagreeing_with_the_span_is_a_hard_error() {
     let (_dir, path) = log_dir();
-    let raw = format!(
-        "{}\n{}\n{}\n",
-        begin("b1", 2),
-        upsert("x"),
-        commit("b1", 2)
-    );
+    let raw = format!("{}\n{}\n{}\n", begin("b1", 2), upsert("x"), commit("b1", 2));
     write_raw(&path, raw.as_bytes());
 
     let err = read_events(&path).unwrap_err().to_string();
-    assert!(err.contains("n"), "expected an n-mismatch error, got: {err}");
+    assert!(
+        err.contains("n"),
+        "expected an n-mismatch error, got: {err}"
+    );
 }
 
 #[test]
@@ -267,18 +282,16 @@ fn test_more_event_lines_than_declared_n_is_a_hard_error() {
     write_raw(&path, raw.as_bytes());
 
     let err = read_events(&path).unwrap_err().to_string();
-    assert!(err.contains("n"), "expected an n-mismatch error, got: {err}");
+    assert!(
+        err.contains("n"),
+        "expected an n-mismatch error, got: {err}"
+    );
 }
 
 #[test]
 fn test_commit_with_a_mismatched_batch_id_is_a_hard_error() {
     let (_dir, path) = log_dir();
-    let raw = format!(
-        "{}\n{}\n{}\n",
-        begin("b1", 1),
-        upsert("x"),
-        commit("b2", 1)
-    );
+    let raw = format!("{}\n{}\n{}\n", begin("b1", 1), upsert("x"), commit("b2", 1));
     write_raw(&path, raw.as_bytes());
 
     let err = read_events(&path).unwrap_err().to_string();
@@ -300,7 +313,10 @@ fn test_committed_len_is_a_span_boundary_not_a_line_boundary() {
     assert_eq!(read_events(&path).unwrap().committed_len, after_first);
 
     // A second span, left open: committed_len must not move.
-    append_raw(&path, format!("{}\n{}\n", begin("open", 2), upsert("c")).as_bytes());
+    append_raw(
+        &path,
+        format!("{}\n{}\n", begin("open", 2), upsert("c")).as_bytes(),
+    );
     let read = read_events(&path).unwrap();
     assert_eq!(read.committed_len, after_first);
     assert_eq!(read.events, vec![upsert("a"), upsert("b")]);
@@ -357,10 +373,7 @@ fn test_body_written_newline_failed_single_append_is_not_promoted() {
     let read = read_events(&path).unwrap();
     assert_eq!(read.events, vec![upsert("kept"), upsert("next")]);
     assert!(
-        !read
-            .events
-            .iter()
-            .any(|e| e["id"] == "never-committed"),
+        !read.events.iter().any(|e| e["id"] == "never-committed"),
         "a newline-failed append must never be promoted by the next append"
     );
 }
@@ -372,7 +385,13 @@ fn test_append_truncates_a_complete_dangling_span() {
     write_raw(&path, committed.as_bytes());
     append_raw(
         &path,
-        format!("{}\n{}\n{}\n", begin("dangling", 2), upsert("x"), upsert("y")).as_bytes(),
+        format!(
+            "{}\n{}\n{}\n",
+            begin("dangling", 2),
+            upsert("x"),
+            upsert("y")
+        )
+        .as_bytes(),
     );
 
     let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
@@ -652,9 +671,7 @@ fn real_corpus_path() -> Option<PathBuf> {
 #[test]
 fn test_real_corpus_replays_identically_through_the_framed_writers() {
     let Some(corpus_path) = real_corpus_path() else {
-        eprintln!(
-            "log_framing: no real corpus found — set KB_REAL_CORPUS_EVENTS to run this lane"
-        );
+        eprintln!("log_framing: no real corpus found — set KB_REAL_CORPUS_EVENTS to run this lane");
         return;
     };
     let original = read_events(&corpus_path).unwrap();
@@ -691,7 +708,10 @@ fn test_compact_emits_a_marker_free_legacy_readable_log() {
     let (before, after) = kb::commands::compact::Compact
         .execute_with_paths(&paths)
         .unwrap();
-    assert_eq!(before, 3, "marker lines must not count toward original_count");
+    assert_eq!(
+        before, 3,
+        "marker lines must not count toward original_count"
+    );
     assert_eq!(after, 3);
 
     let compacted = actions(&paths.events);

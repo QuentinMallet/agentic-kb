@@ -793,11 +793,7 @@ mod tests {
         // Verify events.jsonl has Add followed by 2 EvidenceAdd events
         let lines = events::read_events(&paths.events).unwrap().events;
         // Should have 3 events: 1 upsert + 2 evidence_add (markers are not events)
-        assert_eq!(
-            lines.len(),
-            3,
-            "expected 3 events (1 add + 2 evidence_add)"
-        );
+        assert_eq!(lines.len(), 3, "expected 3 events (1 add + 2 evidence_add)");
 
         let ev0 = &lines[0];
         assert_eq!(ev0["action"], "upsert");

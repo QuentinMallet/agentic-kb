@@ -592,7 +592,10 @@ mod tests {
             read.events.iter().any(|event| event["id"] == entry_id),
             "the synced span must be reader-accepted and committed"
         );
-        assert_eq!(read.committed_len, fs::metadata(&paths.events).unwrap().len());
+        assert_eq!(
+            read.committed_len,
+            fs::metadata(&paths.events).unwrap().len()
+        );
 
         assert!(paths.db.exists(), "add opens the DB before appending");
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();

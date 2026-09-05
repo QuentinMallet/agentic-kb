@@ -570,9 +570,9 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 /// write lock; the re-entrancy registry rejects that rather than deadlocking.
 pub fn open_or_init(paths: &config::Paths) -> Result<()> {
     init_locked(paths)?; // released before recovery: its repairs take the lock
-    // C1/D3 + C2/ADR-7: recovery fires at process entry, never on a read path.
-    // `recover_if_needed` re-acquires the lock only when there is something to
-    // repair, so the steady-state cost here is one cursor comparison.
+                         // C1/D3 + C2/ADR-7: recovery fires at process entry, never on a read path.
+                         // `recover_if_needed` re-acquires the lock only when there is something to
+                         // repair, so the steady-state cost here is one cursor comparison.
     let embedder = crate::commands::add::make_embedder(paths);
     crate::commands::rebuild::recover_if_needed(paths, embedder.as_ref())?;
     Ok(())
@@ -3396,7 +3396,14 @@ mod tests {
             1,
             "replaying the same run_id 5 times must leave exactly one row"
         );
-        assert_eq!(rows[0], ("t1".to_string(), "pass".to_string(), Some("run-1".to_string())));
+        assert_eq!(
+            rows[0],
+            (
+                "t1".to_string(),
+                "pass".to_string(),
+                Some("run-1".to_string())
+            )
+        );
     }
 
     /// Legacy (run_id-less) events get a deterministic synthetic key: a

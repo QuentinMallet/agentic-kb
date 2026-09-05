@@ -329,9 +329,11 @@ fn has_entries(conn: &Connection) -> bool {
 
 fn meta(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
-        .query_row("SELECT value FROM kb_meta WHERE key=?1", params![key], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM kb_meta WHERE key=?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
         .optional()?)
 }
 

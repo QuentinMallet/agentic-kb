@@ -272,8 +272,7 @@ impl<'a> PrefetchedEmbedder<'a> {
 
     /// Forbid any further call into the wrapped embedder.
     pub fn seal(&self) {
-        self.sealed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

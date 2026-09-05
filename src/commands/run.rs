@@ -85,8 +85,8 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::events;
     use crate::components::embedder::NoopEmbedder;
+    use crate::components::events;
     use crate::config::Paths;
     use std::fs;
 

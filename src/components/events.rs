@@ -322,7 +322,9 @@ fn ends_on_intact_span(file: &mut File, len: u64) -> Result<bool> {
     if !window.ends_with(b"\n") {
         return Ok(false);
     }
-    let mut lines: Vec<&[u8]> = window[..window.len() - 1].split(|byte| *byte == b'\n').collect();
+    let mut lines: Vec<&[u8]> = window[..window.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .collect();
     if start > 0 && !lines.is_empty() {
         // The window may open mid-line; that partial line is not usable.
         lines.remove(0);
@@ -822,7 +824,10 @@ mod tests {
             &[serde_json::json!({"action": "upsert", "id": "sync-fail"})],
             move |_| {
                 *attempts.borrow_mut() += 1;
-                Err(io::Error::new(io::ErrorKind::Other, "injected sync failure"))
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected sync failure",
+                ))
             },
             |_| Ok(()),
         );
@@ -1218,11 +1223,8 @@ mod tests {
     fn test_crash_after_commit_marker_leaves_the_whole_batch_committed() {
         if is_crash_child("after-commit") {
             let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
-            append_events_batch(
-                &crash_log(&root),
-                &[crash_upsert("c0"), crash_upsert("c1")],
-            )
-            .unwrap();
+            append_events_batch(&crash_log(&root), &[crash_upsert("c0"), crash_upsert("c1")])
+                .unwrap();
             panic!("child append returned without hitting the configured kill point");
         }
 

@@ -271,14 +271,9 @@ fn test_write_refuses_when_the_cursor_says_a_rebuild_is_due() {
 
     let conn = open_db(&paths.db).unwrap();
     let lock = acquire_lock(&paths.lock).unwrap();
-    let error = cursor::append_and_apply(
-        &lock,
-        &conn,
-        &paths,
-        &FixedEmbedder,
-        &[upsert("e2", "two")],
-    )
-    .unwrap_err();
+    let error =
+        cursor::append_and_apply(&lock, &conn, &paths, &FixedEmbedder, &[upsert("e2", "two")])
+            .unwrap_err();
 
     assert!(
         cursor::is_not_converged(&error),
@@ -310,16 +305,14 @@ fn test_write_refuses_when_the_cursor_is_behind_the_log() {
 
     let conn = open_db(&paths.db).unwrap();
     let lock = acquire_lock(&paths.lock).unwrap();
-    let error = cursor::append_and_apply(
-        &lock,
-        &conn,
-        &paths,
-        &FixedEmbedder,
-        &[upsert("e2", "two")],
-    )
-    .unwrap_err();
+    let error =
+        cursor::append_and_apply(&lock, &conn, &paths, &FixedEmbedder, &[upsert("e2", "two")])
+            .unwrap_err();
 
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert_eq!(fs::metadata(&paths.events).unwrap().len(), before_len);
     drop(lock);
 
@@ -346,7 +339,10 @@ fn test_write_refuses_after_a_deferred_rebuild_under_a_noop_embedder() {
     // The defer: nothing was rebuilt, and nothing was re-baselined either.
     assert!(!recover_if_needed(&paths, &NoopEmbedder).unwrap());
     let error = kb_core::add(&paths, &NoopEmbedder, add_args("e2")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
 
     let conn = open_db(&paths.db).unwrap();
     assert_eq!(
@@ -370,7 +366,10 @@ fn test_empty_batch_write_takes_the_guard() {
     let error =
         cursor::append_and_apply_with(&lock, &conn, &paths, &FixedEmbedder, &[], |_| Ok(()))
             .unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
 }
 
 /// The append path CREATES a missing log. Without a refusal the next write
@@ -401,7 +400,10 @@ fn test_write_refuses_when_the_log_file_is_missing() {
     assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
 
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("e3")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert!(
         format!("{error:#}").contains("missing"),
         "the error must name the missing log: {error:#}"
@@ -441,7 +443,10 @@ fn test_missing_log_end_to_end() {
 
     // Writes: refused, with the missing path named.
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("e3")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert!(format!("{error:#}").contains("missing"), "{error:#}");
     assert!(!paths.events.exists(), "no write may resurrect the log");
 
@@ -494,7 +499,10 @@ fn test_missing_log_outranks_an_obsolete_schema_stamp() {
     drop(conn);
 
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert!(!paths.events.exists(), "the log must not be resurrected");
 }
 
@@ -528,7 +536,10 @@ fn test_missing_log_blocks_a_populated_database_with_an_offset_zero_cursor() {
         );
     }
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert!(!paths.events.exists(), "the log must not be resurrected");
     assert_eq!(live_ids(&paths), vec!["e1".to_string()]);
 }
@@ -623,7 +634,10 @@ fn test_unreadable_tail_defers_and_refuses_writes() {
     // The write is refused, and nothing moved.
     let before_log = fs::read(&paths.events).unwrap();
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("refused")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
     assert_eq!(fs::read(&paths.events).unwrap(), before_log);
     let conn = open_db(&paths.db).unwrap();
     assert_eq!(cursor::read(&conn).unwrap().unwrap(), cursor_before);
@@ -658,11 +672,9 @@ fn test_repairing_the_damaged_line_lets_recovery_converge() {
         "the cursor must be stamped at the log's committed end"
     );
     let rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entries WHERE id='later'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM entries WHERE id='later'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(rows, 1, "the recovered entry must be present exactly once");
     assert_eq!(
@@ -772,7 +784,10 @@ fn test_a_deferral_outranks_a_stale_generation_until_the_log_reads_again() {
         assert!(decision.blocks_writes());
     }
     let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
-    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
 
     // Repair only the log. The generation mismatch is now visible and repairs.
     fs::write(&paths.events, &intact).unwrap();
@@ -915,39 +930,52 @@ fn test_every_apply_event_arm_is_idempotent_under_replay() {
         ),
         (
             "(citation_healed, evidence)",
-            vec![upsert("a5", "five"), {
-                let ev = kb::models::Evidence {
-                    id: "ev-2".to_string(),
-                    entry_id: "a5".to_string(),
-                    kind: "code".to_string(),
-                    citation_path: Some("src/old.rs".to_string()),
-                    citation_sha: None,
-                    citation_hash: "hash".to_string(),
-                    citation_excerpt: None,
-                    derived_from: None,
-                    recorded_at: Some("2026-09-05T00:00:00Z".to_string()),
-                };
-                events::evidence_add_event("a5", &ev, None)
-            },
-            events::citation_healed_event("a5", "ev-2", "src/old.rs", "src/new.rs", "hash", None)],
+            vec![
+                upsert("a5", "five"),
+                {
+                    let ev = kb::models::Evidence {
+                        id: "ev-2".to_string(),
+                        entry_id: "a5".to_string(),
+                        kind: "code".to_string(),
+                        citation_path: Some("src/old.rs".to_string()),
+                        citation_sha: None,
+                        citation_hash: "hash".to_string(),
+                        citation_excerpt: None,
+                        derived_from: None,
+                        recorded_at: Some("2026-09-05T00:00:00Z".to_string()),
+                    };
+                    events::evidence_add_event("a5", &ev, None)
+                },
+                events::citation_healed_event(
+                    "a5",
+                    "ev-2",
+                    "src/old.rs",
+                    "src/new.rs",
+                    "hash",
+                    None,
+                ),
+            ],
         ),
         (
             "(evidence_expire, evidence)",
-            vec![upsert("a6", "six"), {
-                let ev = kb::models::Evidence {
-                    id: "ev-3".to_string(),
-                    entry_id: "a6".to_string(),
-                    kind: "code".to_string(),
-                    citation_path: Some("src/lib.rs".to_string()),
-                    citation_sha: None,
-                    citation_hash: "hash".to_string(),
-                    citation_excerpt: None,
-                    derived_from: None,
-                    recorded_at: Some("2026-09-05T00:00:00Z".to_string()),
-                };
-                events::evidence_add_event("a6", &ev, None)
-            },
-            events::evidence_expire_event("a6", "ev-3", "gone")],
+            vec![
+                upsert("a6", "six"),
+                {
+                    let ev = kb::models::Evidence {
+                        id: "ev-3".to_string(),
+                        entry_id: "a6".to_string(),
+                        kind: "code".to_string(),
+                        citation_path: Some("src/lib.rs".to_string()),
+                        citation_sha: None,
+                        citation_hash: "hash".to_string(),
+                        citation_excerpt: None,
+                        derived_from: None,
+                        recorded_at: Some("2026-09-05T00:00:00Z".to_string()),
+                    };
+                    events::evidence_add_event("a6", &ev, None)
+                },
+                events::evidence_expire_event("a6", "ev-3", "gone"),
+            ],
         ),
         (
             "unknown action (the `_ => {}` arm)",
@@ -1090,7 +1118,11 @@ fn test_read_path_serves_stale_data_and_never_takes_the_write_lock() {
     let ids = done_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the read path blocked on the write lock");
-    assert_eq!(ids, vec!["visible".to_string()], "reads serve what they have");
+    assert_eq!(
+        ids,
+        vec!["visible".to_string()],
+        "reads serve what they have"
+    );
 
     release_tx.send(()).unwrap();
     holder.join().unwrap();
@@ -1141,7 +1173,10 @@ fn test_compaction_bumps_the_generation_and_forces_a_full_rebuild() {
             cursor::inspect(&conn, &paths),
             Decision::FullRebuild(RebuildReason::GenerationMismatch),
         );
-        assert_ne!(cursor_before.generation, cursor::read_generation(&paths.events));
+        assert_ne!(
+            cursor_before.generation,
+            cursor::read_generation(&paths.events)
+        );
     }
     assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
 
@@ -1161,7 +1196,11 @@ fn test_generation_mismatch_alone_forces_a_full_rebuild() {
     let before = fs::read(&paths.events).unwrap();
 
     cursor::bump_generation(&paths.events).unwrap();
-    assert_eq!(fs::read(&paths.events).unwrap(), before, "log bytes unchanged");
+    assert_eq!(
+        fs::read(&paths.events).unwrap(),
+        before,
+        "log bytes unchanged"
+    );
 
     let conn = open_db(&paths.db).unwrap();
     assert_eq!(
@@ -1180,11 +1219,8 @@ fn test_cursorless_database_takes_the_full_rebuild_row() {
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     {
         let conn = open_db(&paths.db).unwrap();
-        conn.execute(
-            "DELETE FROM kb_meta WHERE key LIKE 'applied_log_%'",
-            [],
-        )
-        .unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key LIKE 'applied_log_%'", [])
+            .unwrap();
         assert_eq!(
             cursor::inspect(&conn, &paths),
             Decision::FullRebuild(RebuildReason::CursorMissing)
@@ -1204,8 +1240,11 @@ fn test_obsolete_schema_stamp_takes_the_full_rebuild_row() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
     let conn = open_db(&paths.db).unwrap();
-    conn.execute("UPDATE kb_meta SET value='1' WHERE key='schema_version'", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE kb_meta SET value='1' WHERE key='schema_version'",
+        [],
+    )
+    .unwrap();
     assert_eq!(
         cursor::inspect(&conn, &paths),
         Decision::FullRebuild(RebuildReason::SchemaObsolete)
@@ -1403,7 +1442,9 @@ impl Embedder for TxProbeEmbedder {
         use std::sync::atomic::Ordering;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let probe = Connection::open(&self.db_path).unwrap();
-        probe.busy_timeout(std::time::Duration::from_millis(0)).unwrap();
+        probe
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .unwrap();
         match probe.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {
                 let _ = probe.execute_batch("ROLLBACK");
@@ -1447,11 +1488,15 @@ fn test_no_write_transaction_is_held_across_an_embedder_call() {
 #[test]
 fn test_sealed_prefetch_rejects_an_unresolved_text() {
     use kb::components::embedder::PrefetchedEmbedder;
-    let prefetched = PrefetchedEmbedder::prefetch(&FixedEmbedder, vec!["known".to_string()]).unwrap();
+    let prefetched =
+        PrefetchedEmbedder::prefetch(&FixedEmbedder, vec!["known".to_string()]).unwrap();
     assert!(prefetched.embed("known").is_ok());
     assert!(prefetched.embed("unknown").is_ok(), "open before sealing");
     prefetched.seal();
-    assert!(prefetched.embed("known").is_ok(), "cached texts still resolve");
+    assert!(
+        prefetched.embed("known").is_ok(),
+        "cached texts still resolve"
+    );
     let error = prefetched.embed("unknown").unwrap_err().to_string();
     assert!(
         error.contains("applied-cursor transaction"),

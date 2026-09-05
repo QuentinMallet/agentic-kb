@@ -2128,11 +2128,11 @@ fn handle_audit_record(
             emb,
             &batch,
             |conn| -> Result<(u32, u32)> {
-            db::with_savepoint(conn, "audit_record", || -> Result<(u32, u32)> {
-                let mut rec = 0u32;
+                db::with_savepoint(conn, "audit_record", || -> Result<(u32, u32)> {
+                    let mut rec = 0u32;
 
-                // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
-                let inserted = conn.execute(
+                    // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
+                    let inserted = conn.execute(
                     "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
                      VALUES(?1,?2,?3,?4,?5)",
                     params![
@@ -2144,15 +2144,15 @@ fn handle_audit_record(
                     ],
                 )?;
 
-                // Fault-injection point for the A1 crash test: kills the
-                // process between the audit_runs row insert and the
-                // source_weights upsert, so a crash test can assert the
-                // savepoint above leaves neither committed.
-                kill_point(KillPoint::AuditAfterRunInsert);
+                    // Fault-injection point for the A1 crash test: kills the
+                    // process between the audit_runs row insert and the
+                    // source_weights upsert, so a crash test can assert the
+                    // savepoint above leaves neither committed.
+                    kill_point(KillPoint::AuditAfterRunInsert);
 
-                if inserted > 0 {
-                    // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
-                    let (entry_kind, entry_session_id): (String, String) = conn
+                    if inserted > 0 {
+                        // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
+                        let (entry_kind, entry_session_id): (String, String) = conn
                         .query_row(
                             "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
                             params![entry_id],
@@ -2160,19 +2160,19 @@ fn handle_audit_record(
                         )
                         .unwrap_or_else(|_| ("belief".to_string(), "__GLOBAL__".to_string()));
 
-                    let weight_sql = if verdict {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                        let weight_sql = if verdict {
+                            "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
                          ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
-                    } else {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                        } else {
+                            "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
                          ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
-                    };
-                    conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
-                    rec = 1;
-                }
+                        };
+                        conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
+                        rec = 1;
+                    }
 
-                Ok((rec, exp))
-            })
+                    Ok((rec, exp))
+                })
             },
         );
 
@@ -3857,7 +3857,10 @@ mod tests {
         let resp = dispatch(&paths, &emb, &req2);
         assert_eq!(resp["type"], "error", "{resp}");
         assert!(
-            resp["message"].as_str().unwrap_or("").contains("not converged"),
+            resp["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not converged"),
             "the error must name the divergence: {resp}"
         );
 
@@ -3957,7 +3960,11 @@ mod tests {
             "{resp}"
         );
 
-        let search = dispatch(&paths, &emb, &json!({"method":"search","id":"d3","query":"one"}));
+        let search = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"d3","query":"one"}),
+        );
         assert_eq!(search["type"], "result", "reads stay served: {search}");
         assert!(search["stale"].as_str().is_some(), "{search}");
     }

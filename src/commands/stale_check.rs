@@ -1579,9 +1579,11 @@ mod heal_writer_tests {
             "heal_relocations left the applied cursor behind the log"
         );
         let path: String = conn
-            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT citation_path FROM evidence WHERE id='ev-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(path, "src/new.rs");
     }
