@@ -87,11 +87,26 @@ All Rust ranking lanes use `compare_rank`: scores sort descending, equal scores
 sort by entry ID ascending, `-0.0` is normalized to `0.0`, and `f32::total_cmp`
 provides a total order. This makes ties and floating-point edge cases stable.
 
-Non-finite values from the query embedder are rejected by `validate_embedding`.
-A stored corrupt or non-finite embedding is counted, assigned similarity
-`0.0`, and remains deterministically sortable; this is pinned by
-`nan_blob_is_zero_scored_and_reported_in_search_stats` and implemented by
-`cosine_similarity`, `decode_emb_blob`, and `decode_f16_blob_into`.
+Non-finite values from the query embedder are rejected outright:
+`validate_embedding` returns an error (`"embedder returned a non-finite
+component"`) that propagates out of `search_entries`, so a corrupt query
+embedding fails the whole search rather than merely scoring badly.
+
+A stored (not query) corrupt or non-finite embedding is never dropped from the
+result set. `decode_emb_blob` and `decode_f16_blob_into` detect the bad blob,
+log a `kb: decode_emb_blob: unexpected blob length ...` or `kb:
+cosine_similarity dimension mismatch` diagnostic to stderr, increment the
+process-wide `models::corrupt_embedding_count` counter, and return an empty
+vector; `cosine_similarity` then treats the resulting length mismatch as
+similarity `0.0`, so the row stays in the ranked output and remains
+deterministically sortable. The counter is exposed as
+`db::SearchStats.corrupt_embeddings` by `search_entries_with_stats`, but no CLI
+or MCP caller invokes that function today — `search_entries` (the function
+every production caller uses) does not report the count anywhere. This is
+pinned at the `db` layer by
+`nan_blob_is_zero_scored_and_reported_in_search_stats`, which asserts the
+corrupted row survives with score `0.0` and `stats.corrupt_embeddings > 0`;
+the count itself is not yet surfaced in a CLI or MCP response.
 
 Semantic and cue scoring may scan their indices, but full entry metadata is
 materialized only for the first `2 * limit` ranked IDs in each lane. The bound
@@ -227,3 +242,17 @@ What gets embedded per entry:
 Switching modes requires re-embedding the whole store (`kb reembed` after
 deleting `entries_emb` rows, or `kb rebuild`) — mixed-vintage embeddings make
 cosine scores incomparable. Measure with `kb eval` before and after.
+
+## Deferred Follow-Ups
+
+Two known gaps in the current search/federation contract are tracked as open
+beads rather than fixed here:
+
+- `bd-federated-verify-after-truncate-ayb8` — inline verification currently
+  runs per repository (local and each peer) before `merge_federated_results`
+  performs the global merge and truncation. A row that inline verification
+  spent work on can still be discarded by the federated truncate, so
+  verification effort is not scoped to the final global `--limit`.
+- `bd-prenorm-embeddings-followup-te13` — a deferred change to persist
+  pre-normalized embeddings in a new on-disk format, rather than normalizing
+  at read time on every `cosine_similarity` call.
