@@ -60,6 +60,18 @@ while IFS= read -r line; do
       # (the owning GenServer terminated and tore down the port).
       while IFS= read -r _unused; do :; done
       ;;
+    audit_run)
+      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[]}\n' "$id"
+      ;;
+    audit_record)
+      printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      ;;
+    audit_report)
+      printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      ;;
+    provenance)
+      printf '{"id":"%s","type":"result","roots":["root-1"],"graph":[],"truncated":false}\n' "$id"
+      ;;
     *)
       printf '{"id":"%s","type":"result"}\n' "$id"
       ;;
