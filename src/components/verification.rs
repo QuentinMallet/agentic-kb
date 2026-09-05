@@ -89,6 +89,8 @@ pub enum UnverifiedReason {
     MalformedCitationPath,
     /// `citation_path` escapes the repo root.
     PathEscape,
+    /// A component of `citation_path` is a symbolic link.
+    SymlinkPathRejected,
     /// No file at `citation_path`.
     FileMissing,
     /// Cited byte range lies outside the file.
@@ -125,6 +127,7 @@ impl UnverifiedReason {
             UnverifiedReason::MissingCitationPath => "missing_citation_path",
             UnverifiedReason::MalformedCitationPath => "malformed_citation",
             UnverifiedReason::PathEscape => "path_escape",
+            UnverifiedReason::SymlinkPathRejected => "symlink_path_rejected",
             UnverifiedReason::FileMissing => "file_missing",
             UnverifiedReason::RangeOutOfBounds => "range_out_of_bounds",
             UnverifiedReason::FileTooLarge => "file_too_large",
@@ -187,26 +190,40 @@ impl VerificationOutcome {
 /// Safely join `rel` onto `repo_root`, rejecting any path that escapes the root.
 ///
 /// Rejects: absolute paths, any `..` / root / prefix components.
-/// Canonicalizes both sides and verifies containment.
-/// Returns `None` on any rejection or I/O error during canonicalization.
+/// Walks existing components without following symbolic links.
+/// Returns `None` on any rejection or filesystem error.
 pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return None;
     }
+    let mut candidate = repo_root.to_path_buf();
+    let mut saw_normal_component = false;
     for c in rel_path.components() {
         match c {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            _ => {}
+            Component::CurDir => continue,
+            Component::Normal(name) => {
+                saw_normal_component = true;
+                candidate.push(name);
+                if std::fs::symlink_metadata(&candidate)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
+            }
         }
     }
-    let candidate = repo_root.join(rel_path);
-    let canon_root = repo_root.canonicalize().ok()?;
-    let canon_cand = candidate.canonicalize().ok()?;
-    if !canon_cand.starts_with(&canon_root) {
+    // A component-free `rel` ("", ".", "./.", ...) would otherwise return
+    // `repo_root` itself unchecked -- reject it instead of silently handing
+    // back the repository root to a caller that read `citation_path` from
+    // stored data (e.g. `commands::mcp::returned_entries_stale_warning`).
+    if !saw_normal_component {
         return None;
     }
-    Some(canon_cand)
+    Some(candidate)
 }
 
 /// Parse a whole-file `path` or ranged `path:start-end` citation.
@@ -416,8 +433,19 @@ fn hash_citation_bytes_from(
 /// rejects symlinks at every level with `O_NOFOLLOW`.
 #[cfg(unix)]
 fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<File> {
+    open_citation_file_with_resolver(repo_root, rel_path, Resolver::platform_default())
+}
+
+#[cfg(unix)]
+fn open_citation_file_with_resolver(
+    repo_root: &Path,
+    rel_path: &Path,
+    resolver: Resolver,
+) -> rustix::io::Result<File> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = resolver;
     #[cfg(target_os = "linux")]
-    {
+    if resolver == Resolver::Openat2 {
         use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
 
         let root = open(
@@ -430,7 +458,7 @@ fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<F
             rel_path,
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
         ) {
             Ok(fd) => return Ok(File::from(fd)),
             Err(rustix::io::Errno::NOSYS) => {}
@@ -441,6 +469,60 @@ fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<F
     open_citation_file_fallback(repo_root, rel_path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolver {
+    #[cfg(target_os = "linux")]
+    Openat2,
+    // On Linux this is only reached through `open_citation_file_with_resolver`'s
+    // NOSYS fallthrough (which calls `open_citation_file_fallback` directly,
+    // without constructing this value) and through the test seam -- never by
+    // constructing `Self::Fallback` in production code, since `platform_default`
+    // only does so on non-Linux Unix. That makes the variant itself "never
+    // constructed" on a Linux build, which is expected, not a sign the fallback
+    // path is unreachable in practice.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Fallback,
+}
+
+impl Resolver {
+    fn platform_default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Openat2
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Fallback
+        }
+    }
+}
+
+/// Classify an open failure as a symlink rejection or a plain miss.
+///
+/// `ELOOP` is the uniform "a path component is a symlink" signal on every
+/// resolver: `openat2` with `RESOLVE_NO_SYMLINKS` reports it directly, and
+/// `open_citation_file_fallback` normalizes its own ambiguous `ENOTDIR` to
+/// `ELOOP` before returning (see its symlink disambiguation there), so no
+/// resolver-conditional branch belongs here. A resolver value is still
+/// accepted for symmetry with the not(unix) stub and in case a future
+/// resolver needs one, but the classification itself must not depend on it:
+/// classifying by which resolver was *requested* is wrong exactly when the
+/// requested resolver (e.g. `Openat2`) differs from the one that actually
+/// ran (a NOSYS fallthrough to the fallback walk).
+#[cfg(unix)]
+fn open_failure_reason(error: rustix::io::Errno, _resolver: Resolver) -> UnverifiedReason {
+    if error == rustix::io::Errno::LOOP {
+        UnverifiedReason::SymlinkPathRejected
+    } else {
+        UnverifiedReason::FileMissing
+    }
+}
+
+#[cfg(not(unix))]
+fn open_failure_reason(_error: std::io::Error, _resolver: Resolver) -> UnverifiedReason {
+    UnverifiedReason::FileMissing
+}
+
 #[cfg(not(unix))]
 fn open_citation_file(_repo_root: &Path, _rel_path: &Path) -> std::io::Result<File> {
     // The supported deployment targets are Unix. Fail closed rather than
@@ -449,6 +531,15 @@ fn open_citation_file(_repo_root: &Path, _rel_path: &Path) -> std::io::Result<Fi
         std::io::ErrorKind::Unsupported,
         "descriptor-relative citation opens require openat",
     ))
+}
+
+#[cfg(not(unix))]
+fn open_citation_file_with_resolver(
+    repo_root: &Path,
+    rel_path: &Path,
+    _resolver: Resolver,
+) -> std::io::Result<File> {
+    open_citation_file(repo_root, rel_path)
 }
 
 #[cfg(unix)]
@@ -464,6 +555,7 @@ fn open_citation_file_fallback(repo_root: &Path, rel_path: &Path) -> rustix::io:
     if components.peek().is_none() {
         return Err(rustix::io::Errno::NOENT);
     }
+    let mut candidate = repo_root.to_path_buf();
 
     while let Some(component) = components.next() {
         let name = match component {
@@ -471,12 +563,33 @@ fn open_citation_file_fallback(repo_root: &Path, rel_path: &Path) -> rustix::io:
             Component::CurDir => continue,
             _ => return Err(rustix::io::Errno::XDEV),
         };
+        candidate.push(name);
         let is_last = components.peek().is_none();
         let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         if !is_last {
             flags |= OFlags::DIRECTORY;
         }
-        current = openat(&current, name, flags, Mode::empty())?;
+        current = match openat(&current, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            // A non-final component opened with O_DIRECTORY|O_NOFOLLOW
+            // fails with ENOTDIR both when the component is a
+            // symlink-to-directory (the kernel refuses to follow it) and
+            // when it is an ordinary regular file used as a directory
+            // component. Those are different reasons -- only the first is
+            // a symlink rejection -- so disambiguate with a NOFOLLOW stat
+            // that never resolves the link before classifying.
+            Err(rustix::io::Errno::NOTDIR) if !is_last => {
+                let is_symlink = std::fs::symlink_metadata(&candidate)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                return Err(if is_symlink {
+                    rustix::io::Errno::LOOP
+                } else {
+                    rustix::io::Errno::NOTDIR
+                });
+            }
+            Err(error) => return Err(error),
+        };
     }
 
     Ok(File::from(current))
@@ -540,12 +653,14 @@ static DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE_EMITTED: AtomicBool = AtomicBool::ne
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerificationCapabilities {
     descriptor_containment_degraded: bool,
+    resolver: Resolver,
 }
 
 impl VerificationCapabilities {
     fn platform_default() -> Self {
         Self {
             descriptor_containment_degraded: cfg!(not(target_os = "linux")),
+            resolver: Resolver::platform_default(),
         }
     }
 }
@@ -660,9 +775,13 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
             return Err(UnverifiedReason::PathEscape);
         }
         let file_abs = self.repo_root.join(file_rel);
-        let mut file = match open_citation_file(self.repo_root, Path::new(file_rel)) {
+        let mut file = match open_citation_file_with_resolver(
+            self.repo_root,
+            Path::new(file_rel),
+            self.capabilities.resolver,
+        ) {
             Ok(f) => f,
-            Err(_) => return Err(UnverifiedReason::FileMissing),
+            Err(error) => return Err(open_failure_reason(error, self.capabilities.resolver)),
         };
 
         if !self.opened_file_within_repo(&file, &file_abs) {
@@ -744,14 +863,26 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
     }
 
     fn scan_file(&self, path: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
-        let path_meta = match std::fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(_) => return FileScan::Skipped,
+        // Descriptor-relative, symlink-rejecting open -- no pathname
+        // check-then-open gap. `path` is either repo_root-relative already
+        // (the direct citation, from `safe_join`) or canon_root-relative
+        // (a repo-walk candidate); try both bases so a symlinked repo root
+        // (e.g. macOS `/tmp` -> `/private/tmp`) still resolves.
+        let rel = match path.strip_prefix(self.repo_root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => match self.repo_root.canonicalize() {
+                Ok(canon_root) => match path.strip_prefix(&canon_root) {
+                    Ok(rel) => rel.to_path_buf(),
+                    Err(_) => return FileScan::Skipped,
+                },
+                Err(_) => return FileScan::Skipped,
+            },
         };
-        if path_meta.file_type().is_symlink() || !path_meta.is_file() {
-            return FileScan::Skipped;
-        }
-        let file = match File::open(path) {
+        let file = match open_citation_file_with_resolver(
+            self.repo_root,
+            &rel,
+            self.capabilities.resolver,
+        ) {
             Ok(file) => file,
             Err(_) => return FileScan::Skipped,
         };
@@ -923,7 +1054,9 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
 
         if matches!(
             decayed,
-            UnverifiedReason::PathEscape | UnverifiedReason::FileMissing
+            UnverifiedReason::PathEscape
+                | UnverifiedReason::SymlinkPathRejected
+                | UnverifiedReason::FileMissing
         ) {
             return VerificationOutcome::unverified(decayed);
         }
@@ -1011,7 +1144,12 @@ pub fn verify_evidence(
     let file_abs = repo_root.join(file_rel);
     let file = match open_citation_file(repo_root, Path::new(file_rel)) {
         Ok(file) => file,
-        Err(_) => return VerificationOutcome::unverified(UnverifiedReason::FileMissing),
+        Err(error) => {
+            return VerificationOutcome::unverified(open_failure_reason(
+                error,
+                Resolver::platform_default(),
+            ))
+        }
     };
     if !opened_file_within_repo(&file, &file_abs, repo_root) {
         return VerificationOutcome::unverified(UnverifiedReason::ReadError);
@@ -1064,7 +1202,9 @@ pub fn verify_evidence_from(
 
     if matches!(
         decayed,
-        UnverifiedReason::PathEscape | UnverifiedReason::FileMissing
+        UnverifiedReason::PathEscape
+            | UnverifiedReason::SymlinkPathRejected
+            | UnverifiedReason::FileMissing
     ) {
         return VerificationOutcome::unverified(decayed);
     }
@@ -1150,8 +1290,29 @@ pub(crate) struct FileIdentity {
 #[cfg(unix)]
 impl FileIdentity {
     /// Resolve `path` and return its `(st_dev, st_ino)` identity.
+    ///
+    /// Follows symlinks (`std::fs::metadata`), so callers on a citation
+    /// write/re-verify path must not call this on a raw path derived from
+    /// `citation_path` before the path has been rejected as a symlink --
+    /// use [`FileIdentity::of_file`] on an already-open, resolver-vetted
+    /// descriptor instead.
     pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
         let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Identity of an already-open file descriptor.
+    ///
+    /// This is an `fstat`, not a pathname lookup, so it is safe to call
+    /// after opening through a symlink-rejecting resolver (e.g.
+    /// [`open_citation_descriptor`]): unlike [`FileIdentity::of`], it can
+    /// never re-resolve a symlink the open already refused, so it never
+    /// stats a target the open path rejected.
+    pub(crate) fn of_file(file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
         Ok(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -1359,6 +1520,7 @@ mod tests {
             dir.path(),
             VerificationCapabilities {
                 descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
             },
             &existing_reporter,
             &existing_notice,
@@ -1371,6 +1533,7 @@ mod tests {
             dir.path(),
             VerificationCapabilities {
                 descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
             },
             &missing_reporter,
             &missing_notice,
@@ -1392,6 +1555,7 @@ mod tests {
             dir.path(),
             VerificationCapabilities {
                 descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
             },
             &reporter,
             &notice,
@@ -1413,6 +1577,7 @@ mod tests {
             dir.path(),
             VerificationCapabilities {
                 descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
             },
             &reporter,
             &notice,
@@ -1432,6 +1597,7 @@ mod tests {
             dir.path(),
             VerificationCapabilities {
                 descriptor_containment_degraded: false,
+                resolver: Resolver::platform_default(),
             },
             &reporter,
             &notice,
@@ -1911,8 +2077,106 @@ mod tests {
 
         assert!(matches!(
             hash_check_at_citation(&repo, "citation.txt", None, &hash_bytes(secret)),
-            HashCheck::Failed(UnverifiedReason::FileMissing)
+            HashCheck::Failed(UnverifiedReason::SymlinkPathRejected)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_citations_are_rejected_by_openat2_and_fallback_resolvers() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo = sandbox.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("inside.txt"), b"inside").unwrap();
+        std::fs::write(sandbox.path().join("outside.txt"), b"outside").unwrap();
+        let outside_dir = sandbox.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("nested.txt"), b"nested").unwrap();
+        std::fs::write(repo.join("plain.txt"), b"plain").unwrap();
+
+        symlink(repo.join("inside.txt"), repo.join("inside-link.txt")).unwrap();
+        symlink(
+            sandbox.path().join("outside.txt"),
+            repo.join("outside-link.txt"),
+        )
+        .unwrap();
+        // Mid-path symlink: the directory component itself is a link, not
+        // the cited file. This is the case the fallback resolver's
+        // O_DIRECTORY|O_NOFOLLOW open reports as ENOTDIR rather than
+        // ELOOP, which must still classify as SymlinkPathRejected under
+        // both resolvers (Important 1/2 regression coverage).
+        symlink(&outside_dir, repo.join("linked-dir")).unwrap();
+
+        // (citation path, expected bytes, expected reason) -- covers a
+        // final-component symlink pointing inside the repo, one pointing
+        // outside, a mid-path directory symlink, and a plain regular file
+        // used as a directory component (which must NOT be classified as
+        // a symlink rejection, even though it also raises ENOTDIR under
+        // the fallback resolver).
+        let cases: [(&str, &[u8], UnverifiedReason); 4] = [
+            (
+                "inside-link.txt",
+                b"inside",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            (
+                "outside-link.txt",
+                b"outside",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            (
+                "linked-dir/nested.txt",
+                b"nested",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            ("plain.txt/child", b"plain", UnverifiedReason::FileMissing),
+        ];
+
+        for (link, content, expected) in cases {
+            for resolver in [Resolver::Openat2, Resolver::Fallback] {
+                let reporter = NoopCapabilityReporter;
+                let emitted = AtomicBool::new(true);
+                let verifier = Verifier::with_capabilities(
+                    &repo,
+                    VerificationCapabilities {
+                        descriptor_containment_degraded: false,
+                        resolver,
+                    },
+                    &reporter,
+                    &emitted,
+                );
+                let evidence = make_evidence(Some(link.to_string()), hash_bytes(content), "code");
+                let outcome = verifier.verify_evidence(&evidence, RelocationPolicy::FileThenRepo);
+                assert_eq!(
+                    outcome.reason,
+                    Some(expected.clone()),
+                    "resolver={resolver:?}, link={link}"
+                );
+                assert_eq!(outcome.relocated_to, None);
+            }
+        }
+    }
+
+    // `Resolver::Openat2` only exists on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_failure_reason_ignores_a_stale_resolver_label() {
+        // Regression for Important 2: after a NOSYS fallthrough on Linux,
+        // the descriptor walk that actually ran is Fallback even though
+        // `capabilities.resolver` still reads `Openat2`. Classification
+        // must not depend on which resolver was requested, only on the
+        // errno the walk that ran actually produced -- so passing the
+        // "wrong" resolver label must not change the outcome.
+        assert_eq!(
+            open_failure_reason(rustix::io::Errno::LOOP, Resolver::Openat2),
+            UnverifiedReason::SymlinkPathRejected
+        );
+        assert_eq!(
+            open_failure_reason(rustix::io::Errno::NOTDIR, Resolver::Openat2),
+            UnverifiedReason::FileMissing
+        );
     }
 
     #[cfg(unix)]
@@ -1928,7 +2192,30 @@ mod tests {
         std::fs::write(outside.join("citation.txt"), b"secret").unwrap();
         symlink(&outside, repo.join("linked-dir")).unwrap();
 
-        assert!(open_citation_file_fallback(&repo, Path::new("linked-dir/citation.txt")).is_err());
+        // A mid-path symlink-to-directory fails the O_DIRECTORY|O_NOFOLLOW
+        // open with ENOTDIR, not ELOOP, but must still be normalized to
+        // ELOOP by the walk itself so open_failure_reason classifies it as
+        // SymlinkPathRejected rather than FileMissing (Important 1).
+        assert_eq!(
+            open_citation_file_fallback(&repo, Path::new("linked-dir/citation.txt")).unwrap_err(),
+            rustix::io::Errno::LOOP
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_descriptor_walk_fallback_regular_file_as_dir_component_is_not_a_symlink_rejection() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("plain.txt"), b"plain").unwrap();
+
+        // A regular file used as a directory component also fails with
+        // ENOTDIR, but it is not a symlink, so the walk must leave it as
+        // ENOTDIR (which classifies as FileMissing) rather than
+        // normalizing it to ELOOP like the symlink case above.
+        assert_eq!(
+            open_citation_file_fallback(repo.path(), Path::new("plain.txt/child")).unwrap_err(),
+            rustix::io::Errno::NOTDIR
+        );
     }
 
     #[cfg(unix)]
@@ -2080,9 +2367,107 @@ mod tests {
 
         let result = safe_join(dir.path(), "probe.txt");
         assert!(result.is_some());
-        // Canonical path must be inside the tempdir.
-        let canon = result.unwrap();
-        assert!(canon.starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(result.unwrap(), file_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_symlink_components_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plain/nested")).unwrap();
+        symlink(dir.path().join("plain"), dir.path().join("sym")).unwrap();
+
+        assert_eq!(
+            safe_join(dir.path(), "plain/nested"),
+            Some(dir.path().join("plain/nested"))
+        );
+        assert!(safe_join(dir.path(), "sym/nested").is_none());
+        assert!(safe_join(dir.path(), "plain/../plain").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_a_component_free_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(safe_join(dir.path(), "").is_none());
+        assert!(safe_join(dir.path(), ".").is_none());
+        assert!(safe_join(dir.path(), "./.").is_none());
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #[test]
+        fn prop_safe_join_accepts_exactly_existing_plain_relative_paths(
+            components in prop::collection::vec(
+                prop_oneof![
+                    Just("a"), Just("b"), Just("."), Just(".."),
+                    Just("symdir"), Just("symfile"), Just("missing"),
+                ],
+                0..8,
+            )
+        ) {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_file = outside.path().join("target-file");
+            std::fs::write(&outside_file, b"outside file").unwrap();
+
+            // Walk the same components safe_join will walk, building up the
+            // expected accepted path (skipping "." exactly as safe_join
+            // does) and creating on disk only the prefix that is reachable
+            // before the first component that must reject the whole path:
+            // a syntactic "..", a symlink (of either kind, at any position,
+            // not only trailing), or a component that is never created at
+            // all (the "component does not exist" branch).
+            let mut prefix = dir.path().to_path_buf();
+            let mut saw_normal_component = false;
+            let mut expect_none = false;
+            for component in &components {
+                match *component {
+                    "." => continue,
+                    ".." => {
+                        expect_none = true;
+                        break;
+                    }
+                    "a" | "b" => {
+                        saw_normal_component = true;
+                        prefix.push(*component);
+                        std::fs::create_dir_all(&prefix).unwrap();
+                    }
+                    "symdir" => {
+                        saw_normal_component = true;
+                        prefix.push("symdir");
+                        symlink(outside.path(), &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "symfile" => {
+                        saw_normal_component = true;
+                        prefix.push("symfile");
+                        symlink(&outside_file, &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "missing" => {
+                        saw_normal_component = true;
+                        expect_none = true;
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            let rel = components.join("/");
+            let expected = if expect_none || !saw_normal_component {
+                None
+            } else {
+                Some(prefix)
+            };
+            prop_assert_eq!(safe_join(dir.path(), &rel), expected);
+        }
     }
 
     #[test]
@@ -2232,6 +2617,57 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_file_has_no_check_then_open_window_under_either_resolver() {
+        // Before this fix, scan_file stat'd `path` (rejecting a symlink)
+        // and then re-opened it by pathname -- two syscalls, with a window
+        // between them an attacker could win by swapping a regular file
+        // for a symlink. The fix replaces both with a single
+        // resolver-based open, so there is no window left to race:
+        // confirm a symlinked candidate is rejected under both resolvers
+        // and nothing outside the repo is ever charged or read, using the
+        // same swap sequence as `test_scan_file_swap_to_symlink_never_matches_outside_content`.
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside secret needle").unwrap();
+        let candidate = repo.path().join("candidate.txt");
+
+        for resolver in [Resolver::Openat2, Resolver::Fallback] {
+            std::fs::write(&candidate, b"inside only").unwrap();
+            std::fs::remove_file(&candidate).unwrap();
+            symlink(outside.path(), &candidate).unwrap();
+
+            let reporter = NoopCapabilityReporter;
+            let emitted = AtomicBool::new(true);
+            let verifier = Verifier::with_capabilities(
+                repo.path(),
+                VerificationCapabilities {
+                    descriptor_containment_degraded: false,
+                    resolver,
+                },
+                &reporter,
+                &emitted,
+            );
+            let mut budget = 1024;
+            assert!(
+                matches!(
+                    verifier.scan_file(&candidate, b"outside secret", &mut budget),
+                    FileScan::Skipped
+                ),
+                "resolver={resolver:?}"
+            );
+            assert_eq!(
+                budget, 1024,
+                "resolver={resolver:?}: outside target must not be charged or read"
+            );
+
+            std::fs::remove_file(&candidate).unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_containment_rejects_sibling_prefix_path() {
@@ -2269,14 +2705,52 @@ mod tests {
 
         let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly);
         assert_eq!(outcome.status, VerificationStatus::Unverified);
-        // Non-disclosure rule (bd-eho3): a resolution-level escape (symlink,
-        // no ".." in the syntactic path) is not distinguishable from a plain
-        // missing file without probing outside containment, so it folds to
-        // FileMissing rather than PathEscape. Only syntactic escapes ("..",
-        // absolute paths) report PathEscape now.
-        assert_eq!(outcome.reason, Some(UnverifiedReason::FileMissing));
+        // Non-disclosure rule (bd-eho3): reporting SymlinkPathRejected here
+        // does not create an existence oracle for the sibling target. The
+        // fact being disclosed is that `linked.txt`, a component that lives
+        // inside the repo, is itself a symlink -- metadata read from within
+        // the repository, not from wherever the link resolves to. Whether
+        // the target exists, and whether it is inside or outside the repo,
+        // never affects this reason, so no side channel about the outside
+        // world is opened. Contrast with PathEscape/FileMissing folding,
+        // which exists precisely to avoid disclosing outside-repo state.
+        assert_eq!(outcome.reason, Some(UnverifiedReason::SymlinkPathRejected));
         assert_eq!(outcome.relocated_to, None);
         assert!(!outcome.is_verified(), "sibling content must never verify");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "a strong relocation excerpt must be long enough to search\n",
+            "and must contain enough lines to satisfy the verifier\n"
+        );
+        std::fs::write(dir.path().join("cited.rs"), b"changed bytes").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target.rs"), excerpt).unwrap();
+        symlink(
+            outside.path().join("target.rs"),
+            dir.path().join("candidate.rs"),
+        )
+        .unwrap();
+
+        let mut evidence = make_evidence(
+            Some("cited.rs".to_string()),
+            hash_bytes(b"original bytes"),
+            "code",
+        );
+        evidence.citation_excerpt = Some(excerpt.to_string());
+        let skipped = verify_evidence(&evidence, dir.path(), RelocationPolicy::FileThenRepo);
+        assert_eq!(skipped.status, VerificationStatus::Unverified);
+        assert_eq!(skipped.reason, Some(UnverifiedReason::NoCandidate));
+        assert_eq!(
+            skipped.relocated_to, None,
+            "no relocation means no heal plan"
+        );
     }
 
     #[cfg(unix)]
