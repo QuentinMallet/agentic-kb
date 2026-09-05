@@ -39,7 +39,9 @@ impl Runnable for Cite {
 
 impl Cite {
     pub fn execute(&self) -> Result<()> {
-        let repo_root = config::Paths::discover()?.root;
+        let repo_root = config::Paths::discover()
+            .map_err(|_| anyhow!("kb cite requires a repository with a knowledge base"))?
+            .root;
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         self.execute_with_root(&repo_root, &mut handle)
@@ -156,6 +158,23 @@ mod tests {
     use std::fs;
 
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    /// RAII guard that restores cwd on drop (same pattern as add.rs tests).
+    /// Only safe under `cargo nextest run` (one process per test); see the
+    /// equivalent note on `config::tests::CwdGuard`.
+    struct CwdGuard(std::path::PathBuf);
+    impl CwdGuard {
+        fn set(dir: &Path) -> Self {
+            let orig = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            CwdGuard(orig)
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
@@ -281,5 +300,25 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_cite_execute_reports_a_clear_error_outside_a_knowledge_base_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .state/, no db, no legacy agent-kb/ — nothing for discover() to find.
+        let cmd = Cite {
+            target: "sample.rs".to_string(),
+        };
+
+        let _guard = CwdGuard::set(dir.path());
+        let err = cmd.execute().unwrap_err();
+        drop(_guard);
+
+        assert_eq!(
+            err.to_string(),
+            "kb cite requires a repository with a knowledge base",
+            "outside a KB repo, kb cite must report a clear error instead of \
+             the raw Paths::discover() bail message"
+        );
     }
 }
