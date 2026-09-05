@@ -439,12 +439,31 @@ request_struct!(
     }
 );
 
+/// One row of `audit_record`'s `verdicts` array.
+///
+/// This used to be a raw `Value`, read with
+/// `.get("verdict").and_then(Value::as_bool).unwrap_or(false)` — a verdict
+/// item with a missing or non-boolean `verdict` key (or a missing
+/// `entry_id`) silently coerced to `false` and expired the entry, bypassing
+/// both the note-required check and the permanent-entry guard (both test
+/// `== Some(false)`, which that coercion never produces). A typed struct
+/// with `deny_unknown_fields` rejects all of that — and a stray key inside
+/// one verdict row — at the parse boundary, before any write.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditVerdict {
+    #[serde(deserialize_with = "de_entry_id")]
+    entry_id: String,
+    verdict: bool,
+    note: Option<String>,
+}
+
 request_struct!(
     /// `audit_record` — record audit verdicts.
     AuditRecordRequest {
         #[serde(deserialize_with = "de_run_id")]
         run_id: String,
-        verdicts: Option<Vec<Value>>,
+        verdicts: Option<Vec<AuditVerdict>>,
     }
 );
 
@@ -1998,7 +2017,7 @@ fn handle_audit_record(
         return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
     }
 
-    let verdicts: Vec<Value> = req.verdicts.clone().unwrap_or_default();
+    let verdicts: Vec<AuditVerdict> = req.verdicts.clone().unwrap_or_default();
 
     if verdicts.len() > MAX_AUDIT_VERDICTS {
         return json!({"id":id,"type":"error","code":"parse_error",
@@ -2006,18 +2025,13 @@ fn handle_audit_record(
     }
 
     for verdict in &verdicts {
-        if verdict.get("verdict").and_then(Value::as_bool) == Some(false)
-            && verdict
-                .get("note")
-                .and_then(Value::as_str)
-                .map_or(true, |note| note.trim().is_empty())
-        {
-            let entry_id = verdict
-                .get("entry_id")
-                .and_then(Value::as_str)
-                .unwrap_or("<missing>");
+        let note_is_blank = match verdict.note.as_deref() {
+            Some(note) => note.trim().is_empty(),
+            None => true,
+        };
+        if !verdict.verdict && note_is_blank {
             return json!({"id":id,"type":"error","code":"parse_error",
-                "message":format!("entry '{}' verdict=false requires a non-empty note", entry_id)});
+                "message":format!("entry '{}' verdict=false requires a non-empty note", verdict.entry_id)});
         }
     }
 
@@ -2042,49 +2056,43 @@ fn handle_audit_record(
     // Validate ALL entry_ids up front so no expire events are written for a
     // partially-invalid batch (prevents orphaned expires on retry).
     for v in &verdicts {
-        if let Some(eid) = v.get("entry_id").and_then(|x| x.as_str()) {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE id=?1",
-                    params![eid],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
-            if !exists {
-                return json!({"id":id,"type":"error","code":"invalid_entry_id","message":format!("entry '{}' not found", eid)});
-            }
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id=?1",
+                params![v.entry_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !exists {
+            return json!({"id":id,"type":"error","code":"invalid_entry_id","message":format!("entry '{}' not found", v.entry_id)});
         }
     }
 
     // Validate all (run_id, entry_id) pairs were registered by a prior audit_run call,
     // preventing replay with an arbitrary run_id that bypasses the sampling step.
     for v in &verdicts {
-        if let Some(eid) = v.get("entry_id").and_then(|x| x.as_str()) {
-            let in_candidates: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
-                    params![run_id, eid],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                > 0;
-            if !in_candidates {
-                return json!({"id":id,"type":"error","code":"unknown_run_candidates",
-                    "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", eid, run_id)});
-            }
+        let in_candidates: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, v.entry_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if !in_candidates {
+            return json!({"id":id,"type":"error","code":"unknown_run_candidates",
+                "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", v.entry_id, run_id)});
         }
     }
 
     // Check every destructive verdict before appending any event or writing any row.
     for v in &verdicts {
-        if v.get("verdict").and_then(Value::as_bool) == Some(false) {
-            if let Some(eid) = v.get("entry_id").and_then(Value::as_str) {
-                if db::expire_guard(&conn, eid, false) == Err(db::ExpireRefusal::Permanent) {
-                    return json!({"id":id,"type":"error","code":"permanent_guard",
-                        "message":format!("entry '{}' cannot be expired: permanent", eid)});
-                }
-            }
+        if !v.verdict
+            && db::expire_guard(&conn, &v.entry_id, false) == Err(db::ExpireRefusal::Permanent)
+        {
+            return json!({"id":id,"type":"error","code":"permanent_guard",
+                "message":format!("entry '{}' cannot be expired: permanent", v.entry_id)});
         }
     }
 
@@ -2093,18 +2101,9 @@ fn handle_audit_record(
     // This eliminates the split-brain failure mode where a batch expire could succeed
     // while the subsequent audit_runs inserts fail.
     for verdict_obj in &verdicts {
-        let entry_id = match verdict_obj.get("entry_id").and_then(|v| v.as_str()) {
-            Some(e) => e.to_string(),
-            None => continue,
-        };
-        let verdict = verdict_obj
-            .get("verdict")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let note = verdict_obj
-            .get("note")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let entry_id = verdict_obj.entry_id.clone();
+        let verdict = verdict_obj.verdict;
+        let note = verdict_obj.note.clone();
 
         // The expire event, if any, is appended to the JSONL log here, before
         // the transactional boundary below. That append is the one part of
@@ -5870,6 +5869,55 @@ mod tests {
                 "rejection must name the missing field {missing}: {message}"
             );
         }
+    }
+
+    /// CRITICAL (premium review of bd-21ef.2..bd-21ef.2.12b): the effective
+    /// verdict used to be read as
+    /// `verdict_obj.get("verdict").and_then(|v| v.as_bool()).unwrap_or(false)`,
+    /// so a verdict item with a missing or non-boolean `verdict` key was
+    /// silently treated as `false` and appended an expire event — while both
+    /// the note-required check and the permanent-entry guard test
+    /// `== Some(false)`, which a missing/non-bool key never satisfies, so
+    /// neither guard ever fired. A permanent entry could be expired with no
+    /// note by simply omitting the key. Same hole for a missing `entry_id`
+    /// (previously a silent no-op: `recorded: 0`, not a rejection). All three
+    /// must now be rejected at the parse boundary, before any write.
+    #[test]
+    fn test_audit_record_rejects_a_verdict_item_with_missing_or_non_boolean_verdict() {
+        let (_dir, paths, emb) = setup();
+
+        let missing_verdict = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"audit_record","id":"mv1","run_id":"run-x",
+                    "verdicts":[{"entry_id":"whatever"}]}),
+        );
+        assert_eq!(
+            missing_verdict["code"], "parse_error",
+            "missing verdict key: {missing_verdict}"
+        );
+
+        let string_verdict = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"audit_record","id":"mv2","run_id":"run-x",
+                    "verdicts":[{"entry_id":"whatever","verdict":"false"}]}),
+        );
+        assert_eq!(
+            string_verdict["code"], "parse_error",
+            "non-boolean verdict: {string_verdict}"
+        );
+
+        let missing_entry_id = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"audit_record","id":"mv3","run_id":"run-x",
+                    "verdicts":[{"verdict":true}]}),
+        );
+        assert_eq!(
+            missing_entry_id["code"], "parse_error",
+            "missing entry_id: {missing_entry_id}"
+        );
     }
 
     #[test]

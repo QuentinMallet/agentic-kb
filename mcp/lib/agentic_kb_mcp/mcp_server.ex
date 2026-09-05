@@ -409,6 +409,8 @@ defmodule AgenticKbMcp.McpServer do
             "description" => "Verdicts shaped as {entry_id, verdict, note?}",
             "items" => %{
               "type" => "object",
+              "additionalProperties" => false,
+              "required" => ["entry_id", "verdict"],
               "properties" => %{
                 "entry_id" => %{"type" => "string"},
                 "verdict" => %{"type" => "boolean"},
@@ -528,16 +530,48 @@ defmodule AgenticKbMcp.McpServer do
   end
 
   defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts}) when is_list(verdicts) do
-    Enum.find_value(verdicts, :ok, fn verdict ->
-      if is_map(verdict) and verdict["verdict"] == false and
-           (not is_binary(verdict["note"]) or String.trim(verdict["note"]) == "") do
-        {:error,
-         "entry '#{Map.get(verdict, "entry_id", "<missing>")}' verdict=false requires a non-empty note"}
-      end
-    end)
+    Enum.find_value(verdicts, :ok, &validate_audit_verdict_item/1)
   end
 
   defp validate_tool_values(_tool, _args), do: :ok
+
+  # CRITICAL (premium review of bd-21ef.2..bd-21ef.2.12b): the previous check
+  # was `verdict["verdict"] == false`, which is not satisfied by a missing
+  # `verdict` key or a non-boolean value (e.g. the string `"false"`) — such a
+  # row passed straight through to the Rust port, which used to coerce the
+  # same shape to `false` via `.unwrap_or(false)` and expire the entry with no
+  # note and no permanent-entry check. `additionalProperties: false` on the
+  # tool schema documents the same three requirements (boolean verdict,
+  # string entry_id, no stray keys) but is not itself enforced at runtime, so
+  # this function is the actual gate.
+  defp validate_audit_verdict_item(verdict) when not is_map(verdict) do
+    {:error, "each verdict item must be an object"}
+  end
+
+  defp validate_audit_verdict_item(verdict) do
+    allowed = ~w(entry_id verdict note)
+    unknown = verdict |> Map.keys() |> Enum.reject(&(&1 in allowed)) |> Enum.sort()
+
+    cond do
+      unknown != [] ->
+        {:error,
+         "unknown key#{if length(unknown) > 1, do: "s", else: ""} in verdict item: " <>
+           Enum.join(unknown, ", ")}
+
+      not is_boolean(verdict["verdict"]) ->
+        {:error, "entry '#{Map.get(verdict, "entry_id", "<missing>")}' verdict must be a boolean"}
+
+      not is_binary(verdict["entry_id"]) ->
+        {:error, "each verdict item requires a string entry_id"}
+
+      verdict["verdict"] == false and
+          (not is_binary(verdict["note"]) or String.trim(verdict["note"]) == "") ->
+        {:error, "entry '#{verdict["entry_id"]}' verdict=false requires a non-empty note"}
+
+      true ->
+        nil
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Public API
