@@ -37,10 +37,10 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
-use crate::crash_sim::{kill_point, KillPoint};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
 use crate::components::{db, embedder, events, redactor};
 use crate::config;
+use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -189,12 +189,7 @@ pub fn add_locked(
         );
     }
 
-    let repo_root = paths
-        .db
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("cannot determine repository root from KB database path"))?;
+    let repo_root = &paths.root;
 
     // Normalize path-only evidence before constructing any events. Explicit
     // assertions are authoritative and are never replaced, even when wrong.
@@ -449,10 +444,10 @@ pub fn add_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crash_sim::KillPoint;
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events as ev_mod;
     use crate::config::Paths;
+    use crate::crash_sim::KillPoint;
     use rusqlite::Connection;
     use std::fs;
     use std::process::Command;
@@ -597,7 +592,7 @@ mod tests {
         );
 
         if paths.db.exists() {
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let rows: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE id=?1",
@@ -628,7 +623,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         let evidence_status: String = conn
             .query_row(
@@ -671,7 +666,7 @@ mod tests {
             })]),
         )
         .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, expected_hash);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
@@ -698,7 +693,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence_rows = load_all_test_evidence(&conn);
         assert_eq!(evidence_rows.len(), 3);
         assert!(evidence_rows
@@ -726,7 +721,7 @@ mod tests {
             })]),
         )
         .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, explicit);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
@@ -839,7 +834,7 @@ mod tests {
         assert_eq!(ev4["id"], "new-1");
 
         // DB: old entries must be stale, new entry active.
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         for seed_id in &["seed-1", "seed-2"] {
             let stale: i64 = conn
                 .query_row(
@@ -896,7 +891,7 @@ mod tests {
         // Must succeed — the NoopEmbedder is injected and used, not looked up via env.
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE id='env-test-1'",
@@ -935,7 +930,7 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let session_id: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id='sess-test-1'",

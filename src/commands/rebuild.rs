@@ -570,7 +570,6 @@ mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use std::process::Command as Cmd;
     use std::thread;
@@ -616,14 +615,14 @@ mod tests {
     }
 
     fn count_entries(paths: &Paths) -> i64 {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap()
     }
 
     fn insert_expired_peer(paths: &Paths) {
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
              VALUES('rebuild-peer-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
@@ -680,7 +679,7 @@ mod tests {
 
         Rebuild.execute_with(&paths, &emb).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let peers: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM peers WHERE id='rebuild-peer-expired'",
@@ -705,7 +704,7 @@ mod tests {
         assert_eq!(count_entries(&paths), 10);
 
         // Corrupt DB
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .execute("DELETE FROM entries", [])
             .unwrap();
@@ -716,7 +715,7 @@ mod tests {
     }
 
     fn entry_content(paths: &Paths, id: &str) -> Option<String> {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row(
                 "SELECT content FROM entries WHERE id=?1 AND is_stale=0",
@@ -1053,6 +1052,7 @@ mod tests {
 
         fn clone_paths(paths: &Paths) -> Paths {
             Paths {
+                root: paths.root.clone(),
                 lock: paths.lock.clone(),
                 events: paths.events.clone(),
                 db: paths.db.clone(),

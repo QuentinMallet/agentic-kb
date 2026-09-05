@@ -1568,7 +1568,7 @@ mod tests {
     }
 
     fn insert_expired_peer(paths: &Paths) {
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
              VALUES('compact-peer-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
@@ -1660,7 +1660,7 @@ mod tests {
             .execute_with_paths_and_vacuum(&paths, &VacuumConfig::default())
             .unwrap();
 
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         let peers: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM peers WHERE id='compact-peer-expired'",

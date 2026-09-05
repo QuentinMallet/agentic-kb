@@ -60,6 +60,21 @@ while IFS= read -r line; do
       # (the owning GenServer terminated and tore down the port).
       while IFS= read -r _unused; do :; done
       ;;
+    audit_run)
+      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[]}\n' "$id"
+      ;;
+    audit_record)
+      printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      ;;
+    audit_report)
+      printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      ;;
+    provenance)
+      printf '{"id":"%s","type":"result","roots":["root-1"],"graph":[],"truncated":false}\n' "$id"
+      ;;
+    reembed)
+      printf '{"id":"%s","type":"ok","embedded":0,"failed":0,"failures":[],"skipped":0,"missing":1,"raced":0,"dry_run":false,"noop_embedder":true,"message":"KB_NO_EMBED is set — no embedder available"}\n' "$id"
+      ;;
     *)
       printf '{"id":"%s","type":"result"}\n' "$id"
       ;;

@@ -75,7 +75,10 @@ impl Runnable for CitedBy {
 impl CitedBy {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let repo_root = config::git_repo_root();
+        // paths.root (not a CWD-based git_repo_root() subprocess) so this
+        // agrees with add/cite and the MCP port even inside a managed
+        // .state git worktree, whose own git toplevel would otherwise differ.
+        let repo_root = Some(paths.root.clone());
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         self.execute_with(&paths, repo_root.as_deref(), &mut handle)

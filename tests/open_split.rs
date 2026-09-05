@@ -171,6 +171,104 @@ fn open_ro_recovers_a_hot_wal_left_by_a_crashed_writer() {
     assert_eq!(summary, "summary");
 }
 
+/// Companion to the test above, but for `open_ro_peer`: unlike `open_ro`, a
+/// peer opener must never write a single byte of the peer's `db`, `-wal`,
+/// or `-shm` files, not even to serve a read. It always opens with the
+/// `immutable=1` URI hint (see its doc comment for why a plain
+/// `SQLITE_OPEN_READ_ONLY` handle is not sufficient — it can still write
+/// read-mark bytes into an *existing* `-shm`), which ignores the WAL/shm
+/// machinery entirely, so a row sitting only in a hot, unmerged WAL is
+/// invisible through it even when the `-shm` is missing outright. That is
+/// the documented trade this opener makes to guarantee a peer's on-disk
+/// bytes are never written.
+#[test]
+fn open_ro_peer_never_writes_and_ignores_a_hot_wal_when_shm_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = repo(dir.path());
+    db::open_or_init(&paths).unwrap();
+
+    {
+        let conn = Connection::open(&paths.db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO entries(id, path, summary, content, tags)
+             VALUES('hot','p/hot','hot summary','hot content','[]')",
+            [],
+        )
+        .unwrap();
+        // Never closed: no checkpoint, no clean shutdown — a hot WAL.
+        std::mem::forget(conn);
+    }
+
+    let wal = wal_path(&paths.db);
+    assert!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+        "precondition: the committed row must still live only in the hot WAL"
+    );
+    // Discard the wal-index so a strictly read-only opener cannot recover it.
+    let _ = std::fs::remove_file(shm_path(&paths.db));
+
+    let db_bytes_before = std::fs::read(&paths.db).unwrap();
+    let wal_bytes_before = std::fs::read(&wal).unwrap();
+
+    let conn = db::open_ro_peer(&paths.db)
+        .expect("open_ro_peer must open successfully even with no -shm present");
+    let found: i64 = conn
+        .query_row("SELECT COUNT(*) FROM entries WHERE id='hot'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        found, 0,
+        "open_ro_peer's immutable open ignores the WAL, so the hot-only row must not be visible"
+    );
+    drop(conn);
+
+    assert_eq!(
+        std::fs::read(&paths.db).unwrap(),
+        db_bytes_before,
+        "open_ro_peer must never rewrite the peer's main db file"
+    );
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        wal_bytes_before,
+        "open_ro_peer must never touch the peer's -wal file"
+    );
+    assert!(
+        !shm_path(&paths.db).exists(),
+        "open_ro_peer's immutable open must never recreate the peer's -shm file"
+    );
+}
+
+/// `open_ro_peer` builds a `file:...?immutable=1` URI by string
+/// interpolation, so a peer path containing a character meaningful to the
+/// URI-filename grammar has to be percent-encoded first, or SQLite misparses
+/// the path and the peer is silently skipped as uninitialized. A `#` is the
+/// sharpest case: unencoded, it introduces a URI fragment, truncating the
+/// path SQLite actually opens.
+#[test]
+fn open_ro_peer_percent_encodes_a_hash_in_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("repo#with-hash");
+    let paths = repo(&repo_root);
+    db::open_or_init(&paths).unwrap();
+
+    let conn = db::open_ro_peer(&paths.db)
+        .expect("open_ro_peer must percent-encode a '#' rather than misparse the URI");
+    let entries: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        entries, 1,
+        "open_ro_peer must open the real db at the '#'-containing path, not a misparsed one"
+    );
+}
+
 #[test]
 fn open_or_init_does_not_sweep_expired_peers() {
     let dir = tempfile::tempdir().unwrap();

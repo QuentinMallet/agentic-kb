@@ -98,7 +98,10 @@ impl Context {
             }
             Err(e) => return Err(e),
         };
-        let repo_root = config::git_repo_root();
+        // paths.root (not a CWD-based git_repo_root() subprocess) so this
+        // agrees with add/cite and the MCP port even inside a managed
+        // .state git worktree, whose own git toplevel would otherwise differ.
+        let repo_root = Some(paths.root.clone());
         let working_set = repo_root
             .as_deref()
             .map(enumerate_working_set)

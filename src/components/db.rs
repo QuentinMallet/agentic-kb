@@ -15,6 +15,35 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpireRefusal {
+    Permanent,
+}
+
+/// Refuse expiration of protected entries unless the caller explicitly forces it.
+pub fn expire_guard(
+    conn: &Connection,
+    entry_id: &str,
+    force: bool,
+) -> std::result::Result<(), ExpireRefusal> {
+    if force {
+        return Ok(());
+    }
+
+    let permanent: Option<i64> = conn
+        .query_row(
+            "SELECT permanent FROM entries WHERE id=?1",
+            params![entry_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if permanent == Some(1) {
+        Err(ExpireRefusal::Permanent)
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resource caps (br-h9g, security I2)
 // ---------------------------------------------------------------------------
@@ -220,6 +249,23 @@ fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a non-repository SQLite file whose lifecycle is managed by its owning
+/// component (currently the best-effort query-hit telemetry database).
+/// Repository databases must use `open_ro` or `open_rw` instead.
+pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
+    if is_live_db_path(db_path) {
+        return Err(rusqlite::Error::InvalidPath(db_path.to_path_buf()));
+    }
+    Connection::open(db_path)
+}
+
+/// Raw file opener for tests that intentionally bypass production policy to
+/// inspect or manufacture database states.
+#[cfg(test)]
+pub(crate) fn open_unchecked_for_test(db_path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open(db_path)
+}
+
 /// Create the schema on a connection that may be opening a brand-new file.
 ///
 /// Fresh-DB detection runs BEFORE `ensure_schema`: a DB with no `entries` table
@@ -264,6 +310,108 @@ pub fn open_ro(db_path: &Path) -> Result<Connection> {
         Err(err) => return Err(err).with_context(|| format!("open DB {}", db_path.display())),
     };
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
+    // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
+    // corrupt file, an unreadable page — surface as themselves instead of
+    // being flattened into "uninitialized".
+    let entries_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema of {}", db_path.display()))?;
+    if entries_tables == 0 {
+        return Err(DbUninitialized {
+            db_path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(conn)
+}
+
+/// Percent-encode the characters that are meaningful to SQLite's URI-filename
+/// parser when they appear inside the path itself: `%` (the escape character,
+/// encoded first so the encodings below are not themselves re-escaped), `#`
+/// (introduces a fragment, which SQLite strips from the path), and `?`
+/// (introduces the query string — the very `?immutable=1` [`open_ro_peer`]
+/// appends). Left unencoded, any of these in a peer's path would misparse
+/// the URI; `open_ro_peer`'s caller treats every open failure as "peer
+/// unreachable" (search.rs warns and skips it), so the failure mode is a
+/// silently skipped peer rather than a crash — worth avoiding regardless.
+fn percent_encode_uri_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3f")
+}
+
+/// Open another repository's database for federated (peer) reads.
+///
+/// `open_ro`'s `PRAGMA query_only=ON` blocks logical SQL writes, but the file
+/// handle it opens is still `SQLITE_OPEN_READ_WRITE` so that a lone reader
+/// arriving after a crash can recover a hot WAL — that recovery, and the WAL
+/// checkpoint SQLite performs when the last connection to a WAL database
+/// closes, both write bytes to the file. That is acceptable for a
+/// repository's own database (ADR-1's crash-recovery contract) but never
+/// acceptable for a *peer's* database: this repository has no right to
+/// rewrite another repository's on-disk bytes, ever, for any reason.
+///
+/// A plain `SQLITE_OPEN_READ_ONLY` handle is not enough to guarantee that:
+/// when the peer's `-shm` wal-index already exists, SQLite still opens it
+/// read-write and updates the connection's "read mark" slot in it, to tell
+/// a future checkpoint how far back this reader still needs WAL frames —
+/// a real byte-level write to the peer's `-shm` file, even though the main
+/// db handle never writes the db or `-wal` file itself (pinned by
+/// `tests/open_split.rs::open_ro_peer_never_writes_and_ignores_a_hot_wal_when_shm_is_missing`
+/// and the federated byte-identity test in `commands::search::tests`).
+/// So this always opens with the `immutable=1` URI hint instead, which
+/// tells SQLite the file is a static snapshot and skips the WAL/locking
+/// machinery — and therefore the `-shm` file — entirely, reading only the
+/// main database file as of its last checkpoint. That can miss rows still
+/// sitting in an unmerged WAL, but it is the only way to guarantee zero
+/// bytes of the peer's `db`, `-wal`, or `-shm` files are ever written —
+/// the trade this function exists to make.
+///
+/// `immutable=1` is a promise *to* SQLite, not a guarantee it enforces: it
+/// tells SQLite this connection will take no locks on the file because
+/// nothing else can be writing it, which is true for our own database but
+/// not for a peer's — a peer is another repository with its own live
+/// writer, so its checkpoint can rewrite pages out from under this
+/// unlocked reader mid-query. SQLite's documented contract for that misuse
+/// is "incorrect query results or SQLITE_CORRUPT_VTAB errors", not a clean
+/// failure. In practice a mid-torn-read failure usually surfaces as an
+/// open or query error, which the caller (`search.rs`) already treats as
+/// "peer unreachable" and warns past — degrading safely — but a query that
+/// reads a torn page and still returns *some* row cannot be told apart
+/// from a correct one. That is acceptable only because federated peer
+/// search is best-effort by design (results are merged opportunistically,
+/// never the sole source of truth); this opener must never be reused for
+/// anything where a wrong-but-plausible answer would matter more than a
+/// missing one.
+///
+/// Returns [`DbUninitialized`] under the same conditions as [`open_ro`].
+pub fn open_ro_peer(db_path: &Path) -> Result<Connection> {
+    let uri = format!("file:{}?immutable=1", percent_encode_uri_path(db_path));
+    let conn = match Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open peer DB read-only {}", db_path.display()))
+        }
+    };
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
     // corrupt file, an unreadable page — surface as themselves instead of
     // being flattened into "uninitialized".
@@ -331,7 +479,7 @@ pub fn open_scratch(db_path: &Path) -> Result<Connection> {
 ///
 /// Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) are distinct names, so the
 /// only path to refuse is exactly `<root>/.state/agent-kb/agent-kb.db`.
-fn is_live_db_path(db_path: &Path) -> bool {
+pub(crate) fn is_live_db_path(db_path: &Path) -> bool {
     let Some(file_name) = db_path.file_name() else {
         return false;
     };
@@ -1415,14 +1563,13 @@ pub struct SearchOptions {
     pub inline_verify_k: usize,
     /// Repository root used for inline evidence verification.
     ///
-    /// Preferred for MCP and other long-running contexts where the process CWD
-    /// is not the repo (e.g. the MCP port is typically spawned with CWD `/`,
-    /// causing the CWD-based `find_repo_root()` walk to fail). MCP callers
-    /// derive this via `root_from_db()` (see `src/commands/mcp.rs:40-45`).
-    ///
-    /// When `None`, `search_entries` falls back to walking up from CWD via
-    /// `find_repo_root()`. CLI invocations may leave this `None` because the
-    /// user runs the binary from inside the repo tree.
+    /// Every caller resolves this from `config::Paths::root` — the same
+    /// layout-aware root `add`/`cite` hash evidence against — rather than
+    /// leaving it `None` for a CWD-based `.git` walk to (re)discover, which
+    /// could silently disagree (e.g. inside a nested checkout, or when the
+    /// process cwd isn't the repo at all, as with the MCP port typically
+    /// spawned with cwd `/`). When `None`, verification still runs but always
+    /// reports `Unverified` (no root to resolve citation paths against).
     pub repo_root: Option<PathBuf>,
     /// Pool size for the bounded verify thread pool (br-23b.13).
     /// Currently unused; reserved for forward-compatibility with the
@@ -2480,10 +2627,11 @@ pub fn search_entries(
 
     let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
 
-    // Resolve repo root: prefer explicit `opts.repo_root` (MCP path — CWD is
-    // typically `/`, so CWD-based discovery fails). Fall back to walking up
-    // from CWD via `find_repo_root()` (CLI path — user runs from inside repo).
-    let repo_root: Option<PathBuf> = opts.repo_root.clone().or_else(find_repo_root);
+    // Every caller now resolves and threads the repository root explicitly
+    // (config::Paths::root) instead of relying on a CWD-based `.git` walk,
+    // which could silently disagree with the root `add`/`cite` hash evidence
+    // against (e.g. inside a nested checkout). See docs/decisions/b3-root-derivation.md.
+    let repo_root: Option<PathBuf> = opts.repo_root.clone();
 
     let verify_count = opts.inline_verify_k.min(entries.len());
 
@@ -2685,22 +2833,6 @@ pub fn search_entries(
     Ok(entries)
 }
 
-/// Walk up from CWD to find a directory containing `.git`.
-/// Returns None if not found (e.g. in tempdir tests).
-fn find_repo_root() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut dir: &Path = &cwd;
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2710,6 +2842,26 @@ mod tests {
 
     static UPDATED_AT_FETCH_COUNT: AtomicUsize = AtomicUsize::new(0);
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    /// `open_auxiliary` exists so non-repository SQLite files (query-hit
+    /// telemetry) can bypass the repository lock/DDL discipline, but it must
+    /// still refuse a genuine repository db path — a caller bug that pointed
+    /// an "auxiliary" open at `agent-kb.db` must not silently start managing
+    /// the repository's real database outside the lock. Nothing previously
+    /// exercised this refusal: telemetry's only caller always passes a
+    /// `query-hits.db`-shaped path, which never matches it.
+    #[test]
+    fn open_auxiliary_refuses_a_live_repository_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        open_or_init(&paths).unwrap();
+
+        let err = open_auxiliary(&paths.db).unwrap_err();
+        assert!(
+            matches!(err, SqlError::InvalidPath(ref p) if *p == paths.db),
+            "open_auxiliary must refuse a live repository db path, got: {err:?}"
+        );
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
@@ -4077,20 +4229,21 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // br-bhg: explicit SearchOptions.repo_root threads through to verification.
-    // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
-    // returns None (or the wrong root), causing verified=false on every row.
+    // Regression for MCP cwd=/ case where a CWD-based repo-root walk returned
+    // None (or the wrong root), causing verified=false on every row.
     // -----------------------------------------------------------------------
 
     /// When `opts.repo_root` is `Some(path)`, inline evidence verification must
-    /// resolve citation_path relative to that path — not relative to whatever
-    /// repo `find_repo_root()` discovers from the current working directory.
+    /// resolve citation_path relative to that path — not against the process
+    /// cwd, which no caller relies on any more (every caller resolves
+    /// `repo_root` explicitly from `config::Paths::root`).
     ///
     /// Construction: write a cited file under a tempdir at a unique relative
-    /// path that does NOT exist under the test runner's CWD-discovered repo.
-    /// If `search_entries` honors `opts.repo_root`, verification reads bytes
-    /// from `<tempdir>/<rel>` and succeeds. If it falls back to CWD discovery,
-    /// the file is missing under the wrong root and verification returns
-    /// `Some(false)`.
+    /// path that does NOT exist under the test runner's own cwd. If
+    /// `search_entries` honors `opts.repo_root`, verification reads bytes
+    /// from `<tempdir>/<rel>` and succeeds. If it silently ignored
+    /// `opts.repo_root`, the file would be missing and verification would
+    /// return `Some(false)`.
     #[test]
     fn test_search_uses_explicit_repo_root_when_cwd_is_unrelated() {
         use sha2::{Digest, Sha256};
@@ -4098,10 +4251,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Unique relative path so it cannot collide with any file in the real
-        // worktree (the CWD-discovered repo root). If find_repo_root() were
-        // used instead of opts.repo_root, the verifier would look here:
-        //   <real-worktree>/src/__br_bhg_regression_explicit_root__.rs
+        // Unique relative path so it cannot collide with any file under the
+        // test runner's own cwd. If `opts.repo_root` were ignored, the
+        // verifier would look here:
+        //   <test-runner-cwd>/src/__br_bhg_regression_explicit_root__.rs
         // ...which does not exist, and verified would be Some(false).
         let rel = "src/__br_bhg_regression_explicit_root__.rs";
         let cited_content = b"// br-bhg regression: explicit repo_root\n";
@@ -4175,8 +4328,8 @@ mod tests {
         assert_eq!(
             entry.evidence[0].verified,
             Some(true),
-            "explicit opts.repo_root must be used for verification — CWD-based \
-             find_repo_root() would not find the cited file under the tempdir, \
+            "explicit opts.repo_root must be used for verification — the test \
+             runner's own cwd would not find the cited file under the tempdir, \
              so a Some(true) here proves repo_root threading works (MCP cwd=/ fix)"
         );
     }

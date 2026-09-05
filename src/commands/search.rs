@@ -88,6 +88,31 @@ impl Search {
         self.execute_with(&paths, emb.as_ref())
     }
 
+    /// Build the `SearchOptions` for this invocation, resolving `repo_root`
+    /// from the already-discovered repository root instead of leaving it
+    /// `None` for `search_entries` to re-derive from CWD. `add`/`cite` hash
+    /// evidence against `paths.root`; `search --verify`'s citation
+    /// verification must resolve against that same root, not a CWD-based
+    /// `.git` walk that can point at a different (e.g. nested) repository.
+    fn build_search_options(
+        &self,
+        kb_config: &config::KbConfig,
+        paths: &config::Paths,
+    ) -> db::SearchOptions {
+        db::SearchOptions {
+            limit: self.limit,
+            do_fts: self.fts || !self.semantic,
+            do_semantic: self.semantic || !self.fts,
+            path_prefix: self.path_prefix.clone(),
+            tag_filter: self.tag.clone(),
+            inline_verify_k: self.limit, // verify all results by default
+            repo_root: Some(paths.root.clone()),
+            verify_pool_size: kb_config.verify_pool_size,
+            recency_lambda: kb_config.recency_lambda,
+            mmr_lambda: kb_config.mmr_lambda,
+        }
+    }
+
     /// Execute with explicit paths and embedder (for testing).
     pub fn execute_with(
         &self,
@@ -95,23 +120,7 @@ impl Search {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        // CLI: repo_root left None; search_entries falls back to find_repo_root()
-        // walking from CWD, which is correct for the CLI invocation pattern (user
-        // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
-        // via root_from_db (mcp.rs:40-45) because MCP CWD is typically '/' and CWD
-        // discovery would fail.
-        let opts = db::SearchOptions {
-            limit: self.limit,
-            do_fts: self.fts || !self.semantic,
-            do_semantic: self.semantic || !self.fts,
-            path_prefix: self.path_prefix.clone(),
-            tag_filter: self.tag.clone(),
-            inline_verify_k: self.limit, // verify all results by default
-            repo_root: None,
-            verify_pool_size: kb_config.verify_pool_size,
-            recency_lambda: kb_config.recency_lambda,
-            mmr_lambda: kb_config.mmr_lambda,
-        };
+        let opts = self.build_search_options(&kb_config, paths);
 
         // A pure read: open_ro, never the write lock (ADR-7). An uninitialized
         // repository serves an empty result plus a one-line stderr note, which
@@ -149,8 +158,12 @@ impl Search {
             for peer_path in peer_paths {
                 let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
                 // A peer's DB belongs to another repository: reading it must
-                // never create it, run DDL against it, or sweep its rows.
-                let peer_conn = match db::open_ro(&peer_db) {
+                // never create it, run DDL against it, sweep its rows, or
+                // write so much as a WAL checkpoint to its files. open_ro
+                // (used for the local DB above) tolerates the write-back a
+                // hot-WAL recovery or checkpoint can cause; open_ro_peer is
+                // strictly read-only and never touches the peer's bytes.
+                let peer_conn = match db::open_ro_peer(&peer_db) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("warn: peer {peer_path}: {e}");
@@ -404,6 +417,42 @@ mod tests {
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
     }
 
+    /// The CLI's `search --verify` path must resolve citation verification
+    /// against the already-discovered repository root (`paths.root`), the
+    /// same root `add`/`cite` hash evidence against — not a CWD-based `.git`
+    /// walk that can silently resolve to a different repository.
+    #[test]
+    fn test_build_search_options_uses_paths_root_as_repo_root() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(dir.path());
+        let kb_config = config::KbConfig::from_paths(&paths);
+        let cmd = Search {
+            query: "q".to_string(),
+            fts: false,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            path_prefix: None,
+            tag: None,
+            content: false,
+            local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        };
+
+        let opts = cmd.build_search_options(&kb_config, &paths);
+
+        assert_eq!(
+            opts.repo_root,
+            Some(paths.root.clone()),
+            "search options must carry the discovered repo root explicitly, \
+             not leave it None for a CWD-based .git walk to (re)discover"
+        );
+    }
+
     fn insert_peer_edge(
         conn: &rusqlite::Connection,
         source_repo: &str,
@@ -591,7 +640,7 @@ mod tests {
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
         db::open_or_init(&paths).unwrap();
-        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         insert_peer_edge(&conn, "repo-a", "repo-expired", Some("2000-01-01 00:00:00"));
         insert_peer_edge(&conn, "repo-a", "repo-live", None);
@@ -783,11 +832,11 @@ mod tests {
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
-        // Override CWD-based repo root discovery by using the db search directly
-        // with the root as repo root. Since find_repo_root() walks from CWD (not
-        // the tempdir), we test verification via the MCP path which passes repo_root
-        // explicitly. Instead, verify the evidence array is populated and the
-        // verified field is Some (true or false) — not None.
+        // repo_root is left None here (this test drives db::search_entries
+        // directly rather than through Search::build_search_options), so
+        // verification runs with no root to resolve citation paths against
+        // and always reports Unverified. Just check the evidence array is
+        // populated and verified is attempted (Some), not that it succeeded.
         let results =
             crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts)
                 .unwrap();
@@ -796,8 +845,8 @@ mod tests {
         let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
         assert_eq!(entry.evidence.len(), 1, "entry must have 1 evidence row");
 
-        // verified is Some(bool) — inline verification was attempted
-        // (true if CWD happens to be the tempdir, false otherwise — both are acceptable)
+        // verified is Some(bool) — inline verification was attempted, even
+        // with no repo_root (it reports Unverified rather than being skipped).
         assert!(
             entry.evidence[0].verified.is_some(),
             "verified must not be null for top-K results"
@@ -1082,5 +1131,151 @@ mod tests {
             );
         }
         assert!(!peer_results.is_empty(), "peer FTS must return the entry");
+    }
+
+    #[test]
+    fn test_federated_search_does_not_modify_peer_database() {
+        use crate::commands::add::acquire_lock;
+
+        let peer_dir = tempdir().unwrap();
+        let peer_paths = Paths::from_root(peer_dir.path());
+        let embedder = NoopEmbedder;
+        Add {
+            path: "peer/immutable.rs".to_string(),
+            summary: "immutable peer database marker".to_string(),
+            content: "federated read only".to_string(),
+            tags: "peer".to_string(),
+            version_ref: None,
+            id: Some("immutable-peer-entry".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
+        }
+        .execute_with(&peer_paths, &embedder)
+        .unwrap();
+
+        // Leave the peer's WAL genuinely hot rather than pre-checkpointing it:
+        // open a second WAL-mode connection with auto-checkpoint disabled and
+        // `mem::forget` it instead of closing it, so SQLite's "checkpoint the
+        // last connection to close" behavior never fires. A test that
+        // checkpoints before snapshotting can't catch a federated search that
+        // itself triggers that same checkpoint on close.
+        let keep_wal_hot = db::open_unchecked_for_test(&peer_paths.db).unwrap();
+        keep_wal_hot
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        keep_wal_hot
+            .execute(
+                "INSERT INTO entries(id, path, summary, content, tags)
+                 VALUES('hot-wal-marker','p/hot','hot wal summary','hot wal content','[]')",
+                [],
+            )
+            .unwrap();
+        std::mem::forget(keep_wal_hot);
+
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", peer_paths.db.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", peer_paths.db.display()));
+        assert!(
+            fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "precondition: the peer must have a live, unmerged WAL before federated search runs"
+        );
+
+        let db_bytes_before = fs::read(&peer_paths.db).unwrap();
+        let wal_bytes_before = fs::read(&wal_path).unwrap();
+        let shm_bytes_before = fs::read(&shm_path).unwrap();
+
+        let local_dir = tempdir().unwrap();
+        let local_paths = Paths::from_root(local_dir.path());
+        let lock = acquire_lock(&local_paths.lock).unwrap();
+        let local_conn = db::open_rw(&local_paths, &lock).unwrap();
+        local_conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo) VALUES('immutable-g', 'dep', 'local')",
+            [],
+        ).unwrap();
+        local_conn
+            .execute(
+                "INSERT INTO peers(id, graph_id, source_repo, target_repo, edge_type) \
+             VALUES('immutable-p', 'immutable-g', 'local', ?1, 'dep')",
+                rusqlite::params![peer_dir.path().to_string_lossy()],
+            )
+            .unwrap();
+
+        // Prove the federation traversal actually reaches the registered peer
+        // before running the real command, so the byte-identity assertions
+        // below cannot pass vacuously against a peer nothing ever queried.
+        let peer_paths_found = collect_peer_paths(&local_conn, None, 1, None);
+        assert!(
+            peer_paths_found
+                .iter()
+                .any(|p| std::path::Path::new(p) == peer_dir.path()),
+            "the registered peer edge must be reachable via collect_peer_paths, got {peer_paths_found:?}"
+        );
+        drop(local_conn);
+        drop(lock);
+
+        Search {
+            query: "immutable".to_string(),
+            fts: true,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            content: false,
+            path_prefix: None,
+            tag: None,
+            local_only: false,
+            peers: true,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        }
+        .execute_with(&local_paths, &embedder)
+        .unwrap();
+
+        // Prove the federated search actually returned a peer row — the same
+        // mechanism `Search::execute_with` uses internally (`open_ro_peer` +
+        // `search_entries` against the peer db) must find the marker entry —
+        // so this test cannot pass vacuously if the peer were silently
+        // skipped (e.g. `collect_peer_paths` finding it but the search
+        // itself failing to open or query it).
+        let peer_conn = db::open_ro_peer(&peer_paths.db).unwrap();
+        let peer_opts = db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: Some(peer_dir.path().to_path_buf()),
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let peer_results =
+            db::search_entries(&peer_conn, &embedder, "immutable", &peer_opts).unwrap();
+        let peer_result_ids: Vec<&str> = peer_results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            peer_result_ids.contains(&"immutable-peer-entry"),
+            "federated search must be able to find the peer's marker entry, got {peer_result_ids:?}"
+        );
+        drop(peer_conn);
+
+        assert_eq!(
+            fs::read(&peer_paths.db).unwrap(),
+            db_bytes_before,
+            "federated search must never rewrite the peer's main db file"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            wal_bytes_before,
+            "federated search must never touch the peer's -wal file"
+        );
+        assert_eq!(
+            fs::read(&shm_path).unwrap(),
+            shm_bytes_before,
+            "federated search must never touch the peer's -shm file"
+        );
     }
 }

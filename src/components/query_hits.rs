@@ -5,7 +5,7 @@
 //! `rebuild`. Hits are operational telemetry only; they produce no JSONL events
 //! and are neither a rebuild input nor part of backups.
 
-use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -291,7 +291,20 @@ fn open(path: &Path, create: bool) -> rusqlite::Result<Connection> {
             let _ = fs::create_dir_all(parent);
         }
     }
-    let conn = Connection::open(path)?;
+    let conn = crate::components::db::open_auxiliary(path).map_err(|err| {
+        // open_auxiliary refuses a genuine repository db path outright; that
+        // is a caller bug (telemetry is meant to open only its own
+        // query-hits.db), not an ordinary operational failure, so it must
+        // not vanish into the generic best-effort swallow below.
+        if crate::components::db::is_live_db_path(path) {
+            eprintln!(
+                "kb: warn: query-hit telemetry refused to open a live repository database at {} \
+                 (this is a caller bug, not an operational failure)",
+                path.display()
+            );
+        }
+        err
+    })?;
     configure(&conn)?;
     Ok(conn)
 }
@@ -380,7 +393,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hits.db");
         record_hits(&path, &["new".into()], "mcp");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         conn.execute("INSERT INTO hits(entry_id,queried_at) VALUES('old',0)", [])
             .unwrap();
         conn.execute(
@@ -391,7 +404,7 @@ mod tests {
         .unwrap();
         drop(conn);
         record_hits(&path, &["last".into()], "test");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM hits", [], |r| r.get(0))
             .unwrap();
@@ -425,11 +438,7 @@ mod tests {
         let path = dir.path().join("hits.db");
         record_hits(&path, &["seed".into()], "test");
 
-        let lock_conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .unwrap();
+        let lock_conn = crate::components::db::open_auxiliary(&path).unwrap();
         lock_conn
             .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
             .unwrap();
@@ -440,7 +449,7 @@ mod tests {
         drop(lock_conn);
 
         assert!(path.is_file());
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let ids: Vec<String> = conn
             .prepare("SELECT entry_id FROM hits ORDER BY id")
             .unwrap()
@@ -461,14 +470,14 @@ mod tests {
             &[("new".into(), Some("src/lib.rs".into()))],
             "cli",
         );
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         conn.execute(
             "INSERT INTO injections(session_id,entry_id,surface,injected_at) VALUES('s1','old','cli',0)",
             [],
         ).unwrap();
         drop(conn);
         record_injection(&path, "s1", &[("last".into(), None)], "cli");
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let rows: Vec<(String, Option<String>)> = conn
             .prepare("SELECT entry_id,cited_file FROM injections ORDER BY id")
             .unwrap()
@@ -507,7 +516,7 @@ mod tests {
             "s1",
             br#"{"type":"tool_use","name":"Read","input":{"file_path":"other.rs"}}"#,
         );
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let flags: Vec<i64> = conn
             .prepare("SELECT acted_on FROM injections ORDER BY id")
             .unwrap()
@@ -548,7 +557,7 @@ mod tests {
         record_injection(&path, &session, &[(entry.clone(), Some(cited))], &surface);
         record_hits(&path, &[entry], &surface);
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::components::db::open_auxiliary(&path).unwrap();
         let injection_lengths: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT length(CAST(session_id AS BLOB)), length(CAST(entry_id AS BLOB)), \
