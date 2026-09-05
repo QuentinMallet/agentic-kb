@@ -53,39 +53,9 @@
 //! sealed at `BEGIN`, so a miss inside the transaction is a loud error rather
 //! than a silent stall.
 //!
-//! # Writing during a deferral, and how it converges
+//! # Writing during a deferral
 //!
-//! A write is refused unless the database is converged
-//! ([`Decision::blocks_writes`]), with one exception: row 6, an unreadable log.
-//! Refusing every write over one malformed line is what row 6 exists to prevent,
-//! so the write proceeds — but the cursor does **not** move.
-//!
-//! That leaves the database in a state worth naming plainly, because it is
-//! weaker than anything else this module allows. **The database transiently
-//! materializes the log out of order.** The new batch applies, while the events
-//! between the cursor and the damaged line do not, so the materialized tables
-//! are neither `Materialize(log)` nor `Materialize(prefix of log)` — they are
-//! the committed prefix plus a later, disjoint batch. `DurableBatch.tla`'s
-//! `CursorAgreesWithDB` does not hold here; the invariant that does is weaker
-//! and one-directional: **the cursor never claims more than has been applied.**
-//! Nothing reports the gap as converged, and no repair is silently foreclosed.
-//!
-//! Convergence, once the log is repaired or replaced:
-//!
-//! 1. Repairing the log changes bytes inside `[0, offset)` or its length, so the
-//!    prefix fingerprint stops matching and recovery takes the full-rebuild row —
-//!    the strongest repair, from the log alone.
-//! 2. If the repair somehow leaves the prefix identical (the damage lay wholly
-//!    past the cursor and was excised), recovery takes the tail-replay row and
-//!    applies every event from the cursor forward. The out-of-order batch is
-//!    among them and is re-applied: every `apply_event` arm is idempotent, and
-//!    the one arm that was not — the `run_id`-less `run_history` key — now takes
-//!    a log-derived occurrence index rather than a count of rows already
-//!    present, so re-applying it is a no-op instead of a duplicate.
-//!
-//! Either way the end state is `Materialize(log)`. The transient ordering is
-//! observable to a reader in between, which is why reads report staleness
-//! (`warn_if_behind`, and the MCP `stale` field) for the whole window.
+//! Placeholder — replaced by the contract docs.
 
 use crate::commands::add::Lock;
 use crate::components::db;
@@ -164,10 +134,7 @@ impl RebuildReason {
 /// second record of the gap. Refusing is the only safe answer: the log is
 /// intact, so the repair is always still available.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "refusing to write: the database is not converged with the event log ({reason}). \
-     Run `kb rebuild`, or rerun the command so its recovery can converge first."
-)]
+#[error("refusing to write: the database is not converged with the event log — {reason}")]
 pub struct NotConverged {
     pub reason: String,
 }
@@ -228,14 +195,19 @@ impl Decision {
     ///
     /// Only the rows that say the cursor is a WRONG claim about the log block.
     ///
+    /// Everything except a converged database and an obsolete schema stamp
+    /// blocks.
+    ///
+    /// [`Decision::Defer`] blocks. Applying a batch while events before the
+    /// damage are durable but unapplied would materialize a set that is no
+    /// prefix of the log at all — the committed prefix plus a later, disjoint
+    /// batch — so the database would be ahead of the durable log in one place
+    /// and behind it in another. Not advancing the cursor is not enough to fix
+    /// that; only refusing is.
+    ///
     /// [`Decision::LogMissing`] blocks: the append path would recreate the log
     /// from nothing and the cursor would then be stamped converged against a
     /// log holding one batch, orphaning every earlier entry.
-    ///
-    /// [`Decision::Defer`] does not block: the log is there but unreadable past
-    /// the cursor, and refusing every write over that is what row 6 exists to
-    /// prevent. The write path handles it by applying without advancing the
-    /// cursor, so no false converged claim is made either.
     ///
     /// [`RebuildReason::SchemaObsolete`] does not block: the cursor is still an
     /// accurate claim about how much of the log is applied, and only derived
@@ -244,10 +216,9 @@ impl Decision {
     /// rebuild deliberately defers to avoid dropping embeddings.
     pub fn blocks_writes(&self) -> bool {
         match self {
-            Decision::ReplayTail { .. } | Decision::LogMissing(_) => true,
+            Decision::NoOp => false,
             Decision::FullRebuild(RebuildReason::SchemaObsolete) => false,
-            Decision::FullRebuild(_) => true,
-            Decision::NoOp | Decision::Defer(_) => false,
+            _ => true,
         }
     }
 
@@ -531,15 +502,19 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
     let cursor = match read(conn) {
         Ok(Some(cursor)) => cursor,
         Ok(None) => return Decision::FullRebuild(RebuildReason::CursorMissing),
-        Err(error) => return Decision::Defer(format!("cannot read the applied cursor: {error}")),
+        // Defer cause 1 of 4: the cursor row itself is unreadable.
+        Err(error) => {
+            return Decision::Defer(format!(
+                "the applied cursor cannot be read from {}: {error}. Run `kb rebuild`.",
+                paths.db.display()
+            ))
+        }
     };
-    // Ahead of the schema row on purpose. SchemaObsolete deliberately does not
-    // block writes, so classifying a missing log behind it would leave the
-    // destructive path reachable on any database whose stamp is stale.
     if !paths.events.exists() && (cursor.offset > 0 || has_entries(conn)) {
         // Reached only with a cursor row in hand: `read` above returns early
         // when there is none, and a cursorless database is row 1 — a full
         // rebuild — which is what a database that never had a cursor needs.
+        //
         // The log is not there to compare against. Recovery must not rebuild —
         // that is the unreachable-layout hazard `rebuild` already refuses to
         // auto-repair, because it would drop every entry the vanished log
@@ -548,21 +523,20 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
         // log orphans everything that came before.
         //
         // The offset alone is not enough to spot that. An offset-zero cursor on
-        // a populated database is a real shape — a fresh database seeded before
-        // its first replay, or one written by a binary that predates the cursor
-        // — and it is exactly the state with the most to lose. What must stay
+        // a populated database is a real shape — a database seeded before its
+        // first replay, or one written by a binary that predates the cursor —
+        // and it is exactly the state with the most to lose. What must stay
         // permitted is the genuinely first write in an empty repository, where
         // no log yet is the normal condition rather than a vanished one.
         return Decision::LogMissing(paths.events.clone());
     }
-    if !db::schema_is_current(conn) {
-        return Decision::FullRebuild(RebuildReason::SchemaObsolete);
-    }
     let committed_len = match events::committed_len(&paths.events) {
         Ok(committed_len) => committed_len,
+        // Defer cause 2 of 4: the log's committed length cannot be determined.
         Err(error) => {
             return Decision::Defer(format!(
-                "cannot read the event log at {}: {error}",
+                "the event log at {} cannot be read: {error}. Repair the log, or \
+                 run `kb rebuild`.",
                 paths.events.display()
             ))
         }
@@ -576,9 +550,11 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
     match tail_sha(&paths.events, cursor.offset) {
         Ok(sha) if sha == cursor.tail_sha => {}
         Ok(_) => return Decision::FullRebuild(RebuildReason::TailShaMismatch),
+        // Defer cause 3 of 4: the prefix the cursor names cannot be hashed.
         Err(error) => {
             return Decision::Defer(format!(
-                "cannot hash the event log tail at offset {}: {error}",
+                "the event log prefix at offset {} cannot be hashed: {error}. \
+                 Repair the log, or run `kb rebuild`.",
                 cursor.offset
             ))
         }
@@ -589,20 +565,34 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
         // promising a replay of it: that read is bounded by the bytes appended
         // since the last apply, which is the cost D3 budgets for, and it is what
         // keeps row 6 reachable now that the shortcut exists.
-        match events::read_events_from_offset(&paths.events, cursor.offset) {
+        return match events::read_events_from_offset(&paths.events, cursor.offset) {
             Ok(tail) => Decision::ReplayTail {
                 from: cursor.offset,
                 to: tail.committed_len,
             },
-            Err(error) => Decision::Defer(format!(
-                "cannot read the event log at {} past offset {}: {error}",
-                paths.events.display(),
-                cursor.offset
-            )),
-        }
-    } else {
-        Decision::NoOp
+            // Defer cause 4 of 4: a line past the cursor is unreadable. Name
+            // the byte the operator has to look at, not the whole log.
+            Err(error) => {
+                let damage = events::first_unreadable_offset(&paths.events, cursor.offset);
+                let where_ = match damage {
+                    Some(offset) => format!("from byte {offset}"),
+                    None => format!("past byte {}", cursor.offset),
+                };
+                Decision::Defer(format!(
+                    "the event log at {} is unreadable {where_}: {error}. Repair \
+                     that line, or run `kb rebuild`.",
+                    paths.events.display()
+                ))
+            }
+        };
     }
+    // Last, deliberately. This is the one decision that does NOT block a write,
+    // so any blocking condition evaluated after it would be masked on every
+    // database whose stamp is stale — which is every pre-v3 one.
+    if !db::schema_is_current(conn) {
+        return Decision::FullRebuild(RebuildReason::SchemaObsolete);
+    }
+    Decision::NoOp
 }
 
 /// The one-line staleness note a read-only surface prints.
@@ -685,19 +675,6 @@ pub fn append_and_apply_with<T>(
         }
         .into());
     }
-    // Row 6 lets the write through so the entry points stay alive, but the
-    // cursor must not move: the region the reader choked on was never applied,
-    // and stamping the new end of file over it would claim it was. Leaving the
-    // cursor behind is the state the whole design already handles — every arm
-    // is idempotent, so once the log is repaired a replay converges.
-    let advance_cursor = !matches!(decision, Decision::Defer(_));
-    if !advance_cursor {
-        eprintln!(
-            "kb: WARNING {} — applying this write without advancing the applied \
-             cursor, so nothing claims the unread region was materialized.",
-            decision.describe()
-        );
-    }
 
     // An empty batch appends nothing and moves no cursor, but the caller still
     // gets its transaction — A1's audit record has verdicts with no expire.
@@ -727,14 +704,10 @@ pub fn append_and_apply_with<T>(
     kill_point(KillPoint::AfterLogBatch);
     kill_point(KillPoint::BeforeApply);
 
-    let cursor = if advance_cursor {
-        Some(Cursor {
-            generation: read_generation(&paths.events),
-            offset: committed_len,
-            tail_sha: tail_sha(&paths.events, committed_len)?,
-        })
-    } else {
-        None
+    let cursor = Cursor {
+        generation: read_generation(&paths.events),
+        offset: committed_len,
+        tail_sha: tail_sha(&paths.events, committed_len)?,
     };
 
     let tx = conn.unchecked_transaction()?;
@@ -744,9 +717,7 @@ pub fn append_and_apply_with<T>(
             db::apply_event(conn, &prefetched, event)?;
         }
         let value = inside(conn)?;
-        if let Some(cursor) = &cursor {
-            write(conn, cursor)?;
-        }
+        write(conn, &cursor)?;
         Ok(value)
     })();
     match outcome {

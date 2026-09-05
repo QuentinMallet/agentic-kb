@@ -94,6 +94,22 @@ fn live_ids(paths: &Paths) -> Vec<String> {
     ids
 }
 
+/// Append a line the reader cannot parse, then a valid closed span after it, so
+/// the log ends intact and the damage sits past the cursor. Written by hand
+/// because every append refuses to run over a malformed middle line, which is
+/// the shape these tests need.
+fn damage_log_past_the_cursor(paths: &Paths) {
+    let mut raw = fs::read_to_string(&paths.events).unwrap();
+    raw.push_str("{ not json at all }\n");
+    raw.push_str(&format!(
+        "{}\n{}\n{}\n",
+        json!({"action": "batch_begin", "batch_id": "hand-written", "n": 1}),
+        upsert("later", "after the damage"),
+        json!({"action": "batch_commit", "batch_id": "hand-written", "n": 1}),
+    ));
+    fs::write(&paths.events, &raw).unwrap();
+}
+
 /// Materialized state, exactly the tables the plan's invariant names.
 fn materialized(conn: &Connection) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
@@ -409,6 +425,51 @@ fn test_write_refuses_when_the_log_file_is_missing() {
     assert_eq!(live_ids(&paths), vec!["e1".to_string(), "e2".to_string()]);
 }
 
+/// The missing-log contract end to end: writes refused with the typed error,
+/// reads served, and automatic recovery declining rather than replaying an
+/// absent log over the entries it can no longer justify.
+///
+/// An explicit `kb rebuild` stays available as the operator's deliberate
+/// override — that is the escape hatch the warning names — and is not exercised
+/// here, because taking it is a decision to let the empty log win.
+#[test]
+fn test_missing_log_end_to_end() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap();
+    fs::remove_file(&paths.events).unwrap();
+
+    // Writes: refused, with the missing path named.
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("e3")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(format!("{error:#}").contains("missing"), "{error:#}");
+    assert!(!paths.events.exists(), "no write may resurrect the log");
+
+    // Reads: served, with a staleness note rather than an error.
+    {
+        let conn = open_ro(&paths.db).unwrap();
+        cursor::warn_if_behind(&conn, &paths);
+        let mut stmt = conn
+            .prepare("SELECT id FROM entries WHERE is_stale=0 ORDER BY id")
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ids, vec!["e1".to_string(), "e2".to_string()]);
+    }
+
+    // Automatic recovery: declines, and drops nothing.
+    assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
+    assert_eq!(live_ids(&paths), vec!["e1".to_string(), "e2".to_string()]);
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::inspect(&conn, &paths),
+        Decision::LogMissing(paths.events.clone())
+    );
+}
+
 /// The same refusal must hold when the schema stamp is ALSO stale. An obsolete
 /// stamp deliberately does not block writes, so classifying the missing log
 /// behind the schema row would leave the destructive path reachable on any
@@ -515,56 +576,187 @@ fn test_first_write_in_an_empty_repository_is_not_blocked() {
 
 /// A malformed line PAST the cursor. `committed_len` takes an intact-span
 /// shortcut, so without a tail read this classifies as a replay, and the replay
-/// then hard-errors out of every write entry point — exactly what row 6 exists
-/// to prevent.
+/// then hard-errors out of every entry point.
+///
+/// Recovery must warn and decline rather than propagate that. The write must be
+/// refused: applying a batch while the events before the damage are durable but
+/// unapplied would leave the database holding the committed prefix plus a later,
+/// disjoint batch — ahead of the durable log in one place and behind it in
+/// another, which is no prefix of the log at all.
 #[test]
-fn test_unreadable_tail_defers_without_erroring_out() {
+fn test_unreadable_tail_defers_and_refuses_writes() {
     let (_dir, paths) = repo();
     kb_core::add(&paths, &FixedEmbedder, add_args("applied")).unwrap();
     let cursor_before = cursor_of(&paths).unwrap();
-
-    // Damage sits after the cursor, and the log still ends on a closed span —
-    // written by hand, because every append refuses to run over a malformed
-    // middle line, which is the shape this test needs.
-    let mut raw = fs::read_to_string(&paths.events).unwrap();
-    raw.push_str("{ not json at all }\n");
-    raw.push_str(&format!(
-        "{}\n{}\n{}\n",
-        json!({"action": "batch_begin", "batch_id": "hand-written", "n": 1}),
-        upsert("later", "after the damage"),
-        json!({"action": "batch_commit", "batch_id": "hand-written", "n": 1}),
-    ));
-    fs::write(&paths.events, &raw).unwrap();
+    damage_log_past_the_cursor(&paths);
 
     {
         let conn = open_db(&paths.db).unwrap();
+        let decision = cursor::inspect(&conn, &paths);
         assert!(
-            matches!(cursor::inspect(&conn, &paths), Decision::Defer(_)),
+            matches!(decision, Decision::Defer(_)),
             "a malformed line past the cursor must classify as row 6, not a replay"
+        );
+        assert!(decision.blocks_writes(), "a deferral must refuse writes");
+        assert!(
+            decision.describe().contains("unreadable from byte"),
+            "the reason must name the damaged byte: {}",
+            decision.describe()
         );
     }
 
     // Recovery defers instead of propagating the parse error.
     assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
 
-    // The write entry points stay alive.
-    kb_core::add(&paths, &FixedEmbedder, add_args("written-anyway")).unwrap();
+    // Reads keep working, which is what row 6 exists for.
+    {
+        let conn = open_ro(&paths.db).unwrap();
+        cursor::warn_if_behind(&conn, &paths);
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(live, 1, "reads are served during a deferral");
+    }
+
+    // The write is refused, and nothing moved.
+    let before_log = fs::read(&paths.events).unwrap();
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("refused")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert_eq!(fs::read(&paths.events).unwrap(), before_log);
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(cursor::read(&conn).unwrap().unwrap(), cursor_before);
+    assert_eq!(live_ids(&paths), vec!["applied".to_string()]);
+}
+
+/// Once the malformed line is gone, recovery replays from the cursor, converges,
+/// and stamps the cursor at the log's committed end — with each entry present
+/// exactly once.
+#[test]
+fn test_repairing_the_damaged_line_lets_recovery_converge() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("applied")).unwrap();
+    damage_log_past_the_cursor(&paths);
+
+    // Repair: drop the one unparseable line, leaving the spans intact.
+    let repaired: String = fs::read_to_string(&paths.events)
+        .unwrap()
+        .lines()
+        .filter(|line| serde_json::from_str::<Value>(line).is_ok())
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&paths.events, repaired).unwrap();
+
+    recover_if_needed(&paths, &FixedEmbedder).unwrap();
+
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
+    assert_eq!(
+        cursor::read(&conn).unwrap().unwrap().offset,
+        events::read_events(&paths.events).unwrap().committed_len,
+        "the cursor must be stamped at the log's committed end"
+    );
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE id='later'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "the recovered entry must be present exactly once");
     assert_eq!(
         live_ids(&paths),
-        vec!["applied".to_string(), "written-anyway".to_string()]
+        vec!["applied".to_string(), "later".to_string()]
     );
+}
 
-    // But nothing claims the unread region was materialized.
+/// A deferral that coexists with a stale generation: the committed-length read
+/// fails before the generation is ever compared, so the deferral wins and the
+/// write is still refused. Once the log reads again, the generation row takes
+/// over and the full rebuild converges.
+#[test]
+fn test_a_deferral_outranks_a_stale_generation_until_the_log_reads_again() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    let intact = fs::read_to_string(&paths.events).unwrap();
+
+    // Both at once: the generation moved AND the log stopped parsing.
+    cursor::bump_generation(&paths.events).unwrap();
+    fs::write(&paths.events, format!("{intact}{{ not json at all }}\n")).unwrap();
+
+    {
+        let conn = open_db(&paths.db).unwrap();
+        let decision = cursor::inspect(&conn, &paths);
+        assert!(
+            matches!(decision, Decision::Defer(_)),
+            "the unreadable log must outrank the stale generation: {decision:?}"
+        );
+        assert!(decision.blocks_writes());
+    }
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+
+    // Repair only the log. The generation mismatch is now visible and repairs.
+    fs::write(&paths.events, &intact).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, &paths),
+            Decision::FullRebuild(RebuildReason::GenerationMismatch)
+        );
+    }
+    assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
     let conn = open_db(&paths.db).unwrap();
+    assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
+    assert_eq!(live_ids(&paths), vec!["e1".to_string()]);
+}
+
+/// The tail replay is the repair half of row 7, and recovery can run it more
+/// than once over the same range — a crash after the apply but before anything
+/// observes it, or simply two entry points racing. Running it twice must leave
+/// the materialized tables identical, run_history keys included.
+#[test]
+fn test_replay_tail_twice_over_one_range_changes_nothing() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("seed")).unwrap();
+
+    let legacy_run = json!({
+        "action":"insert","table":"run_history","test_id":"tc","result":"pass",
+        "adapter":null,"detail":null,"ts":"2026-09-05T00:00:00Z"
+    });
+    events::append_events_batch(
+        &paths.events,
+        &[
+            json!({
+                "action":"upsert","table":"test_cases","id":"tc","app":"app","name":"n",
+                "protocol":"browser","config":"{}","version_ref":null,"ts":"2026-09-05T00:00:00Z"
+            }),
+            upsert("tail-1", "one"),
+            legacy_run.clone(),
+            legacy_run,
+        ],
+    )
+    .unwrap();
+
+    let from = cursor_of(&paths).unwrap();
+    let lock = acquire_lock(&paths.lock).unwrap();
+    let conn = db::open_rw(&paths, &lock).unwrap();
+
+    let first = cursor::replay_tail_locked(&lock, &conn, &paths, &FixedEmbedder).unwrap();
+    assert!(first > 0, "the first replay must apply the tail");
+    let after_first = materialized(&conn);
+
+    // Rewind to exactly the range just replayed and run it again.
+    cursor::write(&conn, &from).unwrap();
+    let second = cursor::replay_tail_locked(&lock, &conn, &paths, &FixedEmbedder).unwrap();
+    assert_eq!(second, first, "the same range replays the same events");
     assert_eq!(
-        cursor::read(&conn).unwrap().unwrap(),
-        cursor_before,
-        "the cursor must not advance over a region the reader could not parse"
+        materialized(&conn),
+        after_first,
+        "replaying one range twice must change nothing, run_history keys included"
     );
-    assert!(
-        matches!(cursor::inspect(&conn, &paths), Decision::Defer(_)),
-        "and the database must not report itself converged"
-    );
+    assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
 }
 
 // ---------------------------------------------------------------------------
@@ -846,16 +1038,22 @@ fn test_compaction_bumps_the_generation_and_forces_a_full_rebuild() {
     // Append upsert B and a third upsert A. Do NOT apply them.
     events::append_events_batch(&paths.events, &[upsert("B", "b1"), upsert("A", "a3")]).unwrap();
 
-    // Compact: the superseded A upserts are dropped, so the surviving log is
-    // [B, A] — shorter than the cursor's offset is long, and rewritten under it.
+    // Compact in ANOTHER process: the superseded A upserts are dropped, so the
+    // surviving log is [B, A] — shorter than the cursor's offset is long, and
+    // rewritten under it. Staged by hand because this binary's own `kb compact`
+    // now takes the convergence gate and would refuse while the cursor is
+    // behind; an older pinned binary, or one racing a crash, would not.
     let generation_before = cursor::read_generation(&paths.events);
-    kb::commands::compact::Compact
-        .execute_with_paths(&paths)
-        .unwrap();
+    let compacted: String = [upsert("B", "b1"), upsert("A", "a3")]
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect();
+    fs::write(&paths.events, compacted).unwrap();
+    cursor::bump_generation(&paths.events).unwrap();
     assert_eq!(
         cursor::read_generation(&paths.events),
         generation_before + 1,
-        "compaction must bump the log generation under its rename lock"
+        "compaction bumps the log generation under its rename lock"
     );
 
     // Reopen. The generation check — not the tail hash, and not a crash —

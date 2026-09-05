@@ -3923,6 +3923,45 @@ mod tests {
         );
     }
 
+    /// The port surface of the deferral contract: a write is refused with the
+    /// convergence error, and reads are still served with a staleness note.
+    #[test]
+    fn test_mutating_request_refused_while_the_log_is_unreadable() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("d1");
+        let req = json!({"method":"add","id":"d1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+
+        // A malformed line past the cursor, with the log still ending on a
+        // closed span so `committed_len` takes its shortcut.
+        let mut raw = fs::read_to_string(&paths.events).unwrap();
+        raw.push_str("{ not json at all }\n");
+        raw.push_str(&format!(
+            "{}\n{}\n{}\n",
+            json!({"action": "batch_begin", "batch_id": "hand-written", "n": 1}),
+            json!({"action":"upsert","table":"entries","id":"later","path":"t/l",
+                   "summary":"s","content":"c","tags":[],"kind":"belief",
+                   "ts":"2026-09-05T00:00:00Z"}),
+            json!({"action": "batch_commit", "batch_id": "hand-written", "n": 1}),
+        ));
+        fs::write(&paths.events, raw).unwrap();
+
+        let req2 = json!({"method":"add","id":"d2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "error", "{resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not converged"),
+            "{resp}"
+        );
+
+        let search = dispatch(&paths, &emb, &json!({"method":"search","id":"d3","query":"one"}));
+        assert_eq!(search["type"], "result", "reads stay served: {search}");
+        assert!(search["stale"].as_str().is_some(), "{search}");
+    }
+
     #[test]
     fn test_handle_compact() {
         let (_dir, paths, emb) = setup();

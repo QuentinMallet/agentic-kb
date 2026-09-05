@@ -686,6 +686,41 @@ pub fn read_events_prefix(events_path: &Path, len: u64) -> Result<ReadEvents> {
     })
 }
 
+/// Byte offset of the first line at or after `from` that the reader cannot
+/// parse.
+///
+/// `None` when every line parses — the read may still have failed structurally
+/// (a mid-log dangling `batch_begin`, an `n` mismatch), which is a property of
+/// the span rather than of one line, and the caller then names the boundary it
+/// started from instead.
+///
+/// Used to point an operator at the damage rather than at the whole log.
+pub fn first_unreadable_offset(events_path: &Path, from: u64) -> Option<u64> {
+    let mut file = File::open(events_path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut offset = from;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf).ok()?;
+        if read == 0 {
+            return None;
+        }
+        let has_newline = buf.ends_with(b"\n");
+        let chunk = if has_newline {
+            &buf[..buf.len() - 1]
+        } else {
+            buf.as_slice()
+        };
+        // A torn final chunk is the ordinary uncommitted tail, not damage.
+        if parse_event_line(chunk).is_err() && has_newline {
+            return Some(offset);
+        }
+        offset += read as u64;
+    }
+}
+
 /// Read complete events beginning at a known committed boundary.
 ///
 /// Rebuild records this byte offset while holding the event-log flock and
