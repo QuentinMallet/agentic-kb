@@ -190,26 +190,31 @@ impl VerificationOutcome {
 /// Safely join `rel` onto `repo_root`, rejecting any path that escapes the root.
 ///
 /// Rejects: absolute paths, any `..` / root / prefix components.
-/// Canonicalizes both sides and verifies containment.
-/// Returns `None` on any rejection or I/O error during canonicalization.
+/// Walks existing components without following symbolic links.
+/// Returns `None` on any rejection or filesystem error.
 pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return None;
     }
+    let mut candidate = repo_root.to_path_buf();
     for c in rel_path.components() {
         match c {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            _ => {}
+            Component::CurDir => continue,
+            Component::Normal(name) => {
+                candidate.push(name);
+                if std::fs::symlink_metadata(&candidate)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
+            }
         }
     }
-    let candidate = repo_root.join(rel_path);
-    let canon_root = repo_root.canonicalize().ok()?;
-    let canon_cand = candidate.canonicalize().ok()?;
-    if !canon_cand.starts_with(&canon_root) {
-        return None;
-    }
-    Some(canon_cand)
+    Some(candidate)
 }
 
 /// Parse a whole-file `path` or ranged `path:start-end` citation.
@@ -2169,9 +2174,62 @@ mod tests {
 
         let result = safe_join(dir.path(), "probe.txt");
         assert!(result.is_some());
-        // Canonical path must be inside the tempdir.
-        let canon = result.unwrap();
-        assert!(canon.starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(result.unwrap(), file_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_symlink_components_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plain/nested")).unwrap();
+        symlink(dir.path().join("plain"), dir.path().join("sym")).unwrap();
+
+        assert_eq!(
+            safe_join(dir.path(), "plain/nested"),
+            Some(dir.path().join("plain/nested"))
+        );
+        assert!(safe_join(dir.path(), "sym/nested").is_none());
+        assert!(safe_join(dir.path(), "plain/../plain").is_none());
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #[test]
+        fn prop_safe_join_accepts_exactly_existing_plain_relative_paths(
+            components in prop::collection::vec(
+                prop_oneof![Just("a"), Just("b"), Just(".."), Just("sym")],
+                0..8,
+            )
+        ) {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let mut prefix = dir.path().to_path_buf();
+            for component in &components {
+                match *component {
+                    "a" | "b" => {
+                        prefix.push(*component);
+                        std::fs::create_dir_all(&prefix).unwrap();
+                    }
+                    "sym" => {
+                        let link = prefix.join("sym");
+                        if !link.exists() {
+                            symlink(outside.path(), link).unwrap();
+                        }
+                        break;
+                    }
+                    ".." => break,
+                    _ => unreachable!(),
+                }
+            }
+            let rel = components.join("/");
+            let expected = !components.iter().any(|component| *component == ".." || *component == "sym")
+                && dir.path().join(&rel).exists();
+            prop_assert_eq!(safe_join(dir.path(), &rel).is_some(), expected);
+        }
     }
 
     #[test]
