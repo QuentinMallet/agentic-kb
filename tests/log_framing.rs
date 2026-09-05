@@ -580,13 +580,14 @@ fn synthetic_corpus() -> Vec<Value> {
 /// `created_at` and `updated_at` are skipped: they are populated by
 /// `datetime('now')` defaults, so two replays of the same log straddling a
 /// second boundary disagree on them. That replay non-determinism is C1's T6
-/// rider, not something framing changes. Every other column, including the
-/// event-supplied `ts` and `recorded_at`, is compared.
-fn materialize(events: &[Value]) -> Vec<String> {
-    let conn = open_db_memory().unwrap();
-    for ev in events {
-        apply_event(&conn, &NoopEmbedder, ev).unwrap();
-    }
+/// rider, not something framing changes. `cues.id` is skipped for the same
+/// class of reason: cue rows are replaced wholesale on every entry upsert
+/// (DELETE + re-INSERT), so its `AUTOINCREMENT` surrogate key keeps climbing
+/// across repeated replays of the same log even though the resulting
+/// `(entry_id, cue)` content is unchanged — it is DB-assigned identity, not
+/// event-log-supplied state. Every other column, including the event-supplied
+/// `ts` and `recorded_at`, is compared.
+fn dump_materialized(conn: &rusqlite::Connection) -> Vec<String> {
     let mut rows = Vec::new();
     for table in ["entries", "evidence", "cues", "test_cases", "run_history"] {
         let columns: Vec<String> = conn
@@ -596,6 +597,7 @@ fn materialize(events: &[Value]) -> Vec<String> {
             .unwrap()
             .map(|r| r.unwrap())
             .filter(|c| c != "created_at" && c != "updated_at")
+            .filter(|c| !(table == "cues" && c == "id"))
             .collect();
         let mut stmt = conn
             .prepare(&format!("SELECT {} FROM {table}", columns.join(",")))
@@ -617,6 +619,14 @@ fn materialize(events: &[Value]) -> Vec<String> {
         rows.push(format!("{table}: {}", dumped.join(";")));
     }
     rows
+}
+
+fn materialize(events: &[Value]) -> Vec<String> {
+    let conn = open_db_memory().unwrap();
+    for ev in events {
+        apply_event(&conn, &NoopEmbedder, ev).unwrap();
+    }
+    dump_materialized(&conn)
 }
 
 #[test]
@@ -645,49 +655,55 @@ fn test_synthetic_corpus_of_every_kind_replays_identically_framed_and_unframed()
     assert_eq!(materialize(&framed_read.events), materialize(&corpus));
 }
 
-/// The real event log of this repository. Not committed: it is the user's live
-/// knowledge base. Point `KB_REAL_CORPUS_EVENTS` at a log to run this lane, or
-/// let it discover `.state/agent-kb/agent-kb-events.jsonl` above the manifest.
-fn real_corpus_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("KB_REAL_CORPUS_EVENTS") {
-        let p = PathBuf::from(explicit);
-        return p.exists().then_some(p);
-    }
-    let mut cursor = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    loop {
-        let candidate = cursor
-            .join(".state")
-            .join("agent-kb")
-            .join("agent-kb-events.jsonl");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if !cursor.pop() {
-            return None;
-        }
-    }
-}
-
 #[test]
-fn test_real_corpus_replays_identically_through_the_framed_writers() {
-    let Some(corpus_path) = real_corpus_path() else {
-        eprintln!("log_framing: no real corpus found — set KB_REAL_CORPUS_EVENTS to run this lane");
-        return;
-    };
-    let original = read_events(&corpus_path).unwrap();
-    assert!(
-        original.events.len() > 100,
-        "the real corpus lane needs the production log, found {} events",
-        original.events.len()
-    );
+fn test_vendored_116_event_legacy_corpus_replays_byte_identically() {
+    let fixture = include_bytes!("fixtures/events-116-pre-framing.jsonl");
+    let fixture_text = std::str::from_utf8(fixture).unwrap();
+    assert_eq!(fixture_text.lines().count(), 116);
+
+    // This is intentionally the pre-framing reader: one JSON value per line,
+    // with no interpretation of batch markers or recovery state.
+    let legacy_events: Vec<Value> = fixture_text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(legacy_events.iter().all(|event| {
+        !matches!(
+            event["action"].as_str(),
+            Some("batch_begin" | "batch_commit")
+        )
+    }));
+
+    let (_legacy_dir, legacy_path) = log_dir();
+    write_raw(&legacy_path, fixture);
+    let framed_reader = read_events(&legacy_path).unwrap();
+    assert_eq!(framed_reader.events, legacy_events);
+
+    let legacy_materialization = materialize(&legacy_events);
+    let framed_materialization = materialize(&framed_reader.events);
+    assert_eq!(framed_materialization, legacy_materialization);
+
+    // Applying the same decoded log twice to one database must be a no-op.
+    let conn = open_db_memory().unwrap();
+    for event in &framed_reader.events {
+        apply_event(&conn, &NoopEmbedder, event).unwrap();
+    }
+    let after_first_replay = dump_materialized(&conn);
+    for event in &framed_reader.events {
+        apply_event(&conn, &NoopEmbedder, event).unwrap();
+    }
+    assert_eq!(dump_materialized(&conn), after_first_replay);
 
     let (_dir, framed) = log_dir();
-    append_events_batch(&framed, &original.events).unwrap();
+    for event in &legacy_events {
+        append_event(&framed, event).unwrap();
+    }
     let reread = read_events(&framed).unwrap();
 
-    assert_eq!(reread.events, original.events);
+    assert_eq!(reread.events, legacy_events);
+    assert_eq!(reread.events.len(), 116);
     assert_eq!(reread.committed_len, fs::metadata(&framed).unwrap().len());
-    assert_eq!(materialize(&reread.events), materialize(&original.events));
+    assert_eq!(materialize(&reread.events), legacy_materialization);
 }
 
 // ---------------------------------------------------------------------------
