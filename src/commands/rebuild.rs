@@ -141,6 +141,19 @@ pub fn recover_if_needed(paths: &config::Paths, embedder: &dyn Embedder) -> anyh
             eprintln!("kb: WARNING deferring event-log recovery — {message}");
             Ok(false)
         }
+        cursor::Decision::LogMissing(path) => {
+            // Not a rebuild: replaying a log that is not there would delete
+            // every entry it covered. Not a hard error either — reads keep
+            // working. The write guard is what stops a write from resurrecting
+            // the log and orphaning those entries.
+            eprintln!(
+                "kb: WARNING the event log is missing at {} — the database is \
+                 serving state no log backs. Restore the log, or run `kb rebuild` \
+                 deliberately if the empty log should win.",
+                path.display()
+            );
+            Ok(false)
+        }
         cursor::Decision::ReplayTail { from, to } => {
             eprintln!(
                 "kb: applying {} event-log byte(s) the database is missing \

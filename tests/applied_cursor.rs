@@ -357,6 +357,86 @@ fn test_empty_batch_write_takes_the_guard() {
     assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
 }
 
+/// The append path CREATES a missing log. Without a refusal the next write
+/// resurrects it holding only that batch, stamps the cursor converged against
+/// it, and every earlier entry becomes unbacked by the log — `inspect` then
+/// reports NoOp and the next full rebuild deletes them. Same silent,
+/// unrecoverable divergence as an overwritten cursor, through the "cannot tell"
+/// channel.
+#[test]
+fn test_write_refuses_when_the_log_file_is_missing() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap();
+    let before_cursor = cursor_of(&paths).unwrap();
+    assert!(before_cursor.offset > 0);
+
+    fs::remove_file(&paths.events).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, &paths),
+            Decision::LogMissing(paths.events.clone())
+        );
+    }
+
+    // Recovery declines to rebuild — that would delete both entries — and does
+    // not error out.
+    assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
+
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("e3")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(
+        format!("{error:#}").contains("missing"),
+        "the error must name the missing log: {error:#}"
+    );
+    assert!(
+        !paths.events.exists(),
+        "a refused write must not resurrect the log"
+    );
+
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::read(&conn).unwrap().unwrap(),
+        before_cursor,
+        "the cursor must be untouched"
+    );
+    assert_eq!(
+        cursor::inspect(&conn, &paths),
+        Decision::LogMissing(paths.events.clone()),
+        "the divergence must still be visible afterwards"
+    );
+    assert_eq!(live_ids(&paths), vec!["e1".to_string(), "e2".to_string()]);
+}
+
+/// The same refusal must hold when the schema stamp is ALSO stale. An obsolete
+/// stamp deliberately does not block writes, so classifying the missing log
+/// behind the schema row would leave the destructive path reachable on any
+/// database whose stamp has not caught up — which is every pre-v3 one.
+#[test]
+fn test_missing_log_outranks_an_obsolete_schema_stamp() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
+            .unwrap();
+    }
+    fs::remove_file(&paths.events).unwrap();
+
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::inspect(&conn, &paths),
+        Decision::LogMissing(paths.events.clone()),
+        "the missing log must outrank the obsolete stamp"
+    );
+    drop(conn);
+
+    let error = kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert!(!paths.events.exists(), "the log must not be resurrected");
+}
+
 // ---------------------------------------------------------------------------
 // 3. Idempotent replay of every apply_event arm
 // ---------------------------------------------------------------------------

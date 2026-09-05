@@ -143,6 +143,7 @@ pub fn is_not_converged(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NotConverged>().is_some()
 }
 
+
 /// The D3 recovery decision. Eight table rows, four outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -152,9 +153,18 @@ pub enum Decision {
     ReplayTail { from: u64, to: u64 },
     /// Rows 1-5.
     FullRebuild(RebuildReason),
-    /// Row 6 — the log is unreadable. Defer with a warning rather than take
-    /// down every entry point.
+    /// Row 6 — the log is unreadable past the cursor. Defer with a warning
+    /// rather than take down every entry point.
     Defer(String),
+    /// The log file is absent while the cursor claims a non-zero offset.
+    ///
+    /// Split out of [`Decision::Defer`] because it is the one "cannot tell"
+    /// state where continuing is destructive rather than merely uninformed: the
+    /// append path CREATES a missing log, so the next write would resurrect it
+    /// holding only that batch and stamp the cursor converged against it. Every
+    /// earlier entry would then be unbacked by the log, `inspect` would report
+    /// NoOp, and the next full rebuild would delete them.
+    LogMissing(PathBuf),
 }
 
 impl Decision {
@@ -168,19 +178,22 @@ impl Decision {
     ///
     /// Only the rows that say the cursor is a WRONG claim about the log block.
     ///
-    /// [`Decision::Defer`] does not block: it means the log could not be read,
-    /// and refusing every write over that is exactly what row 6 exists to
-    /// prevent. An append against an unreadable log fails on its own, with the
-    /// parse error rather than a guess.
+    /// [`Decision::LogMissing`] blocks: the append path would recreate the log
+    /// from nothing and the cursor would then be stamped converged against a
+    /// log holding one batch, orphaning every earlier entry.
     ///
-    /// [`RebuildReason::SchemaObsolete`] does not block either: the cursor is
-    /// still an accurate claim about how much of the log is applied, and only
-    /// derived state (cue rows, the embedding vintage) is missing. Blocking it
-    /// would make a pre-v3 database unwritable under `KB_NO_EMBED`, where the
-    /// upgrade rebuild deliberately defers to avoid dropping embeddings.
+    /// [`Decision::Defer`] does not block: the log is there but could not be
+    /// read, and refusing every write over that is what row 6 exists to
+    /// prevent.
+    ///
+    /// [`RebuildReason::SchemaObsolete`] does not block: the cursor is still an
+    /// accurate claim about how much of the log is applied, and only derived
+    /// state (cue rows, the embedding vintage) is missing. Blocking it would
+    /// make a pre-v3 database unwritable under `KB_NO_EMBED`, where the upgrade
+    /// rebuild deliberately defers to avoid dropping embeddings.
     pub fn blocks_writes(&self) -> bool {
         match self {
-            Decision::ReplayTail { .. } => true,
+            Decision::ReplayTail { .. } | Decision::LogMissing(_) => true,
             Decision::FullRebuild(RebuildReason::SchemaObsolete) => false,
             Decision::FullRebuild(_) => true,
             Decision::NoOp | Decision::Defer(_) => false,
@@ -196,6 +209,9 @@ impl Decision {
             }
             Decision::FullRebuild(reason) => reason.as_str().to_string(),
             Decision::Defer(message) => message.clone(),
+            Decision::LogMissing(path) => {
+                format!("the event log is missing at {}", path.display())
+            }
         }
     }
 }
@@ -454,19 +470,20 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
         Ok(None) => return Decision::FullRebuild(RebuildReason::CursorMissing),
         Err(error) => return Decision::Defer(format!("cannot read the applied cursor: {error}")),
     };
+    // Ahead of the schema row on purpose. SchemaObsolete deliberately does not
+    // block writes, so classifying a missing log behind it would leave the
+    // destructive path reachable on any database whose stamp is stale.
+    if cursor.offset > 0 && !paths.events.exists() {
+        // The log is not there to compare against. Recovery must not rebuild —
+        // that is the unreachable-layout hazard `rebuild` already refuses to
+        // auto-repair, because it would drop every entry the vanished log
+        // covered — but a write must not proceed either: the append path
+        // recreates a missing log, and stamping the cursor against a one-batch
+        // log orphans everything that came before.
+        return Decision::LogMissing(paths.events.clone());
+    }
     if !db::schema_is_current(conn) {
         return Decision::FullRebuild(RebuildReason::SchemaObsolete);
-    }
-    if cursor.offset > 0 && !paths.events.exists() {
-        // The log is not there to compare against. That is the unreachable-
-        // layout hazard `rebuild` already refuses to auto-repair (it would drop
-        // every entry the vanished log covered), so it belongs with row 6 —
-        // defer with a warning — rather than with row 5, which is about a log
-        // that exists and is shorter than the cursor claims.
-        return Decision::Defer(format!(
-            "the event log is missing at {}",
-            paths.events.display()
-        ));
     }
     let committed_len = match events::committed_len(&paths.events) {
         Ok(committed_len) => committed_len,

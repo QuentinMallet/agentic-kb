@@ -265,10 +265,21 @@ fn test_partial_log_refuses_auto_rebuild() {
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
-    // Simulate the partial-log hazard: the original log is gone; one later
-    // write created a fresh log containing only a NEW entry.
+    // Simulate the partial-log hazard: the original log is gone and a fresh one
+    // holds only a NEW entry. Staged by hand rather than through `add`, because
+    // C1/T4's write guard now refuses a write while the log is missing —
+    // resurrecting it is what orphans the entries this test is about.
     fs::remove_file(&paths.events).unwrap();
-    add(&paths, &NoopEmbedder, base_args("only-in-new-log")).unwrap();
+    let new_event = serde_json::json!({
+        "action": "upsert", "table": "entries", "id": "only-in-new-log",
+        "path": "src/only.rs", "summary": "s", "content": "c", "tags": [],
+        "kind": "belief", "evidence_status": "n/a", "ts": "2026-09-05T00:00:00Z",
+    });
+    events::append_event(&paths.events, &new_event).unwrap();
+    {
+        let conn = open_db(&paths.db).unwrap();
+        apply_event(&conn, &NoopEmbedder, &new_event).unwrap();
+    }
 
     let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt, "partial log must refuse auto-rebuild");
