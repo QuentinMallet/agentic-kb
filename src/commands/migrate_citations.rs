@@ -12,7 +12,7 @@ use crate::components::events;
 use crate::components::verification::{compute_citation_hash_and_size, parse_citation_path};
 use crate::config;
 use abscissa_core::{Command, Runnable};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::Parser;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Component, Path, PathBuf};
@@ -81,7 +81,7 @@ impl MigrateCitations {
 
     pub fn execute_with_paths(&self, paths: &config::Paths) -> Result<MigrationReport> {
         let conn = db::open_db(&paths.db)?;
-        let repo_root = repo_root_from_paths(paths)?;
+        let repo_root = &paths.root;
         let mut report = plan_migration(&conn, repo_root.as_path(), &paths.events)?;
         if !self.dry_run {
             apply_heals(paths, repo_root.as_path(), &mut report)?;
@@ -89,16 +89,6 @@ impl MigrateCitations {
         render_cli(&report, self.dry_run);
         Ok(report)
     }
-}
-
-fn repo_root_from_paths(paths: &config::Paths) -> Result<std::path::PathBuf> {
-    paths
-        .db
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("could not derive repo root from {}", paths.db.display()))
 }
 
 fn plan_migration(
@@ -456,7 +446,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_heals_matching_legacy_whole_file_range() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let bytes = fs::read(root.join("src/lib.rs")).unwrap();
@@ -512,7 +502,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_skips_bare_rows_on_rerun() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -556,7 +546,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_reports_changed_file_rows() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "abc\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -594,7 +584,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_reports_size_mismatch_rows() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "abc").unwrap();
         let old_end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -635,7 +625,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_dry_run_emits_no_events() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -704,7 +694,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_heals_subdir_file_named_like_events_log() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("fixtures")).unwrap();
         fs::write(root.join("fixtures/agent-kb-events.jsonl"), "fixture\n").unwrap();
         let end = fs::metadata(root.join("fixtures/agent-kb-events.jsonl"))
@@ -740,7 +730,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_skips_when_parent_goes_stale_between_plan_and_apply() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::metadata(root.join("src/lib.rs")).unwrap().len() as usize;
