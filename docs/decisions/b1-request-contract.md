@@ -62,10 +62,11 @@ allow-list.
 ## Fields accepted beyond the pin
 
 The Rust structs accept a superset, so nothing that used to work stops working:
-`search` also takes `peers`, `reachable_from`, `max_hops` and `slug`; `add` also
-takes `session_id`; and the `audit_run`, `audit_record`, `audit_report`,
-`provenance` and `kb_peers_*` methods have no Elixir tool at all. They are
-reachable only by a direct port client.
+`search` also takes `peers`, `reachable_from`, `max_hops` and `slug`, and `add`
+also takes `session_id`. S1 now exposes `audit_run`, `audit_record`,
+`audit_report`, and `provenance` as the Elixir tools `kb_audit_run`,
+`kb_audit_record`, `kb_audit_report`, and `kb_provenance`. The `kb_peers_*`
+methods remain port-only and have no Elixir tool.
 
 ## Behaviour changes the fleet will see
 
