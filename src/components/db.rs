@@ -1396,7 +1396,7 @@ pub fn apply_event(
 
 /// [`apply_event`], with the event's occurrence index in the log.
 ///
-/// Only the run_id-less `run_history` arm reads it; see [`synthetic_run_key`]
+/// Only the run_id-less `run_history` arm reads it; see `synthetic_run_key`
 /// for why an incremental replay must supply it and a from-empty
 /// materialization need not.
 pub fn apply_event_at(

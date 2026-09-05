@@ -52,6 +52,40 @@
 //! SQLite write transaction across up to nine model calls. The prefetch is
 //! sealed at `BEGIN`, so a miss inside the transaction is a loud error rather
 //! than a silent stall.
+//!
+//! # Writing during a deferral, and how it converges
+//!
+//! A write is refused unless the database is converged
+//! ([`Decision::blocks_writes`]), with one exception: row 6, an unreadable log.
+//! Refusing every write over one malformed line is what row 6 exists to prevent,
+//! so the write proceeds — but the cursor does **not** move.
+//!
+//! That leaves the database in a state worth naming plainly, because it is
+//! weaker than anything else this module allows. **The database transiently
+//! materializes the log out of order.** The new batch applies, while the events
+//! between the cursor and the damaged line do not, so the materialized tables
+//! are neither `Materialize(log)` nor `Materialize(prefix of log)` — they are
+//! the committed prefix plus a later, disjoint batch. `DurableBatch.tla`'s
+//! `CursorAgreesWithDB` does not hold here; the invariant that does is weaker
+//! and one-directional: **the cursor never claims more than has been applied.**
+//! Nothing reports the gap as converged, and no repair is silently foreclosed.
+//!
+//! Convergence, once the log is repaired or replaced:
+//!
+//! 1. Repairing the log changes bytes inside `[0, offset)` or its length, so the
+//!    prefix fingerprint stops matching and recovery takes the full-rebuild row —
+//!    the strongest repair, from the log alone.
+//! 2. If the repair somehow leaves the prefix identical (the damage lay wholly
+//!    past the cursor and was excised), recovery takes the tail-replay row and
+//!    applies every event from the cursor forward. The out-of-order batch is
+//!    among them and is re-applied: every `apply_event` arm is idempotent, and
+//!    the one arm that was not — the `run_id`-less `run_history` key — now takes
+//!    a log-derived occurrence index rather than a count of rows already
+//!    present, so re-applying it is a no-op instead of a duplicate.
+//!
+//! Either way the end state is `Materialize(log)`. The transient ordering is
+//! observable to a reader in between, which is why reads report staleness
+//! (`warn_if_behind`, and the MCP `stale` field) for the whole window.
 
 use crate::commands::add::Lock;
 use crate::components::db;
