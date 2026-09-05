@@ -35,28 +35,17 @@ pub enum Peers {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Detect the source repo path from the DB path or fall back to cwd.
+/// The source repo identity used to key peer graph edges.
 ///
-/// Convention: db lives at `<repo>/.state/agent-kb/agent-kb.db` (or via the
-/// `agent-kb/` symlink). Walking two parents from the db file therefore gives
-/// the repo root. We prefer the git-reported toplevel when available so the
-/// path is canonical.
-fn detect_source_repo(db_path: &std::path::Path) -> String {
-    // Try git first — most reliable canonical path.
-    if let Some(root) = config::git_repo_root() {
-        return root.to_string_lossy().to_string();
-    }
-    // Fall back to walking up from the DB path.
-    db_path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
+/// Always `paths.root` -- the same layout-aware repository root the MCP
+/// port uses for `handle_kb_peers_add` -- rather than a CWD-based
+/// `config::git_repo_root()` git subprocess (which could disagree, e.g.
+/// inside a managed `.state` git worktree) or an unconditional two-parent
+/// walk from the db path (wrong for the legacy layout). One repository must
+/// register under one identity regardless of whether it's addressed from
+/// the CLI or the port.
+fn detect_source_repo(paths: &config::Paths) -> String {
+    paths.root.to_string_lossy().to_string()
 }
 
 fn maybe_sweep_expired_peers(conn: &rusqlite::Connection, did_mutate: bool) -> anyhow::Result<()> {
@@ -107,7 +96,7 @@ impl PeersAdd {
         let paths = config::Paths::discover()?;
         let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
-        let source_repo = detect_source_repo(&paths.db);
+        let source_repo = detect_source_repo(&paths);
         let now = chrono::Utc::now().to_rfc3339();
 
         // Compute optional expires_at via SQLite datetime arithmetic.
@@ -201,7 +190,7 @@ impl PeersList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
         let conn = db::open_ro(&paths.db)?;
-        let source_repo = detect_source_repo(&paths.db);
+        let source_repo = detect_source_repo(&paths);
 
         let rows = query_peers_for_repo(&conn, &source_repo, self.graph_type.as_deref())?;
         println!("{}", serde_json::to_string_pretty(&rows)?);

@@ -406,16 +406,6 @@ pub fn git_head_sha_at(dir: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Get the git repo root.
-pub fn git_repo_root() -> Option<PathBuf> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
-}
-
 /// Resolve the model cache directory.
 fn model_cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("FASTEMBED_CACHE_PATH") {

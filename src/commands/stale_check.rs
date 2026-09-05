@@ -183,13 +183,29 @@ impl Runnable for StaleCheck {
 impl StaleCheck {
     /// Execute the stale-check command.
     pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        let report = self.execute_with(&paths)?;
+        render_cli(&report);
+        Ok(())
+    }
+
+    /// Execute against explicit paths (exposed for testing).
+    ///
+    /// `repo_root` resolves from `paths.root` -- the same layout-aware root
+    /// `add`/`cite` hash evidence against and the MCP port passes -- rather
+    /// than a CWD-based `config::git_repo_root()` git subprocess. Those can
+    /// silently disagree: a process cwd inside a managed `.state` git
+    /// worktree has its own git toplevel, so `git_repo_root()` would resolve
+    /// to the worktree while `paths.root` (and the port) resolve to the
+    /// outer repo -- meaning `--relocate` would rewrite evidence hashes
+    /// against the wrong repository.
+    pub fn execute_with(&self, paths: &config::Paths) -> anyhow::Result<StaleCheckReport> {
         if self.files.is_empty() && self.commits.is_empty() && !self.blame {
             anyhow::bail!("provide at least one file path or --commits");
         }
 
-        let paths = config::Paths::discover()?;
         let conn = db::open_db(&paths.db)?;
-        let repo_root = config::git_repo_root();
+        let repo_root = Some(paths.root.clone());
         let policy: RelocationPolicy = self.relocate.into();
 
         let mut report = run_stale_check(
@@ -204,13 +220,12 @@ impl StaleCheck {
         // P4: relocation computes and reports by default.  Rewriting a citation
         // is a separate, off-by-default decision, and even then it writes the
         // path only — never the stored hash.
-        let cfg = config::KbConfig::from_paths(&paths);
+        let cfg = config::KbConfig::from_paths(paths);
         if cfg.relocation_autoheal && policy != RelocationPolicy::Never {
-            heal_relocations(&paths, &mut report)?;
+            heal_relocations(paths, &mut report)?;
         }
 
-        render_cli(&report);
-        Ok(())
+        Ok(report)
     }
 }
 
@@ -710,6 +725,107 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// br-<stale-check-repo-root>: `execute_with` must relocate against
+    /// `paths.root`, not a CWD-based `config::git_repo_root()` git
+    /// subprocess -- the two can silently disagree (e.g. a process cwd
+    /// inside a managed `.state` git worktree has its own git toplevel).
+    ///
+    /// Construction: `old.rs` has changed bytes (hash mismatch against the
+    /// stored citation), but `new.rs` under the same root holds the exact
+    /// recorded excerpt, verbatim and unique enough that it cannot exist
+    /// anywhere under the test runner's own cwd. If relocation resolves
+    /// against `paths.root`, `FileThenRepo` finds `new.rs` and reports
+    /// `Relocated`. If it fell back to (or ignored) some other root, the
+    /// excerpt would not be found and the row would stay `Unverified`.
+    /// The commit SHA is fictitious and unresolvable, which only routes the
+    /// entry to the `unreachable` bucket -- `relocation_pass` still checks
+    /// evidence for every bucket, including `unreachable`.
+    ///
+    /// The sqlite db itself lives in a separate directory from `paths.root`
+    /// (a real repo's db normally nests under root/.state/, but nothing here
+    /// exercises that nesting): `FileThenRepo` walks the whole of
+    /// `paths.root`, and the recorded excerpt is also stored verbatim as the
+    /// `citation_excerpt` column value, so a db file living inside the
+    /// scanned tree would itself be a second (non-unique) match.
+    #[test]
+    fn execute_with_relocates_against_paths_root_not_git_repo_root() {
+        use sha2::{Digest, Sha256};
+
+        let content_tmp = TempDir::new().unwrap();
+        let state_tmp = TempDir::new().unwrap();
+        let root = content_tmp.path();
+        let state_dir = state_tmp.path();
+        let paths = config::Paths {
+            root: root.to_path_buf(),
+            lock: state_dir.join(".lock"),
+            events: state_dir.join("agent-kb-events.jsonl"),
+            db: state_dir.join("agent-kb.db"),
+            fastembed_cache: state_dir.join("fastembed-cache"),
+            compact_state: state_dir.join("compact-state.json"),
+            query_hits: state_dir.join("query-hits.db"),
+        };
+        db::open_or_init(&paths).unwrap();
+        let conn = db::open_db(&paths.db).unwrap();
+
+        let excerpt = concat!(
+            "fn uniquely_relocated_for_stale_check_repo_root_regression_test() {\n",
+            "    let enough_bytes = \"make this excerpt strong and unique in the repository\";\n",
+            "    println!(\"{enough_bytes}\");\n",
+            "}\n"
+        );
+        std::fs::write(root.join("old.rs"), b"changed bytes\n").unwrap();
+        std::fs::write(root.join("new.rs"), excerpt).unwrap();
+        let hash = format!("sha256:{:x}", Sha256::digest(excerpt.as_bytes()));
+
+        conn.execute(
+            "INSERT INTO entries (id, path, summary, content, tags, version_ref, is_stale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                "e1",
+                "old.rs",
+                "test entry",
+                "body",
+                "[]",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, citation_excerpt, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, ?4, ?5, '2024-01-01T00:00:00Z')",
+            params!["ev1", "e1", "old.rs", &hash, excerpt],
+        )
+        .unwrap();
+        drop(conn);
+
+        let cmd = StaleCheck {
+            files: vec![],
+            commits: vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
+            blame: false,
+            relocate: RelocateArg::FileThenRepo,
+        };
+
+        let report = cmd.execute_with(&paths).unwrap();
+
+        assert_eq!(
+            report.unreachable.len(),
+            1,
+            "the fictitious commit SHA must route e1 to unreachable, not vanish"
+        );
+        assert_eq!(
+            report.relocation.len(),
+            1,
+            "relocation_pass must still check unreachable-bucket evidence"
+        );
+        assert_eq!(report.relocation[0].status, VerificationStatus::Relocated);
+        assert_eq!(
+            report.relocation[0].new_path.as_deref(),
+            Some("new.rs"),
+            "relocation must find new.rs under paths.root"
+        );
+    }
 
     #[test]
     fn parse_log_hashes_collects_unique_shas() {
