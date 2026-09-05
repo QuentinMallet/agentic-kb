@@ -4,7 +4,7 @@
 
 For a selected database, derive the repository root layout-aware, and when discovering a database at a candidate root prefer `<root>/.state/agent-kb/agent-kb.db` over `<root>/agent-kb/agent-kb.db`.
 
-The recognized layouts are the canonical `<root>/.state/agent-kb/agent-kb.db` and the tolerated legacy `<root>/agent-kb/agent-kb.db`. If both databases exist at the same candidate root, the canonical database wins. Rust `Paths::discover` and Elixir `DbDiscovery` use that same candidate order.
+The recognized layouts are the canonical `<root>/.state/agent-kb/agent-kb.db` and the tolerated legacy `<root>/agent-kb/agent-kb.db`. If both databases exist at the same candidate root, the canonical database wins. A bare `.state/` marker also beats an existing legacy database, even before the canonical database has been written for the first time (first run, or a legacy checkout mid-migration): the consequence is that such a checkout opens the canonical store -- which may be empty -- rather than the legacy one, until the migration completes. Rust `Paths::discover` and Elixir `DbDiscovery` use that same candidate order.
 
 ## Rejected alternatives
 
