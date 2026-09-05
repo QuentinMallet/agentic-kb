@@ -1942,7 +1942,20 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let uniform_rows = match audit_sample_entries(&conn, sample_size) {
+    // In traffic mode, split the sample_size budget between the uniform and
+    // traffic arms up front so their combined total never exceeds
+    // sample_size — the B1 decision doc's "kb_audit_run freezes up to 50
+    // candidates" claim only holds if a single call can't return up to
+    // 2*sample_size by drawing each arm independently to its own full quota.
+    // Round the uniform half up so sample_size=1 still yields a uniform
+    // sample when traffic can't contribute (e.g. no hit-log).
+    let uniform_budget = if mode == "traffic" {
+        ((sample_size + 1) / 2).max(1)
+    } else {
+        sample_size
+    };
+
+    let uniform_rows = match audit_sample_entries(&conn, uniform_budget) {
         Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -1951,12 +1964,16 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let ts = chrono::Utc::now().to_rfc3339();
 
     // Uniform-first: complete and freeze the unbiased arm before consulting
-    // the separate telemetry file for the additive traffic arm.
+    // the separate telemetry file for the additive traffic arm. The traffic
+    // arm's budget is whatever the uniform arm left unused, so a sparse
+    // uniform draw (fewer present-evidence entries than sample_size) doesn't
+    // waste the remainder of the cap.
     let uniform_ids: Vec<String> = uniform_rows.iter().map(|row| row.0.clone()).collect();
-    let traffic_rows = if mode == "traffic" {
+    let traffic_budget = sample_size.saturating_sub(uniform_rows.len());
+    let traffic_rows = if mode == "traffic" && traffic_budget > 0 {
         query_hits::counts(&paths.query_hits)
             .and_then(|counts| {
-                audit_traffic_entries(&conn, sample_size, &uniform_ids, &counts).ok()
+                audit_traffic_entries(&conn, traffic_budget, &uniform_ids, &counts).ok()
             })
             .unwrap_or_default()
     } else {
@@ -1966,6 +1983,14 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let mut entry_rows: Vec<(AuditEntry, &str)> =
         uniform_rows.into_iter().map(|r| (r, "uniform")).collect();
     entry_rows.extend(traffic_rows.into_iter().map(|r| (r, "traffic")));
+
+    // Defensive: uniform and traffic are already disjoint by construction
+    // (audit_traffic_entries excludes uniform_ids), but dedupe by entry id
+    // anyway so the sample_size cap holds even if that invariant ever slips,
+    // then cap the combined total at sample_size.
+    let mut seen_entry_ids = std::collections::HashSet::new();
+    entry_rows.retain(|(entry, _arm)| seen_entry_ids.insert(entry.0.clone()));
+    entry_rows.truncate(sample_size);
 
     let samples: Vec<Value> = entry_rows
         .iter()
@@ -4205,11 +4230,15 @@ mod tests {
         let mut hot_traffic = 0;
         let mut cold_traffic = 0;
         for _ in 0..60 {
+            // sample_size:2, not 1: the combined uniform+traffic cap now
+            // splits the budget between the two arms (1 each here), so a
+            // budget of 1 would leave the traffic arm nothing to draw and
+            // this test would never see a traffic-tagged sample.
             let resp = handle_audit_run(
                 &tr::<AuditRunRequest>(
                     "audit_run",
                     &json!(null),
-                    &json!({"sample_size":1,"mode":"traffic"}),
+                    &json!({"sample_size":2,"mode":"traffic"}),
                 ),
                 &paths,
             );
@@ -4260,6 +4289,47 @@ mod tests {
         let samples = resp["samples"].as_array().unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0]["arm"], "uniform");
+    }
+
+    /// IMPORTANT (premium review of bd-21ef.2..bd-21ef.2.12b): traffic mode
+    /// used to draw the uniform and traffic arms independently, each up to
+    /// `sample_size`, so a single call could return up to 2*sample_size
+    /// samples — contradicting the B1 decision doc's "kb_audit_run freezes
+    /// up to 50 candidates" claim (the doc's basis for audit_record's
+    /// 50-verdict cap). With 6 present-evidence entries and hit-traffic on
+    /// all of them, both arms independently have enough candidates to fill a
+    /// sample_size=3 request; the combined total must still be capped at 3.
+    #[test]
+    fn test_audit_run_traffic_mode_caps_combined_total_at_sample_size() {
+        let (_dir, paths, emb) = setup();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(add_live_entry(
+                &paths,
+                &emb,
+                &format!("p/cap-traffic-{i}"),
+                None,
+            ));
+        }
+        for eid in &ids {
+            query_hits::record_hits(&paths.query_hits, &[eid.clone()], "test");
+        }
+
+        let resp = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"sample_size": 3, "mode": "traffic"}),
+            ),
+            &paths,
+        );
+        assert_eq!(resp["type"], "ok");
+        let samples = resp["samples"].as_array().unwrap();
+        assert!(
+            samples.len() <= 3,
+            "combined uniform+traffic samples must be capped at sample_size (3), got {}",
+            samples.len()
+        );
     }
 
     #[test]
