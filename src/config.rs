@@ -192,7 +192,20 @@ impl Paths {
     /// a `.state/` directory remains the marker for canonical first-run setup.
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
-        let mut dir: &Path = &cwd;
+        let (paths, warning) = Self::discover_from(&cwd)?;
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        Ok(paths)
+    }
+
+    /// Same walk as [`Self::discover`], parameterized on a starting directory
+    /// instead of the process cwd, and returning the store-divergence warning
+    /// (if any) instead of printing it directly. Split out so tests can assert
+    /// on the warning without mutating the process-wide cwd or capturing
+    /// stderr.
+    fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
+        let mut dir: &Path = start;
         let mut warned_about_inner_state = false;
         loop {
             let inside_managed = is_inside_managed_state_worktree(dir);
@@ -207,29 +220,39 @@ impl Paths {
             } else {
                 let canonical_db = dir.join(".state/agent-kb/agent-kb.db");
                 let legacy_db = dir.join("agent-kb/agent-kb.db");
-                let selected_db = if canonical_db.exists() {
+                // Canonical wins whenever it exists OR its `.state/` marker
+                // does (first run, or a legacy db not yet migrated) — checked
+                // BEFORE the legacy candidate, so canonical wins at every
+                // candidate root as documented in
+                // docs/decisions/b3-root-derivation.md.
+                let selected_db = if canonical_db.exists() || dir.join(".state").is_dir() {
                     Some(canonical_db)
                 } else if legacy_db.exists() {
                     Some(legacy_db)
-                } else if dir.join(".state").is_dir() {
-                    // Preserve the CLI's first-run canonical initialization.
-                    Some(canonical_db)
                 } else {
                     None
                 };
                 if let Some(db) = selected_db {
+                    // The store-divergence warning compares the selected root
+                    // against its canonical form; that comparison is only
+                    // meaningful when canonical was actually selected. A
+                    // legacy-only checkout has no canonical db to diverge
+                    // from — canonicalizing a nonexistent path always fails,
+                    // which would otherwise warn on every legacy-only command.
+                    let warning = if is_canonical_db(&db) {
+                        divergence_warning(dir, &Paths::from_root(dir))
+                    } else {
+                        None
+                    };
                     let paths = Paths::from_db(&db);
-                    if let Some(warning) = divergence_warning(dir, &Paths::from_root(dir)) {
-                        eprintln!("{warning}");
-                    }
-                    return Ok(paths);
+                    return Ok((paths, warning));
                 }
             }
             match dir.parent() {
                 Some(p) => dir = p,
                 None => bail!(
                     "Could not find repo root (no KB database or .state/ directory in {} or any parent)",
-                    cwd.display()
+                    start.display()
                 ),
             }
         }
@@ -410,6 +433,15 @@ mod tests {
     use std::path::PathBuf;
 
     /// RAII guard that restores cwd on drop (same pattern as add.rs tests).
+    ///
+    /// Safety: `std::env::set_current_dir` mutates process-wide state, so this
+    /// is only sound when each test runs in its own process — true under
+    /// `cargo nextest run` (the project's test runner), but NOT under plain
+    /// `cargo test`, which runs tests as threads within one process and could
+    /// race two `CwdGuard`-using tests against each other. Prefer
+    /// `Paths::discover_from(&explicit_dir)` over a `CwdGuard` in new tests
+    /// where possible — it takes the starting directory as an argument and
+    /// never touches process cwd at all.
     struct CwdGuard(PathBuf);
     impl CwdGuard {
         fn set(dir: &Path) -> Self {
@@ -486,6 +518,109 @@ mod tests {
         }
     }
 
+    /// br-<mid-migration>: a candidate root with a `.state/` marker but no
+    /// canonical db file yet (first run, or migration in progress) must still
+    /// select the canonical path over a legacy db that already exists at the
+    /// same root — matching the decision note's "canonical wins at every
+    /// candidate root", including before the canonical db's first write.
+    #[test]
+    fn test_discover_prefers_canonical_state_marker_over_legacy_db_mid_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // `.state/` exists (the canonical marker) but nothing has been written
+        // to the canonical db yet.
+        fs::create_dir_all(root.join(".state")).unwrap();
+        // A legacy db already exists at this same root (not yet migrated).
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        fs::write(&legacy_db, b"legacy").unwrap();
+
+        let _guard = CwdGuard::set(root);
+        let discovered = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        assert_eq!(
+            discovered.db,
+            root.join(".state/agent-kb/agent-kb.db"),
+            "a `.state/` marker must select the canonical path even when a \
+             legacy db exists and the canonical db has not been written yet"
+        );
+    }
+
+    /// br-<nested-checkout-parity>: Rust and Elixir discovery must agree on
+    /// where a nested checkout's own `.state/` marker stops the upward walk,
+    /// even when it has no db file yet. Otherwise the MCP port (Elixir) keeps
+    /// walking to an outer ancestor's real db while the CLI (Rust) stops at
+    /// the nested marker and would create a brand new store there — silently
+    /// splitting one logical repo into two stores. See the matching Elixir
+    /// test in mcp/test/agentic_kb_mcp_test.exs.
+    #[test]
+    fn test_discover_nested_state_marker_stops_before_outer_canonical_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let outer_db = outer.join(".state/agent-kb/agent-kb.db");
+        fs::create_dir_all(outer_db.parent().unwrap()).unwrap();
+        fs::write(&outer_db, b"outer").unwrap();
+
+        // A nested directory has its own bare `.state/` marker (e.g. an
+        // in-progress `kb init`) but no db file of its own yet.
+        let nested = outer.join("nested");
+        fs::create_dir_all(nested.join(".state")).unwrap();
+
+        let _guard = CwdGuard::set(&nested);
+        let discovered = Paths::discover().expect("discover should succeed");
+        drop(_guard);
+
+        assert_eq!(
+            discovered.db,
+            nested.join(".state/agent-kb/agent-kb.db"),
+            "discovery must stop at the nested `.state/` marker, not continue \
+             up to the outer repo's real db"
+        );
+    }
+
+    /// br-<divergence-warning-scope>: the store-divergence warning fires only
+    /// when the *selected* candidate is canonical. A legacy-only checkout has
+    /// no canonical db to diverge from (canonicalize() of a nonexistent path
+    /// always fails), so it must stay silent.
+    #[test]
+    fn test_discover_from_is_silent_on_a_legacy_only_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        fs::write(&legacy_db, b"legacy").unwrap();
+
+        let (paths, warning) = Paths::discover_from(root).expect("discover should succeed");
+        assert_eq!(paths.db, legacy_db);
+        assert!(
+            warning.is_none(),
+            "a legacy-only checkout must not warn about store divergence, got: {warning:?}"
+        );
+    }
+
+    /// The converse of the above: when both a canonical db and a diverging
+    /// legacy db exist at the same root, canonical is selected (per the
+    /// candidate-precedence tests above) and the warning must still fire.
+    #[test]
+    fn test_discover_from_still_warns_when_both_candidates_present_and_diverge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let canonical_db = root.join(".state/agent-kb/agent-kb.db");
+        fs::create_dir_all(canonical_db.parent().unwrap()).unwrap();
+        fs::write(&canonical_db, b"canonical").unwrap();
+        let legacy_db = root.join("agent-kb/agent-kb.db");
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        fs::write(&legacy_db, b"distinct legacy").unwrap();
+
+        let (paths, warning) = Paths::discover_from(root).expect("discover should succeed");
+        assert_eq!(paths.db, canonical_db);
+        assert!(
+            warning.is_some(),
+            "a diverging legacy db next to a selected canonical db must still warn"
+        );
+    }
+
     proptest! {
         #[test]
         fn root_from_db_is_stable_across_supported_layout_reconstruction(
@@ -496,7 +631,34 @@ mod tests {
             let legacy = root.join("agent-kb/agent-kb.db");
             proptest::prop_assert_eq!(root_from_db(&canonical), root.clone());
             proptest::prop_assert_eq!(root_from_db(&legacy), root.clone());
-            proptest::prop_assert_eq!(root_from_db(&root.join(".state/agent-kb/agent-kb.db")), root);
+        }
+
+        #[test]
+        fn root_from_db_handles_the_filesystem_root_boundary_and_relative_paths(
+            components in proptest::collection::vec("[a-z][a-z0-9]{0,7}", 0..6)
+        ) {
+            // Root-level checkout: the repository root itself is "/", i.e. the
+            // last parent-walk step in either layout runs out of directory
+            // components. Decision: root_from_db resolves this to "/", not "."
+            // — "." would misleadingly imply an unresolved/relative path.
+            proptest::prop_assert_eq!(
+                root_from_db(Path::new("/.state/agent-kb/agent-kb.db")),
+                PathBuf::from("/")
+            );
+            proptest::prop_assert_eq!(
+                root_from_db(Path::new("/agent-kb/agent-kb.db")),
+                PathBuf::from("/")
+            );
+
+            // A relative (non-absolute) db path must still resolve using the
+            // same parent-walking rule, anchored at "." instead of "/".
+            let rel_root = components
+                .iter()
+                .fold(PathBuf::from("."), |path, component| path.join(component));
+            let rel_canonical = rel_root.join(".state/agent-kb/agent-kb.db");
+            let rel_legacy = rel_root.join("agent-kb/agent-kb.db");
+            proptest::prop_assert_eq!(root_from_db(&rel_canonical), rel_root.clone());
+            proptest::prop_assert_eq!(root_from_db(&rel_legacy), rel_root);
         }
     }
 
