@@ -662,6 +662,23 @@ fn parse_error(id: &Value, message: impl std::fmt::Display) -> Value {
     })
 }
 
+/// Methods that append to the event log or otherwise mutate the database, and
+/// therefore run C1/D3 recovery before dispatch.
+const MUTATING_METHODS: &[&str] = &[
+    "add",
+    "import",
+    "expire",
+    "stale_check",
+    "compact",
+    "reembed",
+    "run",
+    "test_add",
+    "audit_run",
+    "audit_record",
+    "kb_peers_add",
+    "kb_peers_remove",
+];
+
 fn handle_request(
     line: &str,
     paths: &config::Paths,
@@ -707,6 +724,17 @@ fn handle_request(
                 Err(e) => return parse_error(&id, e),
             }
         };
+    }
+
+    // C1/D3: the server is long-lived, so recovering only at startup is not
+    // enough — an external `kb compact` or another process's crash gap can open
+    // at any point during a session. Every mutating method re-checks before it
+    // takes the lock. `rebuild` is excluded because it is the repair itself, and
+    // the read methods detect and report staleness instead (ADR-7).
+    if MUTATING_METHODS.contains(&method.as_str()) {
+        if let Err(e) = crate::commands::rebuild::recover_if_needed(paths, emb) {
+            eprintln!("warn: event-log recovery before {method} failed: {e}");
+        }
     }
 
     match method.as_str() {
@@ -3737,6 +3765,75 @@ mod tests {
         let req2 = json!({"method":"expire","id":"pg3","entry_id":entry_id,"force":true});
         let resp2 = handle_expire(&tr::<ExpireRequest>("expire", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "ok");
+    }
+
+    /// A long-lived MCP server recovers at startup and then serves for hours.
+    /// An external `kb compact` (or another process's crash gap) opening
+    /// mid-session must be recovered before the next mutating request, not
+    /// erased by it.
+    #[test]
+    fn test_mutating_request_recovers_an_externally_diverged_database() {
+        struct FixedEmbedder;
+        impl embedder::Embedder for FixedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.1; 384])
+            }
+        }
+        let (_dir, paths, _noop) = setup();
+        let emb = FixedEmbedder;
+        let id = json!("m1");
+        let req = json!({"method":"add","id":"m1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+
+        // Another process compacts the log: the generation moves under us.
+        crate::components::cursor::bump_generation(&paths.events).unwrap();
+        {
+            let conn = db::open_ro(&paths.db).unwrap();
+            assert!(crate::components::cursor::inspect(&conn, &paths).is_behind());
+        }
+
+        // The next mutating request recovers first, then writes.
+        let req2 = json!({"method":"add","id":"m2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "ok", "{resp}");
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            crate::components::cursor::inspect(&conn, &paths),
+            crate::components::cursor::Decision::NoOp,
+            "the server must converge rather than re-baseline"
+        );
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(live, 2, "neither entry may be lost by the recovery");
+        let _ = id;
+    }
+
+    /// Same situation, but the server has no embedder, so the rebuild defers.
+    /// It must serve on and refuse the write, never re-baseline.
+    #[test]
+    fn test_mutating_request_refuses_rather_than_rebaselining_when_recovery_defers() {
+        let (_dir, paths, emb) = setup();
+        let req = json!({"method":"add","id":"m1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+        crate::components::cursor::bump_generation(&paths.events).unwrap();
+
+        let req2 = json!({"method":"add","id":"m2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "error", "{resp}");
+        assert!(
+            resp["message"].as_str().unwrap_or("").contains("not converged"),
+            "the error must name the divergence: {resp}"
+        );
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert!(
+            crate::components::cursor::inspect(&conn, &paths).is_behind(),
+            "the divergence must survive the refused write"
+        );
     }
 
     #[test]

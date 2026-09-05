@@ -106,10 +106,11 @@ mod tests {
             "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
             "config": "{}", "ts": "2024-01-01T00:00:00Z"
         });
-        events::append_event(&paths.events, &test_case).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
-        db::apply_event(&conn, &NoopEmbedder, &test_case).unwrap();
-        drop(conn);
+        {
+            let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &NoopEmbedder, &[test_case]).unwrap();
+        }
 
         let cmd = Run {
             test_id: "t1".to_string(),

@@ -281,6 +281,127 @@ fn test_every_writer_leaves_the_cursor_caught_up() {
 }
 
 // ---------------------------------------------------------------------------
+// 2. A write may only start from a converged database
+// ---------------------------------------------------------------------------
+
+/// Overwriting the cursor without reading it first re-baselines a diverged
+/// database to converged, and the divergence becomes unrecoverable: the log is
+/// the only other record of the gap and the new cursor claims it is applied.
+#[test]
+fn test_write_refuses_when_the_cursor_says_a_rebuild_is_due() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    let before_cursor = cursor_of(&paths).unwrap();
+    let before_log = fs::read(&paths.events).unwrap();
+
+    // An external `kb compact` in another process bumps the generation.
+    cursor::bump_generation(&paths.events).unwrap();
+
+    let conn = open_db(&paths.db).unwrap();
+    let lock = acquire_lock(&paths.lock).unwrap();
+    let error = cursor::append_and_apply(
+        &lock,
+        &conn,
+        &paths,
+        &FixedEmbedder,
+        &[upsert("e2", "two")],
+    )
+    .unwrap_err();
+
+    assert!(
+        cursor::is_not_converged(&error),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        fs::read(&paths.events).unwrap(),
+        before_log,
+        "a refused write must not append"
+    );
+    assert_eq!(
+        cursor::read(&conn).unwrap().unwrap(),
+        before_cursor,
+        "a refused write must not touch the cursor"
+    );
+    // The repair is still available, which is the whole point of refusing.
+    drop(lock);
+    assert!(recover_if_needed(&paths, &FixedEmbedder).unwrap());
+}
+
+/// The same guard for a tail-replay gap rather than a rebuild.
+#[test]
+fn test_write_refuses_when_the_cursor_is_behind_the_log() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    // Another process appended and was killed before its apply.
+    events::append_event(&paths.events, &upsert("orphan", "unapplied")).unwrap();
+    let before_len = fs::metadata(&paths.events).unwrap().len();
+
+    let conn = open_db(&paths.db).unwrap();
+    let lock = acquire_lock(&paths.lock).unwrap();
+    let error = cursor::append_and_apply(
+        &lock,
+        &conn,
+        &paths,
+        &FixedEmbedder,
+        &[upsert("e2", "two")],
+    )
+    .unwrap_err();
+
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+    assert_eq!(fs::metadata(&paths.events).unwrap().len(), before_len);
+    drop(lock);
+
+    // Recovery converges it, and the write then succeeds.
+    recover_if_needed(&paths, &FixedEmbedder).unwrap();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e2")).unwrap();
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
+    assert_eq!(
+        live_ids(&paths),
+        vec!["e1".to_string(), "e2".to_string(), "orphan".to_string()]
+    );
+}
+
+/// Route (c): the no-op-embedder rebuild defer returns Ok(false), so without
+/// the guard the very next write re-baselines the database it declined to
+/// repair.
+#[test]
+fn test_write_refuses_after_a_deferred_rebuild_under_a_noop_embedder() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &NoopEmbedder, add_args("e1")).unwrap();
+    cursor::bump_generation(&paths.events).unwrap();
+
+    // The defer: nothing was rebuilt, and nothing was re-baselined either.
+    assert!(!recover_if_needed(&paths, &NoopEmbedder).unwrap());
+    let error = kb_core::add(&paths, &NoopEmbedder, add_args("e2")).unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::inspect(&conn, &paths),
+        Decision::FullRebuild(RebuildReason::GenerationMismatch),
+        "the divergence must still be visible after the refusal"
+    );
+}
+
+/// The empty-batch path takes the guard too: an audit verdict with no expire
+/// still writes audit_runs rows, and those must not land on a diverged
+/// database either.
+#[test]
+fn test_empty_batch_write_takes_the_guard() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("e1")).unwrap();
+    cursor::bump_generation(&paths.events).unwrap();
+
+    let conn = open_db(&paths.db).unwrap();
+    let lock = acquire_lock(&paths.lock).unwrap();
+    let error =
+        cursor::append_and_apply_with(&lock, &conn, &paths, &FixedEmbedder, &[], |_| Ok(()))
+            .unwrap_err();
+    assert!(cursor::is_not_converged(&error), "unexpected error: {error:#}");
+}
+
+// ---------------------------------------------------------------------------
 // 3. Idempotent replay of every apply_event arm
 // ---------------------------------------------------------------------------
 

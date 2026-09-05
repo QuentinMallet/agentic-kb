@@ -1629,10 +1629,13 @@ mod tests {
         }
 
         fn seed(paths: &Paths, emb: &NoopEmbedder) {
+            // Through the applied-cursor writer, so the seeded repository is
+            // converged and the writers under test are not refused.
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(paths, &lock).unwrap();
             for i in 0..SEEDED as u32 {
                 let event = upsert(&format!("seed{i}"), i);
-                events::append_event(&paths.events, &event).unwrap();
-                db::apply_event(&db::open_db(&paths.db).unwrap(), emb, &event).unwrap();
+                cursor::append_and_apply(&lock, &conn, paths, emb, &[event]).unwrap();
             }
         }
 

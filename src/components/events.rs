@@ -621,6 +621,31 @@ fn empty_read() -> ReadEvents {
     }
 }
 
+/// The log's `committed_len` without materializing its events.
+///
+/// Takes the same intact-span shortcut the append path does: a log this binary
+/// has already appended to ends on a closed span, so `committed_len` is the
+/// file length and no scan is needed. Anything else — a legacy tail, a torn
+/// tail, a dangling span — falls through to the full span-aware scan, which is
+/// also where the D7 hard errors live.
+///
+/// The applied-cursor write guard calls this on every write, so the shortcut is
+/// what keeps a write O(bytes appended) instead of O(log size).
+pub fn committed_len(events_path: &Path) -> Result<u64> {
+    if !events_path.exists() {
+        return Ok(0);
+    }
+    let mut file = File::open(events_path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    if ends_on_intact_span(&mut file, len)? {
+        return Ok(len);
+    }
+    Ok(read_events(events_path)?.committed_len)
+}
+
 /// Read all events from a JSONL file.
 pub fn read_events(events_path: &Path) -> Result<ReadEvents> {
     read_events_up_to(events_path, usize::MAX)

@@ -416,8 +416,8 @@ mod tests {
             "is_stale": false,
             "ts": "2024-01-01T00:00:00Z"
         });
-        events::append_event(&paths.events, &upsert).unwrap();
-        apply_event(conn, &NoopEmbedder, &upsert).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[upsert]).unwrap();
     }
 
     fn seed_evidence(
@@ -440,8 +440,8 @@ mod tests {
             recorded_at: Some("2026-09-02T00:00:00Z".to_string()),
         };
         let event = evidence_add_event(entry_id, &evidence, Some("deadbeef"));
-        events::append_event(&paths.events, &event).unwrap();
-        apply_event(conn, &NoopEmbedder, &event).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event]).unwrap();
     }
 
     #[test]

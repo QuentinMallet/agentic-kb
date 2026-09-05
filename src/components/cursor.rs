@@ -111,6 +111,27 @@ impl RebuildReason {
     }
 }
 
+/// A write was refused because the database is not converged with the log.
+///
+/// The applied cursor is a claim about what the database contains. Overwriting
+/// it while it says "rebuild due" or "tail replay due" re-baselines a diverged
+/// database to converged and makes the divergence unrecoverable — there is no
+/// second record of the gap. Refusing is the only safe answer: the log is
+/// intact, so the repair is always still available.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "refusing to write: the database is not converged with the event log ({reason}). \
+     Run `kb rebuild`, or rerun the command so its recovery can converge first."
+)]
+pub struct NotConverged {
+    pub reason: String,
+}
+
+/// True when `err` is (or wraps) [`NotConverged`].
+pub fn is_not_converged(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotConverged>().is_some()
+}
+
 /// The D3 recovery decision. Eight table rows, four outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -129,6 +150,42 @@ impl Decision {
     /// Whether the database is materially behind (or ahead of) the log.
     pub fn is_behind(&self) -> bool {
         !matches!(self, Decision::NoOp)
+    }
+
+    /// Whether a write must be refused rather than allowed to overwrite the
+    /// cursor.
+    ///
+    /// Only the rows that say the cursor is a WRONG claim about the log block.
+    ///
+    /// [`Decision::Defer`] does not block: it means the log could not be read,
+    /// and refusing every write over that is exactly what row 6 exists to
+    /// prevent. An append against an unreadable log fails on its own, with the
+    /// parse error rather than a guess.
+    ///
+    /// [`RebuildReason::SchemaObsolete`] does not block either: the cursor is
+    /// still an accurate claim about how much of the log is applied, and only
+    /// derived state (cue rows, the embedding vintage) is missing. Blocking it
+    /// would make a pre-v3 database unwritable under `KB_NO_EMBED`, where the
+    /// upgrade rebuild deliberately defers to avoid dropping embeddings.
+    pub fn blocks_writes(&self) -> bool {
+        match self {
+            Decision::ReplayTail { .. } => true,
+            Decision::FullRebuild(RebuildReason::SchemaObsolete) => false,
+            Decision::FullRebuild(_) => true,
+            Decision::NoOp | Decision::Defer(_) => false,
+        }
+    }
+
+    /// One clause naming why, for an error message or a staleness note.
+    pub fn describe(&self) -> String {
+        match self {
+            Decision::NoOp => "converged".to_string(),
+            Decision::ReplayTail { from, to } => {
+                format!("the database is behind the event log, {from} of {to} bytes applied")
+            }
+            Decision::FullRebuild(reason) => reason.as_str().to_string(),
+            Decision::Defer(message) => message.clone(),
+        }
     }
 }
 
@@ -366,8 +423,19 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
     if !db::schema_is_current(conn) {
         return Decision::FullRebuild(RebuildReason::SchemaObsolete);
     }
-    let committed_len = match events::read_events(&paths.events) {
-        Ok(read) => read.committed_len,
+    if cursor.offset > 0 && !paths.events.exists() {
+        // The log is not there to compare against. That is the unreachable-
+        // layout hazard `rebuild` already refuses to auto-repair (it would drop
+        // every entry the vanished log covered), so it belongs with row 6 —
+        // defer with a warning — rather than with row 5, which is about a log
+        // that exists and is shorter than the cursor claims.
+        return Decision::Defer(format!(
+            "the event log is missing at {}",
+            paths.events.display()
+        ));
+    }
+    let committed_len = match events::committed_len(&paths.events) {
+        Ok(committed_len) => committed_len,
         Err(error) => {
             return Decision::Defer(format!(
                 "cannot read the event log at {}: {error}",
@@ -407,14 +475,10 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
 /// repair — under `open_ro`'s `PRAGMA query_only` they could not anyway.
 pub fn warn_if_behind(conn: &Connection, paths: &config::Paths) {
     let decision = inspect(conn, paths);
-    let detail = match &decision {
-        Decision::NoOp => return,
-        Decision::ReplayTail { from, to } => {
-            format!("the database is behind the event log ({from} of {to} bytes applied)")
-        }
-        Decision::FullRebuild(reason) => reason.as_str().to_string(),
-        Decision::Defer(message) => message.clone(),
-    };
+    if !decision.is_behind() {
+        return;
+    }
+    let detail = decision.describe();
     eprintln!(
         "kb: WARNING serving possibly stale results — {detail}. Run `kb rebuild` \
          (or any write command) to converge."
@@ -469,6 +533,22 @@ pub fn append_and_apply_with<T>(
     inside: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
     verify_lock(lock, paths)?;
+
+    // A write may only start from a converged database. Without this the helper
+    // appends and then stamps {current generation, new EOF, new tail hash} over
+    // whatever the cursor said, so a database that was one `kb compact` or one
+    // crashed writer behind is silently re-baselined to converged and the
+    // divergence becomes unrecoverable. Three routes reach here diverged: a
+    // long-lived MCP server that recovered only at startup, a CLI dispatch whose
+    // recovery failed and only warned, and the KB_NO_EMBED rebuild defer. Each
+    // now gets a refusal naming the repair instead of silent corruption.
+    let decision = inspect(conn, paths);
+    if decision.blocks_writes() {
+        return Err(NotConverged {
+            reason: decision.describe(),
+        }
+        .into());
+    }
 
     // An empty batch appends nothing and moves no cursor, but the caller still
     // gets its transaction — A1's audit record has verdicts with no expire.

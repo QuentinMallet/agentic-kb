@@ -782,9 +782,9 @@ mod tests {
                 "summary": "old", "content": "old", "tags": [],
                 "ts": "2024-01-01T00:00:00Z",
             });
-            ev_mod::append_event(&paths.events, &ev).unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
-            db::apply_event(&conn, &emb, &ev).unwrap();
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[ev]).unwrap();
         }
 
         // Count lines before.
@@ -1023,10 +1023,11 @@ mod tests {
             "summary": "old", "content": "old", "tags": [],
             "ts": "2024-01-01T00:00:00Z",
         });
-        ev_mod::append_event(&paths.events, &seed_ev).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
-        db::apply_event(&conn, &emb, &seed_ev).unwrap();
-        drop(conn);
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[seed_ev]).unwrap();
+        }
 
         let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
