@@ -86,7 +86,6 @@ reachable only by a direct port client.
    to the next newline. The connection is not dropped and the next request is
    answered.
 6. **A `query` over 8 KiB is an error** before it reaches the embedder or FTS.
-
 7. **A non-array `evidence`, `files`, `commits` or `cues` is now an error.** Each
    was previously read with `as_array()` and *ignored* when it was not one, so
    `kb_add` with `"evidence": {...}` stored an entry with no evidence and said
@@ -98,6 +97,13 @@ reachable only by a direct port client.
    different question than the caller asked.
 9. **`limit: 0` is now an error.** The accepted range starts at 1. It previously
    reached `search_entries` and returned an empty result set.
+10. **A `tools/call` whose `arguments` is neither an object nor null is now an
+    error.** A missing key and an explicit JSON null both still mean "no
+    arguments"; a string or an array is refused rather than coerced.
+11. **With no database, the "run `kb init`" hint wins over an argument error.**
+    Argument validation runs ahead of dispatch, but it is skipped when there is
+    no database to call, because the hint is the only thing the caller can act
+    on at that point.
 
 Two things the closure did *not* change, checked against the base commit so the
 table is not read as broader than it is: an **empty** `expand_ids` array was
