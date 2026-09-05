@@ -1,4 +1,4 @@
-use kb::bench_fixture::{logical_checksum, seed_db, BenchEmbedder, DEFAULT_SEED};
+use kb::bench_fixture::{logical_checksum, seed_fixture, BenchEmbedder, DEFAULT_SEED};
 use kb::components::db;
 use std::fs;
 use std::io;
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     let lock = kb::commands::add::acquire_lock(&paths.lock)?;
     let conn = db::open_rw(&paths, &lock)?;
     let emb = BenchEmbedder::new(seed);
-    seed_db(&conn, &emb, size, seed)?;
+    seed_fixture(&lock, &conn, &paths, &emb, size, seed)?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     println!(
         "{}",
