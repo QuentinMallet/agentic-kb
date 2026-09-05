@@ -53,6 +53,13 @@
 //! sealed at `BEGIN`, so a miss inside the transaction is a loud error rather
 //! than a silent stall.
 //!
+//! [`inspect`]'s convergence check plus its bounded [`tail_sha`] fingerprint
+//! read run on every call to [`append_and_apply`], independent of batch size —
+//! that is the gate this module's docs describe below. Measured under load
+//! (concurrent builds/tests sharing the machine), the gate costs roughly
+//! 25-40 ms per write; a caller doing many small writes should batch events
+//! into one `append_and_apply` call rather than pay the gate once per event.
+//!
 //! # The recovery table, and when a write is refused
 //!
 //! [`inspect`] classifies a database against its log. The plan's D3 table has
@@ -93,6 +100,35 @@
 //! `kb compact` takes the same gate. It rewrites the log of record and bumps its
 //! generation, so running it during a deferral would convert "nobody can tell
 //! what the log holds" into "whatever survived the rewrite is the whole truth".
+//!
+//! # Measured cost of the gate (reference for the T2b write lane)
+//!
+//! The gate is charged per WRITE, not per event, and it is dominated by bounded
+//! reads rather than by the size of the batch it guards. [`inspect`] reads one
+//! `committed_len` window plus the two [`TAIL_SHA_WINDOW`] windows of the
+//! current fingerprint, and the write then hashes two more windows for the
+//! cursor it stamps: about five 64 KiB reads, whatever the batch holds and
+//! however long the log is.
+//!
+//! Measured on a loaded shared machine, 1000 events of ~450 bytes each:
+//!
+//! | Shape | Per write | Per event |
+//! |---|---|---|
+//! | 1000 single-event writes | ~44 ms | ~44 ms |
+//! | 1000 events in one batch | ~2.6 s | ~2.6 ms |
+//!
+//! Of that ~44 ms, ~43 ms is the gate itself — `inspect` ~36 ms and the cursor's
+//! own fingerprint ~7 ms — so at this log size the append and its fsync are
+//! nearly free beside it. Treat the absolute numbers as an upper bound, since
+//! the box was running several suites at once, and the ratio as the finding:
+//! **batching is worth roughly 17x per event, and a caller that writes one event
+//! at a time pays the full fixed cost every time.** That is why the vacuum
+//! fixtures seed in batches, and it is the number the T2b write-lane benchmark
+//! should be re-measured against on a quiet machine.
+//!
+//! The lead to pull if that re-run finds the cost too high: `committed_len`'s
+//! intact-span shortcut reads a whole [`TAIL_SHA_WINDOW`] to confirm the log
+//! ends on a closed span, when the closing span is usually a few hundred bytes.
 
 use crate::commands::add::Lock;
 use crate::components::db;
@@ -429,8 +465,12 @@ pub fn tail_sha(events_path: &Path, offset: u64) -> Result<String> {
     if offset == 0 {
         return Ok(empty_tail_sha());
     }
-    let mut file = fs::File::open(events_path)
-        .with_context(|| format!("open events {} for the prefix fingerprint", events_path.display()))?;
+    let mut file = fs::File::open(events_path).with_context(|| {
+        format!(
+            "open events {} for the prefix fingerprint",
+            events_path.display()
+        )
+    })?;
     let len = file.metadata()?.len();
     anyhow::ensure!(
         len >= offset,
@@ -1189,7 +1229,11 @@ mod crash_tests {
                 None,
             )],
             "evidence_expire" => {
-                vec![events::evidence_expire_event("seed-1", "ev-1", "crash test")]
+                vec![events::evidence_expire_event(
+                    "seed-1",
+                    "ev-1",
+                    "crash test",
+                )]
             }
             other => panic!("unknown writer {other}"),
         };

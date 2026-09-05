@@ -1685,6 +1685,8 @@ mod tests {
     const FULL_VACUUM_PADDING_BYTES: usize = 400;
     const FAST_VACUUM_ENTRIES: usize = 500;
     const FAST_VACUUM_PADDING_BYTES: usize = 16_000;
+    /// Events per applied-cursor write while seeding the vacuum fixture.
+    const VACUUM_SEED_BATCH: usize = 1_000;
 
     fn vacuum_fixture_size() -> (usize, usize) {
         if env::var("PROPTEST_CASES").is_ok() {
@@ -1712,27 +1714,41 @@ mod tests {
         // leaves at least 1024 SQLite free pages (see vacuum_fixture_size).
         let (n_entries, padding_bytes) = vacuum_fixture_size();
         let padding: String = "x".repeat(padding_bytes);
-        for i in 0..n_entries {
-            let ev = serde_json::json!({
-                "action": "upsert", "table": "entries",
-                "id": format!("bulk{i}"),
-                "path": format!("src/bulk{i}.rs"),
-                "summary": format!("bulk entry {i}"),
-                "content": format!("content {i} {padding}"),
-                "tags": [],
-                "ts": "2024-01-01T00:00:00Z"
-            });
-            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[ev])
-                .unwrap();
-        }
+        let upserts: Vec<serde_json::Value> = (0..n_entries)
+            .map(|i| {
+                serde_json::json!({
+                    "action": "upsert", "table": "entries",
+                    "id": format!("bulk{i}"),
+                    "path": format!("src/bulk{i}.rs"),
+                    "summary": format!("bulk entry {i}"),
+                    "content": format!("content {i} {padding}"),
+                    "tags": [],
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            })
+            .collect();
         // Expire all entries to populate the SQLite freelist.
-        for i in 0..n_entries {
-            let ev = serde_json::json!({
-                "action": "expire", "table": "entries",
-                "id": format!("bulk{i}"),
-                "ts": "2024-01-02T00:00:00Z"
-            });
-            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[ev])
+        let expires: Vec<serde_json::Value> = (0..n_entries)
+            .map(|i| {
+                serde_json::json!({
+                    "action": "expire", "table": "entries",
+                    "id": format!("bulk{i}"),
+                    "ts": "2024-01-02T00:00:00Z"
+                })
+            })
+            .collect();
+
+        // In batches, not one write per entry. The gate is per WRITE — an
+        // inspect, two bounded fingerprint reads, an fsync and a cursor row —
+        // so a 12,000-entry fixture seeded one event at a time pays it 24,000
+        // times and runs for tens of minutes. Batching keeps the gate semantics
+        // exactly (each batch is a real converged-to-converged write) and pays
+        // it 24 times instead.
+        for chunk in upserts
+            .chunks(VACUUM_SEED_BATCH)
+            .chain(expires.chunks(VACUUM_SEED_BATCH))
+        {
+            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, chunk)
                 .unwrap();
         }
         drop(conn); // close before compact opens it
@@ -1779,8 +1795,7 @@ mod tests {
         use crate::components::{db, embedder::NoopEmbedder};
         let lock = crate::commands::add::acquire_lock(paths.lock.as_path()).unwrap();
         let conn = db::open_rw(paths, &lock).unwrap();
-        if cursor::inspect(&conn, paths)
-            == Decision::FullRebuild(RebuildReason::GenerationMismatch)
+        if cursor::inspect(&conn, paths) == Decision::FullRebuild(RebuildReason::GenerationMismatch)
         {
             let committed_len = crate::components::events::committed_len(&paths.events).unwrap();
             cursor::write(
