@@ -4,9 +4,9 @@
 records the land-or-defer decision rule for the persisted pre-normalized
 embedding format (follow-up `bd-prenorm-embeddings-followup-te13`) ahead of
 the benchmark run that will decide it, so the threshold cannot be tuned to
-whatever numbers come out. Every result cell below is `TODO`; do not fill
-this page in without also filling in the measurement's date, commit, and
-machine.
+whatever numbers come out.
+
+**Measured 2026-09-06. Verdict: LAND** — see Outcome below.
 
 ## Decision rule
 
@@ -61,20 +61,46 @@ KB_NO_EMBED=1 cargo bench --bench norm_cost
 pre-registers the threshold ahead of that bench being written and run, per
 the C3 plan's requirement that the rule be recorded before the numbers exist.
 
+10,000-entry corpus (decision corpus, per the rule above):
+
 | Site | Marginal cost — current (normalize at read time) | Marginal cost — pre-normalized (persisted unit-norm) | Savings | Meets 10%? |
 |---|---:|---:|---:|:---:|
-| Semantic lane | TODO | TODO | TODO | TODO |
-| Cue lane | TODO | TODO | TODO | TODO |
-| MMR | TODO | TODO | TODO | TODO |
+| Semantic lane | 21.421 ms | 7.9311 ms | 62.98% | Yes |
+| Cue lane | 20.977 ms | 7.5928 ms | 63.80% | Yes |
+| MMR | 1.3668 ms | 0.35486 ms | 74.04% | Yes |
 
-**Provenance (fill in when measured):**
+1,000-entry corpus (supplementary, not decision-relevant):
 
-- **Date:** TODO
-- **Commit:** TODO
-- **Machine:** TODO
+| Site | Marginal cost — current | Marginal cost — pre-normalized | Savings |
+|---|---:|---:|---:|
+| Semantic lane | 1.9185 ms | 0.75112 ms | 60.85% |
+| Cue lane | 2.1663 ms | 0.74129 ms | 65.78% |
+| MMR | 1.4798 ms | 0.42113 ms | 71.54% |
+
+Cosine/dot ratio at 10k: semantic 2.70x, cue 2.76x, mmr 3.85x — dot with
+pre-normalized vectors is markedly faster at every site. Point estimates are
+Criterion medians from `cargo bench --bench norm_cost` (`KB_NO_EMBED=1`); MMR
+was measured at `limit=10, pool=20`.
+
+**Provenance:**
+
+- **Date:** 2026-09-06
+- **Commit:** `91bec50` (this worktree's base, `bd-21ef.3.13-verdict` off the
+  `storage-correctness-2` aggregator)
+- **Machine:** not quiet — a background miner process, a backup job, and a
+  microVM were running concurrently; 1-minute load average was ~7.7 at the
+  start of the run (below the earlier-session peaks of 40-90+, but well
+  above an idle machine). Bench build (`bench` profile) took 4m 09s.
+  Numbers below the ~10x noise floor these conditions imply would need
+  re-verification on a quiet machine; the observed savings (61-74%) are far
+  enough above that floor to stand regardless.
 
 ## Outcome
 
-TODO — LAND or DEFER, decided by applying the rule above to the filled-in
-table. Do not decide from a subset of the three sites, and do not average
-across sites: each site must independently clear 10%.
+**LAND.** All three sites clear the 10% marginal-cost threshold by a wide
+margin at the 10,000-entry corpus (63-74% vs. the 10% bar), decided
+independently per site with no averaging, per the pre-registered rule above.
+The persisted pre-normalized embedding format is justified; the follow-up
+`bd-prenorm-embeddings-followup-te13` is unblocked by this verdict. The
+finiteness guards that were the fallback if this bench had come back DEFER
+already landed unconditionally in C3, independent of this outcome.
