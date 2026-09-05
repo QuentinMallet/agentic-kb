@@ -200,7 +200,12 @@ fn write_span(f: &mut File, events: &[serde_json::Value]) -> Result<()> {
 /// The caller must hold the flock before calling. Nothing in the span is
 /// reader-accepted until its `batch_commit` line lands with its newline, so an
 /// interrupted append contributes zero events rather than a prefix.
-pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<()> {
+/// Returns the log's `committed_len` after the append: the span just written
+/// closed cleanly and everything before it was already committed, so it is the
+/// file length. The applied cursor (C1/D3) records exactly this value, and
+/// taking it from the writer keeps the cost of a write O(bytes appended)
+/// rather than O(log size).
+pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
     append_events_batch_with_sync(
         events_path,
         events,
@@ -215,13 +220,13 @@ fn append_events_batch_with_sync<S, D>(
     events: &[serde_json::Value],
     mut sync_file: S,
     mut sync_dir: D,
-) -> Result<()>
+) -> Result<u64>
 where
     S: FnMut(&File) -> std::io::Result<()>,
     D: FnMut(&Path) -> Result<()>,
 {
     if events.is_empty() {
-        return Ok(());
+        return Ok(read_events(events_path)?.committed_len);
     }
     let file_was_created = !events_path.exists();
     let parent = events_path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -255,7 +260,7 @@ where
     // "AfterSync" means the complete log durability boundary: data plus any
     // directory entries created by this append are stable before DB apply.
     kill_point(KillPoint::AfterSync);
-    Ok(())
+    Ok(f.metadata()?.len())
 }
 
 /// Append a single event to the JSONL log.
@@ -265,7 +270,7 @@ where
 /// newline write fail, and without a span the next append would classify that
 /// complete-JSON tail as reader-accepted and promote an event the caller
 /// reported as failed.
-pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()> {
+pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<u64> {
     append_events_batch(events_path, std::slice::from_ref(event))
 }
 
