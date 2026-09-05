@@ -633,6 +633,50 @@ defmodule AgenticKbMcpTest do
                })
     end
 
+    # CRITICAL (premium review of bd-21ef.2..bd-21ef.2.12b): `verdict["verdict"]
+    # == false` never fires for a missing or non-boolean `verdict` key, so a
+    # verdict item shaped like %{"entry_id" => "x"} (no verdict key at all)
+    # or %{"entry_id" => "x", "verdict" => "false"} (a string, not a boolean)
+    # passed this check and reached the Rust port, which used to coerce the
+    # same shape to `false` via `.unwrap_or(false)` and expire the entry with
+    # no note. All three malformed shapes below (missing verdict, wrong-typed
+    # verdict, missing entry_id) must be rejected here, before the Rust call.
+    test "kb_audit_record rejects a verdict item with a missing or non-boolean verdict" do
+      assert {:error, _} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"entry_id" => "entry-1"}]
+               })
+
+      assert {:error, _} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"entry_id" => "entry-1", "verdict" => "false"}]
+               })
+
+      assert {:error, _} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"verdict" => true}]
+               })
+
+      assert :ok ==
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"entry_id" => "entry-1", "verdict" => true}]
+               })
+    end
+
+    test "kb_audit_record rejects an unknown key inside a verdict item" do
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"entry_id" => "entry-1", "verdict" => true, "extra" => 1}]
+               })
+
+      assert message =~ "extra"
+    end
+
     test "kb_audit_record accepts 50 verdicts and rejects 51" do
       assert :ok ==
                McpServer.validate_tool_args("kb_audit_record", %{
@@ -658,6 +702,8 @@ defmodule AgenticKbMcpTest do
       assert schema["maxItems"] == 50
       assert schema["items"]["if"]["properties"]["verdict"] == %{"const" => false}
       assert schema["items"]["then"]["required"] == ["note"]
+      assert schema["items"]["required"] == ["entry_id", "verdict"]
+      assert schema["items"]["additionalProperties"] == false
     end
 
     test "an unknown argument is rejected, not silently dropped by put_if_present" do
