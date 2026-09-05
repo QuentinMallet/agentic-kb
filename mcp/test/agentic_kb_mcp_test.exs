@@ -605,6 +605,34 @@ defmodule AgenticKbMcpTest do
   end
 
   describe "validate_tool_args/2 (B1)" do
+    test "kb_audit_record requires notes for false verdicts only" do
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [%{"entry_id" => "entry-1", "verdict" => false}]
+               })
+
+      assert message =~ "entry-1"
+      assert message =~ "non-empty note"
+
+      assert {:error, _message} =
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [
+                   %{"entry_id" => "entry-1", "verdict" => false, "note" => "  \t"}
+                 ]
+               })
+
+      assert :ok ==
+               McpServer.validate_tool_args("kb_audit_record", %{
+                 "run_id" => "audit-1",
+                 "verdicts" => [
+                   %{"entry_id" => "entry-1", "verdict" => false, "note" => "unsupported"},
+                   %{"entry_id" => "entry-2", "verdict" => true}
+                 ]
+               })
+    end
+
     test "kb_audit_record accepts 50 verdicts and rejects 51" do
       assert :ok ==
                McpServer.validate_tool_args("kb_audit_record", %{
@@ -619,6 +647,17 @@ defmodule AgenticKbMcpTest do
                })
 
       assert message =~ "50"
+    end
+
+    test "kb_audit_record schema declares conditional notes and the verdict cap" do
+      schema =
+        McpServer.tools()
+        |> Enum.find(&(&1["name"] == "kb_audit_record"))
+        |> get_in(["inputSchema", "properties", "verdicts"])
+
+      assert schema["maxItems"] == 50
+      assert schema["items"]["if"]["properties"]["verdict"] == %{"const" => false}
+      assert schema["items"]["then"]["required"] == ["note"]
     end
 
     test "an unknown argument is rejected, not silently dropped by put_if_present" do
