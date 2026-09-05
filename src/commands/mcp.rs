@@ -1966,7 +1966,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     // Round the uniform half up so sample_size=1 still yields a uniform
     // sample when traffic can't contribute (e.g. no hit-log).
     let uniform_budget = if mode == "traffic" {
-        ((sample_size + 1) / 2).max(1)
+        sample_size.div_ceil(2).max(1)
     } else {
         sample_size
     };
@@ -4393,7 +4393,7 @@ mod tests {
             ));
         }
         for eid in &ids {
-            query_hits::record_hits(&paths.query_hits, &[eid.clone()], "test");
+            query_hits::record_hits(&paths.query_hits, std::slice::from_ref(eid), "test");
         }
 
         let resp = handle_audit_run(
