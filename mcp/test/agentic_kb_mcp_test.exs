@@ -765,6 +765,27 @@ defmodule AgenticKbMcpTest do
       assert schema["items"]["additionalProperties"] == false
     end
 
+    # IMPORTANT (premium review of bd-21ef.2..bd-21ef.2.12b): run_id's schema
+    # declared minLength/maxLength but no `pattern`, so nothing in the
+    # declarative schema matched the Rust rule
+    # (`run_id.bytes().any(|b| b < 0x20)`) that actually rejects control
+    # characters. The pattern is documentation for MCP clients introspecting
+    # the schema — the Rust binary is still the enforcement point.
+    test "kb_audit_record schema's run_id pattern matches the Rust no-control-chars rule" do
+      schema =
+        McpServer.tools()
+        |> Enum.find(&(&1["name"] == "kb_audit_record"))
+        |> get_in(["inputSchema", "properties", "run_id"])
+
+      assert %{"pattern" => pattern} = schema
+      regex = Regex.compile!(pattern)
+      # A space (0x20) is not a control character and the Rust rule
+      # accepts it; only bytes strictly below 0x20 are rejected.
+      assert Regex.match?(regex, "plain run id")
+      refute Regex.match?(regex, "bad\nid")
+      refute Regex.match?(regex, "bad\tid")
+    end
+
     test "an unknown argument is rejected, not silently dropped by put_if_present" do
       assert {:error, message} =
                McpServer.validate_tool_args("kb_add", %{
