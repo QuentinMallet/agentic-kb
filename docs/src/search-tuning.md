@@ -47,12 +47,24 @@ Recency bias adds a single batch SELECT on ≤ `limit` IDs after RRF. Measured o
 ### Federation (Multi-Peer Search)
 
 Under federation, `--limit` is a global cap across the local repository and all
-peers, not a per-repository cap. Results are merged and truncated once.
+peers, not a per-repository cap. `merge_federated_results` collides candidates
+on `id` alone, so there is exactly one surviving row per id across all
+origins: a local row and a peer row sharing an id collide, and the local row
+always wins; two peer rows sharing an id collide too, resolved by the normal
+deterministic ordering (`compare_federated_rows`). The surviving row is then
+stored under the pair `(origin_repo, id)` — that pair is the storage key of
+the row that won the collision, not the collision test itself. Exactly one
+federated truncation follows. These cases are pinned by
+`test_federated_global_limit_dedup_and_local_collision_contract`.
 
 Cross-repository ordering is by within-repository rank position with a
 deterministic `origin_repo`/entry-ID tie-break. It is not a comparison of
 absolute relevance between repositories: repositories can have different corpus
-sizes, and their RRF scores describe rank positions within those corpora.
+sizes, and the scores produced by RRF encode within-corpus rank positions. Thus
+a top-ranked result from a small peer can precede a middling local result; see
+`compare_federated_rows` and
+`test_federated_rank_position_top_tiny_peer_outranks_mid_local`. Peer traversal
+order cannot change the output (`test_federated_order_is_byte_stable_under_peer_traversal_permutation`).
 
 When `--peers` is set, `recency_lambda` is forced to `0.0` regardless of `kb.toml`. Each peer has its own clock; applying per-peer decay would make cross-peer scores incomparable. A warning is logged when `λ > 0` and peers are configured:
 
@@ -61,6 +73,70 @@ warning: recency_lambda forced to 0.0 for peer-federated search
 ```
 
 To use recency bias with federation, coordinate `updated_at` across peers or disable federation for that query.
+
+### Bounds and deterministic ranking
+
+| Input | Accepted range | Enforcement |
+|-------|----------------|-------------|
+| CLI/MCP result limit | `1..=100` | `db::MAX_LIMIT`; `parse_limit` and `NumField::bounded` reject values outside the range |
+| MCP `inline_verify_k` | `0..=100` | `db::MAX_INLINE_VERIFY_K`; `NumField::bounded` rejects values outside the range |
+
+The bounds are re-applied inside `search_entries` by `clamp_search_caps`; the
+public interfaces reject out-of-range requests rather than presenting a
+silently clamped request as accepted. The MCP boundary behavior is pinned by
+`test_search_rejects_limit_above_max_and_honours_the_maximum` and
+`test_search_rejects_inline_verify_k_above_max_and_honours_the_maximum`.
+
+All Rust ranking lanes use `compare_rank`: scores sort descending, equal scores
+sort by entry ID ascending, `-0.0` is normalized to `0.0`, and `f32::total_cmp`
+provides a total order. This makes ties and floating-point edge cases stable.
+
+Non-finite values from the query embedder are rejected outright:
+`validate_embedding` returns an error (`"embedder returned a non-finite
+component"`) that propagates out of `search_entries`, so a corrupt query
+embedding fails the whole search rather than merely scoring badly.
+
+A stored (not query) corrupt or non-finite embedding is never dropped from the
+result set. `decode_emb_blob` and `decode_f16_blob_into` detect the bad blob,
+log a `kb: decode_emb_blob: unexpected blob length ...` or `kb:
+cosine_similarity dimension mismatch` diagnostic to stderr, increment the
+process-wide `models::corrupt_embedding_count` counter, and return an empty
+vector; `cosine_similarity` then treats the resulting length mismatch as
+similarity `0.0`, so the row stays in the ranked output and remains
+deterministically sortable. The counter is exposed as
+`db::SearchStats.corrupt_embeddings` by `search_entries_with_stats`, but no CLI
+or MCP caller invokes that function today — `search_entries` (the function
+every production caller uses) does not report the count anywhere. This is
+pinned at the `db` layer by
+`nan_blob_is_zero_scored_and_reported_in_search_stats`, which asserts the
+corrupted row survives with score `0.0` and `stats.corrupt_embeddings > 0`;
+the count itself is not yet surfaced in a CLI or MCP response.
+
+Semantic and cue scoring may scan their indices, but full entry metadata is
+materialized only for the first `2 * limit` ranked IDs in each lane. The bound
+is implemented by `fetch_search_metadata` in `search_entries` and pinned by
+`p1_metadata_materialization_is_bounded_to_twice_limit_per_lane`. See the
+[S5 search caps decision packet](../decisions/s5-search-caps-packet.md) for the
+resource-cap ruling and rationale.
+
+Evidence metadata is fetched in bounded per-entry batches by
+`fetch_evidence_for_entries`. A malformed database value is returned as a
+search error rather than silently dropping its evidence row; this is pinned by
+`test_fetch_evidence_for_entries_propagates_decode_errors`.
+
+### Literal path prefixes
+
+`--path-prefix` is a literal string prefix. `like_prefix_pattern` escapes the
+SQL `LIKE` metacharacters `%` and `_` (and the escape character `\`) before all
+FTS, semantic, and cue queries apply the filter.
+
+| Query | Before | Now |
+|-------|--------|-----|
+| `--path-prefix 'src/%'` | `%` could match every suffix, effectively selecting `src/*` | Matches only paths beginning with the literal characters `src/%`; returns no rows when none exist |
+| `--path-prefix 'src/_'` | `_` could match any one character | Matches only paths beginning with literal `src/_` |
+
+The behavior is pinned by `test_search_path_prefix_percent_is_literal_and_can_return_empty`
+and `test_search_path_prefix_matches_literal_underscore_prefix_only`.
 
 ### Example
 
@@ -170,3 +246,17 @@ What gets embedded per entry:
 Switching modes requires re-embedding the whole store (`kb reembed` after
 deleting `entries_emb` rows, or `kb rebuild`) — mixed-vintage embeddings make
 cosine scores incomparable. Measure with `kb eval` before and after.
+
+## Deferred Follow-Ups
+
+Two known gaps in the current search/federation contract are tracked as open
+beads rather than fixed here:
+
+- `bd-federated-verify-after-truncate-ayb8` — inline verification currently
+  runs per repository (local and each peer) before `merge_federated_results`
+  performs the global merge and truncation. A row that inline verification
+  spent work on can still be discarded by the federated truncate, so
+  verification effort is not scoped to the final global `--limit`.
+- `bd-prenorm-embeddings-followup-te13` — a deferred change to persist
+  pre-normalized embeddings in a new on-disk format, rather than normalizing
+  at read time on every `cosine_similarity` call.

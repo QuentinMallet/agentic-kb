@@ -9,7 +9,12 @@ When an agent calls `kb_add` with an evidence row containing only a `citation_pa
 - **Caller provides:** `citation_path` (file path or file path + byte range) and optionally `evidence.kind` and `evidence.derived_from`.
 - If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id.
 - **Server resolves:** `citation_hash` (SHA-256 of the byte range) and `citation_sha` (git HEAD commit SHA), computed at write time from the working repository.
-- **Explicit values preserved:** If the caller supplies `citation_hash` or `citation_sha` explicitly, those values are never overwritten — the caller assertion is authoritative.
+- **Explicit hash checked:** If the caller supplies `citation_hash`, `kb_core::add`
+  recomputes the hash from the resolved file descriptor and rejects the whole
+  write if it differs (`test_kb_core_add_rejects_wrong_explicit_citation_hash`).
+  A missing hash is filled with that computed value. An explicitly supplied
+  `citation_sha` remains unchanged; a missing one is filled when a Git HEAD is
+  available at the cited file's directory.
 - **Before event append:** Resolution failures are loud write-time errors that reject the entire `kb_add` call, naming the problematic path and reason. A malformed citation or missing file causes the write to fail, never resulting in an unverifiable row in the database.
 - **Replay invariant:** Resolved fields are persisted in the event as-is; the verifier on later rebuilds or replay never re-resolves them. This means the hash and SHA captured at write time are preserved exactly as computed, unaffected by later file changes or git history rewrites.
 
@@ -28,6 +33,27 @@ Resolution can fail at write time if:
 | I/O errors | Filesystem errors during read | Write rejected with I/O error |
 
 All failures surface as rejections to the caller. There is no silent fallback, no partial writes, and no stored rows that are unverifiable due to resolution failure.
+
+### Symlink migration note
+
+Citation authorship, write-time resolution, direct verification, cited-file
+relocation, and repository relocation all use the same reject-all rule: every
+component of a citation path must be a non-symlink on every platform. The
+resolver seam is exercised by
+`symlink_citations_are_rejected_by_openat2_and_fallback_resolvers`; the join and
+walk sites are covered by `safe_join_rejects_symlink_components_and_parent_components`
+and `relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them`.
+
+The machine-readable reason is `symlink_path_rejected`. It discloses only that
+an in-repository path component is a symbolic link, not its target. In
+`Verifier::verify_evidence`, that reason returns immediately: it is never sent
+to excerpt relocation and therefore cannot produce an auto-heal event. The
+non-disclosure boundary is pinned by
+`test_kb_core_add_symlinked_citation_error_does_not_disclose_target_existence`.
+
+The A0 audit found 41 evidence rows and zero affected citations, so no stored
+row required migration. This audit result and the cross-platform rationale are
+recorded in [ADR-5: Citation symlink policy](../decisions/adr-5-symlink-policy.md).
 
 ## Cheap Compliance: The Rationale
 
