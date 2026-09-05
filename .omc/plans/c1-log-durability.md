@@ -264,9 +264,15 @@ Under the flock:
 | generation ≠ current log generation | full rebuild (log was compacted or rewritten) |
 | tail_sha mismatches the log at that offset | full rebuild |
 | offset > `committed_len` | full rebuild (legacy pre-fix state, external truncation, or a log restored from backup — **not**, after D2, a reachable power-loss state; revision 1 mislabelled it) |
-| log unreadable (`read_events` hard-errors on a malformed *middle* line, `events.rs:307-318`) | defer with a warning, as `rebuild.rs:171-178` already does — do not take down all six entry points |
+| log unreadable (`read_events` hard-errors on a malformed *middle* line, `events.rs:307-318`) | warn and defer recovery; refuse writes, decline rebuild, and serve read-only requests from the current DB |
 | `committed_len` > offset | replay the tail from the cursor, then advance it |
 | `committed_len` == offset | no-op |
+| `LogMissing` while `offset > 0` or the entries table is non-empty | warn and defer recovery; refuse writes, decline rebuild, and serve read-only requests from the current DB |
+
+Rows 6 and 9 deliberately have the same fail-closed write policy. The round-1
+alternative that appended and applied later batches while row 6 was deferred is
+withdrawn: with a durable-but-unapplied batch before the damaged line, that
+materializes a non-prefix of the log and violates `DBNotAheadOfDurable`.
 
 **The cursor does not survive a rebuild swap, so rebuild must write it.** Rebuild replays into a
 *fresh* tmp DB whose `kb_meta` receives only `schema_version` (`rebuild.rs:148`) and
@@ -361,7 +367,7 @@ the flock** (`mcp.rs:233, 306, 517, 775, 1065, 1177, 1644, 1731, 1849, 1923, 197
 `rebuild.rs:118`). Worse, "reader" is a misnomer: every `open_db` runs `ensure_schema`'s `ALTER`s
 (`db.rs:310-330`), `sweep_expired_peers` (a `DELETE`), and possibly `stamp_schema_version`. So on a
 live MCP server `busy != 0` is the *common* case, and a naive fail-closed makes rebuild — which D3
-names as the repair for five of its eight recovery rows — unrunnable exactly when it is needed. C1 is
+names as the repair for five of its nine recovery rows — unrunnable exactly when it is needed. C1 is
 therefore **safe standalone but not live standalone**: safety comes from never unlinking an undrained
 WAL; liveness depends on **C2** closing the unlocked writers. That distinction is recorded in the code
 comment, in T5a's acceptance criteria, and as a cross-component dependency edge from C2's
@@ -530,9 +536,9 @@ space. Tooling: `tlaps` + `tlaplus18` from `flake.nix:163-164`.
 partially-written block producing a garbage *middle* line). `log_durable` as a prefix of `log_written`
 is adequate here only because D2 makes the un-synced region exactly one record — that is a theorem
 about D2, and it belongs in the module as a named `ASSUME` with its justification. The code-side
-consequence still needs a position: `read_events` hard-errors on a malformed middle line
-(`events.rs:307-318`), which would take down all six entry points, so recovery quarantines the
-unparseable line to a sidecar and continues rather than failing every command (see Q4).
+consequence is fail-closed for mutation: `read_events` hard-errors on a malformed middle line
+(`events.rs:307-318`), so recovery warns and declines to rebuild, writes are refused, and read-only
+paths continue to serve the current DB (see D3 row 6 and Q4).
 
 ---
 
@@ -662,7 +668,7 @@ events replays deterministically; the FK to `test_cases` holds.
 ### T4 — Applied cursor + automatic recovery  · P1 · deps T2b, T3, T1a
 `(generation, offset, tail_sha)` in `kb_meta`, written in the same transaction as the apply;
 embeddings pre-resolved before `BEGIN`; one helper owning append+sync+apply+cursor, routed through by
-**all seven** writers; `recover_if_needed` with the eight-row table from D3, fired at process entry
+**all seven** writers; `recover_if_needed` with the nine-row table from D3, fired at process entry
 and write paths only (reads detect and warn — D3/C2-Q1), with the 12 `tests/legacy_replay.rs`
 references updated; poison/quarantine policy. **Constraint from C2:** does not touch `open_db`'s
 body; the cursor write stays inside `apply_event`.
@@ -671,8 +677,8 @@ converges with no manual `kb rebuild`; the same for each of the seven writers, e
 **every `apply_event` arm is shown idempotent under replay, enumerated** — not just `run_history`, so
 a second non-idempotent arm cannot silently pass; a read-only path serves stale data with a warning
 and never takes the write lock; a compacted log bumps the generation and triggers a full rebuild; a
-cursorless DB takes the schema-bump rebuild path; an unreadable log defers with a warning instead of
-failing every entry point; a deterministically failing record is quarantined after K attempts and the
+cursorless DB takes the schema-bump rebuild path; an unreadable or missing non-empty log warns,
+serves reads, and refuses writes/rebuild until repaired or restored; a deterministically failing record is quarantined after K attempts and the
 cursor advances; no write transaction is held across an embedder call (asserted).
 
 ### T5a — Rebuild swap sequence  · P1 · deps T0b, T1a
@@ -747,7 +753,7 @@ aggregator. Includes the `machines_conf` notification from D7 §3.
    front and the split into T0a/T0b/T0c keeps any one model tractable.
 6. **The recovery path becomes the outage.** `recover_if_needed` runs at six entry points; any bug in
    it — poison loop, spurious full rebuild, hard error on an unreadable log — takes down every command
-   at once. *Mitigation:* the defer-with-warning row, the quarantine policy, and CE8's temporal
+   at once. *Mitigation:* the warn-and-refuse-writes rows, the quarantine policy, and CE8's temporal
    property all exist specifically for this; T4's acceptance enumerates them.
 
 ## 10. Open questions

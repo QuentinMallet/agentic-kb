@@ -15,7 +15,8 @@ no `Scenario` constant any more and **no crash point is pinned**: `Crash` is
 enabled at every phase of a batch from the first line through the last apply, in
 every config that sets `AllowCrash = TRUE`.
 
-The four knobs are `Fixed`, `AllowCrash`, `PoisonBatch`, `MaxGen`.
+The six knobs are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`,
+`MaxGen`, and `MaxBatches`.
 
 | Action | Models |
 |---|---|
@@ -102,7 +103,9 @@ breadth-first search was used throughout, including for the two temporal configs
 | `DurableBatch_Cursor_Fixed.cfg` | " (with `Compact` enabled) | PASS | `No error has been found` · 537 / 259 · 03s |
 | `DurableBatch_CE8_Current.cfg` | CE8: unbounded retry of a poison record | VIOLATED | `Error: Temporal properties were violated` · 57 / 27 · 02s |
 | `DurableBatch_CE8_Fixed.cfg` | " under the K-retry dead-letter policy | PASS | `No error has been found` · 64 / 34 · 03s |
-| `DurableBatch_Safety_Fixed.cfg` | **unpinned**, all six safety properties at once | PASS | `No error has been found` · 537 / 259 · 02s |
+| `DurableBatch_Deferred_Current.cfg` | withdrawn design: a write proceeds while damaged and materializes a non-prefix | VIOLATED (deferred-state gates around `CursorAgreesWithDB`, `DBNotAheadOfDurable`, and `CursorNeverAheadOfDB`) | not run in this sandbox; caller runs TLC |
+| `DurableBatch_Deferred_Fixed.cfg` | unreadable tail blocks writes; repair then replays from `cursor.off` | PASS | not run in this sandbox; caller runs TLC |
+| `DurableBatch_Safety_Fixed.cfg` | **unpinned**, all seven invariants plus the truncation action property | PASS | `No error has been found` · 537 / 259 · 02s |
 | `DurableBatch_Safety_Fixed_Poison.cfg` | same, with the poison record and quarantine live | PASS | `No error has been found` · 766 / 374 · 02s |
 | `DurableBatch_Refinement_Fixed.cfg` | refines `InnerGap` over the **full** Next relation | PASS | `No error has been found` · 448 / 216 · 03s |
 | `DurableBatch_Refinement_Current.cfg` | the current design must **not** refine it | VIOLATED | `Error: Action property line 143, col 6 to line 143, col 75 of module InnerGap is violated` · 26 / 21 · 03s |
@@ -137,17 +140,23 @@ several concurrent TLC processes.
 
 ### Non-vacuity
 
-Six invariants are asserted by a passing gate: `TypeOK`, `DurableIsPrefix`,
+Seven invariants are asserted by a passing gate: `TypeOK`, `DurableIsPrefix`,
 `NoHalfBatch`, `DBNotAheadOfDurable`, `OpenRestores`, `CursorAgreesWithDB`, plus
-the action property `TruncationPreservesAccepted`. Each has a config in which
-TLC reaches a violation:
+`CursorNeverAheadOfDB` and the action property `TruncationPreservesAccepted`.
+The deferred amendment also adds the temporal property `DeferredConverges`.
+Their non-vacuity coverage is:
 
-| invariant | violating cfg |
+| invariant / property | non-vacuity evidence |
 |---|---|
 | `NoHalfBatch` | `CE1_Current` |
 | `DBNotAheadOfDurable` | `CE2_Current` |
 | `OpenRestores` | `CE3_Current` |
 | `CursorAgreesWithDB` | `Cursor_Current` |
+| `CursorNeverAheadOfDB` | `Deferred_Current` checks `DeferredCursorNeverAheadOfDB` and reaches the rejected non-prefix DB after `UnsafeWriteWhileDeferred` |
+| `DeferredCursorAgreesWithDB` | `Deferred_Current`; the gate becomes live at `Damage` and fails only after the unsafe write |
+| `DeferredDBNotAheadOfDurable` | `Deferred_Current`; same damaged-state witness |
+| `DeferredCursorNeverAheadOfDB` | `Deferred_Current`; same damaged-state witness |
+| `DeferredConverges` | `Deferred_Fixed`: `Damage` and `Repair` make its antecedent reachable; only fair `Recovery` can establish `CursorCaughtUp` |
 | `TruncationPreservesAccepted` | `NV_Truncate` (adds `BadTruncate`) |
 | `TypeOK` | `NV_TypeOK` (`BadTypeInit` puts `cursor.off` out of range) |
 | `DurableIsPrefix` | not separately witnessed — see §5 gap 1 |
@@ -456,8 +465,8 @@ property `TruncationPreservesAccepted`, not a `TypeOK` conjunct, with
 against a schedule needing 11). `W_ScheduleCompletes` proves all three run to
 completion, with a compaction in between.
 
-**I2 — no unpinned all-invariant config.** `Safety_Fixed` carries all six safety
-properties plus the action property at `MaxBatches = 3`, `MaxGen = 1`,
+**I2 — no unpinned all-invariant config.** `Safety_Fixed` carries all seven
+invariants plus the action property at `MaxBatches = 3`, `MaxGen = 1`,
 `AllowCrash = TRUE`. `Safety_Fixed_Poison` repeats it with the poison record.
 
 **I3 — CE8 hardcoded success on attempt two.** `ApplyFail` and `Quarantine` are
