@@ -530,13 +530,57 @@ defmodule AgenticKbMcpTest do
     "compact" => [%{"type" => "ok", "before" => 4, "after" => 2}],
     "rebuild" => [%{"type" => "ok", "rebuilt" => 3, "truncated_tail" => nil}],
     "kb_get" => [%{"type" => "result", "entry" => RenderFixture.full_entry()}],
-    "audit_run" => [%{"type" => "ok", "run_id" => "audit-1", "samples" => []}],
+    "audit_run" => [
+      %{"type" => "ok", "run_id" => "audit-1", "samples" => []},
+      %{
+        "type" => "ok",
+        "run_id" => "audit-2",
+        "samples" => [
+          %{
+            "id" => "e1",
+            "path" => "p/e1",
+            "summary" => "s1",
+            "kind" => "belief",
+            "evidence_status" => "present",
+            "arm" => "uniform",
+            "evidence" => []
+          }
+        ]
+      }
+    ],
     "audit_record" => [%{"type" => "ok", "recorded" => 1, "expired" => 0}],
     "audit_report" => [
       %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => nil, "total_runs" => 0, "per_arm_precision" => []},
       %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => "2026-09-05T00:00:00Z", "total_runs" => 1, "per_arm_precision" => [], "injection_telemetry" => %{"eligible" => 1}}
     ],
     "provenance" => [%{"type" => "result", "roots" => ["root-1"], "graph" => [], "truncated" => false}]
+  }
+
+  # IMPORTANT (premium review of bd-21ef.2..bd-21ef.2.12b): the shape-table
+  # test below only refuted the raw-JSON fallback, but mcp_server.ex has a
+  # catch-all `%{"type" => "ok"} -> "OK"` clause ahead of that fallback — so
+  # deleting a specific `"ok"`-shaped renderer clause (audit_run, audit_record,
+  # add, run, etc.) still rendered "OK" and the test stayed green. One
+  # expected substring per shape, in the same order as @response_shapes,
+  # closes that hole alongside `refute text == "OK"`.
+  @response_shape_expected_substrings %{
+    "search" => ["(no results)", "(no results)"],
+    "add" => ["Added entry new-1", "Added entry new-1"],
+    "cite" => ["citation_path=a.ex"],
+    "import" => ["Imported 1 entries"],
+    "stale_check" => ["Checked 0 file(s)"],
+    "expire" => ["Expired entry entry-1"],
+    "run" => ["Recorded run run-1"],
+    "test_add" => ["Added test case test-1"],
+    "tests" => ["(no test cases)"],
+    "reembed" => ["Re-embedded 0 entries", "[dry-run]", "1 failed"],
+    "compact" => ["Compacted: 4 events"],
+    "rebuild" => ["Rebuilt 3 entries"],
+    "kb_get" => ["[kb#ent-001]"],
+    "audit_run" => ["Audit run audit-1", "id=e1"],
+    "audit_record" => ["Recorded 1 audit verdict"],
+    "audit_report" => ["Audit report:", "Audit report:"],
+    "provenance" => ["Provenance roots:"]
   }
 
   describe "S1 response rendering" do
@@ -552,12 +596,27 @@ defmodule AgenticKbMcpTest do
     end
 
     test "every dispatched Rust success shape has a specific renderer" do
-      for {method, shapes} <- @response_shapes, shape <- shapes do
+      for {method, shapes} <- @response_shapes,
+          {shape, index} <- Enum.with_index(shapes) do
         %{"content" => [%{"type" => "text", "text" => text}]} = McpServer.render_result(shape)
         fallback = shape |> :json.encode() |> IO.iodata_to_binary()
 
         refute text == fallback,
                "#{method} #{inspect(Map.keys(shape))} fell through to the generic JSON renderer"
+
+        # A deleted "ok"-shaped renderer clause falls through to the generic
+        # `%{"type" => "ok"} -> "OK"` catch-all, which is neither the raw-JSON
+        # fallback above nor caught by it — this refute is the actual gate.
+        refute text == "OK",
+               "#{method} #{inspect(Map.keys(shape))} fell through to the generic \"ok\" renderer"
+
+        expected = Enum.at(@response_shape_expected_substrings[method], index)
+
+        assert expected,
+               "no expected substring declared for #{method} shape #{index} — add one to @response_shape_expected_substrings"
+
+        assert text =~ expected,
+               "#{method} shape #{index} did not render #{inspect(expected)}: #{inspect(text)}"
       end
 
       error = %{"type" => "error", "code" => "db_error", "message" => "boom"}
