@@ -120,7 +120,13 @@ fn materialized(conn: &Connection) -> Vec<(String, Vec<String>)> {
         ("cues", "SELECT entry_id,cue FROM cues ORDER BY entry_id,cue"),
         ("entries_emb", "SELECT rowid,hex(embedding) FROM entries_emb ORDER BY rowid"),
         ("run_history", "SELECT test_id,result,adapter,detail,ts,run_id FROM run_history ORDER BY run_id"),
-        ("entries_fts", "SELECT rowid,id,path,summary,content,tags FROM entries_fts ORDER BY rowid"),
+        // rowid is entries_fts's own AUTOINCREMENT surrogate: apply_event
+        // deletes and re-inserts the row on every upsert, so the surrogate
+        // keeps climbing across repeated replays even though the resulting
+        // (id, path, summary, content, tags) content is unchanged — the same
+        // class of DB-assigned identity excluded for cues.id above and in
+        // tests/log_framing.rs's dump_materialized.
+        ("entries_fts", "SELECT id,path,summary,content,tags FROM entries_fts ORDER BY id,path,summary,content,tags"),
     ] {
         let mut stmt = conn.prepare(sql).unwrap();
         let cols = stmt.column_count();
