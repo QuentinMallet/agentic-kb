@@ -190,26 +190,40 @@ impl VerificationOutcome {
 /// Safely join `rel` onto `repo_root`, rejecting any path that escapes the root.
 ///
 /// Rejects: absolute paths, any `..` / root / prefix components.
-/// Canonicalizes both sides and verifies containment.
-/// Returns `None` on any rejection or I/O error during canonicalization.
+/// Walks existing components without following symbolic links.
+/// Returns `None` on any rejection or filesystem error.
 pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return None;
     }
+    let mut candidate = repo_root.to_path_buf();
+    let mut saw_normal_component = false;
     for c in rel_path.components() {
         match c {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            _ => {}
+            Component::CurDir => continue,
+            Component::Normal(name) => {
+                saw_normal_component = true;
+                candidate.push(name);
+                if std::fs::symlink_metadata(&candidate)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
+            }
         }
     }
-    let candidate = repo_root.join(rel_path);
-    let canon_root = repo_root.canonicalize().ok()?;
-    let canon_cand = candidate.canonicalize().ok()?;
-    if !canon_cand.starts_with(&canon_root) {
+    // A component-free `rel` ("", ".", "./.", ...) would otherwise return
+    // `repo_root` itself unchecked -- reject it instead of silently handing
+    // back the repository root to a caller that read `citation_path` from
+    // stored data (e.g. `commands::mcp::returned_entries_stale_warning`).
+    if !saw_normal_component {
         return None;
     }
-    Some(canon_cand)
+    Some(candidate)
 }
 
 /// Parse a whole-file `path` or ranged `path:start-end` citation.
@@ -2332,9 +2346,107 @@ mod tests {
 
         let result = safe_join(dir.path(), "probe.txt");
         assert!(result.is_some());
-        // Canonical path must be inside the tempdir.
-        let canon = result.unwrap();
-        assert!(canon.starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(result.unwrap(), file_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_symlink_components_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plain/nested")).unwrap();
+        symlink(dir.path().join("plain"), dir.path().join("sym")).unwrap();
+
+        assert_eq!(
+            safe_join(dir.path(), "plain/nested"),
+            Some(dir.path().join("plain/nested"))
+        );
+        assert!(safe_join(dir.path(), "sym/nested").is_none());
+        assert!(safe_join(dir.path(), "plain/../plain").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_a_component_free_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(safe_join(dir.path(), "").is_none());
+        assert!(safe_join(dir.path(), ".").is_none());
+        assert!(safe_join(dir.path(), "./.").is_none());
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #[test]
+        fn prop_safe_join_accepts_exactly_existing_plain_relative_paths(
+            components in prop::collection::vec(
+                prop_oneof![
+                    Just("a"), Just("b"), Just("."), Just(".."),
+                    Just("symdir"), Just("symfile"), Just("missing"),
+                ],
+                0..8,
+            )
+        ) {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_file = outside.path().join("target-file");
+            std::fs::write(&outside_file, b"outside file").unwrap();
+
+            // Walk the same components safe_join will walk, building up the
+            // expected accepted path (skipping "." exactly as safe_join
+            // does) and creating on disk only the prefix that is reachable
+            // before the first component that must reject the whole path:
+            // a syntactic "..", a symlink (of either kind, at any position,
+            // not only trailing), or a component that is never created at
+            // all (the "component does not exist" branch).
+            let mut prefix = dir.path().to_path_buf();
+            let mut saw_normal_component = false;
+            let mut expect_none = false;
+            for component in &components {
+                match *component {
+                    "." => continue,
+                    ".." => {
+                        expect_none = true;
+                        break;
+                    }
+                    "a" | "b" => {
+                        saw_normal_component = true;
+                        prefix.push(*component);
+                        std::fs::create_dir_all(&prefix).unwrap();
+                    }
+                    "symdir" => {
+                        saw_normal_component = true;
+                        prefix.push("symdir");
+                        symlink(outside.path(), &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "symfile" => {
+                        saw_normal_component = true;
+                        prefix.push("symfile");
+                        symlink(&outside_file, &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "missing" => {
+                        saw_normal_component = true;
+                        expect_none = true;
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            let rel = components.join("/");
+            let expected = if expect_none || !saw_normal_component {
+                None
+            } else {
+                Some(prefix)
+            };
+            prop_assert_eq!(safe_join(dir.path(), &rel), expected);
+        }
     }
 
     #[test]
