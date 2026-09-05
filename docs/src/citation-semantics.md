@@ -59,7 +59,7 @@ The intent is loud failure: a typo in a citation path must surface as a parse er
 
 **Empty files.** A whole-file citation of an empty file is legal and meaningful. It asserts that the file is empty (0 bytes). The hash is `sha256("")` = `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. If the file later gains bytes, the hash changes and the evidence row is flagged as unverified.
 
-**Non-regular files.** Directories, symlinks, and device files are rejected as `FileMissing`. A file opened with `File::open()` must be a regular file (`metadata.is_file()` check required).
+**Non-regular files.** Directories and device files are rejected as `FileMissing`. Any symbolic-link component, whether it points inside or outside the repository, is rejected as `SymlinkPathRejected` (`symlink_path_rejected` on machine-readable surfaces). This reason is not eligible for relocation or auto-heal. A file opened for verification must be a regular file (`metadata.is_file()` check required).
 
 ## Verification Semantics
 
@@ -77,6 +77,7 @@ The `verify_evidence()` function **never returns an error**. All conditions that
 
 - Malformed citation path
 - File not found or not a regular file
+- Symbolic link in any citation path component
 - Byte range outside file bounds
 - I/O errors during hashing
 - Hash mismatch
