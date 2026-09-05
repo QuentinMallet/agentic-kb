@@ -26,3 +26,9 @@ The Rust line-JSON port implements `kb_peers_add`, `kb_peers_list`, and
 not expose them as agent tools. Peer-graph setup is an operator and lifecycle-hook
 action, not an agent action. Revisit this boundary only when a concrete agent
 workflow needs to edit the peer graph directly.
+
+Controls from the threat model
+(`KB security/threat-models/mcp-audit-surface`) bound audit verdict batches,
+require notes for destructive verdicts, and preserve permanent entries. Caller
+identity, rate limits, and OPA policy enforcement remain deferred follow-ups in
+beads `bd-1orr`.

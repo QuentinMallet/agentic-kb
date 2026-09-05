@@ -105,6 +105,21 @@ methods remain port-only and have no Elixir tool.
     Argument validation runs ahead of dispatch, but it is skipped when there is
     no database to call, because the hint is the only thing the caller can act
     on at that point.
+12. **`audit_record` rejects `verdict:false` without a non-empty, trimmed
+    `note`.** The error names the offending entry, and the whole request is
+    rejected before any write.
+13. **`audit_record` rejects more than 50 verdicts.** This matches the maximum
+    `audit_run` sample size and bounds one request's write amplification.
+14. **`audit_record` rejects a false verdict for a permanent entry.** The error
+    names the entry and the `permanent` reason; no expire event or audit row is
+    written. Explicit `expire` retains its existing `force=true` override.
+
+### Audit tools
+
+`kb_audit_run` freezes up to 50 candidates. `kb_audit_record` accepts at most
+50 verdicts from that run; destructive false verdicts require an explanation
+and cannot expire permanent entries. `kb_audit_report` summarizes recorded
+results, and `kb_provenance` walks the derived-from graph.
 
 Two things the closure did *not* change, checked against the base commit so the
 table is not read as broader than it is: an **empty** `expand_ids` array was
