@@ -126,7 +126,7 @@ pub(crate) fn run_reembed(
     dry_run: bool,
     max_chars: usize,
 ) -> anyhow::Result<ReembedReport> {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_| {})
 }
 
 #[cfg(test)]
@@ -138,16 +138,16 @@ fn run_reembed_with_hook<B>(
     before_batch: B,
 ) -> anyhow::Result<ReembedReport>
 where
-    B: FnMut(usize),
+    B: FnMut(usize, &[PendingWrite]),
 {
     run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_| {})
 }
 
-/// `before_batch(batch_index)` fires right before a batch's write lock is
-/// acquired; `after_batch(batch_index)` fires right after that batch's
-/// connection is dropped (commit already applied, lock released). Tests
-/// use these to observe batching and to time the real lock-hold window
-/// from the outside.
+/// `before_batch(batch_index, batch)` fires right before a batch's write
+/// lock is acquired; `after_batch(batch_index)` fires right after that
+/// batch's connection is dropped (commit already applied, lock released).
+/// Tests use these to observe batching (which ids land in which batch) and
+/// to time the real lock-hold window from the outside.
 fn run_reembed_with_hooks<B, A>(
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
@@ -157,7 +157,7 @@ fn run_reembed_with_hooks<B, A>(
     mut after_batch: A,
 ) -> anyhow::Result<ReembedReport>
 where
-    B: FnMut(usize),
+    B: FnMut(usize, &[PendingWrite]),
     A: FnMut(usize),
 {
     // Selection is unlocked and read-only.
@@ -252,7 +252,7 @@ where
     if db_identity(&paths.db) != initial_db_identity {
         report.failed = 0;
         report.failures.clear();
-        let mut no_before = |_: usize| {};
+        let mut no_before = |_: usize, _: &[PendingWrite]| {};
         let mut no_after = |_: usize| {};
         write_batches(
             paths,
@@ -326,11 +326,11 @@ fn write_batches<B, A>(
     before_batch: &mut B,
     after_batch: &mut A,
 ) where
-    B: FnMut(usize),
+    B: FnMut(usize, &[PendingWrite]),
     A: FnMut(usize),
 {
     for (batch_index, batch) in writes.chunks(REEMBED_WRITE_BATCH_SIZE).enumerate() {
-        before_batch(batch_index);
+        before_batch(batch_index, batch);
         let lock = match acquire_lock(&paths.lock) {
             Ok(lock) => lock,
             Err(error) => {
@@ -436,6 +436,15 @@ mod tests {
         }
     }
 
+    const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn proptest_cases(default_full: u32) -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
     fn seed(paths: &config::Paths, id: &str, summary: &str) {
         Add {
             path: format!("docs/{id}"),
@@ -462,27 +471,28 @@ mod tests {
         db::open_or_init(&paths).unwrap();
         seed(&paths, "race", "old");
         let fresh = FixedEmbedder(0.75);
-        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.25), false, 1800, |batch| {
-            if batch == 0 {
-                Add {
-                    path: "docs/race".to_string(),
-                    summary: "fresh".to_string(),
-                    content: "body".to_string(),
-                    tags: "test".to_string(),
-                    version_ref: None,
-                    id: Some("race".to_string()),
-                    permanent: false,
-                    replace_path: false,
-                    kind: "convention".to_string(),
-                    evidence: vec![],
-                    evidence_file: None,
-                    cues: vec![],
+        let report =
+            run_reembed_with_hook(&paths, &FixedEmbedder(0.25), false, 1800, |batch, _| {
+                if batch == 0 {
+                    Add {
+                        path: "docs/race".to_string(),
+                        summary: "fresh".to_string(),
+                        content: "body".to_string(),
+                        tags: "test".to_string(),
+                        version_ref: None,
+                        id: Some("race".to_string()),
+                        permanent: false,
+                        replace_path: false,
+                        kind: "convention".to_string(),
+                        evidence: vec![],
+                        evidence_file: None,
+                        cues: vec![],
+                    }
+                    .execute_with(&paths, &fresh)
+                    .unwrap();
                 }
-                .execute_with(&paths, &fresh)
-                .unwrap();
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(report.embedded, 0);
         assert_eq!(
             report.raced, 1,
@@ -505,27 +515,28 @@ mod tests {
         // or a writer racing ahead of its own reembed pass): the rowid is
         // still absent from entries_emb, so an id-only re-check would let
         // this batch's stale-content vector through.
-        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.25), false, 1800, |batch| {
-            if batch == 0 {
-                Add {
-                    path: "docs/content-race".to_string(),
-                    summary: "new-summary-after-selection".to_string(),
-                    content: "body".to_string(),
-                    tags: "test".to_string(),
-                    version_ref: None,
-                    id: Some("content-race".to_string()),
-                    permanent: false,
-                    replace_path: false,
-                    kind: "convention".to_string(),
-                    evidence: vec![],
-                    evidence_file: None,
-                    cues: vec![],
+        let report =
+            run_reembed_with_hook(&paths, &FixedEmbedder(0.25), false, 1800, |batch, _| {
+                if batch == 0 {
+                    Add {
+                        path: "docs/content-race".to_string(),
+                        summary: "new-summary-after-selection".to_string(),
+                        content: "body".to_string(),
+                        tags: "test".to_string(),
+                        version_ref: None,
+                        id: Some("content-race".to_string()),
+                        permanent: false,
+                        replace_path: false,
+                        kind: "convention".to_string(),
+                        evidence: vec![],
+                        evidence_file: None,
+                        cues: vec![],
+                    }
+                    .execute_with(&paths, &embedder::NoopEmbedder)
+                    .unwrap();
                 }
-                .execute_with(&paths, &embedder::NoopEmbedder)
-                .unwrap();
-            }
-        })
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(report.embedded, 0);
         assert_eq!(report.raced, 1);
         let conn = db::open_ro(&paths.db).unwrap();
@@ -558,7 +569,7 @@ mod tests {
         }
         let replacement = paths.db.with_extension("replacement");
         std::fs::copy(&paths.db, &replacement).unwrap();
-        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch| {
+        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch, _| {
             if batch == 1 {
                 std::fs::rename(&replacement, &paths.db).unwrap();
             }
@@ -606,7 +617,7 @@ mod tests {
             conn.execute("UPDATE entries SET is_stale = 1 WHERE id = 'gone-0'", [])
                 .unwrap();
         }
-        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch| {
+        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch, _| {
             if batch == 1 {
                 std::fs::rename(&replacement, &paths.db).unwrap();
             }
@@ -736,7 +747,7 @@ mod tests {
             &FixedEmbedder(0.5),
             false,
             1800,
-            |_batch_index| start.set(Some(std::time::Instant::now())),
+            |_batch_index, _batch| start.set(Some(std::time::Instant::now())),
             |_batch_index| {
                 if let Some(s) = start.get() {
                     elapsed.set(Some(s.elapsed()));
@@ -763,11 +774,16 @@ mod tests {
             seed(&paths, &format!("batch-{index}"), "seed");
         }
         let batches_seen = std::cell::Cell::new(0usize);
-        let report =
-            run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch_index| {
+        let report = run_reembed_with_hook(
+            &paths,
+            &FixedEmbedder(0.5),
+            false,
+            1800,
+            |batch_index, _| {
                 batches_seen.set(batches_seen.get().max(batch_index + 1));
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(report.embedded, total);
         let expected_batches = total.div_ceil(REEMBED_WRITE_BATCH_SIZE);
         assert_eq!(
@@ -778,10 +794,35 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(64),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
         #[test]
-        fn proptest_reembed_batch_partition_never_loses_or_duplicates_ids(ids in proptest::collection::vec("[a-z0-9]{1,12}", 0..200)) {
-            let flattened: Vec<_> = ids.chunks(REEMBED_WRITE_BATCH_SIZE).flatten().cloned().collect();
-            proptest::prop_assert_eq!(flattened, ids);
+        fn proptest_reembed_batches_cover_every_id_exactly_once(count in 0usize..48) {
+            // The previous version of this property asserted
+            // chunks().flatten() == input — a std-library fact about
+            // slice::chunks that never called any reembed code (review
+            // finding). This version seeds real entries and collects the
+            // ids write_batches actually puts in each batch via the hook,
+            // proving the real partition covers every id exactly once.
+            let dir = tempfile::tempdir().unwrap();
+            let paths = config::Paths::from_root(dir.path());
+            db::open_or_init(&paths).unwrap();
+            let ids: Vec<String> = (0..count).map(|i| format!("prop-{i}")).collect();
+            for id in &ids {
+                seed(&paths, id, "seed");
+            }
+            let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+            run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |_batch_index, batch| {
+                seen.borrow_mut().extend(batch.iter().map(|w| w.id.clone()));
+            })
+            .unwrap();
+            let mut union = seen.into_inner();
+            let mut expected = ids;
+            union.sort();
+            expected.sort();
+            proptest::prop_assert_eq!(union, expected, "every id must appear in exactly one batch, with no duplicates or omissions");
         }
     }
 }
