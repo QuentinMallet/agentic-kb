@@ -908,10 +908,37 @@ fn handle_search(
             let meta = search_meta(paths, &results);
             record_query_results(paths, &results);
             let entries = entries_to_json(results);
-            json!({"id": id, "type": "result", "entries": entries, "_meta": meta})
+            with_stale_note(
+                json!({"id": id, "type": "result", "entries": entries, "_meta": meta}),
+                &conn,
+                paths,
+            )
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
+}
+
+/// The staleness reason to attach to a read response, if any.
+///
+/// The server writes its warnings to stderr, which never reaches the agent on
+/// the other end of the port, so a read that is serving a database behind the
+/// log has to say so in the response itself. Additive: the field is absent when
+/// the database is converged, and no existing field changes shape.
+fn stale_note(conn: &rusqlite::Connection, paths: &config::Paths) -> Option<String> {
+    let decision = cursor::inspect(conn, paths);
+    decision.is_behind().then(|| decision.describe())
+}
+
+/// Attach a `stale` field to `response` when `conn`'s database is behind the log.
+fn with_stale_note(
+    mut response: Value,
+    conn: &rusqlite::Connection,
+    paths: &config::Paths,
+) -> Value {
+    if let (Some(note), Some(object)) = (stale_note(conn, paths), response.as_object_mut()) {
+        object.insert("stale".to_string(), Value::String(note));
+    }
+    response
 }
 
 fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
@@ -1123,7 +1150,8 @@ fn handle_kb_get(req: &KbGetRequest, paths: &config::Paths) -> Value {
     };
 
     match db::fetch_entry_by_id(&conn, entry_id) {
-        Ok(Some(entry)) => json!({
+        Ok(Some(entry)) => with_stale_note(
+            json!({
             "id": id,
             "type": "result",
             "entry": {
@@ -1141,7 +1169,10 @@ fn handle_kb_get(req: &KbGetRequest, paths: &config::Paths) -> Value {
                 "evidence_status": entry.evidence_status,
                 "evidence": full_evidence_to_json(entry.evidence),
             }
-        }),
+            }),
+            &conn,
+            paths,
+        ),
         Ok(None) => json!({
             "id": id,
             "type": "error",
@@ -3787,10 +3818,10 @@ mod tests {
         assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
 
         // Another process compacts the log: the generation moves under us.
-        crate::components::cursor::bump_generation(&paths.events).unwrap();
+        cursor::bump_generation(&paths.events).unwrap();
         {
             let conn = db::open_ro(&paths.db).unwrap();
-            assert!(crate::components::cursor::inspect(&conn, &paths).is_behind());
+            assert!(cursor::inspect(&conn, &paths).is_behind());
         }
 
         // The next mutating request recovers first, then writes.
@@ -3800,8 +3831,8 @@ mod tests {
 
         let conn = db::open_ro(&paths.db).unwrap();
         assert_eq!(
-            crate::components::cursor::inspect(&conn, &paths),
-            crate::components::cursor::Decision::NoOp,
+            cursor::inspect(&conn, &paths),
+            cursor::Decision::NoOp,
             "the server must converge rather than re-baseline"
         );
         let live: i64 = conn
@@ -3820,7 +3851,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let req = json!({"method":"add","id":"m1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
         assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
-        crate::components::cursor::bump_generation(&paths.events).unwrap();
+        cursor::bump_generation(&paths.events).unwrap();
 
         let req2 = json!({"method":"add","id":"m2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
         let resp = dispatch(&paths, &emb, &req2);
@@ -3832,7 +3863,7 @@ mod tests {
 
         let conn = db::open_ro(&paths.db).unwrap();
         assert!(
-            crate::components::cursor::inspect(&conn, &paths).is_behind(),
+            cursor::inspect(&conn, &paths).is_behind(),
             "the divergence must survive the refused write"
         );
     }
@@ -3843,9 +3874,52 @@ mod tests {
     fn assert_cursor_converged(paths: &config::Paths, handler: &str) {
         let conn = db::open_ro(&paths.db).unwrap();
         assert_eq!(
-            crate::components::cursor::inspect(&conn, paths),
-            crate::components::cursor::Decision::NoOp,
+            cursor::inspect(&conn, paths),
+            cursor::Decision::NoOp,
             "{handler} left the applied cursor behind the log"
+        );
+    }
+
+    /// A read served from a database behind the log must say so in the
+    /// response. Server stderr never reaches the agent on the other end of the
+    /// port, so without this a KB_NO_EMBED session serves stale results in
+    /// silence.
+    #[test]
+    fn test_reads_report_staleness_in_the_response() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("s1");
+        let req_add =
+            json!({"path":"t/s","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        let entry_id = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb)
+            ["entry_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Converged: the field is absent, and no existing field changed.
+        let search = json!({"method":"search","id":"s2","query":"one"});
+        let fresh = dispatch(&paths, &emb, &search);
+        assert_eq!(fresh["type"], "result");
+        assert!(fresh.get("stale").is_none(), "{fresh}");
+        let get = json!({"method":"kb_get","id":"s3","entry_id":entry_id});
+        let fresh_get = dispatch(&paths, &emb, &get);
+        assert_eq!(fresh_get["type"], "result");
+        assert!(fresh_get.get("stale").is_none(), "{fresh_get}");
+
+        // Behind: both reads carry a reason, and both still return results.
+        cursor::bump_generation(&paths.events).unwrap();
+        let stale = dispatch(&paths, &emb, &search);
+        assert_eq!(stale["type"], "result");
+        assert!(
+            stale["stale"].as_str().unwrap_or("").contains("generation"),
+            "{stale}"
+        );
+        let stale_get = dispatch(&paths, &emb, &get);
+        assert_eq!(stale_get["type"], "result");
+        assert!(stale_get["stale"].as_str().is_some(), "{stale_get}");
+        assert!(
+            stale_get["entry"]["id"].as_str().is_some(),
+            "the entry must still be served: {stale_get}"
         );
     }
 
