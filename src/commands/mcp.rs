@@ -1605,9 +1605,14 @@ fn handle_reembed(
                 .iter()
                 .map(|failure| json!({"id":failure.id,"cause":failure.cause}))
                 .collect();
+            // noop_embedder is additive: with KB_NO_EMBED set, run_reembed
+            // returns early after selection (embedded:0, missing:N) with no
+            // writes attempted at all — without this flag that response is
+            // indistinguishable from a run that tried and embedded nothing
+            // (review finding).
             json!({"id":id,"type":"ok","embedded":report.embedded,"failed":report.failed,
                    "failures":failures,"skipped":report.skipped,"missing":report.missing,
-                   "dry_run":dry_run})
+                   "raced":report.raced,"dry_run":dry_run,"noop_embedder":emb.is_noop()})
         }
         Err(error) => json!({"id":id,"type":"error","code":"db_error","message":error.to_string()}),
     }
@@ -6360,8 +6365,46 @@ mod tests {
         assert_eq!(response["embedded"], cli.embedded);
         assert_eq!(response["failed"], cli.failed);
         assert_eq!(response["skipped"], cli.skipped);
+        assert_eq!(response["raced"], cli.raced);
         assert_eq!(response["failures"][0]["id"], cli.failures[0].id);
         assert_eq!(response["failures"][0]["cause"], cli.failures[0].cause);
+        assert_eq!(response["noop_embedder"], false);
+    }
+
+    #[test]
+    fn test_handle_reembed_signals_noop_embedder_distinct_from_a_stalled_run() {
+        let dir = tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        crate::commands::add::Add {
+            path: "docs/noop".to_string(),
+            summary: "noop".to_string(),
+            content: "body".to_string(),
+            tags: "test".to_string(),
+            version_ref: None,
+            id: Some("noop".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
+        }
+        .execute_with(&paths, &NoopEmbedder)
+        .unwrap();
+        let response = handle_reembed(
+            &ReembedRequest {
+                method: "reembed".to_string(),
+                id: json!("noop-check"),
+                dry_run: Some(false),
+                max_chars: None,
+            },
+            &paths,
+            &NoopEmbedder,
+        );
+        assert_eq!(response["embedded"], 0);
+        assert_eq!(response["missing"], 1);
+        assert_eq!(response["noop_embedder"], true);
     }
 }
 
