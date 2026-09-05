@@ -211,7 +211,18 @@ where
     // Reconcile once against the live pathname. If rebuild atomically replaced
     // the database between batches, rows committed to the old inode are
     // restored here without overwriting embeddings already in the new DB.
+    // Pass one's failed/failures reflect that stale database, not the live
+    // one, so they are discarded rather than kept alongside pass two's
+    // results — otherwise a real failure (e.g. a rejecting trigger still in
+    // place) would be recorded twice for the same id (review finding).
+    // embedded_ids is NOT reset here: an id can already be live on the
+    // CURRENT path before the swap is even detected (a later batch that
+    // landed on the replacement file before this check runs), and resetting
+    // would forget that real write. The final live-db verification below,
+    // not this reset, is what decides report.embedded.
     if db_identity(&paths.db) != initial_db_identity {
+        report.failed = 0;
+        report.failures.clear();
         let mut no_hook = |_| {};
         write_batches(
             paths,
@@ -222,6 +233,17 @@ where
             &mut no_hook,
         );
     }
+
+    // Ground truth: embedded_ids accumulates every id that got a successful
+    // INSERT at some point, but a swap mid-run can invalidate that — an id
+    // written to an inode that is no longer live, and which no longer
+    // resolves at all in the replacement (deleted, or now stale), is not
+    // actually embedded anywhere (review finding). Confirm every candidate
+    // against the CURRENT live db and only count what is really there; a
+    // dropped id is not double-reported here because the reconcile pass
+    // above already re-attempted its write and recorded the miss as
+    // `raced` at that point (see write_batches).
+    report.embedded = confirm_embedded_ids_are_live(paths, &embedded_ids)?;
     Ok(report)
 }
 
@@ -229,6 +251,39 @@ fn db_identity(path: &std::path::Path) -> Option<(u64, u64)> {
     std::fs::metadata(path)
         .ok()
         .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// Counts how many of `ids` currently have a live embedding row (joined
+/// through the entries table by rowid, on whatever file `paths.db` names
+/// right now). Chunked into IN-clause batches to bound one query's
+/// parameter count for a large candidate set.
+fn confirm_embedded_ids_are_live(
+    paths: &config::Paths,
+    ids: &HashSet<String>,
+) -> anyhow::Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = db::open_ro(&paths.db)?;
+    let ordered: Vec<&String> = ids.iter().collect();
+    let mut confirmed = 0usize;
+    for chunk in ordered.chunks(500) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM entries e JOIN entries_emb emb ON emb.rowid = e.rowid
+             WHERE e.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let count: i64 = stmt.query_row(
+            rusqlite::params_from_iter(chunk.iter().map(|id| id.as_str())),
+            |r| r.get(0),
+        )?;
+        confirmed += count as usize;
+    }
+    Ok(confirmed)
 }
 
 fn write_batches<F>(
@@ -475,11 +530,67 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report.embedded, REEMBED_WRITE_BATCH_SIZE + 3);
+        assert_eq!(
+            report.failed, 0,
+            "pass one's failures must not survive into the reconcile pass"
+        );
         let conn = db::open_ro(&paths.db).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entries_emb", [], |r| r.get(0))
             .unwrap();
+        assert_eq!(
+            count, report.embedded as i64,
+            "report.embedded must equal the rows actually present in the live db"
+        );
         assert_eq!(count, (REEMBED_WRITE_BATCH_SIZE + 3) as i64);
+    }
+
+    #[test]
+    fn test_reembed_swap_drops_ids_that_no_longer_resolve_in_the_replacement_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = REEMBED_WRITE_BATCH_SIZE + 2;
+        for index in 0..total {
+            seed(&paths, &format!("gone-{index}"), "seed");
+        }
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        let replacement = paths.db.with_extension("replacement");
+        std::fs::copy(&paths.db, &replacement).unwrap();
+        // In the replacement db only (not the one pass one writes against
+        // before the swap), mark one entry stale — simulating a rebuild
+        // that dropped it. Pass one embeds it fine against the still-live
+        // old db; after the swap, it must no longer be counted.
+        {
+            let conn = rusqlite::Connection::open(&replacement).unwrap();
+            conn.execute("UPDATE entries SET is_stale = 1 WHERE id = 'gone-0'", [])
+                .unwrap();
+        }
+        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch| {
+            if batch == 1 {
+                std::fs::rename(&replacement, &paths.db).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            report.embedded,
+            total - 1,
+            "gone-0 no longer resolves live and must not stay counted"
+        );
+        assert_eq!(report.failed, 0);
+        let conn = db::open_ro(&paths.db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries_emb", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, report.embedded as i64,
+            "report.embedded must equal the rows actually present in the live db, not overcount a vanished id"
+        );
     }
 
     #[test]
