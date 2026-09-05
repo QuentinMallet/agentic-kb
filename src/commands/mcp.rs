@@ -1764,21 +1764,11 @@ fn handle_expire(
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    // Guard: refuse to expire permanent entries unless force=true
-    if !force {
-        let permanent: Option<i64> = conn
-            .query_row(
-                "SELECT permanent FROM entries WHERE id=?1",
-                params![entry_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if permanent == Some(1) {
-            return json!({
-                "id": id, "type": "error", "code": "permanent_guard",
-                "message": format!("entry '{}' is permanent; set force=true to expire it", entry_id)
-            });
-        }
+    if db::expire_guard(&conn, &entry_id, force) == Err(db::ExpireRefusal::Permanent) {
+        return json!({
+            "id": id, "type": "error", "code": "permanent_guard",
+            "message": format!("entry '{}' is permanent; set force=true to expire it", entry_id)
+        });
     }
 
     let ts = chrono::Utc::now().to_rfc3339();
@@ -2042,6 +2032,18 @@ fn handle_audit_record(
             if !in_candidates {
                 return json!({"id":id,"type":"error","code":"unknown_run_candidates",
                     "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", eid, run_id)});
+            }
+        }
+    }
+
+    // Check every destructive verdict before appending any event or writing any row.
+    for v in &verdicts {
+        if v.get("verdict").and_then(Value::as_bool) == Some(false) {
+            if let Some(eid) = v.get("entry_id").and_then(Value::as_str) {
+                if db::expire_guard(&conn, eid, false) == Err(db::ExpireRefusal::Permanent) {
+                    return json!({"id":id,"type":"error","code":"permanent_guard",
+                        "message":format!("entry '{}' cannot be expired: permanent", eid)});
+                }
             }
         }
     }
@@ -4343,6 +4345,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_refuses_permanent_sample_and_expires_non_permanent_sample() {
+        let (_dir, paths, emb) = setup();
+        let id = json!(null);
+        // kind must stay audit-eligible: `convention`/`memory` entries get
+        // evidence_status='n/a' and audit_sample_entries excludes anything
+        // that isn't evidence_status='present' (see the n/a-exclusion test
+        // above), so a permanent `convention` entry would never be sampled.
+        let permanent_req = json!({"path":"p/permanent-audit","summary":"s","content":"c","tags":[],
+                                    "kind":"observation","permanent":true,
+                                    "evidence":[{"kind":"code","citation_hash":"sha256:abc","citation_path":"src/foo.rs:1-5"}]});
+        let permanent_resp =
+            handle_add(&tr::<AddRequest>("add", &id, &permanent_req), &paths, &emb);
+        let permanent_id = permanent_resp["entry_id"].as_str().unwrap().to_string();
+        let ordinary_id = add_live_entry(&paths, &emb, "p/ordinary-audit", None);
+
+        let run = handle_audit_run(
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 2})),
+            &paths,
+        );
+        let run_id = run["run_id"].as_str().unwrap();
+        assert!(run["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample["id"] == permanent_id));
+
+        let refused = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":run_id,"verdicts":[{"entry_id":permanent_id,"verdict":false,"note":"bad evidence"}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(refused["code"], "permanent_guard");
+        assert!(refused["message"].as_str().unwrap().contains(&permanent_id));
+        assert!(refused["message"].as_str().unwrap().contains("permanent"));
+
+        let expired = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":run_id,"verdicts":[{"entry_id":ordinary_id,"verdict":false,"note":"bad evidence"}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(expired["expired"], 1);
+
+        // The permanent entry must remain live and searchable: the batch
+        // pre-check refuses the whole request before any write, so the
+        // earlier `refused` call above could not have expired it either.
+        let search = handle_search(
+            &tr::<SearchRequest>(
+                "search",
+                &id,
+                &json!({"query": "permanent-audit", "mode": "fts"}),
+            ),
+            &paths,
+            &emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        );
+        assert!(
+            search["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == permanent_id),
+            "permanent entry must still be live and searchable after the refused verdict"
+        );
     }
 
     #[test]
