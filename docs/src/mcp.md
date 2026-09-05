@@ -58,6 +58,15 @@ returns `line_too_long` for a request line over 10 MiB and discards through the
 newline so the next request remains framed. `handle_search` rejects a query
 whose byte length exceeds `MAX_QUERY_BYTES` (8 KiB) before retrieval.
 
+The limit and `inline_verify_k` boundary cases are pinned by
+`test_search_rejects_limit_above_max_and_honours_the_maximum` and
+`test_search_rejects_inline_verify_k_above_max_and_honours_the_maximum`.
+
+Rendered search context is capped at 32,000 bytes by
+`@format_entries_max_bytes`. `format_entries` retains whole entries only and
+appends `…(N more entries omitted)` when the cap omits results; the behavior is
+pinned by `bytes ceiling truncates at whole-entry boundary and appends omitted count`.
+
 ## Retrieval results
 
 `handle_search` returns truncated hits: summary, first content paragraph, and
@@ -66,7 +75,9 @@ evidence metadata. `render_result/1` preserves evidence status as `verified`,
 verification budget. Derived evidence is checked by
 `add_validation::validate_kb_add_inputs` to carry a non-empty `derived_from`
 identifier no longer than 200 characters. Search results omit
-`citation_excerpt` and carry a `[kb#<id>]` marker.
+`citation_excerpt` and carry a `[kb#<id>]` marker. The Rust `entries_to_json`
+wire shape caps each content field at 8,000 characters and appends
+`...(truncated)`.
 
 `handle_kb_get` expands that marker to the untruncated entry and full evidence.
 `wrap_citation_excerpt` encloses excerpts in
@@ -127,6 +138,17 @@ non-empty trimmed note; before writing any batch, `handle_audit_record` calls
 `db::expire_guard` and refuses to expire a permanent entry. The peer mutations
 route through `handle_kb_peers_add` and `handle_kb_peers_remove`, which acquire
 the repository lock and use `db::open_rw`.
+
+## `kb_provenance`
+
+The Rust result contains `roots`, `dangling`, `graph`, and `truncated`.
+`handle_provenance` reads parent IDs with `ORDER BY derived_from`, making the
+traversal output repeatable; `test_handle_provenance_is_deterministic_across_parent_insertion_order`
+pins byte-identical arrays across insertion orders. A missing referenced parent
+is retained as an edge target and listed separately in `dangling`, rather than
+being reported as a root (`test_handle_provenance_reports_dangling_parent_separately_from_roots`).
+The Elixir text renderer currently prints roots, graph edges, and the
+`truncated` flag from that result (`render_result`).
 
 ## Root selection
 
