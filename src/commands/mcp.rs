@@ -1989,6 +1989,22 @@ fn handle_audit_record(
             "message":format!("verdicts must contain at most {} items", MAX_AUDIT_VERDICTS)});
     }
 
+    for verdict in &verdicts {
+        if verdict.get("verdict").and_then(Value::as_bool) == Some(false)
+            && verdict
+                .get("note")
+                .and_then(Value::as_str)
+                .map_or(true, |note| note.trim().is_empty())
+        {
+            let entry_id = verdict
+                .get("entry_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            return json!({"id":id,"type":"error","code":"parse_error",
+                "message":format!("entry '{}' verdict=false requires a non-empty note", entry_id)});
+        }
+    }
+
     if verdicts.is_empty() {
         return json!({"id": id, "type": "ok", "recorded": 0, "expired": 0});
     }
@@ -2941,6 +2957,16 @@ mod tests {
         (entry_id, resolved_sid)
     }
 
+    /// A `verdict:false` row requires a non-empty note; build the request shape
+    /// generically over generated bools so proptests stay valid under that rule.
+    fn verdict_json(entry_id: &str, verdict: bool) -> Value {
+        if verdict {
+            json!({"entry_id": entry_id, "verdict": true})
+        } else {
+            json!({"entry_id": entry_id, "verdict": false, "note": "generated negative verdict"})
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
             cases: proptest_cases(256),
@@ -2973,7 +2999,7 @@ mod tests {
                 let path = format!("prop/agg/{}/{}/{}", ki, si, verdict);
                 let (entry_id, _) = add_entry_and_seed(&paths, &emb, &path, kind, session_id, run_id);
                 entry_map.entry(key).or_insert_with(|| entry_id.clone());
-                verdict_objs.push(json!({"entry_id": entry_id, "verdict": verdict}));
+                verdict_objs.push(verdict_json(&entry_id, *verdict));
             }
 
             let req = json!({"run_id": run_id, "verdicts": verdict_objs});
@@ -3045,10 +3071,10 @@ mod tests {
             // Record verdicts for all entries.
             let mut verdict_objs: Vec<serde_json::Value> = Vec::new();
             for (eid, v) in null_eids.iter().zip(verdict_null.iter().cycle()) {
-                verdict_objs.push(json!({"entry_id": eid, "verdict": v}));
+                verdict_objs.push(verdict_json(eid, *v));
             }
             for (eid, v) in named_eids.iter().zip(verdict_named.iter().cycle()) {
-                verdict_objs.push(json!({"entry_id": eid, "verdict": v}));
+                verdict_objs.push(verdict_json(eid, *v));
             }
             let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": verdict_objs})), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok");
@@ -3151,14 +3177,14 @@ mod tests {
 
             // DB-A: apply in forward order.
             let fwd_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
-                json!({"entry_id": eid, "verdict": v})
+                verdict_json(eid, *v)
             }).collect();
             let resp_a = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": fwd_verdicts})), &paths_a, &emb_a);
             proptest::prop_assert_eq!(&resp_a["type"], "ok", "forward apply must succeed");
 
             // DB-B: apply in reversed order.
             let rev_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
-                json!({"entry_id": eid, "verdict": v})
+                verdict_json(eid, *v)
             }).collect::<Vec<_>>().into_iter().rev().collect();
             let resp_b = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": rev_verdicts})), &paths_b, &emb_b);
             proptest::prop_assert_eq!(&resp_b["type"], "ok", "reversed apply must succeed");
@@ -4336,7 +4362,7 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/exp", None);
         seed_audit_candidate(&paths, "run-002", &eid);
         let id = json!(null);
-        let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false, "note": "evidence is stale"}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -4353,6 +4379,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 1);
+    }
+
+    #[test]
+    fn test_handle_audit_record_rejects_false_without_note_but_accepts_supported_forms() {
+        let (_dir, paths, emb) = setup();
+        let false_id = add_live_entry(&paths, &emb, "p/note-false", None);
+        let true_id = add_live_entry(&paths, &emb, "p/note-true", None);
+        seed_audit_candidate(&paths, "run-note", &false_id);
+        seed_audit_candidate(&paths, "run-note", &true_id);
+        let id = json!(null);
+
+        let rejected = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(rejected["type"], "error");
+        assert!(rejected["message"].as_str().unwrap().contains(&false_id));
+
+        let whitespace_rejected = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"  \t"}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(whitespace_rejected["type"], "error");
+
+        let accepted_false = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"unsupported evidence"}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(accepted_false["type"], "ok");
+
+        let accepted_true = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &id,
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":true_id,"verdict":true}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(accepted_true["type"], "ok");
     }
 
     #[test]
@@ -4611,7 +4692,7 @@ mod tests {
         }
 
         let id = json!(null);
-        let req = json!({"run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let req = json!({"run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -4827,7 +4908,13 @@ mod tests {
         let verdicts: Vec<Value> = eids
             .iter()
             .enumerate()
-            .map(|(i, eid)| json!({"entry_id": eid, "verdict": i < 3}))
+            .map(|(i, eid)| {
+                if i < 3 {
+                    json!({"entry_id": eid, "verdict": true})
+                } else {
+                    json!({"entry_id": eid, "verdict": false, "note": "unsupported evidence"})
+                }
+            })
             .collect();
         let req = json!({"run_id": "run-report", "verdicts": verdicts});
         handle_audit_record(
@@ -5477,7 +5564,7 @@ mod tests {
         assert!(samples.iter().any(|s| s["id"] == eid));
 
         // Step 3: kb_audit_record verdict=false → entry gone from kb_search
-        let rec_req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false}]});
+        let rec_req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
         let rec_resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &rec_req),
             &paths,

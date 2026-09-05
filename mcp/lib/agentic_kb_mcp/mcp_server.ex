@@ -413,6 +413,14 @@ defmodule AgenticKbMcp.McpServer do
                 "entry_id" => %{"type" => "string"},
                 "verdict" => %{"type" => "boolean"},
                 "note" => %{"type" => "string"}
+              },
+              "if" => %{
+                "properties" => %{"verdict" => %{"const" => false}},
+                "required" => ["verdict"]
+              },
+              "then" => %{
+                "required" => ["note"],
+                "properties" => %{"note" => %{"type" => "string", "minLength" => 1}}
               }
             }
           }
@@ -517,6 +525,16 @@ defmodule AgenticKbMcp.McpServer do
   defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts})
        when is_list(verdicts) and length(verdicts) > 50 do
     {:error, "verdicts must contain at most 50 items"}
+  end
+
+  defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts}) when is_list(verdicts) do
+    Enum.find_value(verdicts, :ok, fn verdict ->
+      if is_map(verdict) and verdict["verdict"] == false and
+           (not is_binary(verdict["note"]) or String.trim(verdict["note"]) == "") do
+        {:error,
+         "entry '#{Map.get(verdict, "entry_id", "<missing>")}' verdict=false requires a non-empty note"}
+      end
+    end)
   end
 
   defp validate_tool_values(_tool, _args), do: :ok
