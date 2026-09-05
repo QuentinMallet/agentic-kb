@@ -3,6 +3,7 @@
 use kb::commands::add::{acquire_lock, Add};
 use kb::commands::compress::{run as compress_run, Compress};
 use kb::commands::eval::Eval;
+use kb::commands::peers::{PeersEdgeList, PeersList, PeersShow};
 use kb::commands::stale_check::{RelocateArg, StaleCheck};
 use kb::commands::tests::Tests;
 use kb::components::db;
@@ -38,6 +39,10 @@ fn migrated_read_surfaces_are_pinned_to_open_ro() {
         ),
         ("tests list", include_str!("../src/commands/tests.rs")),
         ("compress", include_str!("../src/commands/compress.rs")),
+        (
+            "peers list/show/edge-list",
+            include_str!("../src/commands/peers.rs"),
+        ),
         (
             "mcp (handle_audit_report)",
             include_str!("../src/commands/mcp.rs"),
@@ -115,7 +120,47 @@ fn migrated_readers_serve_data_while_the_write_lock_is_held() {
         .unwrap();
     assert_eq!(entries_before, 1, "the seed must have landed");
 
+    // Seed one live peer row so each peer reader must return actual data.
+    {
+        let source_repo = paths.root.to_string_lossy().into_owned();
+        let seed_lock = acquire_lock(&paths.lock).unwrap();
+        let conn = db::open_rw(&paths, &seed_lock).unwrap();
+        conn.execute(
+            "INSERT INTO graphs (id, graph_type, epic_slug, source_repo, created_at) VALUES ('g1', 'dep', NULL, ?1, '2026-09-05T00:00:00Z')",
+            [&source_repo],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (id, graph_id, source_repo, target_repo, edge_type, created_at) VALUES ('p1', 'g1', ?1, 'target-repo', 'member', '2026-09-05T00:00:00Z')",
+            [&source_repo],
+        )
+        .unwrap();
+    }
+
     let lock = acquire_lock(&paths.lock).unwrap();
+
+    for (label, read) in [
+        ("PeersList::execute_with", 0_u8),
+        ("PeersShow::execute_with", 1_u8),
+        ("PeersEdgeList::execute_with", 2_u8),
+    ] {
+        let paths = paths.clone();
+        require_unblocked(label, move || {
+            let mut out = Vec::new();
+            match read {
+                0 => PeersList { graph_type: None }.execute_with(&paths, &mut out)?,
+                1 => PeersShow {
+                    repo_path: paths.root.to_string_lossy().into_owned(),
+                }
+                .execute_with(&paths, &mut out)?,
+                2 => PeersEdgeList { epic_slug: None }.execute_with(&paths, &mut out)?,
+                _ => unreachable!(),
+            }
+            let rows: serde_json::Value = serde_json::from_slice(&out)?;
+            anyhow::ensure!(rows.as_array().is_some_and(|rows| rows.len() == 1));
+            Ok(())
+        });
+    }
 
     // Tests::execute_with: a pure read, must not block or error.
     {

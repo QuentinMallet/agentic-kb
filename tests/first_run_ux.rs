@@ -14,6 +14,7 @@ use kb::commands::cited_by::CitedBy;
 use kb::commands::compact::Compact;
 use kb::commands::context::Context;
 use kb::commands::eval::Eval;
+use kb::commands::peers::{PeersEdgeList, PeersList, PeersShow};
 use kb::commands::search::Search;
 use kb::commands::stale_check::{RelocateArg, StaleCheck};
 use kb::commands::tests::Tests;
@@ -228,4 +229,55 @@ fn kb_stale_check_on_a_fresh_repo_is_empty_and_succeeds() {
         !paths.db.exists(),
         "the read path must not create the database"
     );
+}
+
+fn assert_empty_peer_read(paths: &Paths, out: &[u8]) {
+    assert_eq!(serde_json::from_slice::<Value>(out).unwrap(), json!([]));
+    assert_eq!(
+        kb::components::db::uninitialized_note(&paths.db),
+        format!(
+            "kb: no knowledge base at {} — returning an empty result; run `kb rebuild` to materialize it from the event log",
+            paths.db.display()
+        ),
+        "the read's db::note_uninitialized call must use the standard stderr note"
+    );
+    assert!(
+        !paths.db.exists(),
+        "the peer read must not create the database"
+    );
+}
+
+#[test]
+fn kb_peers_list_on_a_fresh_repo_is_empty_notes_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+    let mut out = Vec::new();
+    PeersList { graph_type: None }
+        .execute_with(&paths, &mut out)
+        .unwrap();
+    assert_empty_peer_read(&paths, &out);
+}
+
+#[test]
+fn kb_peers_show_on_a_fresh_repo_is_empty_notes_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+    let mut out = Vec::new();
+    PeersShow {
+        repo_path: "repo".into(),
+    }
+    .execute_with(&paths, &mut out)
+    .unwrap();
+    assert_empty_peer_read(&paths, &out);
+}
+
+#[test]
+fn kb_peers_edge_list_on_a_fresh_repo_is_empty_notes_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+    let mut out = Vec::new();
+    PeersEdgeList { epic_slug: None }
+        .execute_with(&paths, &mut out)
+        .unwrap();
+    assert_empty_peer_read(&paths, &out);
 }

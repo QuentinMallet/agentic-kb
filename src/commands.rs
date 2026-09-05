@@ -102,18 +102,30 @@ impl KbCmd {
     /// because it *is* the repair, and `mcp` because it derives its paths from
     /// `--db` and initializes itself at startup.
     fn mutates(&self) -> bool {
-        !matches!(
-            self,
-            KbCmd::Search(_)
-                | KbCmd::CitedBy(_)
-                | KbCmd::Cite(_)
-                | KbCmd::Context(_)
-                | KbCmd::Eval(_)
-                | KbCmd::Tests(_)
-                | KbCmd::OlderThan(_)
-                | KbCmd::Rebuild(_)
-                | KbCmd::Mcp(_)
-        )
+        match self {
+            KbCmd::Add(_) => true,
+            KbCmd::Search(_) => false,
+            KbCmd::Mcp(_) => false,
+            KbCmd::MigrateCitations(_) => true,
+            KbCmd::StaleCheck(_) => true,
+            KbCmd::Rebuild(_) => false,
+            KbCmd::Compact(_) => true,
+            KbCmd::Compress(_) => true,
+            KbCmd::CitedBy(_) => false,
+            KbCmd::Cite(_) => false,
+            KbCmd::Context(_) => false,
+            KbCmd::Eval(_) => false,
+            KbCmd::Expire(_) => true,
+            KbCmd::Reembed(_) => true,
+            KbCmd::Tests(_) => false,
+            KbCmd::TestAdd(_) => true,
+            KbCmd::Run(_) => true,
+            KbCmd::Ingest(_) => true,
+            KbCmd::Import(_) => true,
+            KbCmd::OlderThan(_) => false,
+            KbCmd::Peers(cmd) => cmd.mutates(),
+            KbCmd::Hook(_) => true,
+        }
     }
 }
 
@@ -152,5 +164,118 @@ impl Configurable<KbConfig> for EntryPoint {
 
     fn process_config(&self, config: KbConfig) -> Result<KbConfig, FrameworkError> {
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod mutation_classification_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn assert_classification(args: &[&str], expected: bool) {
+        let entry = EntryPoint::try_parse_from(args)
+            .unwrap_or_else(|e| panic!("invalid classification-test argv {args:?}: {e}"));
+        assert_eq!(entry.cmd.mutates(), expected, "argv: {args:?}");
+    }
+
+    #[test]
+    fn every_cli_and_peers_variant_has_an_explicit_mutation_classification() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &[
+                    "kb",
+                    "add",
+                    "--path",
+                    "p",
+                    "--summary",
+                    "s",
+                    "--content",
+                    "c",
+                    "--tags",
+                    "t",
+                ],
+                true,
+            ),
+            (&["kb", "search", "q"], false),
+            (&["kb", "mcp", "--db", "agent-kb.db"], false),
+            (&["kb", "migrate-citations"], true),
+            (&["kb", "stale-check", "p"], true),
+            (&["kb", "rebuild"], false),
+            (&["kb", "compact"], true),
+            (&["kb", "compress", "p"], true),
+            (&["kb", "cited-by", "p"], false),
+            (&["kb", "cite", "p"], false),
+            (&["kb", "context", "--budget", "100"], false),
+            (&["kb", "eval", "golden.jsonl"], false),
+            (&["kb", "expire", "id"], true),
+            (&["kb", "reembed"], true),
+            (&["kb", "tests"], false),
+            (
+                &[
+                    "kb",
+                    "test-add",
+                    "--app",
+                    "a",
+                    "--name",
+                    "n",
+                    "--protocol",
+                    "rust_tool",
+                    "--config",
+                    "{}",
+                ],
+                true,
+            ),
+            (&["kb", "run", "id", "--result", "pass"], true),
+            (
+                &[
+                    "kb",
+                    "ingest",
+                    "--path",
+                    "p",
+                    "--summary",
+                    "s",
+                    "--tags",
+                    "t",
+                ],
+                true,
+            ),
+            (&["kb", "import", "p"], true),
+            (&["kb", "older-than", "1"], false),
+            (
+                &[
+                    "kb",
+                    "hook",
+                    "session-end",
+                    "--transcript",
+                    "p",
+                    "--session-id",
+                    "s",
+                ],
+                true,
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_classification(args, *expected);
+        }
+
+        let peer_cases: &[(&[&str], bool)] = &[
+            (&["kb", "peers", "add", "target", "--type", "dep"], true),
+            (&["kb", "peers", "list"], false),
+            (&["kb", "peers", "remove", "id"], true),
+            (&["kb", "peers", "show", "repo"], false),
+            (&["kb", "peers", "import", "seeds.json"], true),
+            (
+                &[
+                    "kb", "peers", "edge", "add", "source", "target", "--type", "dep",
+                ],
+                true,
+            ),
+            (&["kb", "peers", "edge", "list"], false),
+            (&["kb", "peers", "edge", "remove", "id"], true),
+            (&["kb", "peers", "edge", "cleanup-epic", "slug"], true),
+        ];
+        for (args, expected) in peer_cases {
+            assert_classification(args, *expected);
+        }
     }
 }
