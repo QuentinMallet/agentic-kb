@@ -257,6 +257,9 @@ beads rather than fixed here:
   performs the global merge and truncation. A row that inline verification
   spent work on can still be discarded by the federated truncate, so
   verification effort is not scoped to the final global `--limit`.
-- `bd-prenorm-embeddings-followup-te13` — a deferred change to persist
-  pre-normalized embeddings in a new on-disk format, rather than normalizing
-  at read time on every `cosine_similarity` call.
+- `bd-prenorm-embeddings-followup-te13` — a change to persist pre-normalized
+  embeddings in a new on-disk format, rather than normalizing at read time on
+  every `cosine_similarity` call. The `docs/benchmarks/p2-prenormalization.md`
+  measurement cleared the pre-registered 10% marginal-cost threshold at every
+  site (63-74% savings at 10,000 entries), so this is no longer deferred: it
+  is approved to land.
