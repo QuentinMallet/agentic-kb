@@ -650,6 +650,7 @@ BadTruncate ==
 SpecBadTruncate == Init /\ [][Next \/ BadTruncate]_vars
 
 BadTypeInit ==
+  /\ log_present = TRUE
   /\ log_written = << >> /\ log_durable = << >>
   /\ db = {} /\ db_committed = {}
   /\ cursor = [gen |-> 0, off |-> MaxLogLen + 7]
