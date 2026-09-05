@@ -251,8 +251,8 @@ fn heal_relocations(
     let conn = &db::open_rw(paths, &lock)?;
 
     for r in report.relocation.iter_mut() {
-        let new_path = match &r.new_path {
-            Some(p) if r.status == VerificationStatus::Relocated => p.clone(),
+        let new_path = match relocation_heal_target(r) {
+            Some(path) => path.to_string(),
             _ => continue,
         };
         // ApplyHeal re-reads the complete evidence row and live parent while
@@ -304,6 +304,16 @@ fn heal_relocations(
         r.healed = true;
     }
     Ok(())
+}
+
+fn relocation_heal_target(entry: &RelocationEntry) -> Option<&str> {
+    if entry.reason == Some("symlink_path_rejected") {
+        return None;
+    }
+    match (&entry.new_path, entry.status) {
+        (Some(path), VerificationStatus::Relocated) => Some(path),
+        _ => None,
+    }
 }
 
 /// Shared orchestration for the CLI subcommand and the MCP `kb_stale_check`
@@ -1319,6 +1329,21 @@ mod tests {
             ..Default::default()
         });
         assert!(healed[0].ends_with("(healed)"), "{healed:?}");
+    }
+
+    #[test]
+    fn symlink_path_rejection_is_never_eligible_for_auto_heal() {
+        let entry = RelocationEntry {
+            entry_id: "entry".to_string(),
+            evidence_id: "evidence".to_string(),
+            status: VerificationStatus::Relocated,
+            old_path: "link.rs".to_string(),
+            new_path: Some("target.rs".to_string()),
+            reason: Some("symlink_path_rejected"),
+            healed: false,
+        };
+
+        assert_eq!(relocation_heal_target(&entry), None);
     }
 
     #[test]
