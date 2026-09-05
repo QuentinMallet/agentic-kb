@@ -1,6 +1,6 @@
 //! `peers` subcommand — manage peer repo graph edges
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
+use crate::commands::add::acquire_lock;
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -105,7 +105,7 @@ impl PeersAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
         let source_repo = detect_source_repo(&paths.db);
         let now = chrono::Utc::now().to_rfc3339();
@@ -232,7 +232,7 @@ impl Runnable for PeersRemove {
 impl PeersRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
 
         let deleted = conn.execute("DELETE FROM peers WHERE id=?1", params![self.peer_id])?;
@@ -447,7 +447,7 @@ impl PeersImport {
         let entries: Vec<PeerSeedEntry> = serde_json::from_slice(&file_bytes)
             .with_context(|| format!("parse seeds file: {}", self.seeds_file))?;
 
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut added = 0usize;
@@ -601,7 +601,7 @@ impl PeersEdgeAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -725,7 +725,7 @@ impl Runnable for PeersEdgeRemove {
 impl PeersEdgeRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
 
         let deleted = conn.execute("DELETE FROM peers WHERE id=?1", params![self.edge_id])?;
@@ -764,7 +764,7 @@ impl Runnable for PeersEdgeCleanupEpic {
 impl PeersEdgeCleanupEpic {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
         let conn = db::open_rw(&paths, &lock)?;
 
         let deleted = conn.execute("DELETE FROM peers WHERE epic_slug = ?1", params![self.slug])?;
