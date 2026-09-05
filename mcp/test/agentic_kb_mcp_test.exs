@@ -579,10 +579,17 @@ defmodule AgenticKbMcpTest do
   # needed. Raw bytes matter: OTP's `:json` decodes JSON `null` to the atom
   # `:null`, which no round-trip through an Elixir map would reproduce.
   describe "tools/call request path (B1)" do
-    defp call_line(line) do
+    # A db_path that exists as far as the server is concerned, so argument
+    # normalisation and validation actually run. Requests that clear validation
+    # reach PortManager with no manager started and come back as an envelope,
+    # never a crash.
+    @with_db %{db_path: "/nonexistent/agent-kb.db"}
+    @without_db %{db_path: nil}
+
+    defp call_line(line, state) do
       output =
         ExUnit.CaptureIO.capture_io(fn ->
-          assert {:noreply, _state} = McpServer.handle_cast({:line, line}, %{db_path: nil})
+          assert {:noreply, _state} = McpServer.handle_cast({:line, line}, state)
         end)
 
       output |> String.trim() |> :json.decode()
@@ -592,29 +599,37 @@ defmodule AgenticKbMcpTest do
       response =
         call_line(
           ~s({"jsonrpc":"2.0","id":1,"method":"tools/call",) <>
-            ~s("params":{"name":"kb_search","arguments":null}})
+            ~s("params":{"name":"kb_search","arguments":null}}),
+          @with_db
         )
 
+      # The point is that normalisation ran and nothing raised: whatever the
+      # port lane answers, it is a well-formed result envelope.
       refute Map.has_key?(response, "error")
       assert %{"result" => %{"content" => [%{"text" => text}]}} = response
-      assert text =~ "No agent-kb.db found"
+      refute text =~ "unknown argument"
+      refute text =~ "arguments must be"
     end
 
     test "an omitted arguments key does not crash the server" do
       response =
         call_line(
-          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_search"}})
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_search"}}),
+          @with_db
         )
 
+      refute Map.has_key?(response, "error")
       assert %{"result" => %{"content" => [%{"text" => text}]}} = response
-      assert text =~ "No agent-kb.db found"
+      refute text =~ "unknown argument"
+      refute text =~ "arguments must be"
     end
 
     test "a non-object arguments is rejected rather than coerced" do
       response =
         call_line(
           ~s({"jsonrpc":"2.0","id":1,"method":"tools/call",) <>
-            ~s("params":{"name":"kb_search","arguments":"oops"}})
+            ~s("params":{"name":"kb_search","arguments":"oops"}}),
+          @with_db
         )
 
       assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
@@ -625,12 +640,27 @@ defmodule AgenticKbMcpTest do
       response =
         call_line(
           ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_add",) <>
-            ~s("arguments":{"path":"a/b","summary":"s","content":"c","confidence":0.9}}})
+            ~s("arguments":{"path":"a/b","summary":"s","content":"c","confidence":0.9}}}),
+          @with_db
         )
 
       assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
       assert text =~ "confidence"
       assert text =~ "unknown argument"
+    end
+
+    test "an uninitialised repo answers the kb-init hint, not an argument error" do
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_search",) <>
+            ~s("arguments":{"query":"q","bogus":1}}}),
+          @without_db
+        )
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} = response
+
+      assert text =~ "No agent-kb.db found",
+             "the actionable hint must win over an argument error when there is no DB"
     end
   end
 end
