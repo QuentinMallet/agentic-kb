@@ -39,8 +39,7 @@ impl Runnable for Cite {
 
 impl Cite {
     pub fn execute(&self) -> Result<()> {
-        let repo_root =
-            config::git_repo_root().ok_or_else(|| anyhow!("kb cite requires a git repo root"))?;
+        let repo_root = config::Paths::discover()?.root;
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         self.execute_with_root(&repo_root, &mut handle)
