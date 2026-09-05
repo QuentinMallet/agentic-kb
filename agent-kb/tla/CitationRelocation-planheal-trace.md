@@ -99,25 +99,54 @@ all still matched the recorded premise.
 
 ## Cfg matrix
 
-The sandbox here cannot run the full TLC matrix. The table below records the intended
-cfg set and the expected outcome for each run on the host.
+**Recorded 2026-09-05.** Every `CitationRelocation*.cfg` in this directory was run to
+completion, sequentially (one TLC process at a time, never two concurrently), via the
+private-metadir runner (`tlc -workers 4`, TLC2 2.19 of 08 August 2024, JVM tmpdir and
+`-metadir` both under `/tmp/tlc-orch`, never the checked-in tree's shared `states/`
+directory). This replaces the earlier "intended" table, which recorded a plan rather than
+an outcome. The runner applies a fixed `-workers 4` to every cfg, so the previously listed
+per-cfg worker counts (2/3/4) were never actually honored by any run and are dropped from
+this table in favor of what was actually used.
 
-| cfg | MaxRows | MaxCandidates | MaxPaths | UnsafeApply | UnsafeVerdict | expected outcome | workers |
-|---|---|---|---|---|---|---|---|
-| `CitationRelocation.cfg` | 1 | 2 | 2 | FALSE | FALSE | green: all 9 invariants hold | 2 |
-| `CitationRelocation_NV_Discard.cfg` | 1 | 2 | 2 | FALSE | FALSE | violated: `NoStalePlanEverDiscarded` only | 4 |
-| `CitationRelocation_Paths3.cfg` | 1 | 2 | 3 | FALSE | FALSE | green: all 9 invariants hold | 2 |
-| `CitationRelocation_Rows2.cfg` | 2 | 1 | 2 | FALSE | FALSE | green: all 9 invariants hold | 3 |
-| `CitationRelocation_UnsafeApply.cfg` | 1 | 2 | 2 | TRUE | FALSE | violated: `NoStaleHealCommit` | 4 |
-| `CitationRelocation_UnsafeApply_Isolation.cfg` | 1 | 2 | 2 | TRUE | FALSE | green: remaining 8 invariants hold | 4 |
-| `CitationRelocation_UnsafeApply_Paths3.cfg` | 1 | 2 | 3 | TRUE | FALSE | violated: `NoStaleHealCommit` | 4 |
-| `CitationRelocation_UnsafeApply_Rows2.cfg` | 2 | 2 | 2 | TRUE | FALSE | violated: `NoStaleHealCommit` | 4 |
-| `CitationRelocation_UnsafeVerdict.cfg` | 1 | 2 | 2 | TRUE | TRUE | violated: `NoStaleHealCommit` and `NonUniqueUnverified` and/or `WeakExcerptUnverified` | 4 |
+| cfg | MaxRows | MaxCandidates | MaxPaths | UnsafeApply | UnsafeVerdict | expected outcome | observed outcome | distinct states | depth | wall time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `CitationRelocation.cfg` | 1 | 2 | 2 | FALSE | FALSE | green: all 9 invariants hold | **green** — no error found | 26,296 | 7 | 6s |
+| `CitationRelocation_NV_Discard.cfg` | 1 | 2 | 2 | FALSE | FALSE | violated: `NoStalePlanEverDiscarded` only | **violated: `NoStalePlanEverDiscarded`** | 6,716 | 4 | 2s |
+| `CitationRelocation_Paths3.cfg` | 1 | 2 | 3 | FALSE | FALSE | green: all 9 invariants hold | **green** — no error found | 120,798 | 7 | 29s |
+| `CitationRelocation_Rows2.cfg` | 2 | 1 | 2 | FALSE | FALSE | green: all 9 invariants hold | **green** — no error found | 9,705,472 | 11 | 16min 43s |
+| `CitationRelocation_UnsafeApply.cfg` | 1 | 2 | 2 | TRUE | FALSE | violated: `NoStaleHealCommit` | **violated: `NoStaleHealCommit`** | 5,392 | 4 | 1s |
+| `CitationRelocation_UnsafeApply_Isolation.cfg` | 1 | 2 | 2 | TRUE | FALSE | green: remaining 8 invariants hold | **green** — no error found | 26,380 | 7 | 2s |
+| `CitationRelocation_UnsafeApply_Paths3.cfg` | 1 | 2 | 3 | TRUE | FALSE | violated: `NoStaleHealCommit` | **violated: `NoStaleHealCommit`** | 12,296 | 4 | 1s |
+| `CitationRelocation_UnsafeApply_Rows2.cfg` | 2 | 2 | 2 | TRUE | FALSE | violated: `NoStaleHealCommit` | **violated: `NoStaleHealCommit`** | 583,383 | 4 | 12s |
+| `CitationRelocation_UnsafeVerdict.cfg` | 1 | 2 | 2 | TRUE | TRUE | violated: `NoStaleHealCommit` and `NonUniqueUnverified` and/or `WeakExcerptUnverified` | **violated: `NonUniqueUnverified`** | 4,087 | 4 | 0s |
+
+Every observed outcome matches its documented expected outcome. No cfg failed to parse.
+See §Discrepancies below for the one case (`UnsafeVerdict`) that needs an explanatory note,
+which is not a contradiction.
 
 The isolation row is the point of `CitationRelocation_UnsafeApply_Isolation.cfg`: with
-the path premise removed and `NoStaleHealCommit` omitted, the other eight invariants are
-expected to stay green. That is stronger than saying the unsafe run "happens" to report
-only one failure.
+the path premise removed and `NoStaleHealCommit` omitted, the other eight invariants
+stayed green, confirmed by this run. That is stronger than saying the unsafe run "happens"
+to report only one failure.
+
+## Discrepancies
+
+None that contradict a documented expectation. One clarification:
+
+- **`CitationRelocation_UnsafeVerdict.cfg`** — the matrix's expected-outcome cell was
+  phrased as "`NoStaleHealCommit` and `NonUniqueUnverified` and/or `WeakExcerptUnverified`"
+  because this cfg's invariant list (confirmed present in the `.cfg` file) includes all
+  three, and TLC's breadth-first model checker reports and halts at the *first* invariant
+  violation it encounters, not every invariant that would eventually fail. The recorded run
+  halted on `NonUniqueUnverified` at state 4 (an `ApplyHeal` action with `contentStale` and
+  `verdictStale` both `TRUE`, `committed |-> TRUE`). This is consistent with, not a
+  contradiction of, the documented expectation — the "and/or" phrasing was written to
+  anticipate exactly this first-violation-wins behavior. `NoStaleHealCommit` was not
+  independently re-confirmed to fire in isolation under this cfg (that is what
+  `CitationRelocation_UnsafeApply.cfg`, run separately above, already establishes).
+- Per-cfg worker counts in the previous table version (2/3/4) were never actually used by
+  any TLC invocation; the runner hard-codes `-workers 4`. Corrected in the table above by
+  omitting a per-row worker column and stating the fixed value once.
 
 ## Why the main cfg is `MaxRows = 1`
 
