@@ -162,9 +162,21 @@ pub fn recover_if_needed(paths: &config::Paths, embedder: &dyn Embedder) -> anyh
             );
             let lock = acquire_lock(&paths.lock)?;
             let conn = db::open_rw(paths, &lock)?;
-            let applied = cursor::replay_tail_locked(&lock, &conn, paths, embedder)?;
-            eprintln!("kb: recovery applied {applied} event(s).");
-            Ok(false)
+            match cursor::replay_tail_locked(&lock, &conn, paths, embedder) {
+                Ok(applied) => {
+                    eprintln!("kb: recovery applied {applied} event(s).");
+                    Ok(false)
+                }
+                // The tail was readable when `inspect` classified it and is not
+                // now — a concurrent writer, or damage that landed in between.
+                // Same disposition as row 6: warn, keep every entry point
+                // alive, do not propagate a parse error out of recovery.
+                Err(error) if cursor::is_log_unreadable(&error) => {
+                    eprintln!("kb: WARNING deferring event-log recovery — {error}");
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
         }
         cursor::Decision::FullRebuild(reason) => full_rebuild_for(paths, embedder, reason),
     }

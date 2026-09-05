@@ -437,6 +437,60 @@ fn test_missing_log_outranks_an_obsolete_schema_stamp() {
     assert!(!paths.events.exists(), "the log must not be resurrected");
 }
 
+/// A malformed line PAST the cursor. `committed_len` takes an intact-span
+/// shortcut, so without a tail read this classifies as a replay, and the replay
+/// then hard-errors out of every write entry point — exactly what row 6 exists
+/// to prevent.
+#[test]
+fn test_unreadable_tail_defers_without_erroring_out() {
+    let (_dir, paths) = repo();
+    kb_core::add(&paths, &FixedEmbedder, add_args("applied")).unwrap();
+    let cursor_before = cursor_of(&paths).unwrap();
+
+    // Damage sits after the cursor, and the log still ends on a closed span —
+    // written by hand, because every append refuses to run over a malformed
+    // middle line, which is the shape this test needs.
+    let mut raw = fs::read_to_string(&paths.events).unwrap();
+    raw.push_str("{ not json at all }\n");
+    raw.push_str(&format!(
+        "{}\n{}\n{}\n",
+        json!({"action": "batch_begin", "batch_id": "hand-written", "n": 1}),
+        upsert("later", "after the damage"),
+        json!({"action": "batch_commit", "batch_id": "hand-written", "n": 1}),
+    ));
+    fs::write(&paths.events, &raw).unwrap();
+
+    {
+        let conn = open_db(&paths.db).unwrap();
+        assert!(
+            matches!(cursor::inspect(&conn, &paths), Decision::Defer(_)),
+            "a malformed line past the cursor must classify as row 6, not a replay"
+        );
+    }
+
+    // Recovery defers instead of propagating the parse error.
+    assert!(!recover_if_needed(&paths, &FixedEmbedder).unwrap());
+
+    // The write entry points stay alive.
+    kb_core::add(&paths, &FixedEmbedder, add_args("written-anyway")).unwrap();
+    assert_eq!(
+        live_ids(&paths),
+        vec!["applied".to_string(), "written-anyway".to_string()]
+    );
+
+    // But nothing claims the unread region was materialized.
+    let conn = open_db(&paths.db).unwrap();
+    assert_eq!(
+        cursor::read(&conn).unwrap().unwrap(),
+        cursor_before,
+        "the cursor must not advance over a region the reader could not parse"
+    );
+    assert!(
+        matches!(cursor::inspect(&conn, &paths), Decision::Defer(_)),
+        "and the database must not report itself converged"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Idempotent replay of every apply_event arm
 // ---------------------------------------------------------------------------

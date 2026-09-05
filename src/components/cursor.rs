@@ -143,6 +143,22 @@ pub fn is_not_converged(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NotConverged>().is_some()
 }
 
+/// The event log could not be read from the cursor onward.
+///
+/// Distinguished from every other replay failure so recovery can give it row
+/// 6's disposition — warn and defer — instead of propagating a parse error out
+/// of every write entry point.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot read the event log past offset {offset}: {detail}")]
+pub struct LogUnreadable {
+    pub offset: u64,
+    pub detail: String,
+}
+
+/// True when `err` is (or wraps) [`LogUnreadable`].
+pub fn is_log_unreadable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LogUnreadable>().is_some()
+}
 
 /// The D3 recovery decision. Eight table rows, four outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,9 +198,10 @@ impl Decision {
     /// from nothing and the cursor would then be stamped converged against a
     /// log holding one batch, orphaning every earlier entry.
     ///
-    /// [`Decision::Defer`] does not block: the log is there but could not be
-    /// read, and refusing every write over that is what row 6 exists to
-    /// prevent.
+    /// [`Decision::Defer`] does not block: the log is there but unreadable past
+    /// the cursor, and refusing every write over that is what row 6 exists to
+    /// prevent. The write path handles it by applying without advancing the
+    /// cursor, so no false converged claim is made either.
     ///
     /// [`RebuildReason::SchemaObsolete`] does not block: the cursor is still an
     /// accurate claim about how much of the log is applied, and only derived
@@ -511,9 +528,21 @@ pub fn inspect(conn: &Connection, paths: &config::Paths) -> Decision {
         }
     }
     if committed_len > cursor.offset {
-        Decision::ReplayTail {
-            from: cursor.offset,
-            to: committed_len,
+        // `committed_len` takes an intact-span shortcut, so it can report a
+        // length for a log whose MIDDLE is malformed. Read the tail before
+        // promising a replay of it: that read is bounded by the bytes appended
+        // since the last apply, which is the cost D3 budgets for, and it is what
+        // keeps row 6 reachable now that the shortcut exists.
+        match events::read_events_from_offset(&paths.events, cursor.offset) {
+            Ok(tail) => Decision::ReplayTail {
+                from: cursor.offset,
+                to: tail.committed_len,
+            },
+            Err(error) => Decision::Defer(format!(
+                "cannot read the event log at {} past offset {}: {error}",
+                paths.events.display(),
+                cursor.offset
+            )),
         }
     } else {
         Decision::NoOp
@@ -600,6 +629,19 @@ pub fn append_and_apply_with<T>(
         }
         .into());
     }
+    // Row 6 lets the write through so the entry points stay alive, but the
+    // cursor must not move: the region the reader choked on was never applied,
+    // and stamping the new end of file over it would claim it was. Leaving the
+    // cursor behind is the state the whole design already handles — every arm
+    // is idempotent, so once the log is repaired a replay converges.
+    let advance_cursor = !matches!(decision, Decision::Defer(_));
+    if !advance_cursor {
+        eprintln!(
+            "kb: WARNING {} — applying this write without advancing the applied \
+             cursor, so nothing claims the unread region was materialized.",
+            decision.describe()
+        );
+    }
 
     // An empty batch appends nothing and moves no cursor, but the caller still
     // gets its transaction — A1's audit record has verdicts with no expire.
@@ -629,8 +671,15 @@ pub fn append_and_apply_with<T>(
     kill_point(KillPoint::AfterLogBatch);
     kill_point(KillPoint::BeforeApply);
 
-    let generation = read_generation(&paths.events);
-    let tail = tail_sha(&paths.events, committed_len)?;
+    let cursor = if advance_cursor {
+        Some(Cursor {
+            generation: read_generation(&paths.events),
+            offset: committed_len,
+            tail_sha: tail_sha(&paths.events, committed_len)?,
+        })
+    } else {
+        None
+    };
 
     let tx = conn.unchecked_transaction()?;
     prefetched.seal();
@@ -639,14 +688,9 @@ pub fn append_and_apply_with<T>(
             db::apply_event(conn, &prefetched, event)?;
         }
         let value = inside(conn)?;
-        write(
-            conn,
-            &Cursor {
-                generation,
-                offset: committed_len,
-                tail_sha: tail,
-            },
-        )?;
+        if let Some(cursor) = &cursor {
+            write(conn, cursor)?;
+        }
         Ok(value)
     })();
     match outcome {
@@ -687,7 +731,12 @@ pub fn replay_tail_locked(
     let Some(cursor) = read(conn)? else {
         anyhow::bail!("applied cursor: replay_tail_locked called on a cursorless database");
     };
-    let tail = events::read_events_from_offset(&paths.events, cursor.offset)?;
+    let tail = events::read_events_from_offset(&paths.events, cursor.offset).map_err(|error| {
+        LogUnreadable {
+            offset: cursor.offset,
+            detail: format!("{error:#}"),
+        }
+    })?;
     let committed_len = tail.committed_len;
     if committed_len <= cursor.offset {
         return Ok(0);
