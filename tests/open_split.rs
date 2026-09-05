@@ -241,6 +241,34 @@ fn open_ro_peer_never_writes_and_ignores_a_hot_wal_when_shm_is_missing() {
     );
 }
 
+/// `open_ro_peer` builds a `file:...?immutable=1` URI by string
+/// interpolation, so a peer path containing a character meaningful to the
+/// URI-filename grammar has to be percent-encoded first, or SQLite misparses
+/// the path and the peer is silently skipped as uninitialized. A `#` is the
+/// sharpest case: unencoded, it introduces a URI fragment, truncating the
+/// path SQLite actually opens.
+#[test]
+fn open_ro_peer_percent_encodes_a_hash_in_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("repo#with-hash");
+    let paths = repo(&repo_root);
+    db::open_or_init(&paths).unwrap();
+
+    let conn = db::open_ro_peer(&paths.db)
+        .expect("open_ro_peer must percent-encode a '#' rather than misparse the URI");
+    let entries: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        entries, 1,
+        "open_ro_peer must open the real db at the '#'-containing path, not a misparsed one"
+    );
+}
+
 #[test]
 fn open_or_init_does_not_sweep_expired_peers() {
     let dir = tempfile::tempdir().unwrap();

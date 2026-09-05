@@ -300,6 +300,23 @@ pub fn open_ro(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Percent-encode the characters that are meaningful to SQLite's URI-filename
+/// parser when they appear inside the path itself: `%` (the escape character,
+/// encoded first so the encodings below are not themselves re-escaped), `#`
+/// (introduces a fragment, which SQLite strips from the path), and `?`
+/// (introduces the query string — the very `?immutable=1` [`open_ro_peer`]
+/// appends). Left unencoded, any of these in a peer's path would misparse
+/// the URI; `open_ro_peer`'s caller treats every open failure as "peer
+/// unreachable" (search.rs warns and skips it), so the failure mode is a
+/// silently skipped peer rather than a crash — worth avoiding regardless.
+fn percent_encode_uri_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3f")
+}
+
 /// Open another repository's database for federated (peer) reads.
 ///
 /// `open_ro`'s `PRAGMA query_only=ON` blocks logical SQL writes, but the file
@@ -327,9 +344,26 @@ pub fn open_ro(db_path: &Path) -> Result<Connection> {
 /// bytes of the peer's `db`, `-wal`, or `-shm` files are ever written —
 /// the trade this function exists to make.
 ///
+/// `immutable=1` is a promise *to* SQLite, not a guarantee it enforces: it
+/// tells SQLite this connection will take no locks on the file because
+/// nothing else can be writing it, which is true for our own database but
+/// not for a peer's — a peer is another repository with its own live
+/// writer, so its checkpoint can rewrite pages out from under this
+/// unlocked reader mid-query. SQLite's documented contract for that misuse
+/// is "incorrect query results or SQLITE_CORRUPT_VTAB errors", not a clean
+/// failure. In practice a mid-torn-read failure usually surfaces as an
+/// open or query error, which the caller (`search.rs`) already treats as
+/// "peer unreachable" and warns past — degrading safely — but a query that
+/// reads a torn page and still returns *some* row cannot be told apart
+/// from a correct one. That is acceptable only because federated peer
+/// search is best-effort by design (results are merged opportunistically,
+/// never the sole source of truth); this opener must never be reused for
+/// anything where a wrong-but-plausible answer would matter more than a
+/// missing one.
+///
 /// Returns [`DbUninitialized`] under the same conditions as [`open_ro`].
 pub fn open_ro_peer(db_path: &Path) -> Result<Connection> {
-    let uri = format!("file:{}?immutable=1", db_path.display());
+    let uri = format!("file:{}?immutable=1", percent_encode_uri_path(db_path));
     let conn = match Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
