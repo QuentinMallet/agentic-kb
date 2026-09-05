@@ -620,7 +620,7 @@ mod tests {
         // that dropped it. Pass one embeds it fine against the still-live
         // old db; after the swap, it must no longer be counted.
         {
-            let conn = rusqlite::Connection::open(&replacement).unwrap();
+            let conn = db::open_unchecked_for_test(&replacement).unwrap();
             conn.execute("UPDATE entries SET is_stale = 1 WHERE id = 'gone-0'", [])
                 .unwrap();
         }
