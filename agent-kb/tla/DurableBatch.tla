@@ -24,9 +24,12 @@ those bounds.
 
 Reads are intentionally not state transitions in this write/recovery model.
 During `deferred` or `LogMissing` they remain available against the current
-`db`; only writes, automatic recovery, rebuild, and compaction are represented
-and blocked.  This is the D3 row-9 disposition: serve reads, refuse writes,
-and decline a rebuild when a non-trivial DB has lost its log.
+`db`; only writes, automatic recovery, and compaction are represented and
+blocked.  This is the D3 row-9 disposition: serve reads, refuse writes, and
+decline the *automatic* rebuild (`recover_if_needed`, modelled by
+`RecoverIdle`) when a non-trivial DB has lost its log.  `RebuildAll` models
+that same automatic-path decline, not the operator-invoked `kb rebuild`
+command -- see "OUT OF MODEL SCOPE -- row 9 boundaries" below.
 
 WRITE SCHEDULE.  Batch contents are fixed so the refinement to InnerGap is
 total: InnerGap can only produce a 1-event upsert batch (StartNoReplace) or
@@ -63,6 +66,38 @@ trusted while unsynced.  Interior zero-fill damage (a data=writeback or
 partially-written block producing a garbage MIDDLE line) is therefore not
 modelled here; the code-side disposition is the quarantine-the-unparseable
 -line policy in the plan (Q4).  Recorded as a named ASSUME below.
+
+OUT OF MODEL SCOPE -- row 9 boundaries.  Three things D3 row 9
+(`LogMissing`) does NOT cover, none of them machine-checked here:
+
+  1. Restoration of a vanished log has no transition.  Once `LogVanishes`
+     fires, `Fixed`'s only way back to `log_present = TRUE` is the withdrawn
+     `UnsafeWriteWhileLogMissing` action, which requires `~Fixed`.  Row 9 is
+     therefore an ABSORBING state in the fixed design: `LogMissingFreezesState`
+     and `LogMissingBlocksWrites` hold vacuously-forever from that point on,
+     not because recovery was attempted and succeeded.  `LogVanishes` is also
+     guarded `~deferred` (matching `cursor.rs:inspect`, where `LogMissing`
+     pre-empts every `Defer` cause), so the two absorbing/outstanding
+     conditions cannot compose and `DeferredConverges` is not exercised by a
+     missing log; it is not weakened or scoped for this, because the module's
+     own guards make the composition unreachable rather than merely untested.
+  2. `RebuildAll`'s `~LogMissing` guard models only the AUTOMATIC decline
+     (`recover_if_needed`, i.e. the code path also modelled by `RecoverIdle`).
+     Operator-invoked `kb rebuild` is a deliberate, ungated override in the
+     implementation (`rebuild.rs:393`'s `execute_with` never calls
+     `cursor::inspect`) and can destructively empty a row-9 database; that
+     override is not represented by any action here.
+  3. A cursorless populated database whose log has vanished is NOT row 9 in
+     the code: `cursor::inspect` classifies it as `FullRebuild(CursorMissing)`
+     before the missing-log check ever runs (`cursor.rs:583`), and that path
+     is separately fail-closed (`rebuild.rs`'s `full_rebuild_for` refuses to
+     rebuild it). This module always carries a cursor and cannot express a
+     cursorless state, so this boundary is outside what it proves.
+
+Recorded as named comments here and in DurableBatch-counterexamples.md rather
+than as ASSUMEs: none of the three is a machine-checkable non-fact the way
+`OutOfScope_InteriorDamage` is -- they are transitions the model omits, not
+premises TLC could contradict.
 ***************************************************************************)
 
 CONSTANTS EntryIds, MaxLogLen, MaxBatches, MaxGen, K, PoisonBatch,
@@ -526,7 +561,14 @@ RecoverIdle ==
   /\ UNCHANGED <<log_present, log_lost, log_written, log_durable, generation, phase, nstarted,
                  cur, aidx, attempts, quarantined, deferred, damage_repaired>>
 
-\* Operator-invoked `kb rebuild`.
+\* recover_if_needed's full-rebuild branch, unconditional re-materialization
+\* from the durable log regardless of whether the cursor names the current
+\* prefix.  This is the AUTOMATIC decline path, not the operator-invoked
+\* `kb rebuild` command: the code deliberately does NOT gate the operator
+\* command on `LogMissing` (rebuild.rs:393's execute_with never calls
+\* cursor::inspect), so an operator-invoked rebuild of a row-9 database is a
+\* real, destructive, and out-of-model transition -- see "OUT OF MODEL SCOPE
+\* -- row 9 boundaries" above the CONSTANTS block.
 RebuildAll ==
   /\ phase = "idle"
   /\ Fixed
@@ -662,6 +704,11 @@ W_Rec_NoOp ==
 W_ScheduleCompletes ==
   ~(nstarted = MaxBatches /\ "C" \in db /\ phase = "idle" /\ cur = 0)
 
+\* Row 9 reachability: `LogMissing` is not vacuously false in the LogMissing
+\* configs -- `LogMissingBlocksWrites` and `LogMissingDoesNotStart` would
+\* otherwise hold by never firing `LogVanishes` at all.
+W_NotLogMissing == ~LogMissing
+
 ---------------------------------------------------------------------------
 (* Deliberate violations, for the non-vacuity configs                      *)
 
@@ -710,6 +757,12 @@ SpecBadType == BadTypeInit /\ [][Next]_vars
 (* Compaction is excluded from the refinement configs (MaxGen = 0):        *)
 (* InnerGap's jsonl only ever grows, so a log rewrite is outside the       *)
 (* abstraction by construction.  Compaction correctness is T0c's model.    *)
+(*                                                                         *)
+(* LogVanishes is excluded from the refinement configs for the identical   *)
+(* reason (AllowLogMissing = FALSE): it empties log_durable, so the mapped *)
+(* jsonl would shrink, which is equally outside InnerGap's grows-only      *)
+(* abstraction.  Confirmed: flipping AllowLogMissing to TRUE on            *)
+(* DurableBatch_Refinement_Fixed.cfg alone violates InnerSafety.           *)
 (***************************************************************************)
 ToInner(l) == [kind |-> l.act, id |-> l.id]
 ToInnerSeq(s) == [i \in 1..Len(s) |-> ToInner(s[i])]
