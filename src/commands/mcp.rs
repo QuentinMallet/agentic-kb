@@ -1293,6 +1293,18 @@ fn handle_import(
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
+    // One lock covers every duplicate check and its corresponding insert.
+    // Besides serialising the batch, this prevents two importers observing the
+    // same absent path and both adding it.
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    let conn = match db::open_rw(paths, &lock) {
+        Ok(conn) => conn,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+
     for seed in &seeds {
         let path = seed
             .get("path")
@@ -1300,15 +1312,9 @@ fn handle_import(
             .unwrap_or("")
             .to_string();
 
-        // Upsert=false: skip entries already present. Open a short-lived read
-        // connection for the check; kb_core::add acquires the write lock below.
+        // Upsert=false: skip entries already present while retaining the same
+        // lock that governs the possible insert below.
         if !upsert {
-            let conn = match db::open_db(&paths.db) {
-                Ok(c) => c,
-                Err(e) => {
-                    return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
-                }
-            };
             let exists: bool = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path = ?1 AND is_stale = 0",
@@ -1352,9 +1358,11 @@ fn handle_import(
         }
         let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
-        // Route through kb_core::add so redaction and JSONL-first atomicity are
-        // applied consistently (same path as handle_add).
-        if let Err(e) = kb_core::add(
+        // The batch already owns the repository lock, so use the explicitly
+        // locked variant and avoid a self-deadlocking second flock.
+        if let Err(e) = kb_core::add_locked(
+            &lock,
+            &conn,
             paths,
             emb,
             kb_core::AddArgs {
@@ -3778,6 +3786,71 @@ mod tests {
         let resp2 = handle_import(&tr::<ImportRequest>("import", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "ok");
         assert_eq!(resp2["imported"], 1);
+    }
+
+    #[test]
+    fn test_handle_import_two_writers_insert_once_and_skip_once() {
+        use std::sync::{Arc, Barrier};
+
+        let (dir, paths, _emb) = setup();
+        let seeds_path = dir.path().join("concurrent-seeds.json");
+        let seeds = json!([{
+            "path":"test/concurrent-import",
+            "summary":"one logical entry",
+            "content":"same payload",
+            "tags":[],
+            "kind":"convention"
+        }]);
+        fs::write(&seeds_path, serde_json::to_string(&seeds).unwrap()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let responses: Vec<Value> = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..2 {
+                let paths = paths.clone();
+                let seeds_path = seeds_path.clone();
+                let barrier = Arc::clone(&barrier);
+                workers.push(scope.spawn(move || {
+                    let id = json!(format!("writer-{worker}"));
+                    let request = json!({
+                        "method":"import",
+                        "id":id,
+                        "path":seeds_path.to_str().unwrap()
+                    });
+                    barrier.wait();
+                    handle_import(
+                        &tr::<ImportRequest>("import", &id, &request),
+                        &paths,
+                        &NoopEmbedder,
+                    )
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("import worker panicked"))
+                .collect()
+        });
+
+        assert!(responses.iter().all(|response| response["type"] == "ok"));
+        let imported: u64 = responses
+            .iter()
+            .map(|r| r["imported"].as_u64().unwrap())
+            .sum();
+        let skipped: u64 = responses
+            .iter()
+            .map(|r| r["skipped"].as_u64().unwrap())
+            .sum();
+        assert_eq!((imported, skipped), (1, 1));
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path='test/concurrent-import' AND is_stale=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
