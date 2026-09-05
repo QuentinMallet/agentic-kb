@@ -272,16 +272,15 @@ SyncLog ==
                  damage_repaired>>
 
 \* `inspect` finds an unreadable durable line beyond the applied cursor.
-\* Taking Damage from ready makes the already-written batch durable, but
-\* abandons its apply; thus the pre-Damage DB still agrees with the cursor.
+\* Any completed append may be damaged, regardless of how many earlier
+\* batches were applied.  Damage makes a merely-written batch durable too,
+\* so both ready and already-synced-but-unapplied batches are covered.
 Damage ==
-  /\ Fixed
   /\ AllowDeferred
   /\ ~deferred
-  /\ phase = "ready"
-  /\ nstarted = 1
+  /\ phase \in {"ready", "synced"}
   /\ cursor.gen = generation
-  /\ cursor.off < Len(log_written)
+  /\ cursor.off < CommittedLen(log_written)
   /\ log_durable' = log_written
   /\ deferred' = TRUE
   /\ damage_repaired' = FALSE
@@ -292,10 +291,12 @@ Damage ==
   /\ UNCHANGED <<log_written, db, db_committed, cursor, generation,
                  nstarted, quarantined>>
 
-\* While inspection returns Defer, a write fsyncs its complete envelope and
-\* applies that batch idempotently, but deliberately leaves the cursor alone.
-DeferredWrite ==
-  /\ Fixed
+\* Counterexample for the withdrawn alternative.  The old design proceeds
+\* with a write while inspection is deferred, applies it without extending
+\* the readable durable prefix, and cannot advance the cursor.  Fixed has no
+\* corresponding transition: StartBatch is guarded by ~deferred.
+UnsafeWriteWhileDeferred ==
+  /\ ~Fixed
   /\ deferred
   /\ ~damage_repaired
   /\ phase = "idle"
@@ -305,7 +306,7 @@ DeferredWrite ==
          nl == log_written \o BatchLines(b)
          nd == FoldEvents(BatchEvents(b), db_committed)
      IN /\ log_written' = nl
-        /\ log_durable' = nl
+        /\ log_durable' = log_durable
         /\ db' = nd
         /\ db_committed' = nd
         /\ nstarted' = b
@@ -488,14 +489,14 @@ RebuildAll ==
 
 Next ==
   \/ StartBatch \/ AppendLine \/ PartialFlush \/ SyncLog
-  \/ Damage \/ DeferredWrite \/ Repair \/ Recovery
+  \/ Damage \/ UnsafeWriteWhileDeferred \/ Repair \/ Recovery
   \/ ApplyEvent \/ ApplyFail \/ Quarantine \/ FinishBatch
   \/ Crash \/ Open \/ TruncateUncommittedTail
   \/ Compact \/ RecoverIdle \/ RebuildAll
 
 Spec == Init /\ [][Next]_vars
 FairSpec == Init /\ [][Next]_vars /\ WF_vars(Next)
-DeferredFairSpec == Spec /\ WF_vars(Repair) /\ WF_vars(Recovery)
+DeferredFairSpec == Spec /\ WF_vars(Recovery)
 
 ---------------------------------------------------------------------------
 (* Invariants                                                              *)
@@ -516,16 +517,10 @@ DBNotAheadOfDurable ==
 \* CE3.  Recovery restores the invariant at open time without a schema bump.
 OpenRestores == phase = "opened" => db = Materialize(log_durable, quarantined)
 
-\* Historical D3 invariant, retained so Deferred_Current can exhibit the
-\* reviewed counterexample: DeferredWrite changes the DB but not the cursor.
+\* D3 invariant: the cursor and the DB prefix it names always agree.
 CursorAgreesWithDB ==
   cursor.gen = generation =>
     db_committed = Materialize(Prefix(log_durable, cursor.off), quarantined)
-
-\* The equality is required only when no deferred recovery is outstanding.
-CursorAgreesWhenNotDeferred ==
-  \/ ~Fixed
-  \/ (deferred \/ CursorAgreesWithDB)
 
 \* When generation/offset are comparable, replaying everything after the
 \* cursor over the current DB converges to the durable log's materialization.
@@ -537,18 +532,9 @@ CursorNeverAheadOfDB ==
   \/ FoldEvents(TailEvents, db_committed) =
        Materialize(log_durable, quarantined)
 
-\* Witness that reapplying an already-applied durable tail has no further
-\* effect.  The fixed schedule consists of idempotent upsert/expire arms.
-TailReplayIsIdempotent ==
-  \/ ~Fixed
-  \/ cursor.gen # generation
-  \/ cursor.off > DurCommittedLen
-  \/ LET once == FoldEvents(TailEvents, db_committed)
-     IN FoldEvents(TailEvents, once) = once
-
 CursorCaughtUp ==
   /\ cursor.gen = generation
-  /\ cursor.off = Len(log_durable)
+  /\ cursor.off = DurCommittedLen
   /\ db_committed = Materialize(log_durable, quarantined)
 
 \* Repair leaves `deferred` set until fair Recovery replays from cursor.off.
