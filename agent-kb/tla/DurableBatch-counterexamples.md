@@ -24,6 +24,10 @@ The six knobs are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`,
 | `AppendLine` | one `writeln!` of one physical line (`events.rs:117-133`) |
 | `PartialFlush` | OS writeback: an arbitrary longer prefix becomes durable **without** an explicit sync — this is what exposes an unframed partial batch |
 | `SyncLog` | D2 `sync_data` of the whole written log |
+| `Damage` | inspection finds an unreadable committed tail beyond `cursor.off`; writes become blocked |
+| `UnsafeWriteWhileDeferred` | `Fixed = FALSE` only: the withdrawn alternative writes while damaged |
+| `Repair` | the damaged tail becomes readable in place; deferral remains outstanding |
+| `Recovery` | after repair, replay from `cursor.off` to `DurCommittedLen` and clear deferral |
 | `ApplyEvent` | one `db::apply_event`; the last one also writes the D3 cursor **in the same transaction** |
 | `ApplyFail` | a deterministically failing apply (down embedder, malformed record) |
 | `Quarantine` | D3 poison policy: dead-letter after K attempts, advance the cursor past it |
