@@ -7,6 +7,7 @@ AGENTS.md
 /target
 result
 result-*
+docs/book/
 # .omc: explicitly ignore ephemeral dirs, persistent artifacts tracked by default
 # Using **/.omc/<dir> patterns covers both root and nested .omc/ dirs.
 # Trade-off: must update this list if new ephemeral dirs are added to .omc/
