@@ -52,9 +52,11 @@ struct Candidate {
     summary: String,
     content: String,
     tags: String,
+    updated_at: String,
 }
 struct PendingWrite {
     id: String,
+    updated_at: String,
     blob: Vec<u8>,
 }
 
@@ -133,7 +135,7 @@ where
     // Selection is unlocked and read-only.
     let conn = db::open_ro(&paths.db)?;
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags FROM entries e
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at FROM entries e
          WHERE e.is_stale = 0 AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
     )?;
     let candidates = stmt
@@ -144,6 +146,7 @@ where
                 summary: r.get(2)?,
                 content: r.get(3)?,
                 tags: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -188,6 +191,7 @@ where
         match emb.embed(&text) {
             Ok(vector) => writes.push(PendingWrite {
                 id: candidate.id,
+                updated_at: candidate.updated_at,
                 blob: f32s_to_f16_blob(&vector),
             }),
             Err(error) => record_failure(&mut report, candidate.id, error.to_string()),
@@ -274,11 +278,18 @@ fn write_batches<F>(
         let mut stmt_failures = Vec::new();
         let mut raced = 0usize;
         for write in batch {
+            // updated_at is re-checked alongside id/is_stale/absence
+            // (review finding): a concurrent content edit that has not yet
+            // written its own embedding still leaves the rowid absent from
+            // entries_emb, so the id/absence check alone would let this
+            // batch's vector — computed from the pre-edit content — land
+            // on top of the new content.
             match txn.execute(
                 "INSERT OR IGNORE INTO entries_emb(rowid, embedding)
-                 SELECT e.rowid, ?2 FROM entries e WHERE e.id = ?1 AND e.is_stale = 0
+                 SELECT e.rowid, ?3 FROM entries e WHERE e.id = ?1 AND e.is_stale = 0
+                 AND e.updated_at = ?2
                  AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
-                params![write.id, write.blob],
+                params![write.id, write.updated_at, write.blob],
             ) {
                 Ok(1) => successes.push(write.id.clone()),
                 Ok(_) => raced += 1,
@@ -392,6 +403,53 @@ mod tests {
             "SELECT emb.embedding FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id='race'",
             [], |r| r.get(0)).unwrap();
         assert_eq!(blob, f32s_to_f16_blob(&vec![0.75; 384]));
+    }
+
+    #[test]
+    fn test_reembed_skips_when_content_changed_after_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        seed(&paths, "content-race", "old-summary");
+        // Concurrent edit that does NOT write an embedding (e.g. KB_NO_EMBED,
+        // or a writer racing ahead of its own reembed pass): the rowid is
+        // still absent from entries_emb, so an id-only re-check would let
+        // this batch's stale-content vector through.
+        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.25), false, 1800, |batch| {
+            if batch == 0 {
+                Add {
+                    path: "docs/content-race".to_string(),
+                    summary: "new-summary-after-selection".to_string(),
+                    content: "body".to_string(),
+                    tags: "test".to_string(),
+                    version_ref: None,
+                    id: Some("content-race".to_string()),
+                    permanent: false,
+                    replace_path: false,
+                    kind: "convention".to_string(),
+                    evidence: vec![],
+                    evidence_file: None,
+                    cues: vec![],
+                }
+                .execute_with(&paths, &embedder::NoopEmbedder)
+                .unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.raced, 1);
+        let conn = db::open_ro(&paths.db).unwrap();
+        let has_embedding: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id='content-race')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_embedding,
+            "a vector computed from stale content must not be written after a concurrent content edit"
+        );
     }
 
     #[test]
