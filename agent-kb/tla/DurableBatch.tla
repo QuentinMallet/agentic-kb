@@ -18,7 +18,8 @@ Two designs share one state machine, selected by the constant `Fixed`:
                   written inside the apply transaction).
 
 Nothing in this module pins a crash point or a step ordering.  The knobs
-are `Fixed`, `AllowCrash`, `PoisonBatch`, `MaxGen`, `MaxBatches`; every
+are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`, `MaxGen`,
+`MaxBatches`; every
 config exercises the full `Next` relation under those bounds.
 
 WRITE SCHEDULE.  Batch contents are fixed so the refinement to InnerGap is
@@ -84,6 +85,13 @@ ASSUME OutOfScope_InteriorDamage == TRUE
   (* See "OUT OF MODEL SCOPE -- D2 prefix adequacy" above.  This ASSUME is
      the named carrier the plan's section 5 requires; its justification is
      the paragraph above, not a machine-checked fact. *)
+
+ASSUME OutOfScope_LogMissing == TRUE
+  (* This model represents the log as a sequence and has no file-existence
+     state.  Treating absence as <<>> would lose the decision-row distinction
+     between a genuinely empty log and LogMissing with cursor.off > 0 or a
+     non-empty entries table.  The latter's refused writes, allowed reads,
+     and declined rebuild therefore remain an explicit model boundary. *)
 
 ASSUME Bounds ==
   /\ EntryIds = {"A", "B", "C"}
@@ -271,6 +279,7 @@ Damage ==
   /\ AllowDeferred
   /\ ~deferred
   /\ phase = "ready"
+  /\ nstarted = 1
   /\ cursor.gen = generation
   /\ cursor.off < Len(log_written)
   /\ log_durable' = log_written
@@ -516,7 +525,7 @@ CursorAgreesWithDB ==
 \* The equality is required only when no deferred recovery is outstanding.
 CursorAgreesWhenNotDeferred ==
   \/ ~Fixed
-  \/ ~deferred => CursorAgreesWithDB
+  \/ (deferred \/ CursorAgreesWithDB)
 
 \* When generation/offset are comparable, replaying everything after the
 \* cursor over the current DB converges to the durable log's materialization.
