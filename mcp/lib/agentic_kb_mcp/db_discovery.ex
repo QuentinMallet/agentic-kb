@@ -1,7 +1,8 @@
 defmodule AgenticKbMcp.DbDiscovery do
   @moduledoc """
-  Walk up from cwd looking first for the fleet-ratified canonical
-  .state/agent-kb/agent-kb.db, then for the legacy agent-kb/agent-kb.db fallback.
+  At each directory, select the canonical .state/agent-kb/agent-kb.db when it
+  exists; otherwise select the legacy agent-kb/agent-kb.db, matching Rust
+  Paths.discover() candidate order and precedence.
   Roots inside a managed .state git worktree are skipped, mirroring Rust
   Paths.discover().
   """
