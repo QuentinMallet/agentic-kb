@@ -19,8 +19,12 @@ Two designs share one state machine, selected by the constant `Fixed`:
 
 Nothing in this module pins a crash point or a step ordering.  The knobs
 are `Fixed`, `AllowCrash`, `AllowDeferred`, `PoisonBatch`, `MaxGen`,
-`MaxBatches`; every
-config exercises the full `Next` relation under those bounds.
+`MaxBatches`; every config exercises the full `Next` relation under those
+bounds.
+
+Reads are intentionally not state transitions in this write/recovery model.
+During `deferred` they remain available against the current `db`; only writes,
+automatic recovery, rebuild, and compaction are represented and blocked.
 
 WRITE SCHEDULE.  Batch contents are fixed so the refinement to InnerGap is
 total: InnerGap can only produce a 1-event upsert batch (StartNoReplace) or
@@ -526,7 +530,6 @@ CursorAgreesWithDB ==
 \* cursor over the current DB converges to the durable log's materialization.
 \* This is the operational meaning of the cursor never being ahead of DB.
 CursorNeverAheadOfDB ==
-  \/ ~Fixed
   \/ cursor.gen # generation
   \/ cursor.off > DurCommittedLen
   \/ FoldEvents(TailEvents, db_committed) =
@@ -539,6 +542,14 @@ CursorCaughtUp ==
 
 \* Repair leaves `deferred` set until fair Recovery replays from cursor.off.
 DeferredConverges == damage_repaired ~> CursorCaughtUp
+
+\* Counterexample gates: unlike the unconditional fixed-design invariants,
+\* these become obligations only after Damage.  This makes Deferred_Current
+\* report the withdrawn write-while-damaged defect instead of the older
+\* current-design fact that no cursor exists at all.
+DeferredCursorAgreesWithDB == ~deferred \/ CursorAgreesWithDB
+DeferredDBNotAheadOfDurable == ~deferred \/ DBNotAheadOfDurable
+DeferredCursorNeverAheadOfDB == ~deferred \/ CursorNeverAheadOfDB
 
 DurableIsPrefix == IsPrefix(log_durable, log_written)
 
