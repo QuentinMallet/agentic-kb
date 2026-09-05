@@ -503,16 +503,45 @@ defmodule AgenticKbMcpTest do
     "kb_provenance" => ["entry_id", "max_depth"]
   }
 
+  # Successful wire envelopes emitted by every Rust handler reachable through
+  # dispatch_tool/3. Errors all share the final {type:error,message} renderer.
+  # Reembed is intentionally represented by each of its three return sites.
+  @response_shapes %{
+    "search" => [
+      %{"type" => "result", "entries" => []},
+      %{"type" => "result", "entries" => [], "_meta" => RenderFixture.meta()}
+    ],
+    "add" => [
+      %{"type" => "ok", "entry_id" => "new-1"},
+      %{"type" => "ok", "entry_id" => "new-1", "similar_existing" => [%{"id" => "old-1", "path" => "p", "summary" => "s", "score" => 0.91}]}
+    ],
+    "cite" => [%{"type" => "result", "citation_path" => "a.ex", "citation_sha" => nil, "citation_hash" => "h", "file_size" => 12}],
+    "import" => [%{"type" => "ok", "imported" => 1, "skipped" => 0}],
+    "stale_check" => [%{"type" => "result", "stale" => [], "review" => [], "unreachable" => [], "checked" => 0}],
+    "expire" => [%{"type" => "ok", "expired" => "entry-1"}],
+    "run" => [%{"type" => "ok", "run_id" => "run-1", "test_id" => "test-1", "result" => "pass"}],
+    "test_add" => [%{"type" => "ok", "test_id" => "test-1"}],
+    "tests" => [%{"type" => "result", "test_cases" => [], "count" => 0}],
+    "reembed" => [
+      %{"type" => "ok", "embedded" => 0, "skipped" => 0, "missing" => 0, "message" => "no embedder"},
+      %{"type" => "ok", "embedded" => 0, "skipped" => 1, "missing" => 2, "dry_run" => true},
+      %{"type" => "ok", "embedded" => 2, "failed" => 1, "skipped" => 1}
+    ],
+    "compact" => [%{"type" => "ok", "before" => 4, "after" => 2}],
+    "rebuild" => [%{"type" => "ok", "rebuilt" => 3, "truncated_tail" => nil}],
+    "kb_get" => [%{"type" => "result", "entry" => RenderFixture.full_entry()}],
+    "audit_run" => [%{"type" => "ok", "run_id" => "audit-1", "samples" => []}],
+    "audit_record" => [%{"type" => "ok", "recorded" => 1, "expired" => 0}],
+    "audit_report" => [
+      %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => nil, "total_runs" => 0, "per_arm_precision" => []},
+      %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => "2026-09-05T00:00:00Z", "total_runs" => 1, "per_arm_precision" => [], "injection_telemetry" => %{"eligible" => 1}}
+    ],
+    "provenance" => [%{"type" => "result", "roots" => ["root-1"], "graph" => [], "truncated" => false}]
+  }
+
   describe "S1 response rendering" do
     test "kb_add renders near-duplicate details" do
-      response = %{
-        "type" => "ok",
-        "entry_id" => "new-1",
-        "similar_existing" => [
-          %{"id" => "old-1", "path" => "p", "summary" => "s", "score" => 0.91}
-        ]
-      }
-
+      response = @response_shapes["add"] |> tl() |> hd()
       %{"content" => [%{"text" => text}]} = McpServer.render_result(response)
 
       assert text =~ "Similar existing entries"
@@ -520,6 +549,19 @@ defmodule AgenticKbMcpTest do
       assert text =~ "path=p"
       assert text =~ "summary=s"
       assert text =~ "score=0.91"
+    end
+
+    test "every dispatched Rust success shape has a specific renderer" do
+      for {method, shapes} <- @response_shapes, shape <- shapes do
+        %{"content" => [%{"type" => "text", "text" => text}]} = McpServer.render_result(shape)
+        fallback = shape |> :json.encode() |> IO.iodata_to_binary()
+
+        refute text == fallback,
+               "#{method} #{inspect(Map.keys(shape))} fell through to the generic JSON renderer"
+      end
+
+      error = %{"type" => "error", "code" => "db_error", "message" => "boom"}
+      assert %{"isError" => true, "content" => [%{"text" => "boom"}]} = McpServer.render_result(error)
     end
   end
 
