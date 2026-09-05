@@ -61,6 +61,23 @@ The intent is loud failure: a typo in a citation path must surface as a parse er
 
 **Non-regular files.** Directories and device files are rejected as `FileMissing`. Any symbolic-link component, whether it points inside or outside the repository, is rejected as `SymlinkPathRejected` (`symlink_path_rejected` on machine-readable surfaces). This reason is not eligible for relocation or auto-heal. A file opened for verification must be a regular file (`metadata.is_file()` check required).
 
+This reject-all policy is identical at every citation resolution site and on
+every platform (`symlink_citations_are_rejected_by_openat2_and_fallback_resolvers`,
+`safe_join_rejects_symlink_components_and_parent_components`, and
+`relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them`). The
+reason reveals only that an in-repository component is a symlink, not where it
+points. The compatibility audit found 41 evidence rows and zero affected; see
+[ADR-5: Citation symlink policy](../decisions/adr-5-symlink-policy.md) rather
+than duplicating its security rationale here.
+
+**Caller-supplied hashes.** Supplying `citation_hash` does not bypass
+authorship validation. `kb_core::add` computes the file hash and
+rejects a mismatch before append; this is pinned by
+`test_kb_core_add_rejects_wrong_explicit_citation_hash`. `parse_cite_target`
+and `parse_citation_path` both require `start < end`, so empty and reversed
+ranges are rejected (`test_parse_cite_target_rejects_start_greater_than_end`
+and `test_parse_cite_target_rejects_empty_range_exactly`).
+
 ## Verification Semantics
 
 When an evidence row is verified, its `citation_path` is parsed and the byte range is hashed. The result has three possible statuses:
@@ -96,6 +113,28 @@ When a whole-file citation's hash no longer matches at its original path, but th
 ```
 
 This is the natural generalization of range relocation: a whole-file citation at a new location becomes a bare whole-file citation at that location.
+
+### Relocation safety and scan bounds
+
+Relocation succeeds only for exactly one excerpt match. If a second match is
+found, `Verifier::search_for_excerpt` stops and reports `NonUnique`; it never
+picks one candidate. `multiple_candidates_report_multiplicity` and
+`prop_non_unique_is_never_relocated` pin this behavior.
+
+Repository-wide relocation does not descend into `.git`, `target`,
+`node_modules`, `.state`, or `agent-kb`, and `excluded_names` also adds plain
+non-glob names from the repository-root `.gitignore`. This prevents build
+outputs and the KB's own stored excerpts from becoming candidates; see
+`excluded_directories_are_not_searched`, `gitignored_directory_is_not_searched`,
+and `search_never_treats_the_kb_store_as_a_relocation_candidate`.
+
+The scan charges each candidate file's size against
+`MAX_RELOCATION_SCAN_BYTES`. If the next file exceeds the remaining budget,
+`Verifier::scan_file` returns `CapExceeded`, which becomes the user-visible
+unverified reason `scan_cap_exceeded` (`ScanCapExceeded`). This means the scan
+could not establish repository-wide uniqueness within its bounded work; it
+does not mean that no candidate exists, and a candidate found before exhaustion
+is not accepted as unique.
 
 ## The `kb cite` Tool
 

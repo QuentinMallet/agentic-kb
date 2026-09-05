@@ -47,12 +47,20 @@ Recency bias adds a single batch SELECT on ≤ `limit` IDs after RRF. Measured o
 ### Federation (Multi-Peer Search)
 
 Under federation, `--limit` is a global cap across the local repository and all
-peers, not a per-repository cap. Results are merged and truncated once.
+peers, not a per-repository cap. `merge_federated_results` deduplicates on the
+pair `(origin_repo, id)` and performs the one federated truncation. If the same
+entry ID occurs locally and in a peer, the local row wins; peer/peer collisions
+use the normal deterministic ordering. These cases are pinned by
+`test_federated_global_limit_dedup_and_local_collision_contract`.
 
 Cross-repository ordering is by within-repository rank position with a
 deterministic `origin_repo`/entry-ID tie-break. It is not a comparison of
 absolute relevance between repositories: repositories can have different corpus
-sizes, and their RRF scores describe rank positions within those corpora.
+sizes, and the scores produced by RRF encode within-corpus rank positions. Thus
+a top-ranked result from a small peer can precede a middling local result; see
+`compare_federated_rows` and
+`test_federated_rank_position_top_tiny_peer_outranks_mid_local`. Peer traversal
+order cannot change the output (`test_federated_order_is_byte_stable_under_peer_traversal_permutation`).
 
 When `--peers` is set, `recency_lambda` is forced to `0.0` regardless of `kb.toml`. Each peer has its own clock; applying per-peer decay would make cross-peer scores incomparable. A warning is logged when `λ > 0` and peers are configured:
 
@@ -61,6 +69,55 @@ warning: recency_lambda forced to 0.0 for peer-federated search
 ```
 
 To use recency bias with federation, coordinate `updated_at` across peers or disable federation for that query.
+
+### Bounds and deterministic ranking
+
+| Input | Accepted range | Enforcement |
+|-------|----------------|-------------|
+| CLI/MCP result limit | `1..=100` | `db::MAX_LIMIT`; `parse_limit` and `NumField::bounded` reject values outside the range |
+| MCP `inline_verify_k` | `0..=100` | `db::MAX_INLINE_VERIFY_K`; `NumField::bounded` rejects values outside the range |
+
+The bounds are re-applied inside `search_entries` by `clamp_search_caps`; the
+public interfaces reject out-of-range requests rather than presenting a
+silently clamped request as accepted. The MCP boundary behavior is pinned by
+`test_search_rejects_limit_above_max_and_honours_the_maximum` and
+`test_search_rejects_inline_verify_k_above_max_and_honours_the_maximum`.
+
+All Rust ranking lanes use `compare_rank`: scores sort descending, equal scores
+sort by entry ID ascending, `-0.0` is normalized to `0.0`, and `f32::total_cmp`
+provides a total order. This makes ties and floating-point edge cases stable.
+
+Non-finite values from the query embedder are rejected by `validate_embedding`.
+A stored corrupt or non-finite embedding is counted, assigned similarity
+`0.0`, and remains deterministically sortable; this is pinned by
+`nan_blob_is_zero_scored_and_reported_in_search_stats` and implemented by
+`cosine_similarity`, `decode_emb_blob`, and `decode_f16_blob_into`.
+
+Semantic and cue scoring may scan their indices, but full entry metadata is
+materialized only for the first `2 * limit` ranked IDs in each lane. The bound
+is implemented by `fetch_search_metadata` in `search_entries` and pinned by
+`p1_metadata_materialization_is_bounded_to_twice_limit_per_lane`. See the
+[S5 search caps decision packet](../decisions/s5-search-caps-packet.md) for the
+resource-cap ruling and rationale.
+
+Evidence metadata is fetched in bounded per-entry batches by
+`fetch_evidence_for_entries`. A malformed database value is returned as a
+search error rather than silently dropping its evidence row; this is pinned by
+`test_fetch_evidence_for_entries_propagates_decode_errors`.
+
+### Literal path prefixes
+
+`--path-prefix` is a literal string prefix. `like_prefix_pattern` escapes the
+SQL `LIKE` metacharacters `%` and `_` (and the escape character `\`) before all
+FTS, semantic, and cue queries apply the filter.
+
+| Query | Before | Now |
+|-------|--------|-----|
+| `--path-prefix 'src/%'` | `%` could match every suffix, effectively selecting `src/*` | Matches only paths beginning with the literal characters `src/%`; returns no rows when none exist |
+| `--path-prefix 'src/_'` | `_` could match any one character | Matches only paths beginning with literal `src/_` |
+
+The behavior is pinned by `test_search_path_prefix_percent_is_literal_and_can_return_empty`
+and `test_search_path_prefix_matches_literal_underscore_prefix_only`.
 
 ### Example
 
