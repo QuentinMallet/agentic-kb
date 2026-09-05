@@ -847,8 +847,8 @@ fn handle_search(
     let inline_verify_k = inline_verify_k.min(db::MAX_INLINE_VERIFY_K);
 
     // br-bhg: MCP port is typically spawned with CWD=`/` (Elixir PortManager), so
-    // CWD-based `find_repo_root()` discovery fails. Pass the repository root
-    // retained when the explicitly-provided db path was resolved.
+    // a CWD-based .git walk would fail. Pass the repository root retained when
+    // the explicitly-provided db path was resolved.
     let repo_root = Some(paths.root.clone());
     let opts = db::SearchOptions {
         limit,
@@ -1624,7 +1624,11 @@ fn handle_stale_check(req: &StaleCheckRequest, paths: &config::Paths) -> Value {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    let repo_root = config::git_repo_root();
+    // Use the already-resolved repository root instead of shelling out to git
+    // from the process cwd: the MCP port is typically spawned with cwd `/`,
+    // so a CWD-based git rev-parse would fail (or, worse, resolve to whatever
+    // repo happens to contain `/`).
+    let repo_root = Some(paths.root.clone());
     // MCP `kb_stale_check` is an agent-interactive call: no filesystem walk on
     // this lane (plan §6 S2). Relocation surfaces via the CLI's `--relocate`.
     let report = match run_stale_check(

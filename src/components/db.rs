@@ -1563,14 +1563,13 @@ pub struct SearchOptions {
     pub inline_verify_k: usize,
     /// Repository root used for inline evidence verification.
     ///
-    /// Preferred for MCP and other long-running contexts where the process CWD
-    /// is not the repo (e.g. the MCP port is typically spawned with CWD `/`,
-    /// causing the CWD-based `find_repo_root()` walk to fail). MCP callers
-    /// obtain this from `config::Paths::root`.
-    ///
-    /// When `None`, `search_entries` falls back to walking up from CWD via
-    /// `find_repo_root()`. CLI invocations may leave this `None` because the
-    /// user runs the binary from inside the repo tree.
+    /// Every caller resolves this from `config::Paths::root` — the same
+    /// layout-aware root `add`/`cite` hash evidence against — rather than
+    /// leaving it `None` for a CWD-based `.git` walk to (re)discover, which
+    /// could silently disagree (e.g. inside a nested checkout, or when the
+    /// process cwd isn't the repo at all, as with the MCP port typically
+    /// spawned with cwd `/`). When `None`, verification still runs but always
+    /// reports `Unverified` (no root to resolve citation paths against).
     pub repo_root: Option<PathBuf>,
     /// Pool size for the bounded verify thread pool (br-23b.13).
     /// Currently unused; reserved for forward-compatibility with the
@@ -2628,10 +2627,11 @@ pub fn search_entries(
 
     let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
 
-    // Resolve repo root: prefer explicit `opts.repo_root` (MCP path — CWD is
-    // typically `/`, so CWD-based discovery fails). Fall back to walking up
-    // from CWD via `find_repo_root()` (CLI path — user runs from inside repo).
-    let repo_root: Option<PathBuf> = opts.repo_root.clone().or_else(find_repo_root);
+    // Every caller now resolves and threads the repository root explicitly
+    // (config::Paths::root) instead of relying on a CWD-based `.git` walk,
+    // which could silently disagree with the root `add`/`cite` hash evidence
+    // against (e.g. inside a nested checkout). See docs/decisions/b3-root-derivation.md.
+    let repo_root: Option<PathBuf> = opts.repo_root.clone();
 
     let verify_count = opts.inline_verify_k.min(entries.len());
 
@@ -2831,22 +2831,6 @@ pub fn search_entries(
     }
 
     Ok(entries)
-}
-
-/// Walk up from CWD to find a directory containing `.git`.
-/// Returns None if not found (e.g. in tempdir tests).
-fn find_repo_root() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut dir: &Path = &cwd;
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4245,20 +4229,21 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // br-bhg: explicit SearchOptions.repo_root threads through to verification.
-    // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
-    // returns None (or the wrong root), causing verified=false on every row.
+    // Regression for MCP cwd=/ case where a CWD-based repo-root walk returned
+    // None (or the wrong root), causing verified=false on every row.
     // -----------------------------------------------------------------------
 
     /// When `opts.repo_root` is `Some(path)`, inline evidence verification must
-    /// resolve citation_path relative to that path — not relative to whatever
-    /// repo `find_repo_root()` discovers from the current working directory.
+    /// resolve citation_path relative to that path — not against the process
+    /// cwd, which no caller relies on any more (every caller resolves
+    /// `repo_root` explicitly from `config::Paths::root`).
     ///
     /// Construction: write a cited file under a tempdir at a unique relative
-    /// path that does NOT exist under the test runner's CWD-discovered repo.
-    /// If `search_entries` honors `opts.repo_root`, verification reads bytes
-    /// from `<tempdir>/<rel>` and succeeds. If it falls back to CWD discovery,
-    /// the file is missing under the wrong root and verification returns
-    /// `Some(false)`.
+    /// path that does NOT exist under the test runner's own cwd. If
+    /// `search_entries` honors `opts.repo_root`, verification reads bytes
+    /// from `<tempdir>/<rel>` and succeeds. If it silently ignored
+    /// `opts.repo_root`, the file would be missing and verification would
+    /// return `Some(false)`.
     #[test]
     fn test_search_uses_explicit_repo_root_when_cwd_is_unrelated() {
         use sha2::{Digest, Sha256};
@@ -4266,10 +4251,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Unique relative path so it cannot collide with any file in the real
-        // worktree (the CWD-discovered repo root). If find_repo_root() were
-        // used instead of opts.repo_root, the verifier would look here:
-        //   <real-worktree>/src/__br_bhg_regression_explicit_root__.rs
+        // Unique relative path so it cannot collide with any file under the
+        // test runner's own cwd. If `opts.repo_root` were ignored, the
+        // verifier would look here:
+        //   <test-runner-cwd>/src/__br_bhg_regression_explicit_root__.rs
         // ...which does not exist, and verified would be Some(false).
         let rel = "src/__br_bhg_regression_explicit_root__.rs";
         let cited_content = b"// br-bhg regression: explicit repo_root\n";
@@ -4343,8 +4328,8 @@ mod tests {
         assert_eq!(
             entry.evidence[0].verified,
             Some(true),
-            "explicit opts.repo_root must be used for verification — CWD-based \
-             find_repo_root() would not find the cited file under the tempdir, \
+            "explicit opts.repo_root must be used for verification — the test \
+             runner's own cwd would not find the cited file under the tempdir, \
              so a Some(true) here proves repo_root threading works (MCP cwd=/ fix)"
         );
     }

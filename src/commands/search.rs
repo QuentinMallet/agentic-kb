@@ -88,6 +88,31 @@ impl Search {
         self.execute_with(&paths, emb.as_ref())
     }
 
+    /// Build the `SearchOptions` for this invocation, resolving `repo_root`
+    /// from the already-discovered repository root instead of leaving it
+    /// `None` for `search_entries` to re-derive from CWD. `add`/`cite` hash
+    /// evidence against `paths.root`; `search --verify`'s citation
+    /// verification must resolve against that same root, not a CWD-based
+    /// `.git` walk that can point at a different (e.g. nested) repository.
+    fn build_search_options(
+        &self,
+        kb_config: &config::KbConfig,
+        paths: &config::Paths,
+    ) -> db::SearchOptions {
+        db::SearchOptions {
+            limit: self.limit,
+            do_fts: self.fts || !self.semantic,
+            do_semantic: self.semantic || !self.fts,
+            path_prefix: self.path_prefix.clone(),
+            tag_filter: self.tag.clone(),
+            inline_verify_k: self.limit, // verify all results by default
+            repo_root: Some(paths.root.clone()),
+            verify_pool_size: kb_config.verify_pool_size,
+            recency_lambda: kb_config.recency_lambda,
+            mmr_lambda: kb_config.mmr_lambda,
+        }
+    }
+
     /// Execute with explicit paths and embedder (for testing).
     pub fn execute_with(
         &self,
@@ -95,23 +120,7 @@ impl Search {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        // CLI: repo_root left None; search_entries falls back to find_repo_root()
-        // walking from CWD, which is correct for the CLI invocation pattern (user
-        // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
-        // via Paths::root because MCP CWD is typically '/' and CWD
-        // discovery would fail.
-        let opts = db::SearchOptions {
-            limit: self.limit,
-            do_fts: self.fts || !self.semantic,
-            do_semantic: self.semantic || !self.fts,
-            path_prefix: self.path_prefix.clone(),
-            tag_filter: self.tag.clone(),
-            inline_verify_k: self.limit, // verify all results by default
-            repo_root: None,
-            verify_pool_size: kb_config.verify_pool_size,
-            recency_lambda: kb_config.recency_lambda,
-            mmr_lambda: kb_config.mmr_lambda,
-        };
+        let opts = self.build_search_options(&kb_config, paths);
 
         // A pure read: open_ro, never the write lock (ADR-7). An uninitialized
         // repository serves an empty result plus a one-line stderr note, which
@@ -406,6 +415,42 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    /// The CLI's `search --verify` path must resolve citation verification
+    /// against the already-discovered repository root (`paths.root`), the
+    /// same root `add`/`cite` hash evidence against — not a CWD-based `.git`
+    /// walk that can silently resolve to a different repository.
+    #[test]
+    fn test_build_search_options_uses_paths_root_as_repo_root() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(dir.path());
+        let kb_config = config::KbConfig::from_paths(&paths);
+        let cmd = Search {
+            query: "q".to_string(),
+            fts: false,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            path_prefix: None,
+            tag: None,
+            content: false,
+            local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        };
+
+        let opts = cmd.build_search_options(&kb_config, &paths);
+
+        assert_eq!(
+            opts.repo_root,
+            Some(paths.root.clone()),
+            "search options must carry the discovered repo root explicitly, \
+             not leave it None for a CWD-based .git walk to (re)discover"
+        );
     }
 
     fn insert_peer_edge(
@@ -787,11 +832,11 @@ mod tests {
         };
         let conn = crate::components::db::open_db(&paths.db).unwrap();
 
-        // Override CWD-based repo root discovery by using the db search directly
-        // with the root as repo root. Since find_repo_root() walks from CWD (not
-        // the tempdir), we test verification via the MCP path which passes repo_root
-        // explicitly. Instead, verify the evidence array is populated and the
-        // verified field is Some (true or false) — not None.
+        // repo_root is left None here (this test drives db::search_entries
+        // directly rather than through Search::build_search_options), so
+        // verification runs with no root to resolve citation paths against
+        // and always reports Unverified. Just check the evidence array is
+        // populated and verified is attempted (Some), not that it succeeded.
         let results =
             crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts)
                 .unwrap();
@@ -800,8 +845,8 @@ mod tests {
         let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
         assert_eq!(entry.evidence.len(), 1, "entry must have 1 evidence row");
 
-        // verified is Some(bool) — inline verification was attempted
-        // (true if CWD happens to be the tempdir, false otherwise — both are acceptable)
+        // verified is Some(bool) — inline verification was attempted, even
+        // with no repo_root (it reports Unverified rather than being skipped).
         assert!(
             entry.evidence[0].verified.is_some(),
             "verified must not be null for top-K results"
