@@ -1293,24 +1293,32 @@ fn handle_import(
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
-    // One lock covers every duplicate check and its corresponding insert.
-    // Besides serialising the batch, this prevents two importers observing the
-    // same absent path and both adding it.
-    let lock = match acquire_lock(&paths.lock) {
-        Ok(lock) => lock,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-    let conn = match db::open_rw(paths, &lock) {
-        Ok(conn) => conn,
-        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
-    };
-
     for seed in &seeds {
         let path = seed
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // Per-seed lock: covers only this seed's duplicate check and its
+        // corresponding insert, not the whole batch's citation hashing and
+        // embedding work. That still prevents two importers from both
+        // observing this seed's path absent and both adding it — the check
+        // and the matching insert happen under one continuously-held lock —
+        // while releasing the lock between seeds so it isn't held for the
+        // whole batch's duration.
+        let lock = match acquire_lock(&paths.lock) {
+            Ok(lock) => lock,
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
+        let conn = match db::open_rw(paths, &lock) {
+            Ok(conn) => conn,
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
 
         // Upsert=false: skip entries already present while retaining the same
         // lock that governs the possible insert below.
@@ -1358,8 +1366,8 @@ fn handle_import(
         }
         let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
 
-        // The batch already owns the repository lock, so use the explicitly
-        // locked variant and avoid a self-deadlocking second flock.
+        // This seed's iteration already owns the repository lock, so use the
+        // explicitly locked variant and avoid a self-deadlocking second flock.
         if let Err(e) = kb_core::add_locked(
             &lock,
             &conn,
