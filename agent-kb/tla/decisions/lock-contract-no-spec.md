@@ -74,6 +74,18 @@ This record waives only a new TLA+ module for these ADR-1 surfaces. It does not 
 
 ## Reviewer + analyst sign-off
 
-- [ ] code-reviewer confirms the registry and the six-site TTL-filter inventory (filter on sites 1-5, no filter on site 6) match this record.
-- [ ] analyst confirms no uncovered state machine was introduced on these three surfaces.
+- [x] code-reviewer confirms the registry and the six-site TTL-filter inventory (filter on sites 1-5, no filter on site 6) match this record.
+- [x] analyst confirms no uncovered state machine was introduced on these three surfaces.
+
+## Sign-off record (2026-09-05)
+
+**Code-reviewer pass** (opus code-reviewer agent, `rev-waiver-c2`): **SIGN-OFF GRANTED.** The
+registry matches the record in substance, and the six-site TTL-filter inventory matches exactly
+— filter on sites 1-5, no filter on site 6, and the six-site enumeration is total at HEAD
+(`542d49d`). Full report: `signoffs/c2-waiver-reviewer-2026-09-05.md`.
+
+**Analyst pass** (opus analyst agent, `audit-waiver-c2`): **SIGN-OFF GRANTED.** No uncovered
+state machine was introduced on these three surfaces. Recommended non-blocking follow-up, quoted
+verbatim from the report's closing section: "Finding 11 is a recommended follow-up task, not a C2
+blocker." Full report: `signoffs/c2-waiver-analyst-2026-09-05.md`.
 
