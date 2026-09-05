@@ -416,7 +416,7 @@ pub fn open_scratch(db_path: &Path) -> Result<Connection> {
 ///
 /// Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) are distinct names, so the
 /// only path to refuse is exactly `<root>/.state/agent-kb/agent-kb.db`.
-fn is_live_db_path(db_path: &Path) -> bool {
+pub(crate) fn is_live_db_path(db_path: &Path) -> bool {
     let Some(file_name) = db_path.file_name() else {
         return false;
     };
@@ -2795,6 +2795,26 @@ mod tests {
 
     static UPDATED_AT_FETCH_COUNT: AtomicUsize = AtomicUsize::new(0);
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    /// `open_auxiliary` exists so non-repository SQLite files (query-hit
+    /// telemetry) can bypass the repository lock/DDL discipline, but it must
+    /// still refuse a genuine repository db path — a caller bug that pointed
+    /// an "auxiliary" open at `agent-kb.db` must not silently start managing
+    /// the repository's real database outside the lock. Nothing previously
+    /// exercised this refusal: telemetry's only caller always passes a
+    /// `query-hits.db`-shaped path, which never matches it.
+    #[test]
+    fn open_auxiliary_refuses_a_live_repository_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        open_or_init(&paths).unwrap();
+
+        let err = open_auxiliary(&paths.db).unwrap_err();
+        assert!(
+            matches!(err, SqlError::InvalidPath(ref p) if *p == paths.db),
+            "open_auxiliary must refuse a live repository db path, got: {err:?}"
+        );
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
