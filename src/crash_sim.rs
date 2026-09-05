@@ -17,6 +17,9 @@ pub enum KillPoint {
     BeforeApply,
     AfterApply,
     CompactAfterRewrite,
+    /// Between compaction's generation bump and its rename of the rewritten
+    /// log into place.
+    CompactAfterGenerationBump,
     /// D4 step 1 gate, `KP_PRE_CHECKPOINT`: before the live-DB checkpoint.
     SwapPreCheckpoint,
     /// D4 step 1, `KP_POST_CHECKPOINT`: after the checkpoint, before the
@@ -43,6 +46,7 @@ impl KillPoint {
             Self::BeforeApply => "before-apply",
             Self::AfterApply => "after-apply",
             Self::CompactAfterRewrite => "compact-after-rewrite",
+            Self::CompactAfterGenerationBump => "compact-after-generation-bump",
             Self::SwapPreCheckpoint => "swap-pre-checkpoint",
             Self::SwapPostCheckpoint => "swap-post-checkpoint",
             Self::SwapPostTmpSync => "swap-post-tmp-sync",
@@ -85,6 +89,7 @@ impl FromStr for KillPoint {
             "before-apply" => Ok(Self::BeforeApply),
             "after-apply" => Ok(Self::AfterApply),
             "compact-after-rewrite" => Ok(Self::CompactAfterRewrite),
+            "compact-after-generation-bump" => Ok(Self::CompactAfterGenerationBump),
             "swap-pre-checkpoint" => Ok(Self::SwapPreCheckpoint),
             "swap-post-checkpoint" => Ok(Self::SwapPostCheckpoint),
             "swap-post-tmp-sync" => Ok(Self::SwapPostTmpSync),

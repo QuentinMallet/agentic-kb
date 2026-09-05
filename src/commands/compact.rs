@@ -283,16 +283,24 @@ impl Compact {
             }
             f.sync_data()?; // flush pages before rename to prevent truncation on crash
         }
+        // C1/D3: the log generation is bumped under the SAME lock as the
+        // rename, and BEFORE it. Compaction only removes lines, so a cursor
+        // whose bytes all survive still validates against the rewritten log and
+        // would replay the compacted tail onto a database that already holds
+        // the original tail — dropped orphan expires never re-applied, entries
+        // that should be stale staying live, no error. The generation makes
+        // that detection O(1) and total (CompactMaterialize.tla CE7).
+        //
+        // Bumping first is the safe order for a crash in this window: the log
+        // is still the pre-compaction one but reads as a newer generation, so
+        // recovery over-reports and costs one spurious rebuild. Bumping after
+        // the rename would leave a compacted log carrying its pre-compaction
+        // generation — the exact undetectable divergence the counter exists to
+        // catch.
+        let generation = crate::components::cursor::bump_generation(&paths.events)?;
+        crate::crash_sim::kill_point(crate::crash_sim::KillPoint::CompactAfterGenerationBump);
         fs::rename(&tmp, &paths.events)?;
         sync_parent_dir(&paths.events)?;
-        // C1/D3: the log generation is bumped under the SAME lock as the
-        // rename. Compaction only removes lines, so a cursor whose bytes all
-        // survive still validates against the rewritten log and would replay
-        // the compacted tail onto a database that already holds the original
-        // tail — dropped orphan expires never re-applied, entries that should
-        // be stale staying live, no error. The generation makes that detection
-        // O(1) and total (CompactMaterialize.tla CE7).
-        let generation = crate::components::cursor::bump_generation(&paths.events)?;
         eprintln!("compact: event log generation is now {generation}");
 
         // Optional VACUUM: fires AFTER the atomic rename so a crash during VACUUM
@@ -374,6 +382,69 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    /// A crash between the generation bump and the rename must never leave a
+    /// compacted log carrying its pre-compaction generation — that is the one
+    /// state the counter cannot detect, and every later recovery would replay a
+    /// compacted tail onto a database holding the original one.
+    ///
+    /// Bumping first makes the crash window over-report instead: the log is
+    /// still pre-compaction but reads as a newer generation, which costs one
+    /// spurious rebuild and loses nothing.
+    #[test]
+    fn test_crash_between_generation_bump_and_rename_over_reports() {
+        use crate::components::cursor;
+        use std::process::Command;
+
+        if std::env::var("KB_COMPACT_CRASH_ROOT").is_ok() {
+            let root = std::env::var("KB_COMPACT_CRASH_ROOT").unwrap();
+            let paths = Paths::from_root(std::path::Path::new(&root));
+            let _ = Compact.execute_with_paths(&paths);
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        for i in 0..3 {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": "e1", "path": "a.rs", "summary": format!("v{i}"),
+                "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            });
+            append_event(&paths.events, &ev).unwrap();
+        }
+        let before_bytes = fs::read(&paths.events).unwrap();
+        let before_generation = cursor::read_generation(&paths.events);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("test_crash_between_generation_bump_and_rename_over_reports")
+            .arg("--nocapture")
+            .env("KB_COMPACT_CRASH_ROOT", root)
+            .env(
+                "KB_CRASH_AFTER",
+                crate::crash_sim::KillPoint::CompactAfterGenerationBump.as_str(),
+            )
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "the child did not reach the kill point"
+        );
+
+        assert_eq!(
+            fs::read(&paths.events).unwrap(),
+            before_bytes,
+            "the rename must not have happened"
+        );
+        assert_eq!(
+            cursor::read_generation(&paths.events),
+            before_generation + 1,
+            "the bump must be durable before the rename"
+        );
     }
 
     #[test]
