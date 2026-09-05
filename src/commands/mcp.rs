@@ -687,9 +687,13 @@ fn handle_request(
         Err(e) => {
             // B1: the envelope carries a best-effort id recovered from the raw
             // line, so a client can still correlate a rejected request.
-            let prefix = &line[..line.len().min(ID_SCAN_PREFIX_BYTES)];
+            // Sliced on bytes, not on the `&str`: the budget can land inside a
+            // multi-byte char, and `&line[..n]` would panic there — aborting
+            // the port process over one malformed request.
+            let bytes = line.as_bytes();
+            let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(ID_SCAN_PREFIX_BYTES)]);
             return json!({
-                "id": shallow_scan_id(prefix),
+                "id": shallow_scan_id(&prefix),
                 "type": "error",
                 "code": "parse_error",
                 "message": e.to_string()
@@ -5847,6 +5851,31 @@ mod tests {
             assert_eq!(resp["code"], "parse_error", "{line}");
             assert_eq!(resp["id"], Value::Null, "{line} -> {resp}");
         }
+    }
+
+    /// The id scan slices the raw line at a fixed byte budget. Slicing a
+    /// `&str` at a byte index that is not a char boundary panics, and a panic
+    /// in the request loop aborts the port process — so an unparseable line
+    /// whose 4096th byte falls inside a multi-byte char must still answer.
+    #[test]
+    fn test_parse_error_id_scan_survives_a_multibyte_char_at_the_prefix_boundary() {
+        let (_dir, paths, emb) = setup();
+
+        let head = "{\"id\":\"boundary-id\",\"x\":\"";
+        let mut line = String::with_capacity(ID_SCAN_PREFIX_BYTES + 2);
+        line.push_str(head);
+        line.push_str(&"a".repeat(ID_SCAN_PREFIX_BYTES - head.len() - 1));
+        // Two bytes, so the second one lands exactly on the scan budget.
+        line.push('é');
+        assert_eq!(line.len(), ID_SCAN_PREFIX_BYTES + 1);
+        assert!(
+            !line.is_char_boundary(ID_SCAN_PREFIX_BYTES),
+            "the fixture must put a char boundary violation at the budget"
+        );
+
+        let resp = handle_request(&line, &paths, &emb, 10, None, 0.0, 0.0);
+        assert_eq!(resp["code"], "parse_error");
+        assert_eq!(resp["id"], "boundary-id");
     }
 
     #[test]
