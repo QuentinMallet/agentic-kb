@@ -76,11 +76,17 @@ OUT OF MODEL SCOPE -- row 9 boundaries.  Three things D3 row 9
      therefore an ABSORBING state in the fixed design: `LogMissingFreezesState`
      and `LogMissingBlocksWrites` hold vacuously-forever from that point on,
      not because recovery was attempted and succeeded.  `LogVanishes` is also
-     guarded `~deferred` (matching `cursor.rs:inspect`, where `LogMissing`
-     pre-empts every `Defer` cause), so the two absorbing/outstanding
-     conditions cannot compose and `DeferredConverges` is not exercised by a
-     missing log; it is not weakened or scoped for this, because the module's
-     own guards make the composition unreachable rather than merely untested.
+     guarded `~deferred`.  This is a MODELLING CHOICE, not a claim that a real
+     log file cannot vanish while a deferral is outstanding -- it plainly can.
+     The guard mirrors `cursor.rs:inspect`'s dispatch order (a call made after
+     both conditions hold reports `LogMissing`, never `Defer`) and keeps
+     `DeferredConverges` meaningful by construction: with the guard, the two
+     absorbing/outstanding conditions cannot compose in this model, so
+     `DeferredConverges` is not exercised by a missing log and is left
+     unweakened rather than scoped around an untested composition. Without the
+     guard, a `LogVanishes` while `deferred` would need its own semantics (e.g.
+     clearing the deferral) and its own re-verified cfgs; that alternative was
+     not taken here.
   2. `RebuildAll`'s `~LogMissing` guard models only the AUTOMATIC decline
      (`recover_if_needed`, i.e. the code path also modelled by `RecoverIdle`).
      Operator-invoked `kb rebuild` is a deliberate, ungated override in the
@@ -366,8 +372,12 @@ LogVanishes ==
   /\ AllowLogMissing
   /\ log_present
   /\ phase = "idle"
-  /\ ~deferred   \* matches cursor.rs:inspect: LogMissing pre-empts Defer, so a
-                 \* vanish while a deferral is outstanding has no code counterpart
+  /\ ~deferred   \* Modelling choice, not a physical claim: a real log file can
+                 \* vanish regardless of `deferred`.  The guard mirrors
+                 \* cursor.rs:inspect's dispatch order -- a call made after
+                 \* both conditions hold reports LogMissing, never Defer -- and
+                 \* keeps `DeferredConverges` meaningful by construction; see
+                 \* "OUT OF MODEL SCOPE -- row 9 boundaries" item 1 above.
   /\ (cursor.off > 0 \/ db_committed /= EmptyDB)
   /\ log_present' = FALSE
   /\ log_written' = << >>

@@ -372,13 +372,18 @@ safety-invariant suite plus `LogMissingBlocksWrites` and
 `LogMissingFreezesState` — no liveness property. Row 9's interaction with
 `Crash` and with the deferred-repair scenario was previously untested by any
 committed config; this closes that gap for safety. (The `~deferred` guard on
-`LogVanishes` above also means `DeferredConverges`, the module's D3 liveness
-claim, is never composed with a missing log by construction: `LogMissing`
-forces `phase = "idle"` and blocks every action that could start a new
-deferral, and `LogVanishes` cannot fire while one is outstanding, so the two
-absorbing conditions cannot occur together. `DeferredConverges` itself is
-therefore left unscoped and unweakened — the composition is unreachable, not
-merely untested, so there is nothing to scope it against.)
+`LogVanishes` above is a modelling choice, not a claim that a real log file
+cannot vanish while a deferral is outstanding — it plainly can; the guard
+exists to mirror `cursor.rs:inspect`'s dispatch order (`LogMissing` pre-empts
+every `Defer` cause when both are true at the point `inspect` is called) and
+to keep `DeferredConverges` meaningful without scoping it. With the guard in
+place, `DeferredConverges`, the module's D3 liveness claim, is never composed
+with a missing log in this model: `LogMissing` forces `phase = "idle"` and
+blocks every action that could start a new deferral, and `LogVanishes` cannot
+fire while one is outstanding, so the two absorbing conditions cannot occur
+together within the model as constructed. `DeferredConverges` is therefore
+left unscoped and unweakened here — but this is a property of the guard, not
+an independent fact about the real system.)
 
 `DurableBatch_WIT_W_NotLogMissing.cfg` is new: `W_NotLogMissing == ~LogMissing`
 gives a reachability witness for the row-9 branch itself, matching the
