@@ -149,8 +149,12 @@ impl Search {
             for peer_path in peer_paths {
                 let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
                 // A peer's DB belongs to another repository: reading it must
-                // never create it, run DDL against it, or sweep its rows.
-                let peer_conn = match db::open_ro(&peer_db) {
+                // never create it, run DDL against it, sweep its rows, or
+                // write so much as a WAL checkpoint to its files. open_ro
+                // (used for the local DB above) tolerates the write-back a
+                // hot-WAL recovery or checkpoint can cause; open_ro_peer is
+                // strictly read-only and never touches the peer's bytes.
+                let peer_conn = match db::open_ro_peer(&peer_db) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("warn: peer {peer_path}: {e}");
@@ -1108,10 +1112,35 @@ mod tests {
         .execute_with(&peer_paths, &embedder)
         .unwrap();
 
-        // Finish any recovery/checkpoint work before taking the snapshot.
-        drop(db::open_ro(&peer_paths.db).unwrap());
-        let bytes_before = fs::read(&peer_paths.db).unwrap();
-        let modified_before = fs::metadata(&peer_paths.db).unwrap().modified().unwrap();
+        // Leave the peer's WAL genuinely hot rather than pre-checkpointing it:
+        // open a second WAL-mode connection with auto-checkpoint disabled and
+        // `mem::forget` it instead of closing it, so SQLite's "checkpoint the
+        // last connection to close" behavior never fires. A test that
+        // checkpoints before snapshotting can't catch a federated search that
+        // itself triggers that same checkpoint on close.
+        let keep_wal_hot = db::open_unchecked_for_test(&peer_paths.db).unwrap();
+        keep_wal_hot
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        keep_wal_hot
+            .execute(
+                "INSERT INTO entries(id, path, summary, content, tags)
+                 VALUES('hot-wal-marker','p/hot','hot wal summary','hot wal content','[]')",
+                [],
+            )
+            .unwrap();
+        std::mem::forget(keep_wal_hot);
+
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", peer_paths.db.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", peer_paths.db.display()));
+        assert!(
+            fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "precondition: the peer must have a live, unmerged WAL before federated search runs"
+        );
+
+        let db_bytes_before = fs::read(&peer_paths.db).unwrap();
+        let wal_bytes_before = fs::read(&wal_path).unwrap();
+        let shm_bytes_before = fs::read(&shm_path).unwrap();
 
         let local_dir = tempdir().unwrap();
         let local_paths = Paths::from_root(local_dir.path());
@@ -1128,6 +1157,17 @@ mod tests {
                 rusqlite::params![peer_dir.path().to_string_lossy()],
             )
             .unwrap();
+
+        // Prove the federation traversal actually reaches the registered peer
+        // before running the real command, so the byte-identity assertions
+        // below cannot pass vacuously against a peer nothing ever queried.
+        let peer_paths_found = collect_peer_paths(&local_conn, None, 1, None);
+        assert!(
+            peer_paths_found
+                .iter()
+                .any(|p| std::path::Path::new(p) == peer_dir.path()),
+            "the registered peer edge must be reachable via collect_peer_paths, got {peer_paths_found:?}"
+        );
         drop(local_conn);
         drop(lock);
 
@@ -1149,10 +1189,48 @@ mod tests {
         .execute_with(&local_paths, &embedder)
         .unwrap();
 
-        assert_eq!(fs::read(&peer_paths.db).unwrap(), bytes_before);
+        // Prove the federated search actually returned a peer row — the same
+        // mechanism `Search::execute_with` uses internally (`open_ro_peer` +
+        // `search_entries` against the peer db) must find the marker entry —
+        // so this test cannot pass vacuously if the peer were silently
+        // skipped (e.g. `collect_peer_paths` finding it but the search
+        // itself failing to open or query it).
+        let peer_conn = db::open_ro_peer(&peer_paths.db).unwrap();
+        let peer_opts = db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: Some(peer_dir.path().to_path_buf()),
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let peer_results =
+            db::search_entries(&peer_conn, &embedder, "immutable", &peer_opts).unwrap();
+        let peer_result_ids: Vec<&str> = peer_results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            peer_result_ids.contains(&"immutable-peer-entry"),
+            "federated search must be able to find the peer's marker entry, got {peer_result_ids:?}"
+        );
+        drop(peer_conn);
+
         assert_eq!(
-            fs::metadata(&peer_paths.db).unwrap().modified().unwrap(),
-            modified_before
+            fs::read(&peer_paths.db).unwrap(),
+            db_bytes_before,
+            "federated search must never rewrite the peer's main db file"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            wal_bytes_before,
+            "federated search must never touch the peer's -wal file"
+        );
+        assert_eq!(
+            fs::read(&shm_path).unwrap(),
+            shm_bytes_before,
+            "federated search must never touch the peer's -shm file"
         );
     }
 }

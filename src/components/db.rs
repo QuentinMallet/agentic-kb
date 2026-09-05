@@ -300,6 +300,74 @@ pub fn open_ro(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open another repository's database for federated (peer) reads.
+///
+/// `open_ro`'s `PRAGMA query_only=ON` blocks logical SQL writes, but the file
+/// handle it opens is still `SQLITE_OPEN_READ_WRITE` so that a lone reader
+/// arriving after a crash can recover a hot WAL — that recovery, and the WAL
+/// checkpoint SQLite performs when the last connection to a WAL database
+/// closes, both write bytes to the file. That is acceptable for a
+/// repository's own database (ADR-1's crash-recovery contract) but never
+/// acceptable for a *peer's* database: this repository has no right to
+/// rewrite another repository's on-disk bytes, ever, for any reason.
+///
+/// A plain `SQLITE_OPEN_READ_ONLY` handle is not enough to guarantee that:
+/// when the peer's `-shm` wal-index already exists, SQLite still opens it
+/// read-write and updates the connection's "read mark" slot in it, to tell
+/// a future checkpoint how far back this reader still needs WAL frames —
+/// a real byte-level write to the peer's `-shm` file, even though the main
+/// db handle never writes the db or `-wal` file itself (pinned by
+/// `tests/open_split.rs::open_ro_peer_never_writes_and_ignores_a_hot_wal_when_shm_is_missing`
+/// and the federated byte-identity test in `commands::search::tests`).
+/// So this always opens with the `immutable=1` URI hint instead, which
+/// tells SQLite the file is a static snapshot and skips the WAL/locking
+/// machinery — and therefore the `-shm` file — entirely, reading only the
+/// main database file as of its last checkpoint. That can miss rows still
+/// sitting in an unmerged WAL, but it is the only way to guarantee zero
+/// bytes of the peer's `db`, `-wal`, or `-shm` files are ever written —
+/// the trade this function exists to make.
+///
+/// Returns [`DbUninitialized`] under the same conditions as [`open_ro`].
+pub fn open_ro_peer(db_path: &Path) -> Result<Connection> {
+    let uri = format!("file:{}?immutable=1", db_path.display());
+    let conn = match Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open peer DB read-only {}", db_path.display()))
+        }
+    };
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
+    // corrupt file, an unreadable page — surface as themselves instead of
+    // being flattened into "uninitialized".
+    let entries_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema of {}", db_path.display()))?;
+    if entries_tables == 0 {
+        return Err(DbUninitialized {
+            db_path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(conn)
+}
+
 /// Open for mutation, against proof that this repository's write lock is held.
 ///
 /// `Paths` rather than a bare DB path because the lock is NOT derivable from
