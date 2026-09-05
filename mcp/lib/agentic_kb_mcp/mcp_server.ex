@@ -402,14 +402,20 @@ defmodule AgenticKbMcp.McpServer do
   @doc """
   Rejects `tools/call` arguments the tool's schema does not declare.
 
-  Returns `:ok` for a known tool whose arguments are all declared, and for an
-  unknown tool (which `dispatch_tool/3` reports on its own). Returns
-  `{:error, message}` naming every undeclared key.
+  Returns `:ok` for a known tool whose arguments are all declared, for an
+  unknown tool (which `dispatch_tool/3` reports on its own), and for absent
+  arguments — `nil` for a missing key, `:null` for an explicit JSON null —
+  neither of which carries a key to reject. Returns `{:error, message}`
+  naming every undeclared key.
 
   Public so tests can assert the rejection without a live port
   (B1: an unknown argument must be *rejected*, not dropped by
   `put_if_present/3` while building the port request).
   """
+  def validate_tool_args(_tool, nil), do: :ok
+
+  def validate_tool_args(_tool, args) when args in [nil, :null], do: :ok
+
   def validate_tool_args(tool, args) when is_map(args) do
     case List.keyfind(@tool_arg_names, tool, 0) do
       nil ->
@@ -506,13 +512,14 @@ defmodule AgenticKbMcp.McpServer do
          %{"method" => "tools/call", "id" => id, "params" => %{"name" => tool} = params},
          state
        ) do
-    args = Map.get(params, "arguments", %{})
-
-    # B1 / ADR-4: validate before dispatch_tool/3 builds the port request, so an
-    # undeclared argument never reaches the Rust boundary at all.
+    # B1 / ADR-4: normalise, then validate, before dispatch_tool/3 builds the
+    # port request — so neither a missing `arguments` nor an undeclared
+    # argument reaches the Rust boundary.
     result =
-      case validate_tool_args(tool, args) do
-        :ok -> dispatch_tool(tool, args, state)
+      with {:ok, args} <- tool_args(params),
+           :ok <- validate_tool_args(tool, args) do
+        dispatch_tool(tool, args, state)
+      else
         {:error, message} -> text_error(message)
       end
 
@@ -1084,6 +1091,19 @@ defmodule AgenticKbMcp.McpServer do
 
   defp write_response(response) do
     IO.puts(json_encode!(response))
+  end
+
+  # A missing `arguments` key decodes to nil; an explicit JSON `null` decodes
+  # to the atom `:null`, because that is what OTP's `:json` yields — NOT nil,
+  # so `Map.get(params, "arguments") || %{}` would not catch it. Both mean "no
+  # arguments". Anything else that is not an object is a client error rather
+  # than something to coerce (ADR-4).
+  defp tool_args(params) do
+    case Map.get(params, "arguments") do
+      args when args in [nil, :null] -> {:ok, %{}}
+      args when is_map(args) -> {:ok, args}
+      other -> {:error, "arguments must be a JSON object (got #{inspect(other)})"}
+    end
   end
 
   defp put_if_present(map, _key, nil), do: map

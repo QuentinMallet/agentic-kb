@@ -551,6 +551,16 @@ defmodule AgenticKbMcpTest do
       end
     end
 
+    # Pins the total contract independently of the tools/call ordering, so a
+    # later reordering cannot mask the nil-arguments crash.
+    # Pins the total contract independently of the tools/call ordering, so a
+    # later reordering cannot mask the missing-arguments crash. `:null` is what
+    # OTP's `:json` yields for an explicit JSON null; `nil` is a missing key.
+    test "absent arguments are accepted rather than raising FunctionClauseError" do
+      assert :ok == McpServer.validate_tool_args("kb_search", nil)
+      assert :ok == McpServer.validate_tool_args("kb_search", :null)
+    end
+
     test "an unknown tool is not reported as an argument error" do
       assert :ok == McpServer.validate_tool_args("kb_nonexistent", %{"whatever" => 1})
     end
@@ -559,6 +569,68 @@ defmodule AgenticKbMcpTest do
       for tool <- McpServer.tools() do
         assert :ok == McpServer.validate_tool_args(tool["name"], %{})
       end
+    end
+  end
+
+  # B1 finding 8: the wiring at the tools/call clause — not validate_tool_args/2
+  # in isolation — is what the fleet actually exercises. These drive the real
+  # request path with raw JSON bytes: handle_cast({:line, ...}) -> json_decode
+  # -> handle_request -> validate -> dispatch, with db_path: nil so no port is
+  # needed. Raw bytes matter: OTP's `:json` decodes JSON `null` to the atom
+  # `:null`, which no round-trip through an Elixir map would reproduce.
+  describe "tools/call request path (B1)" do
+    defp call_line(line) do
+      output =
+        ExUnit.CaptureIO.capture_io(fn ->
+          assert {:noreply, _state} = McpServer.handle_cast({:line, line}, %{db_path: nil})
+        end)
+
+      output |> String.trim() |> :json.decode()
+    end
+
+    test "an explicit null arguments does not crash the server" do
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call",) <>
+            ~s("params":{"name":"kb_search","arguments":null}})
+        )
+
+      refute Map.has_key?(response, "error")
+      assert %{"result" => %{"content" => [%{"text" => text}]}} = response
+      assert text =~ "No agent-kb.db found"
+    end
+
+    test "an omitted arguments key does not crash the server" do
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_search"}})
+        )
+
+      assert %{"result" => %{"content" => [%{"text" => text}]}} = response
+      assert text =~ "No agent-kb.db found"
+    end
+
+    test "a non-object arguments is rejected rather than coerced" do
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call",) <>
+            ~s("params":{"name":"kb_search","arguments":"oops"}})
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
+      assert text =~ "arguments must be a JSON object"
+    end
+
+    test "an unknown argument is rejected through the real tools/call path" do
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_add",) <>
+            ~s("arguments":{"path":"a/b","summary":"s","content":"c","confidence":0.9}}})
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
+      assert text =~ "confidence"
+      assert text =~ "unknown argument"
     end
   end
 end
