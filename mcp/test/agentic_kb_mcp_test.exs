@@ -523,9 +523,14 @@ defmodule AgenticKbMcpTest do
     "test_add" => [%{"type" => "ok", "test_id" => "test-1"}],
     "tests" => [%{"type" => "result", "test_cases" => [], "count" => 0}],
     "reembed" => [
-      %{"type" => "ok", "embedded" => 0, "skipped" => 0, "missing" => 0, "message" => "no embedder"},
-      %{"type" => "ok", "embedded" => 0, "skipped" => 1, "missing" => 2, "dry_run" => true},
-      %{"type" => "ok", "embedded" => 2, "failed" => 1, "skipped" => 1}
+      %{"type" => "ok", "embedded" => 0, "failed" => 0, "failures" => [], "skipped" => 0,
+        "missing" => 1, "raced" => 0, "dry_run" => false, "noop_embedder" => true,
+        "message" => "KB_NO_EMBED is set — no embedder available"},
+      %{"type" => "ok", "embedded" => 0, "failed" => 0, "failures" => [], "skipped" => 1,
+        "missing" => 2, "raced" => 0, "dry_run" => true, "noop_embedder" => false},
+      %{"type" => "ok", "embedded" => 2, "failed" => 1,
+        "failures" => [%{"id" => "bad", "cause" => "boom"}], "skipped" => 1, "missing" => 4,
+        "raced" => 1, "dry_run" => false, "noop_embedder" => false}
     ],
     "compact" => [%{"type" => "ok", "before" => 4, "after" => 2}],
     "rebuild" => [%{"type" => "ok", "rebuilt" => 3, "truncated_tail" => nil}],
@@ -573,7 +578,7 @@ defmodule AgenticKbMcpTest do
     "run" => ["Recorded run run-1"],
     "test_add" => ["Added test case test-1"],
     "tests" => ["(no test cases)"],
-    "reembed" => ["Re-embedded 0 entries", "[dry-run]", "1 failed"],
+    "reembed" => ["KB_NO_EMBED is set", "[dry-run]", "1 failed"],
     "compact" => ["Compacted: 4 events"],
     "rebuild" => ["Rebuilt 3 entries"],
     "kb_get" => ["[kb#ent-001]"],
