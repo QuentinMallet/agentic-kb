@@ -10,7 +10,7 @@
 | Surface | New temporal semantics? | TLA+ disposition | Implementation/test obligation |
 |---|---|---|---|
 | Global `flock` writer exclusion | No. The global exclusive flock is already an assumption of `AgentKb.tla`. | **Waived.** A second model would restate the existing assumption rather than test a new transition system. | `open_rw(&Paths, &Lock)` requires a live, path-matching token; normal exclusion tests remain required. |
-| Process-local re-entrancy / self-deadlock | Yes: a second acquire can wait forever. This is a liveness failure. | **Not covered by the waiver's flock argument and not proved by `&Lock`.** A type token proves that a matching live guard exists at a mutating open; it cannot prove that the process did not attempt to acquire the same flock twice. | ADR-1's process-local canonical-path registry in `acquire_lock` converts a second in-process acquire from a deadlock into an error. **L1a (`bd-21ef.2.3`) must carry the registry test**, with its bounded test timeout, proving the second acquire errors rather than hangs. **The test must also cover two path spellings that canonicalize to one file** (e.g. a relative path and `std::fs::canonicalize`'s output for it) — `PeersShow::execute` (`peers.rs:264-271`) already treats "as-is" and canonicalized spellings of the same `repo_path` as two lookups that must be reconciled by id; the registry has the same obligation in the other direction, keying on the canonicalized path so a second acquire under a *different* spelling of the same file is still recognized as re-entrant rather than silently deadlocking. |
+| Process-local re-entrancy / self-deadlock | Yes: a second acquire can wait forever. This is a liveness failure. | **Not covered by the waiver's flock argument and not proved by `&Lock`.** A type token proves that a matching live guard exists at a mutating open; it cannot prove that the process did not attempt to acquire the same flock twice. | ADR-1's process-local canonical-path registry in `acquire_lock` converts a second acquire **on the same thread** from a deadlock into an error. The registry is keyed per thread (`(ThreadId, PathBuf)`, `src/commands/add.rs:230`); a second acquire from a *different* thread of the same process deliberately blocks rather than erroring — that is ordinary mutual exclusion, and rebuild's schema-upgrade single-flight and its Phase 2 concurrent-writer guarantee both depend on same-process threads serializing on the flock rather than failing, pinned by `tests/open_split.rs:499` (`a_second_thread_blocks_on_the_flock_rather_than_being_rejected`). **L1a (`bd-21ef.2.3`) must carry the registry test**, with its bounded test timeout, proving the second acquire errors rather than hangs. **The test must also cover two path spellings that canonicalize to one file** (e.g. a relative path and `std::fs::canonicalize`'s output for it) — `PeersShow::execute` (`peers.rs:264-271`) already treats "as-is" and canonicalized spellings of the same `repo_path` as two lookups that must be reconciled by id; the registry has the same obligation in the other direction, keying on the canonicalized path so a second acquire under a *different* spelling of the same file is still recognized as re-entrant rather than silently deadlocking. |
 | Two-phase peer TTL | Yes: an expired row may be logically absent while still physically present until a locked sweep. | **Waived with an explicit total-read argument, corrected below.** Safety does not depend on sweep timing because every *consumer-visible* peer read site applies `AND (expires_at IS NULL OR expires_at >= datetime('now'))`. Therefore no peer consumer can observe the logically expired row even if physical deletion is arbitrarily delayed. **This is not total over every peer read site** — see the inventory below, which corrects the original version of this row (it claimed five surfaces and missed a sixth, internal one at `peers.rs:441-448`). | **L1b's test must assert exactly this:** expired peers are invisible to list, show, edge-list, graph traversal, and federated search while the database row remains physically present (no delete has occurred). The internal sixth site (`peers.rs:441-448`) is explicitly excluded from that filter — see below. |
 
 ## Peer read-site inventory (corrects the original TTL row)
@@ -19,14 +19,19 @@ The original TTL row said the read filter is total over five named surfaces. It 
 five *consumer-visible* surfaces, but there are six peer read sites in `src/`, and the sixth is
 internal and must **not** get the filter. Enumerated by file:line:
 
-| # | Site | File:line | Consumer-visible? | Filter applies? |
+**File:line anchoring note (amended 2026-09-06):** the line numbers originally recorded here had
+drifted from HEAD within weeks (verified by the C2 waiver code-reviewer pass, see the "Sign-off
+record" below). Line numbers are dropped from this table in favor of function-name anchors, which
+survive reflow; the file names are kept.
+
+| # | Site | Function anchor (file) | Consumer-visible? | Filter applies? |
 |---|---|---|---|---|
-| 1 | `kb peers list` (`PeersList::execute` → `query_peers_for_repo`) | `peers.rs:196`, SQL at `peers.rs:300` | Yes — printed directly to the caller. | **Yes.** An expired peer must not appear in the list. |
-| 2 | `kb peers show` (`PeersShow::execute` → `query_peers_by_either_repo`, called twice for the as-is and canonicalized path) | `peers.rs:259-278`, SQL at `peers.rs:339` | Yes — printed directly to the caller. | **Yes.** |
-| 3 | `kb peers edge-list` (`PeersEdgeList::execute`) | `peers.rs:669-678` | Yes — printed directly to the caller. | **Yes.** |
-| 4 | Federated peer-graph traversal (`collect_peer_paths` → `bfs_peers`/`query_direct_peers`/`query_neighbors` → `query_target_repos`) | `search.rs:258-345` (bind sites at `:294`, `:297`, `:340`, `:345`) | Yes, indirectly — controls which peer repos' entries are federated into a `kb search` result. | **Yes.** An expired peer edge must not be traversable, or a repo it points at leaks into federated results through a link that should no longer exist. |
-| 5 | MCP `kb_peers_list` (`handle_kb_peers_list`) | `mcp.rs:1916-1935`, SQL at `mcp.rs:1928` | Yes — returned directly in the MCP response. | **Yes.** Same obligation as site 1, over the MCP surface instead of the CLI. |
-| 6 | `kb peers import` duplicate-suppression check (inline `SELECT id FROM peers WHERE source_repo=?1 AND target_repo=?2 AND edge_type='member' AND (epic_slug IS ?3 ...)`) | `peers.rs:441-448` | **No.** The result is never returned to the caller; it only decides whether the loop `continue`s past this entry instead of inserting a new one. | **No — must not apply.** |
+| 1 | `kb peers list` (`PeersList::execute` → `query_peers_for_repo`) | `query_peers_for_repo` (`peers.rs`) — predicate injection site inside the function | Yes — printed directly to the caller. | **Yes.** An expired peer must not appear in the list. |
+| 2 | `kb peers show` (`PeersShow::execute` → `query_peers_by_either_repo`, called twice for the as-is and canonicalized path) | `query_peers_by_either_repo` (`peers.rs`) — predicate injection site inside the function | Yes — printed directly to the caller. | **Yes.** |
+| 3 | `kb peers edge-list` (`PeersEdgeList::execute` → `query_peer_edges`) | `query_peer_edges` (`peers.rs`) — predicate injection site inside the function | Yes — printed directly to the caller. | **Yes.** |
+| 4 | Federated peer-graph traversal (`collect_peer_paths` → `bfs_peers`/`query_direct_peers`/`query_neighbors` → `query_target_repos`) | `query_direct_peers` and `query_neighbors` (`search.rs`) — predicate injected at both bind sites in each function | Yes, indirectly — controls which peer repos' entries are federated into a `kb search` result. | **Yes.** An expired peer edge must not be traversable, or a repo it points at leaks into federated results through a link that should no longer exist. |
+| 5 | MCP `kb_peers_list` (`handle_kb_peers_list`) | `handle_kb_peers_list` (`mcp.rs`) — predicate injection site inside the function | Yes — returned directly in the MCP response. | **Yes.** Same obligation as site 1, over the MCP surface instead of the CLI. |
+| 6 | `kb peers import` duplicate-suppression check (inline `SELECT id FROM peers WHERE source_repo=?1 AND target_repo=?2 AND edge_type='member' AND (epic_slug IS ?3 ...)`) | `PeersImport::execute` (`peers.rs`) — inline check, no separate query helper | **No.** The result is never returned to the caller; it only decides whether the loop `continue`s past this entry instead of inserting a new one. | **No — must not apply.** |
 
 **Why site 6 is different, and why the recommendation is to leave it unfiltered rather than add the
 filter for uniformity:** the `peers` table has no `UNIQUE` constraint on `(source_repo,
@@ -88,4 +93,29 @@ registry matches the record in substance, and the six-site TTL-filter inventory 
 state machine was introduced on these three surfaces. Recommended non-blocking follow-up, quoted
 verbatim from the report's closing section: "Finding 11 is a recommended follow-up task, not a C2
 blocker." Full report: `signoffs/c2-waiver-analyst-2026-09-05.md`.
+
+## Amendment (2026-09-06)
+
+Two corrections from the code-reviewer sign-off pass (`signoffs/c2-waiver-reviewer-2026-09-05.md`,
+findings F3/MEDIUM and F4/LOW), applied above:
+
+1. **Re-entrancy row wording (was imprecise, not wrong in substance).** The row previously said the
+   registry "converts a second in-process acquire from a deadlock into an error." The registry is
+   keyed per thread, not per process (`(ThreadId, PathBuf)`, `src/commands/add.rs:230`), so a second
+   acquire from a *different* thread of the same process deliberately blocks rather than erroring —
+   `tests/open_split.rs:499` (`a_second_thread_blocks_on_the_flock_rather_than_being_rejected`) pins
+   this as intended behavior, and rebuild's schema-upgrade single-flight plus its Phase 2
+   concurrent-writer guarantee both depend on same-process threads serializing on the flock rather
+   than failing. The row now reads "a second acquire **on the same thread**," with that
+   cross-thread-contention note inline.
+2. **Inventory table file:line drift.** Every file:line citation in the peer read-site inventory
+   table had drifted from HEAD within weeks of being recorded. Replaced with function-name anchors
+   (`query_peers_for_repo`, `query_peers_by_either_repo`, `query_peer_edges`, `query_direct_peers`,
+   `query_neighbors`, `handle_kb_peers_list`, and the inline check in `PeersImport::execute`),
+   keeping the file names (`peers.rs`, `search.rs`, `mcp.rs`). Substance was intact throughout —
+   every cited surface still existed and behaved as described; only the line numbers were stale.
+
+Not amended (out of scope for this pass, left for a separate follow-up if pursued): the `db.rs`
+non-unique-index citation in the paragraph following the inventory table has the same drift and
+was not touched here.
 
