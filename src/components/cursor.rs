@@ -53,9 +53,46 @@
 //! sealed at `BEGIN`, so a miss inside the transaction is a loud error rather
 //! than a silent stall.
 //!
-//! # Writing during a deferral
+//! # The recovery table, and when a write is refused
 //!
-//! Placeholder — replaced by the contract docs.
+//! [`inspect`] classifies a database against its log. The plan's D3 table has
+//! eight rows; a ninth, [`Decision::LogMissing`], was split out of row 6 because
+//! it is the one "cannot tell" state where continuing is destructive rather than
+//! merely uninformed — the append path CREATES a missing log, so a write would
+//! resurrect it holding one batch and orphan everything earlier.
+//!
+//! **Every decision except a converged database and an obsolete schema stamp
+//! refuses writes** ([`Decision::blocks_writes`]). In particular row 6 refuses.
+//! Letting a write through during a deferral would apply a batch while events
+//! before the damage are durable but unapplied, leaving the database holding the
+//! committed prefix plus a later, disjoint batch: ahead of the durable log in
+//! one place and behind it in another, so no prefix of the log at all. Declining
+//! to advance the cursor does not repair that — only refusing does.
+//!
+//! An obsolete schema stamp is the exception, and it is evaluated **last** for
+//! that reason: it is the only non-blocking decision, so any blocking condition
+//! ranked behind it would be masked on every database whose stamp is stale,
+//! which is every pre-v3 one.
+//!
+//! Row 6 has four causes, and all four refuse writes:
+//!
+//! 1. the cursor row itself cannot be read;
+//! 2. the log's `committed_len` cannot be determined;
+//! 3. the prefix the cursor names cannot be hashed;
+//! 4. a line past the cursor cannot be parsed — the message names the first
+//!    damaged byte, so an operator is pointed at the line rather than the log.
+//!
+//! What row 6 still buys is that **reads keep working**. Recovery warns and
+//! declines instead of propagating a parse error out of every entry point,
+//! `search` and `kb_get` serve what they have with a staleness note, and the
+//! repair stays available because the log is never written to in the meantime.
+//! Once the damage is repaired the prefix fingerprint or the tail read agrees
+//! again, recovery replays from the cursor, and the cursor is stamped at the
+//! log's committed end.
+//!
+//! `kb compact` takes the same gate. It rewrites the log of record and bumps its
+//! generation, so running it during a deferral would convert "nobody can tell
+//! what the log holds" into "whatever survived the rewrite is the whole truth".
 
 use crate::commands::add::Lock;
 use crate::components::db;
