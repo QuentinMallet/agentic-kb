@@ -152,6 +152,13 @@ fn test_add_writes_all_three_cursor_rows_in_the_apply_transaction() {
 /// caught up. One that appends and applies without touching it leaves the
 /// cursor permanently behind, and then every subsequent open replays its
 /// events — a rare crash gap turned into a guaranteed loop.
+///
+/// Each row drives the production entry point, not the helper it delegates to,
+/// so a regression inside one of those commands is visible here. The MCP
+/// handlers are private to their module and are covered by the equivalent
+/// assertions in `src/commands/mcp.rs`; `stale_check`'s and
+/// `migrate_citations`' heal writers likewise, in their own modules, because
+/// both need a git repository and a relocated file to reach.
 #[test]
 fn test_every_writer_leaves_the_cursor_caught_up() {
     type Writer = Box<dyn Fn(&Paths)>;
@@ -175,18 +182,33 @@ fn test_every_writer_leaves_the_cursor_caught_up() {
             }),
         ),
         (
+            "test_add.rs (kb test-add)",
+            Box::new(|paths: &Paths| {
+                kb::commands::test_add::TestAdd {
+                    app: "a".to_string(),
+                    name: "n".to_string(),
+                    protocol: "browser".to_string(),
+                    config: "{}".to_string(),
+                    id: Some("tc-1".to_string()),
+                    version_ref: None,
+                }
+                .execute_with_paths(paths)
+                .unwrap();
+            }),
+        ),
+        (
             "run.rs (kb run)",
             Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
-                let lock = acquire_lock(&paths.lock).unwrap();
-                let event = json!({
-                    "action": "upsert", "table": "test_cases",
-                    "id": "tc-1", "app": "a", "name": "n", "protocol": "browser",
-                    "config": "{}", "version_ref": null, "ts": "2026-09-05T00:00:00Z",
-                });
-                cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event]).unwrap();
-                drop(conn);
-                drop(lock);
+                kb::commands::test_add::TestAdd {
+                    app: "a".to_string(),
+                    name: "n".to_string(),
+                    protocol: "browser".to_string(),
+                    config: "{}".to_string(),
+                    id: Some("tc-1".to_string()),
+                    version_ref: None,
+                }
+                .execute_with_paths(paths)
+                .unwrap();
                 kb::commands::run::Run {
                     test_id: "tc-1".to_string(),
                     result: "pass".to_string(),
@@ -194,72 +216,6 @@ fn test_every_writer_leaves_the_cursor_caught_up() {
                     detail: None,
                 }
                 .execute_with_paths(paths, &NoopEmbedder)
-                .unwrap();
-            }),
-        ),
-        (
-            "test_add.rs (kb test-add), MCP kb_test_add",
-            Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
-                let lock = acquire_lock(&paths.lock).unwrap();
-                let event = json!({
-                    "action": "upsert", "table": "test_cases",
-                    "id": "tc-2", "app": "a", "name": "n", "protocol": "browser",
-                    "config": "{}", "version_ref": null, "ts": "2026-09-05T00:00:00Z",
-                });
-                cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event]).unwrap();
-            }),
-        ),
-        (
-            "stale_check.rs / migrate_citations.rs (citation_healed)",
-            Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
-                let lock = acquire_lock(&paths.lock).unwrap();
-                let event =
-                    events::citation_healed_event("w-add", "ev-x", "a.rs", "b.rs", "hash", None);
-                cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event]).unwrap();
-            }),
-        ),
-        (
-            "mcp.rs handle_run / handle_expire",
-            Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
-                let lock = acquire_lock(&paths.lock).unwrap();
-                let event = json!({
-                    "action": "expire", "table": "entries",
-                    "id": "w-add", "reason": "mcp", "ts": "2026-09-05T00:00:00Z",
-                    "session": "mcp",
-                });
-                cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event]).unwrap();
-            }),
-        ),
-        (
-            "mcp.rs handle_audit_record (append_and_apply_with)",
-            Box::new(|paths: &Paths| {
-                let conn = open_db(&paths.db).unwrap();
-                let lock = acquire_lock(&paths.lock).unwrap();
-                let event = json!({
-                    "action": "expire", "table": "entries",
-                    "id": "w-add", "reason": "audit verdict=false",
-                    "ts": "2026-09-05T00:00:00Z", "session": "mcp",
-                });
-                cursor::append_and_apply_with(
-                    &lock,
-                    &conn,
-                    paths,
-                    &NoopEmbedder,
-                    &[event],
-                    |conn| {
-                        db::with_savepoint(conn, "audit_record", || {
-                            conn.execute(
-                                "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
-                                 VALUES('r1','w-add','false',NULL,'2026-09-05T00:00:00Z')",
-                                [],
-                            )?;
-                            Ok(())
-                        })
-                    },
-                )
                 .unwrap();
             }),
         ),

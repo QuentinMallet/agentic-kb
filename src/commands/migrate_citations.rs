@@ -498,6 +498,15 @@ mod tests {
         assert_eq!(events[2]["old_path"], format!("src/lib.rs:0-{end}"));
         assert_eq!(events[2]["new_path"], "src/lib.rs");
         assert_eq!(events[2]["citation_hash"], hash);
+
+        // C1/T4: the heal writer must leave the applied cursor caught up, or
+        // every later open replays its events.
+        let ro = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&ro, &paths),
+            cursor::Decision::NoOp,
+            "the citation_healed writer left the applied cursor behind the log"
+        );
     }
 
     #[test]

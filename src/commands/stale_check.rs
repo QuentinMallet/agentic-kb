@@ -1490,3 +1490,86 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod heal_writer_tests {
+    //! C1/T4: `heal_relocations` is a production applied-cursor writer. It
+    //! needs a git repository and a relocated citation to reach, which is why
+    //! it is exercised here rather than from `tests/applied_cursor.rs`.
+
+    use super::*;
+    use crate::commands::add::acquire_lock;
+    use crate::components::embedder::NoopEmbedder;
+    use crate::components::{cursor, events};
+    use crate::config::Paths;
+    use crate::models::{Evidence, VerificationStatus};
+
+    #[test]
+    fn test_heal_relocations_leaves_the_cursor_caught_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        // Seed an entry plus one evidence row, through the applied-cursor
+        // writer so the repository starts converged.
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "entry-1",
+            "path": "src/lib.rs", "summary": "entry", "content": "content",
+            "tags": [], "kind": "observation", "evidence_status": "present",
+            "ts": "2026-09-05T00:00:00Z",
+        });
+        let evidence = Evidence {
+            id: "ev-1".to_string(),
+            entry_id: "entry-1".to_string(),
+            kind: "code".to_string(),
+            citation_path: Some("src/old.rs".to_string()),
+            citation_sha: None,
+            citation_hash: "deadbeef".to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: Some("2026-09-05T00:00:00Z".to_string()),
+        };
+        let evidence_event = events::evidence_add_event("entry-1", &evidence, None);
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(
+                &lock,
+                &conn,
+                &paths,
+                &NoopEmbedder,
+                &[upsert, evidence_event],
+            )
+            .unwrap();
+        }
+
+        let mut report = StaleCheckReport {
+            relocation: vec![RelocationEntry {
+                entry_id: "entry-1".to_string(),
+                evidence_id: "ev-1".to_string(),
+                status: VerificationStatus::Relocated,
+                old_path: "src/old.rs".to_string(),
+                new_path: Some("src/new.rs".to_string()),
+                reason: None,
+                healed: false,
+            }],
+            ..Default::default()
+        };
+        heal_relocations(&paths, &mut report).unwrap();
+        assert!(report.relocation[0].healed, "the row must be healed");
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, &paths),
+            cursor::Decision::NoOp,
+            "heal_relocations left the applied cursor behind the log"
+        );
+        let path: String = conn
+            .query_row("SELECT citation_path FROM evidence WHERE id='ev-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(path, "src/new.rs");
+    }
+}

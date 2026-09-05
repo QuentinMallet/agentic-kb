@@ -908,11 +908,17 @@ mod crash_tests {
 
     /// The ten production writers collapse to six distinct event shapes
     /// reaching `append_and_apply`; each is killed between the durable append
-    /// and the apply. `kb_core::add` covers `kb add`, `kb ingest` and MCP
-    /// `kb_add`; `run`/`test_add`/`expire` each cover their CLI and MCP twin;
-    /// `citation_healed` covers `stale_check` and `migrate_citations`; the MCP
-    /// audit record writes the same `expire` shape through
-    /// `append_and_apply_with`.
+    /// and the apply.
+    ///
+    /// The first four drive their production command, so a regression inside
+    /// one of those commands fails this test. `kb_core::add` covers `kb add`,
+    /// `kb ingest` and MCP `kb_add`; `run`, `test_add` and `expire` each cover
+    /// their CLI command and its MCP twin, which build the same event. The last
+    /// two are event shapes rather than commands: `citation_healed` and
+    /// `evidence_expire` come from `stale_check` and `migrate_citations`, whose
+    /// production paths need a git repository and a relocated file that a crash
+    /// child cannot cheaply stage — their cursor behaviour is asserted in those
+    /// modules' own tests instead.
     const WRITERS: [&str; 6] = [
         "kb_core_add",
         "expire",
@@ -970,20 +976,46 @@ mod crash_tests {
                     .unwrap();
                 return;
             }
-            "expire" => vec![json!({
-                "action": "expire", "table": "entries", "id": "seed-1",
-                "reason": "crash test", "ts": "2026-09-05T00:00:00Z",
-            })],
-            "run" => vec![json!({
-                "action": "insert", "table": "run_history",
-                "test_id": "t1", "result": "pass", "adapter": "rust_tool",
-                "detail": null, "ts": "2026-09-05T00:00:00Z", "run_id": "crash-run-1",
-            })],
-            "test_add" => vec![json!({
-                "action": "upsert", "table": "test_cases",
-                "id": "tc-crash", "app": "app", "name": "n", "protocol": "browser",
-                "config": "{}", "version_ref": null, "ts": "2026-09-05T00:00:00Z",
-            })],
+            "expire" => {
+                drop(conn);
+                drop(lock);
+                crate::commands::expire::Expire {
+                    id: "seed-1".to_string(),
+                    reason: Some("crash test".to_string()),
+                    force: false,
+                }
+                .execute_with(&paths, &embedder)
+                .unwrap();
+                return;
+            }
+            "run" => {
+                drop(conn);
+                drop(lock);
+                crate::commands::run::Run {
+                    test_id: "t1".to_string(),
+                    result: "pass".to_string(),
+                    adapter: Some("rust_tool".to_string()),
+                    detail: None,
+                }
+                .execute_with_paths(&paths, &embedder)
+                .unwrap();
+                return;
+            }
+            "test_add" => {
+                drop(conn);
+                drop(lock);
+                crate::commands::test_add::TestAdd {
+                    app: "app".to_string(),
+                    name: "n".to_string(),
+                    protocol: "browser".to_string(),
+                    config: "{}".to_string(),
+                    id: Some("tc-crash".to_string()),
+                    version_ref: None,
+                }
+                .execute_with_paths(&paths)
+                .unwrap();
+                return;
+            }
             "citation_healed" => vec![events::citation_healed_event(
                 "seed-1",
                 "ev-1",

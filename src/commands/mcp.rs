@@ -3745,6 +3745,7 @@ mod tests {
         let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["expired"].as_str().unwrap(), entry_id);
+        assert_cursor_converged(&paths, "handle_expire");
     }
 
     #[test]
@@ -3836,6 +3837,18 @@ mod tests {
         );
     }
 
+    /// C1/T4: every MCP write handler must leave the applied cursor caught up
+    /// with the log. A handler that appends and applies without advancing it
+    /// puts every later open into a replay loop.
+    fn assert_cursor_converged(paths: &config::Paths, handler: &str) {
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            crate::components::cursor::inspect(&conn, paths),
+            crate::components::cursor::Decision::NoOp,
+            "{handler} left the applied cursor behind the log"
+        );
+    }
+
     #[test]
     fn test_handle_compact() {
         let (_dir, paths, emb) = setup();
@@ -3866,6 +3879,7 @@ mod tests {
         let resp = handle_test_add(&tr::<TestAddRequest>("test_add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["test_id"].as_str().is_some());
+        assert_cursor_converged(&paths, "handle_test_add");
 
         // List tests
         let req2 = json!({"method":"tests","id":"ta2","app":"myapp"});
@@ -3891,6 +3905,7 @@ mod tests {
         let resp = handle_run(&tr::<RunRequest>("run", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["result"], "pass");
+        assert_cursor_converged(&paths, "handle_run");
         // T3 (bd-21ef.1.8): the mcp `run` emitter must always carry a
         // run_id — the keyed-insertion apply arm relies on it for
         // idempotent replay (CompactMaterialize.tla D5.1).
@@ -4508,6 +4523,7 @@ mod tests {
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["recorded"], 1);
         assert_eq!(resp["expired"], 0);
+        assert_cursor_converged(&paths, "handle_audit_record");
 
         let conn = db::open_db(&paths.db).unwrap();
         let n: i64 = conn

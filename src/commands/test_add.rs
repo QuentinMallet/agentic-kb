@@ -42,6 +42,13 @@ impl TestAdd {
     /// Execute the test-add command.
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
+        self.execute_with_paths(&paths)
+    }
+
+    /// Execute with explicit paths, so tests can drive this entry point rather
+    /// than the applied-cursor helper it delegates to (matching `run.rs`).
+    pub fn execute_with_paths(&self, paths: &config::Paths) -> anyhow::Result<()> {
+        let paths = paths.clone();
         let lock = acquire_lock(&paths.lock)?;
         let id = self
             .id
