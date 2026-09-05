@@ -8,7 +8,7 @@
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::cursor;
 use crate::components::db;
-use crate::components::verification::{verify_evidence, RelocationPolicy};
+use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
 use crate::config;
 use crate::models::{Evidence, VerificationStatus};
 use abscissa_core::{Command, Runnable};
@@ -252,8 +252,8 @@ fn heal_relocations(
     let conn = &db::open_rw(paths, &lock)?;
 
     for r in report.relocation.iter_mut() {
-        let new_path = match &r.new_path {
-            Some(p) if r.status == VerificationStatus::Relocated => p.clone(),
+        let new_path = match relocation_heal_target(r) {
+            Some(path) => path.to_string(),
             _ => continue,
         };
         // ApplyHeal re-reads the complete evidence row and live parent while
@@ -305,6 +305,26 @@ fn heal_relocations(
         r.healed = true;
     }
     Ok(())
+}
+
+fn relocation_heal_target(entry: &RelocationEntry) -> Option<&str> {
+    // Belt-and-braces, not the load-bearing guard: `SymlinkPathRejected`
+    // already short-circuits before relocation in `verify_evidence` and
+    // `verify_evidence_from` (src/components/verification.rs, the decay
+    // matches that fold to `unverified` before any candidate search), so a
+    // real `RelocationEntry` can never carry this reason together with
+    // `status == Relocated` and a `new_path` -- `RelocationEntry`'s own
+    // invariant (`new_path` is `Some` exactly when `status == Relocated`,
+    // `reason` is `Some` exactly when `status == Unverified`) forbids it.
+    // This check exists so the guard does not rely on that invariant
+    // transitively holding at every present and future call site.
+    if entry.reason == Some(UnverifiedReason::SymlinkPathRejected.as_str()) {
+        return None;
+    }
+    match (&entry.new_path, entry.status) {
+        (Some(path), VerificationStatus::Relocated) => Some(path),
+        _ => None,
+    }
 }
 
 /// Shared orchestration for the CLI subcommand and the MCP `kb_stale_check`
@@ -1320,6 +1340,21 @@ mod tests {
             ..Default::default()
         });
         assert!(healed[0].ends_with("(healed)"), "{healed:?}");
+    }
+
+    #[test]
+    fn symlink_path_rejection_is_never_eligible_for_auto_heal() {
+        let entry = RelocationEntry {
+            entry_id: "entry".to_string(),
+            evidence_id: "evidence".to_string(),
+            status: VerificationStatus::Relocated,
+            old_path: "link.rs".to_string(),
+            new_path: Some("target.rs".to_string()),
+            reason: Some(UnverifiedReason::SymlinkPathRejected.as_str()),
+            healed: false,
+        };
+
+        assert_eq!(relocation_heal_target(&entry), None);
     }
 
     #[test]
