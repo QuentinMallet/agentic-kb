@@ -10,22 +10,18 @@ use rusqlite::params;
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 
-/// Writes per lock acquisition. Design target: <= 50 ms lock-hold per batch
-/// on an idle host. `test_reembed_batch_lock_hold_budget` measures this exact
-/// batch and prints the observed duration.
+/// Writes per lock acquisition. Budget: <= 50 ms lock-hold per batch on an
+/// idle host. `test_reembed_batch_lock_hold_budget` (ignored by default —
+/// see its doc comment) measures this exact batch and prints the observed
+/// duration; it is a measurement to be taken on a quiet host, not a CI gate.
 ///
-/// Measured 2026-09-05 on a dev machine under heavy concurrent-build load
-/// (uptime load average ~24 on 12 cores; ~17 concurrent cargo/rustc
-/// processes sharing the same target dir across sibling worktrees): 431ms
-/// and 319ms in isolation, and 634ms when run inside the full `cargo
-/// nextest run` (611 tests, several running concurrently). All are far
-/// above the 50 ms idle-host target; the gap is scheduling/disk-fsync
-/// contention from unrelated concurrent processes, not batch algorithmic
-/// cost — the batch itself does a fixed 32 inserts. The test's assertion
-/// is rounded up to 2000 ms so it still catches an algorithmic regression
-/// (e.g. accidental O(n^2) work per batch) without flaking on a loaded
-/// shared build machine. Re-measure and tighten back toward 50 ms on an
-/// idle host.
+/// Measured 2026-09-05 on this dev machine under heavy concurrent-build
+/// load (uptime load average ~24-28 on 12 cores; ~17 concurrent
+/// cargo/rustc processes sharing the target dir across sibling worktrees):
+/// 431 ms and 319 ms in isolation, 634 ms inside a full `cargo nextest run`.
+/// These numbers are contaminated by concurrent builds and are not a
+/// measurement of the 50 ms idle-host budget — a quiet-machine
+/// re-measurement is owed at post-impl.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,7 +421,16 @@ mod tests {
         assert!(report.failures[0].cause.contains("fixture write rejected"));
     }
 
+    /// Measures the wall-clock lock-hold time of one write batch against the
+    /// <= 50 ms budget documented on `REEMBED_WRITE_BATCH_SIZE`. This is a
+    /// measurement to be taken on a quiet host, not a CI gate: on a machine
+    /// with concurrent builds or tests competing for disk/CPU, the same
+    /// batch measures hundreds of ms slower for reasons unrelated to this
+    /// code (see the doc comment on the constant for recorded samples).
+    /// Run explicitly with `cargo test -p kb test_reembed_batch_lock_hold_budget -- --ignored --nocapture`
+    /// on an idle host and record the printed duration.
     #[test]
+    #[ignore = "lock-hold budget measurement; run explicitly on a quiet host"]
     fn test_reembed_batch_lock_hold_budget() {
         let dir = tempfile::tempdir().unwrap();
         let paths = config::Paths::from_root(dir.path());
@@ -442,13 +447,35 @@ mod tests {
         }
         let elapsed = start.elapsed();
         eprintln!("reembed batch lock hold measurement: {elapsed:?}");
-        // Design target is <= 50ms on an idle host; the threshold below is
-        // widened to 2000ms to tolerate this dev machine's heavy concurrent
-        // build/test load (see REEMBED_WRITE_BATCH_SIZE doc comment for
-        // measured samples, including inside a full `cargo nextest run`).
-        // This still catches an algorithmic regression (e.g. an accidental
-        // O(n^2) pass per batch) without flaking under load.
-        assert!(elapsed <= std::time::Duration::from_millis(2000));
+        assert!(elapsed <= std::time::Duration::from_millis(50));
+    }
+
+    /// Non-ignored structural companion to the budget measurement above:
+    /// asserts that `write_batches` actually chunks writes by
+    /// `REEMBED_WRITE_BATCH_SIZE` (via the batch-index hook), rather than
+    /// some other size, without depending on wall-clock timing.
+    #[test]
+    fn test_reembed_batches_writes_by_the_configured_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = REEMBED_WRITE_BATCH_SIZE + 1;
+        for index in 0..total {
+            seed(&paths, &format!("batch-{index}"), "seed");
+        }
+        let batches_seen = std::cell::Cell::new(0usize);
+        let report =
+            run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch_index| {
+                batches_seen.set(batches_seen.get().max(batch_index + 1));
+            })
+            .unwrap();
+        assert_eq!(report.embedded, total);
+        let expected_batches = total.div_ceil(REEMBED_WRITE_BATCH_SIZE);
+        assert_eq!(
+            batches_seen.get(),
+            expected_batches,
+            "write_batches must chunk writes using REEMBED_WRITE_BATCH_SIZE"
+        );
     }
 
     proptest::proptest! {
