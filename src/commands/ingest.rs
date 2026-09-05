@@ -287,9 +287,9 @@ fn advance_char_boundary(s: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::db;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
 
@@ -370,7 +370,7 @@ mod tests {
         };
         ingest.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='docs/test.md' AND is_stale=0",
@@ -418,7 +418,7 @@ mod tests {
         };
         ingest.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='docs/legacy.md' AND is_stale=0",
@@ -501,7 +501,7 @@ mod tests {
                 version_ref: Some("sha-a".to_string()),
             };
             ingest.execute_with(&paths, &embedder).unwrap();
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path='docs/a.md' AND is_stale=0",
@@ -532,7 +532,7 @@ mod tests {
                 version_ref: Some("sha-b".to_string()),
             };
             ingest.execute_with(&paths, &embedder).unwrap();
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path='docs/b.md' AND is_stale=0",

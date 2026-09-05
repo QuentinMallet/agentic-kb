@@ -88,7 +88,6 @@ mod tests {
     use crate::commands::add::Add;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
 
@@ -125,7 +124,7 @@ mod tests {
         };
         expire_cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let is_stale: i64 = conn
             .query_row(
                 "SELECT is_stale FROM entries WHERE id='expire-test-1'",
@@ -205,7 +204,7 @@ mod tests {
         };
         expire_cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let is_stale: i64 = conn
             .query_row(
                 "SELECT is_stale FROM entries WHERE id='perm-expire-2'",

@@ -597,7 +597,7 @@ mod tests {
         );
 
         if paths.db.exists() {
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let rows: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE id=?1",
@@ -628,7 +628,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         let evidence_status: String = conn
             .query_row(
@@ -671,7 +671,7 @@ mod tests {
             })]),
         )
         .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, expected_hash);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
@@ -698,7 +698,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence_rows = load_all_test_evidence(&conn);
         assert_eq!(evidence_rows.len(), 3);
         assert!(evidence_rows
@@ -726,7 +726,7 @@ mod tests {
             })]),
         )
         .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, explicit);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(ev4["id"], "new-1");
 
         // DB: old entries must be stale, new entry active.
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         for seed_id in &["seed-1", "seed-2"] {
             let stale: i64 = conn
                 .query_row(
@@ -896,7 +896,7 @@ mod tests {
         // Must succeed — the NoopEmbedder is injected and used, not looked up via env.
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE id='env-test-1'",
@@ -935,7 +935,7 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let session_id: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id='sess-test-1'",

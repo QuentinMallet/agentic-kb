@@ -568,7 +568,6 @@ mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use std::process::Command as Cmd;
     use std::thread;
@@ -614,7 +613,7 @@ mod tests {
     }
 
     fn count_entries(paths: &Paths) -> i64 {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap()
@@ -662,7 +661,7 @@ mod tests {
         assert_eq!(count_entries(&paths), 10);
 
         // Corrupt DB
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .execute("DELETE FROM entries", [])
             .unwrap();
@@ -673,7 +672,7 @@ mod tests {
     }
 
     fn entry_content(paths: &Paths, id: &str) -> Option<String> {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row(
                 "SELECT content FROM entries WHERE id=?1 AND is_stale=0",

@@ -211,6 +211,23 @@ fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a non-repository SQLite file whose lifecycle is managed by its owning
+/// component (currently the best-effort query-hit telemetry database).
+/// Repository databases must use `open_ro` or `open_rw` instead.
+pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
+    if is_live_db_path(db_path) {
+        return Err(rusqlite::Error::InvalidPath(db_path.to_path_buf()));
+    }
+    Connection::open(db_path)
+}
+
+/// Raw file opener for tests that intentionally bypass production policy to
+/// inspect or manufacture database states.
+#[cfg(test)]
+pub(crate) fn open_unchecked_for_test(db_path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open(db_path)
+}
+
 /// Create the schema on a connection that may be opening a brand-new file.
 ///
 /// Fresh-DB detection runs BEFORE `ensure_schema`: a DB with no `entries` table

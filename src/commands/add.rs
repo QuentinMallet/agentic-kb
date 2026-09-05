@@ -326,7 +326,6 @@ mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command as Cmd;
@@ -415,7 +414,7 @@ mod tests {
         assert!(events_content.contains("test-id-1"));
 
         // Verify DB row
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let (path, summary): (String, String) = conn
             .query_row(
                 "SELECT path, summary FROM entries WHERE id='test-id-1'",
@@ -452,7 +451,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let permanent: i64 = conn
             .query_row(
                 "SELECT permanent FROM entries WHERE id='perm-test-1'",
@@ -574,7 +573,7 @@ mod tests {
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let old_stale: i64 = conn
             .query_row("SELECT is_stale FROM entries WHERE id='rp-old'", [], |r| {
                 r.get(0)
@@ -624,7 +623,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let version_ref: Option<String> = conn
             .query_row(
                 "SELECT version_ref FROM entries WHERE path = 'src/lib.rs'",
@@ -648,7 +647,7 @@ mod tests {
         let cmd = make_add("src/lib.rs", "kind-default-1");
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let kind: String = conn
             .query_row(
                 "SELECT kind FROM entries WHERE id='kind-default-1'",
@@ -812,7 +811,7 @@ mod tests {
         assert_eq!(ev2["entry_id"], "batch-ev-1");
 
         // Verify evidence rows in DB
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let ev_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evidence WHERE entry_id='batch-ev-1'",
@@ -873,7 +872,7 @@ mod tests {
         std::env::remove_var("OMC_SESSION_ID");
 
         // AC2: entries.session_id must be "test123" (NOT NULL).
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let session_id: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id='sess-prop-1'",
