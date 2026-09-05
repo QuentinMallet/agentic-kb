@@ -56,7 +56,15 @@ pub fn run(
         .unwrap_or(config.compress_threshold);
 
     // Step 1: load the most recent non-stale entry at the given path.
-    let conn = db::open_db(&paths.db)?;
+    let conn = match db::open_ro(&paths.db) {
+        Ok(conn) => conn,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            db::note_uninitialized(&paths.db);
+            println!("nothing to compress: no entry found at '{}'", compress.path);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let row: Option<(String, String, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT id, summary, content, kind FROM entries WHERE path = ?1 AND is_stale = 0 ORDER BY rowid DESC LIMIT 1",
@@ -170,7 +178,7 @@ pub fn run(
 
     // Fetch tags + evidence for the existing entry so the compressed version
     // preserves the original's evidential standing (required for mandated kinds).
-    let conn2 = db::open_db(&paths.db)?;
+    let conn2 = db::open_ro(&paths.db)?;
     let tags_json: serde_json::Value = {
         let mut stmt = conn2.prepare("SELECT tags FROM entries WHERE id = ?1")?;
         let tags_str: String = stmt.query_row(params![entry_id], |r| r.get(0))?;

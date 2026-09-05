@@ -1,6 +1,5 @@
 //! `tests` subcommand
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -28,7 +27,20 @@ impl Tests {
     /// Execute the tests command.
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        self.execute_with(&paths)
+    }
+
+    /// Execute with explicit paths (exposed for testing).
+    pub fn execute_with(&self, paths: &config::Paths) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                println!("(no test cases)");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let mut count = 0;
 
         if let Some(ref a) = self.app {

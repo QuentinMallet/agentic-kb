@@ -6,13 +6,17 @@
 //! never to an error exit — so `kb search` on a fresh clone behaves exactly as
 //! it did when the read path silently created the DB.
 //!
-//! The two MCP surfaces (`handle_kb_get`, `handle_provenance`) are private
-//! functions and are covered by unit tests in `src/commands/mcp.rs`.
+//! The MCP surfaces (`handle_kb_get`, `handle_provenance`, `handle_search`,
+//! `handle_audit_report`) are private functions and are covered by unit
+//! tests in `src/commands/mcp.rs`.
 
 use kb::commands::cited_by::CitedBy;
 use kb::commands::compact::Compact;
 use kb::commands::context::Context;
+use kb::commands::eval::Eval;
 use kb::commands::search::Search;
+use kb::commands::stale_check::{RelocateArg, StaleCheck};
+use kb::commands::tests::Tests;
 use kb::components::embedder::NoopEmbedder;
 use kb::components::events;
 use kb::config::Paths;
@@ -152,5 +156,76 @@ fn kb_compact_on_a_fresh_repo_stays_a_pure_log_rewrite() {
         !paths.db.exists(),
         "compact must not materialize a database as a side effect of the \
          locked peer sweep when nothing has been built locally yet"
+    );
+}
+
+#[test]
+fn kb_tests_on_a_fresh_repo_is_empty_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+
+    Tests { app: None }
+        .execute_with(&paths)
+        .expect("a fresh repo must produce an empty result, not an error");
+
+    assert!(
+        !paths.db.exists(),
+        "the read path must not create the database"
+    );
+}
+
+#[test]
+fn kb_eval_on_a_fresh_repo_is_empty_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+
+    let golden = dir.path().join("golden.jsonl");
+    std::fs::write(
+        &golden,
+        "{\"query\": \"anything\", \"expected_ids\": [\"missing\"], \"split\": \"dev\"}\n",
+    )
+    .unwrap();
+
+    let eval = Eval {
+        golden: Some(golden),
+        sealed: false,
+        compare: None,
+        fts: false,
+        semantic: false,
+        k: 10,
+        json: false,
+        min_recall: None,
+        min_mrr: None,
+    };
+
+    eval.execute_with(&paths, &NoopEmbedder)
+        .expect("a fresh repo must produce an empty result, not an error");
+
+    assert!(
+        !paths.db.exists(),
+        "the read path must not create the database"
+    );
+}
+
+#[test]
+fn kb_stale_check_on_a_fresh_repo_is_empty_and_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = fresh_repo(dir.path());
+
+    let report = StaleCheck {
+        files: vec!["src/lib.rs".to_string()],
+        commits: vec![],
+        blame: false,
+        relocate: RelocateArg::Never,
+    }
+    .execute_with(&paths)
+    .expect("a fresh repo must produce an empty result, not an error");
+
+    assert!(report.stale.is_empty());
+    assert!(report.review.is_empty());
+    assert!(report.unreachable.is_empty());
+    assert!(
+        !paths.db.exists(),
+        "the read path must not create the database"
     );
 }

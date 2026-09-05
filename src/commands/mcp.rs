@@ -2207,8 +2207,21 @@ fn handle_audit_record(
 
 fn handle_audit_report(req: &AuditReportRequest, paths: &config::Paths) -> Value {
     let id = &req.id;
-    let conn = match db::open_db(&paths.db) {
+    // Pure read (ADR-7). An uninitialized repository has recorded no audit
+    // runs, so it gets the same empty report a fresh database would.
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            db::note_uninitialized(&paths.db);
+            return json!({
+                "id": id,
+                "type": "result",
+                "per_kind_session_precision": [],
+                "last_run_at": null,
+                "total_runs": 0,
+                "per_arm_precision": [],
+            });
+        }
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 

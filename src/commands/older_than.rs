@@ -34,7 +34,7 @@ impl OlderThan {
             return Ok(());
         }
 
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         self.execute_with_conn(&conn, days)
     }
 
