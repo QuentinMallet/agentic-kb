@@ -107,8 +107,8 @@ breadth-first search was used throughout, including for the two temporal configs
 | `DurableBatch_Cursor_Fixed.cfg` | " (with `Compact` enabled) | PASS | `No error has been found` · 537 / 259 · 03s |
 | `DurableBatch_CE8_Current.cfg` | CE8: unbounded retry of a poison record | VIOLATED | `Error: Temporal properties were violated` · 57 / 27 · 02s |
 | `DurableBatch_CE8_Fixed.cfg` | " under the K-retry dead-letter policy | PASS | `No error has been found` · 64 / 34 · 03s |
-| `DurableBatch_Deferred_Current.cfg` | withdrawn design: a write proceeds while damaged and materializes a non-prefix | VIOLATED (deferred-state gates around `CursorAgreesWithDB`, `DBNotAheadOfDurable`, and `CursorNeverAheadOfDB`) | not run in this sandbox; caller runs TLC |
-| `DurableBatch_Deferred_Fixed.cfg` | unreadable tail blocks writes; repair then replays from `cursor.off` | PASS | not run in this sandbox; caller runs TLC |
+| `DurableBatch_Deferred_Current.cfg` | withdrawn design: a write proceeds while damaged and materializes a non-prefix | VIOLATED (deferred-state gates around `CursorAgreesWithDB`, `DBNotAheadOfDurable`, and `CursorNeverAheadOfDB`) | `Error: Invariant DeferredCursorAgreesWithDB is violated` · 58 distinct · 03s |
+| `DurableBatch_Deferred_Fixed.cfg` | unreadable tail blocks writes; repair then replays from `cursor.off` | PASS | `No error has been found` · 83 distinct · 03s |
 | `DurableBatch_Safety_Fixed.cfg` | **unpinned**, all seven invariants plus the truncation action property | PASS | `No error has been found` · 537 / 259 · 02s |
 | `DurableBatch_Safety_Fixed_Poison.cfg` | same, with the poison record and quarantine live | PASS | `No error has been found` · 766 / 374 · 02s |
 | `DurableBatch_Refinement_Fixed.cfg` | refines `InnerGap` over the **full** Next relation | PASS | `No error has been found` · 448 / 216 · 03s |
