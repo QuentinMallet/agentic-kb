@@ -138,18 +138,8 @@ impl KbConfig {
     /// Load KbConfig from `kb.toml` relative to the repo root derived from `paths`.
     /// Falls back to `KbConfig::default()` when the file is absent or unparseable.
     ///
-    /// The repo root is inferred as `paths.db.parent().parent().parent()` (i.e. the
-    /// directory above `.state/agent-kb/`).
     pub fn from_paths(paths: &Paths) -> Self {
-        let root = paths
-            .db
-            .parent() // agent-kb/
-            .and_then(|p| p.parent()) // .state/
-            .and_then(|p| p.parent()); // repo root
-        let toml_path = match root {
-            Some(r) => r.join("kb.toml"),
-            None => return Self::default(),
-        };
+        let toml_path = paths.root.join("kb.toml");
         let content = match std::fs::read_to_string(&toml_path) {
             Ok(s) => s,
             Err(_) => return Self::default(),
@@ -180,6 +170,8 @@ impl Default for EmbedConfig {
 /// Resolved paths for the kb workspace
 #[derive(Debug, Clone)]
 pub struct Paths {
+    /// Repository root against which repository-relative paths are resolved.
+    pub root: PathBuf,
     /// Lock file path
     pub lock: PathBuf,
     /// Event log JSONL path
@@ -195,28 +187,39 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Walk up from cwd to find the repo root (has a .state/ directory).
-    /// Always returns the canonical `.state/agent-kb/agent-kb.db` form, consistent
-    /// with `from_root()`. The `agent-kb/` symlink convention at the repo root is
-    /// intentionally ignored here -- symlink-fallback removal is a separate follow-up
-    /// chore (see plan sec-paths-discover-canonical-form-regression, revision #11).
+    /// Walk up from cwd to find a repository database. At each candidate root,
+    /// canonical storage wins over legacy storage. With no existing database,
+    /// a `.state/` directory remains the marker for canonical first-run setup.
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let mut dir: &Path = &cwd;
         let mut warned_about_inner_state = false;
         loop {
-            if dir.join(".state").is_dir() {
-                if is_inside_managed_state_worktree(dir) {
-                    if !warned_about_inner_state {
-                        eprintln!(
-                            "WARNING: ignored root candidate {} inside a managed .state git worktree; continuing to the outer repo root",
-                            dir.display()
-                        );
-                        warned_about_inner_state = true;
-                    }
+            let inside_managed = is_inside_managed_state_worktree(dir);
+            if inside_managed {
+                if dir.join(".state").is_dir() && !warned_about_inner_state {
+                    eprintln!(
+                        "WARNING: ignored root candidate {} inside a managed .state git worktree; continuing to the outer repo root",
+                        dir.display()
+                    );
+                    warned_about_inner_state = true;
+                }
+            } else {
+                let canonical_db = dir.join(".state/agent-kb/agent-kb.db");
+                let legacy_db = dir.join("agent-kb/agent-kb.db");
+                let selected_db = if canonical_db.exists() {
+                    Some(canonical_db)
+                } else if legacy_db.exists() {
+                    Some(legacy_db)
+                } else if dir.join(".state").is_dir() {
+                    // Preserve the CLI's first-run canonical initialization.
+                    Some(canonical_db)
                 } else {
-                    let paths = Paths::from_root(dir);
-                    if let Some(warning) = divergence_warning(dir, &paths) {
+                    None
+                };
+                if let Some(db) = selected_db {
+                    let paths = Paths::from_db(&db);
+                    if let Some(warning) = divergence_warning(dir, &Paths::from_root(dir)) {
                         eprintln!("{warning}");
                     }
                     return Ok(paths);
@@ -225,7 +228,7 @@ impl Paths {
             match dir.parent() {
                 Some(p) => dir = p,
                 None => bail!(
-                    "Could not find repo root (no .state/ directory in {} or any parent)",
+                    "Could not find repo root (no KB database or .state/ directory in {} or any parent)",
                     cwd.display()
                 ),
             }
@@ -236,6 +239,7 @@ impl Paths {
     /// Uses `.state/agent-kb/` consistently (no symlink in test tempdirs).
     pub fn from_root(root: &Path) -> Self {
         Paths {
+            root: root.to_path_buf(),
             lock: root.join(".state").join(".lock"),
             events: root
                 .join(".state")
@@ -250,6 +254,53 @@ impl Paths {
             query_hits: root.join(".state").join("agent-kb").join("query-hits.db"),
         }
     }
+
+    /// Build paths around an explicitly selected database in either supported layout.
+    pub fn from_db(db: &Path) -> Self {
+        let root = root_from_db(db);
+        let mut paths = Self::from_root(&root);
+        paths.db = db.to_path_buf();
+
+        if !is_canonical_db(db) {
+            if let Some(db_dir) = db.parent() {
+                paths.lock = db_dir.join("agent-kb.lock");
+                paths.events = db_dir.join("agent-kb-events.jsonl");
+                paths.compact_state = db_dir.join("compact-state.json");
+                paths.query_hits = db_dir.join("query-hits.db");
+            }
+        }
+        paths
+    }
+}
+
+/// Derive a repository root from a canonical or legacy database path.
+pub fn root_from_db(db: &Path) -> PathBuf {
+    let Some(db_dir) = db.parent() else {
+        return PathBuf::from(".");
+    };
+    if is_canonical_db(db) {
+        db_dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else {
+        db_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
+}
+
+fn is_canonical_db(db: &Path) -> bool {
+    let Some(db_dir) = db.parent() else {
+        return false;
+    };
+    db_dir.file_name().is_some_and(|name| name == "agent-kb")
+        && db_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".state")
 }
 
 fn is_inside_managed_state_worktree(candidate: &Path) -> bool {
@@ -354,6 +405,7 @@ fn model_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fs;
     use std::path::PathBuf;
 
@@ -384,6 +436,7 @@ mod tests {
     fn test_paths_from_root() {
         let root = Path::new("/tmp/test-repo");
         let paths = Paths::from_root(root);
+        assert_eq!(paths.root, root);
         assert_eq!(paths.lock, PathBuf::from("/tmp/test-repo/.state/.lock"));
         assert_eq!(
             paths.events,
@@ -397,6 +450,54 @@ mod tests {
             paths.compact_state,
             PathBuf::from("/tmp/test-repo/.state/agent-kb/compact-state.json")
         );
+    }
+
+    #[test]
+    fn test_layout_candidate_precedence_and_root_match_elixir_rule() {
+        for (canonical, legacy, expected_legacy) in [
+            (true, false, false),
+            (false, true, true),
+            (true, true, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let canonical_db = root.join(".state/agent-kb/agent-kb.db");
+            let legacy_db = root.join("agent-kb/agent-kb.db");
+            if canonical {
+                fs::create_dir_all(canonical_db.parent().unwrap()).unwrap();
+                fs::write(&canonical_db, b"").unwrap();
+            }
+            if legacy {
+                fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+                fs::write(&legacy_db, b"").unwrap();
+            }
+
+            let _guard = CwdGuard::set(root);
+            let paths = Paths::discover().unwrap();
+            drop(_guard);
+            let expected_db = if expected_legacy {
+                &legacy_db
+            } else {
+                &canonical_db
+            };
+            assert_eq!(&paths.db, expected_db);
+            assert_eq!(paths.root, root);
+            assert_eq!(root_from_db(expected_db), root);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn root_from_db_is_stable_across_supported_layout_reconstruction(
+            components in proptest::collection::vec("[a-z][a-z0-9]{0,7}", 1..6)
+        ) {
+            let root = components.iter().fold(PathBuf::from("/"), |path, component| path.join(component));
+            let canonical = root.join(".state/agent-kb/agent-kb.db");
+            let legacy = root.join("agent-kb/agent-kb.db");
+            proptest::prop_assert_eq!(root_from_db(&canonical), root.clone());
+            proptest::prop_assert_eq!(root_from_db(&legacy), root.clone());
+            proptest::prop_assert_eq!(root_from_db(&root.join(".state/agent-kb/agent-kb.db")), root);
+        }
     }
 
     /// P4: relocation never mutates evidence unless the operator opts in, and
