@@ -306,57 +306,115 @@ reaches `idle` — 34 distinct states, no violation.
 ### LogMissing — row 9 refuses resurrection
 
 Both LogMissing configs enable `LogVanishes` only from `phase = "idle"` after
-the model has non-trivial durable history. The action sets `log_present = FALSE`
-and clears both log sequences while deliberately retaining `db`,
-`db_committed`, and `cursor`. `LogMissing` is therefore true, whereas a fresh
-empty log in `Init` is not missing.
+the model has non-trivial durable history, and (as of this revision) only
+when `~deferred` — matching `cursor.rs:inspect`, where `LogMissing` pre-empts
+every `Defer` cause, so a vanish while a deferral is outstanding has no code
+counterpart. The action sets `log_present = FALSE` and clears both log
+sequences while deliberately retaining `db`, `db_committed`, and `cursor`, and
+sets the monotone ghost `log_lost' = TRUE` (never cleared again). `LogMissing`
+is therefore true, whereas a fresh empty log in `Init` is not missing.
 
 In `DurableBatch_LogMissing_Current.cfg`, `UnsafeWriteWhileLogMissing` models
 the withdrawn alternative: it creates a new present file, appends the next
 batch to that empty file, applies the batch to the retained DB, and leaves the
 durable sequence empty. Once the file is present again the temporary
-LogMissing exception no longer applies, so `DBNotAheadOfDurable` and
-`CursorAgreesWithDB` expose the resurrected-log inconsistency.
+LogMissing exception no longer applies to `DBNotAheadOfDurable` et al. — but
+an earlier, *unrelated* CE2-class defect (`ApplyEvent` sets `db_committed'`
+unconditionally whenever `Fixed = FALSE`) reaches those same three invariants
+first, at depth 5, well before `LogVanishes` can fire. That was this
+document's previously-recorded caveat: the cfg's counterexample did not
+actually exercise the withdrawn alternative it was meant to demonstrate.
+
+**Fix.** The cfg's `INVARIANT` list now checks three ghost-gated obligations
+instead: `LostDBNotAheadOfDurable == ~log_lost \/ DBNotAheadOfDurable` (and the
+`LostCursorAgreesWithDB` / `LostCursorNeverAheadOfDB` pair), mirroring the
+module's existing `Deferred*` gating idiom. `log_lost` stays TRUE across a
+resurrection even though `LogMissing` itself goes false again, so the shallow
+CE2-class violation — which fires while `log_lost = FALSE` — no longer
+satisfies the antecedent, and TLC's breadth-first search is forced past it to
+the intended defect. Verified end-to-end:
+
+```
+Error: Invariant LostDBNotAheadOfDurable is violated.
+Init → StartBatch → AppendLine → ApplyEvent → FinishBatch → LogVanishes →
+UnsafeWriteWhileLogMissing
+224 states generated, 135 distinct states found, depth 13
+```
+
+`LogVanishes` is the seventh transition and `UnsafeWriteWhileLogMissing` the
+eighth, exactly the withdrawn-alternative pathway the cfg exists to
+demonstrate. (Two routes were verified for this fix — this ghost-variable
+route, and a cheaper `PROPERTY LogMissingDoesNotStart`-only variant that needs
+no new variable. The ghost route was chosen because it produces a
+counterexample end-to-end from the real `Init` rather than relying on an
+action property to separately rule out `nstarted` advancing, and because it
+generalizes to any future obligation that should survive past a resurrection,
+not just this one.)
 
 In `DurableBatch_LogMissing_Fixed.cfg`, `StartBatch`, `Compact`, `Recovery`,
 `RecoverIdle`, and `RebuildAll` are guarded by `~LogMissing`. Reads are not
 actions in this model and remain available from the unchanged DB. The config
 checks all three cursor/durability invariants, `LogMissingBlocksWrites` (the
-state stays idle), and the action property `LogMissingDoesNotStart` (no
-transition from a missing-log state can increase `nstarted`).
+state stays idle), the action property `LogMissingDoesNotStart` (no
+transition from a missing-log state can increase `nstarted`), and — new in
+this revision — the tighter action property `LogMissingFreezesState ==
+[][LogMissing => UNCHANGED <<db, db_committed, cursor, generation>>]_vars`.
+The three-invariant disjunct (`\/ LogMissing`) is sound only because nothing
+under `Fixed` can move those variables while `LogMissing` holds; the freeze
+property states that directly, so a future guard accidentally dropped from
+some DB-mutating action would be caught by it even in a state the three
+invariants can't see. `AllowCrash` is now `TRUE` in this cfg (previously
+`FALSE` for no stated reason); the wider search is still green.
 
-- `DurableBatch_LogMissing_Current.cfg`: **VIOLATED** — `DBNotAheadOfDurable`
-  (and, at the same state, `CursorAgreesWithDB`; `cursor.gen = generation = 0`,
-  `log_durable = <<>>`, so `Materialize(Prefix(log_durable, cursor.off), {}) = {}`
-  while `db_committed = {"A"}`), 13 states generated / 10 distinct, depth 5,
-  01s.
-- `DurableBatch_LogMissing_Fixed.cfg`: **PASS** — 163 states generated / 83
-  distinct, depth 30, 00s. `LogMissingBlocksWrites` and
-  `LogMissingDoesNotStart` both hold over the full, exhaustively-searched
+`DurableBatch_LogMissing_Compose.cfg` is new: `Fixed = TRUE`,
+`AllowCrash = AllowDeferred = AllowLogMissing = TRUE`, checking the standard
+safety-invariant suite plus `LogMissingBlocksWrites` and
+`LogMissingFreezesState` — no liveness property. Row 9's interaction with
+`Crash` and with the deferred-repair scenario was previously untested by any
+committed config; this closes that gap for safety. (The `~deferred` guard on
+`LogVanishes` above also means `DeferredConverges`, the module's D3 liveness
+claim, is never composed with a missing log by construction: `LogMissing`
+forces `phase = "idle"` and blocks every action that could start a new
+deferral, and `LogVanishes` cannot fire while one is outstanding, so the two
+absorbing conditions cannot occur together. `DeferredConverges` itself is
+therefore left unscoped and unweakened — the composition is unreachable, not
+merely untested, so there is nothing to scope it against.)
+
+`DurableBatch_WIT_W_NotLogMissing.cfg` is new: `W_NotLogMissing == ~LogMissing`
+gives a reachability witness for the row-9 branch itself, matching the
+module's existing `W_Rec_*` / `W_Inner_*` convention that a green safety
+result must not be a vacuous one.
+
+- `DurableBatch_LogMissing_Current.cfg`: **VIOLATED** — `LostDBNotAheadOfDurable`,
+  224 states generated / 135 distinct, depth 13, 01s.
+- `DurableBatch_LogMissing_Fixed.cfg`: **PASS** — 601 states generated / 291
+  distinct, depth 30, 01s. `LogMissingBlocksWrites`, `LogMissingDoesNotStart`,
+  and `LogMissingFreezesState` all hold over the full, exhaustively-searched
   state space.
+- `DurableBatch_LogMissing_Compose.cfg`: **PASS** — 664 states generated / 307
+  distinct, depth 28, 01s.
+- `DurableBatch_WIT_W_NotLogMissing.cfg`: **VIOLATED** (witness) — 132 states
+  generated / 74 distinct, depth 15, 01s.
 
-**Caveat on the `Current` trace.** The counterexample TLC actually finds does
-**not** traverse `LogVanishes` or `UnsafeWriteWhileLogMissing` — it is the
-pre-existing, LogMissing-unrelated bug already isolated by
-`DurableBatch_CE2_Current.cfg`: `ApplyEvent` sets `db_committed' = nd`
-unconditionally whenever `~(Fixed /\ ~last)`, i.e. whenever `Fixed = FALSE`,
-regardless of whether the log has ever gone missing. The 4-transition trace is
-`Init → StartBatch → AppendLine → ApplyEvent`, reaching `db_committed = {"A"}`
-against `log_durable = <<>>` at depth 5 — well before `LogVanishes` could ever
-fire (that action additionally requires `phase = "idle"` after non-trivial
-durable history). `CE1_Current.cfg`, `CE3_Current.cfg`, and
-`Cursor_Current.cfg` avoid this same shallow pre-emption by omitting
-`DBNotAheadOfDurable` from their own `INVARIANT` lists (each checks only its
-own scenario's invariant); `DurableBatch_LogMissing_Current.cfg` includes
-`DBNotAheadOfDurable`, so TLC's breadth-first search reports this shallower,
-unrelated violation first. The invariant names in the result match this
-document's prediction, but the mechanism does not match the prose above (row
-9 resurrection via `UnsafeWriteWhileLogMissing`) — that specific pathway
-remains unexercised by this cfg as currently constituted. Full trace:
-`tlc-logmissing-current.txt` (caller scratchpad). No `.tla`/`.cfg` edits were
-made to address this — flagged for the spec owner to decide whether the
-`Current` cfg should drop `DBNotAheadOfDurable` (mirroring `CE1`/`CE3`/
-`Cursor`) so the LogVanishes-specific counterexample surfaces instead.
+**RebuildAll comment correction.** The module previously labelled `RebuildAll`
+"Operator-invoked `kb rebuild`" and guarded it with `~LogMissing`. Reviewed:
+the implementation does not gate the operator command this way at all —
+`rebuild.rs:393`'s `execute_with` never calls `cursor::inspect`, so an
+operator-invoked `kb rebuild` of a row-9 database is a real, destructive
+override (`rebuild.rs:151-152`'s own warning text tells the operator to run it
+"deliberately if the empty log should win"). Only the *automatic* path,
+`recover_if_needed` (already separately modelled by `RecoverIdle`), actually
+declines. `RebuildAll`'s comment and the module header sentence now say this
+guard corresponds to the automatic decline, not the deliberate operator
+override; the override itself is recorded as an out-of-model-scope boundary
+(module header, "OUT OF MODEL SCOPE -- row 9 boundaries"), alongside log
+restoration being unmodelled (row 9 is absorbing under `Fixed`) and cursorless
+databases classifying as row 1 rather than row 9 in the code
+(`cursor.rs:583`'s `FullRebuild(CursorMissing)` fires before the missing-log
+check, and is separately fail-closed by `rebuild.rs`'s `full_rebuild_for`).
+None of the three is machine-checked; they are transitions this module omits,
+not premises TLC could contradict, so they are recorded as comments rather
+than as `ASSUME`s.
 
 ### Regression: the `AllowLogMissing = FALSE` amendment changes no other verdict
 
@@ -414,6 +472,21 @@ early-stop non-determinism described above, not a behavioral change — every
 `PASS` cfg (full state-space search, therefore deterministic) reproduces its
 prior distinct-state count exactly.
 
+**Second regression pass (spec-gate fixes, this revision).** This revision
+adds one more variable (`log_lost`, a monotone ghost) and one more guard
+(`LogVanishes` now requires `~deferred`) on top of the amendment above. Both
+are non-restrictive for `AllowLogMissing = FALSE`: `log_lost` stays constant
+`FALSE` (only `LogVanishes` sets it, and that action is disabled), and the
+`~deferred` guard only removes behavior from `LogVanishes`, which is already
+disabled. Re-ran the full matrix (`tlcrun.sh DurableBatch 1800`, all 30
+`DurableBatch_*.cfg` files including the two new ones) in this pass: every
+`PASS` cfg reproduced its exact prior distinct-state count again
+(`CE1_Fixed` 216, `CE2_Fixed` 216, `CE3_Fixed` 216, `CE8_Fixed` 34,
+`Cursor_Fixed` 259, `Deferred_Fixed` 83, `Refinement_Fixed` 216,
+`Safety_Fixed` 259, `Safety_Fixed_Poison` 374), and every `VIOLATED`/witness
+cfg reported the same invariant or property name as before. No cfg's verdict
+moved.
+
 ### Refinement — the current design does not refine `InnerGap`
 
 `DurableBatch_Refinement_Current.cfg` · `Fixed = FALSE`
@@ -462,8 +535,8 @@ Step correspondence, all of it data-carrying rather than a constant projection:
 - `ApplyEvent` → `ApplyNext`; the last one leaves the abstract phase at `"done"`.
 - `FinishBatch` → `Reset`. `Crash` → `Crash`. `Open` → `Rebuild`.
 
-Two things are excluded from the refinement configs and both are stated rather
-than hidden:
+Three things are excluded from the refinement configs and all are stated
+rather than hidden:
 
 1. **`MaxGen = 0`, so `Compact` is off.** `InnerGap.jsonl` only ever grows, so a
    log rewrite is outside the abstraction by construction. Compaction correctness
@@ -485,6 +558,16 @@ than hidden:
 2. **`PoisonBatch = 0`, so `Quarantine` is off.** Dead-lettering advances the
    cursor past a record without applying it, which `InnerGap` cannot express.
    `Safety_Fixed_Poison` checks the safety invariants with quarantine live.
+3. **`AllowLogMissing = FALSE`, so `LogVanishes` is off.** `LogVanishes` empties
+   `log_durable`, so the mapped `jsonl` would shrink for exactly the same
+   reason compaction is excluded above — `InnerGap.jsonl` only ever grows, and
+   a missing log is equally outside that abstraction by construction.
+   Confirmed against a private scratch copy: flipping `AllowLogMissing` to
+   `TRUE` on `DurableBatch_Refinement_Fixed.cfg` alone (nothing else changed)
+   violates `InnerSafety` (early-stop state counts vary run to run, as noted
+   above; not committed as a cfg since it is a deliberately-broken variant,
+   not part of the run matrix). Row 9 is a state class this refinement
+   provably does not cover, not one it happens not to reach.
 
 `AllowCrash = TRUE` in both refinement configs, so the check runs over the full
 `Next` relation including crash, open and truncation — not over a crash-free
