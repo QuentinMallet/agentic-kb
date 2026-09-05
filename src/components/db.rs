@@ -45,6 +45,38 @@ pub fn expire_guard(
     }
 }
 
+/// Total relevance order shared by every Rust ranking lane.
+///
+/// Scores descend and ids ascend.  `-0.0` is canonicalised because SQLite
+/// compares both zero representations equal. FTS5's `rank` is BM25 ascending,
+/// i.e. the inverse-sign convention of the descending relevance scores here.
+pub fn compare_rank(score_a: f32, id_a: &str, score_b: f32, id_b: &str) -> std::cmp::Ordering {
+    let score_a = if score_a == 0.0 { 0.0 } else { score_a };
+    let score_b = if score_b == 0.0 { 0.0 } else { score_b };
+    score_b.total_cmp(&score_a).then_with(|| id_a.cmp(id_b))
+}
+
+fn validate_embedding(embedding: Vec<f32>) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        embedding.iter().all(|x| x.is_finite()),
+        "embedder returned a non-finite component"
+    );
+    Ok(embedding)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchStats {
+    pub corrupt_embeddings: u64,
+}
+
+impl SearchStats {
+    pub fn snapshot() -> Self {
+        Self {
+            corrupt_embeddings: crate::models::corrupt_embedding_count(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resource caps (br-h9g, security I2)
 // ---------------------------------------------------------------------------
@@ -66,9 +98,11 @@ pub fn expire_guard(
 //
 // Values are deliberately conservative — they sit well above any observed
 // agent workflow (typical limit=10, inline_verify_k=10, evidence rows ~5)
-// while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
-// = 4k verification threads, which the test host tolerates.
+// while keeping worst-case fan-out bounded at
+// MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY.
 pub const MAX_LIMIT: usize = 100;
+pub const MAX_INLINE_VERIFY_K: usize = MAX_LIMIT;
+pub const MAX_VERIFY_POOL_SIZE: usize = 32;
 
 /// Relocation policy on the interactive search path — pinned to
 /// [`RelocationPolicy::Never`].
@@ -102,7 +136,18 @@ fn clamp_chars<'a>(s: &'a str, max: usize, field: &str, id: &str) -> std::borrow
         std::borrow::Cow::Owned(s.chars().take(max).collect())
     }
 }
-pub const MAX_INLINE_VERIFY_K: usize = 20;
+
+fn like_prefix_pattern(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
 
@@ -1553,7 +1598,7 @@ pub fn apply_event_at(
                     let mode = EmbedTextMode::from_env();
                     check_embed_mode_vintage(conn, mode);
                     let text = entry_embed_text(mode, path, summary, content, &tags);
-                    let emb = embedder.embed(&text)?;
+                    let emb = validate_embedding(embedder.embed(&text)?)?;
                     let blob = f32s_to_f16_blob(&emb);
                     conn.execute(
                         "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
@@ -1570,7 +1615,7 @@ pub fn apply_event_at(
                         let blob: Option<Vec<u8>> = if embedder.is_noop() {
                             None
                         } else {
-                            Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                            Some(f32s_to_f16_blob(&validate_embedding(embedder.embed(cue)?)?))
                         };
                         conn.execute(
                             "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
@@ -1857,9 +1902,8 @@ pub struct SearchOptions {
     /// spawned with cwd `/`). When `None`, verification still runs but always
     /// reports `Unverified` (no root to resolve citation paths against).
     pub repo_root: Option<PathBuf>,
-    /// Pool size for the bounded verify thread pool (br-23b.13).
-    /// Currently unused; reserved for forward-compatibility with the
-    /// 23b.13 task that replaces the per-request `thread::scope` path.
+    /// Pool size for the bounded verify thread pool.
+    /// Values above `MAX_VERIFY_POOL_SIZE` are clamped inside `search_entries`.
     pub verify_pool_size: Option<usize>,
     /// Recency-bias decay factor (λ in exp(-λ·days)) applied after RRF scoring.
     /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
@@ -1942,6 +1986,63 @@ pub struct SearchEntry {
     pub origin_repo: Option<String>,
     /// DB `updated_at` for stale-warning checks in presentation layers.
     pub updated_at: String,
+}
+
+#[derive(Clone, Copy)]
+struct EffectiveSearchCaps {
+    limit: usize,
+    inline_verify_k: usize,
+    verify_pool_size: usize,
+}
+
+fn default_verify_pool_size() -> usize {
+    num_cpus::get_physical().max(1)
+}
+
+fn clamp_search_caps(opts: &SearchOptions) -> EffectiveSearchCaps {
+    EffectiveSearchCaps {
+        limit: opts.limit.min(MAX_LIMIT),
+        inline_verify_k: opts.inline_verify_k.min(MAX_INLINE_VERIFY_K),
+        verify_pool_size: opts
+            .verify_pool_size
+            .unwrap_or_else(default_verify_pool_size)
+            .clamp(1, MAX_VERIFY_POOL_SIZE),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchRuntimeStats {
+    effective_limit: usize,
+    effective_inline_verify_k: usize,
+    effective_verify_pool_size: usize,
+    scheduled_verification_tasks: usize,
+    spawned_verify_workers: usize,
+    semantic_materialized_rows: usize,
+    semantic_materialized_bytes: usize,
+    cue_materialized_rows: usize,
+    cue_materialized_bytes: usize,
+}
+
+#[cfg(test)]
+fn search_runtime_stats_cell() -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<SearchRuntimeStats>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn record_search_runtime_stats(stats: SearchRuntimeStats) {
+    *search_runtime_stats_cell().lock().unwrap() = Some(stats);
+}
+
+#[cfg(test)]
+fn take_search_runtime_stats() -> SearchRuntimeStats {
+    search_runtime_stats_cell()
+        .lock()
+        .unwrap()
+        .take()
+        .expect("search runtime stats must be recorded")
 }
 
 pub struct FetchEntryByIdResult {
@@ -2073,14 +2174,13 @@ pub fn fetch_evidence_for_entries(
                     kind: r.get(2)?,
                     citation_path: r.get(3)?,
                     citation_sha: r.get(4)?,
-                    citation_hash: r.get(5).unwrap_or_default(),
+                    citation_hash: r.get(5)?,
                     citation_excerpt: r.get(6)?,
                     derived_from: r.get(7)?,
                     recorded_at: r.get(8)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .collect()
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         // Group rows by entry_id (rows are already sorted by entry_id via ORDER BY).
@@ -2124,32 +2224,28 @@ impl FtsReadPath {
     }
 }
 
-pub type FtsRow = (String, String, String, String, String, String);
+pub type FtsRow = (String, String, String, String, String, String, f64);
 
 pub fn fts_query_contentless(
     conn: &Connection,
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts f
          JOIN entries e ON e.id = f.id
          WHERE f.entries_fts MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                opts.path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -2158,6 +2254,7 @@ pub fn fts_query_contentless(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
@@ -2171,25 +2268,21 @@ pub fn fts_query_content_entries(
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts_v2 f
          JOIN entries e ON e.rowid = f.rowid
          WHERE f.entries_fts_v2 MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                opts.path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -2198,12 +2291,47 @@ pub fn fts_query_content_entries(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+/// Fetch the requested prefix plus the complete BM25 tie run at its boundary.
+/// The query grows geometrically only while the final fetched row is still tied,
+/// avoiding the O(database-size) cost of an unlimited parity query.
+fn fts_rows_through_boundary_tie(
+    conn: &Connection,
+    path: FtsReadPath,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut extended = opts.clone();
+    extended.limit = opts.limit.saturating_add(1);
+    loop {
+        let rows = match path {
+            FtsReadPath::Contentless => fts_query_contentless(conn, safe_query, &extended)?,
+            FtsReadPath::ContentEntries => fts_query_content_entries(conn, safe_query, &extended)?,
+        };
+        if opts.limit == 0 || rows.len() <= opts.limit {
+            return Ok(rows);
+        }
+        let boundary = rows[opts.limit - 1].6;
+        if rows.last().is_some_and(|row| row.6 != boundary) {
+            let end = rows
+                .iter()
+                .position(|row| row.6 != boundary && row.6 > boundary)
+                .unwrap_or(rows.len());
+            return Ok(rows.into_iter().take(end).collect());
+        }
+        if rows.len() < extended.limit || extended.limit == usize::MAX {
+            return Ok(rows);
+        }
+        extended.limit = extended.limit.saturating_mul(2);
+    }
 }
 
 /// Shared hybrid search used by both the CLI and MCP handler.
@@ -2381,12 +2509,7 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
             });
         }
     }
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    scored.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
     scored.truncate(limit);
     Ok(scored)
 }
@@ -2454,12 +2577,62 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
                     .unwrap_or(0.0);
                 (i, lambda * rel - (1.0 - lambda) * max_sim)
             })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| compare_rank(a.1, &remaining[a.0].id, b.1, &remaining[b.0].id))
             .unwrap_or((0, 0.0));
         selected.push(remaining.remove(best_idx));
     }
 
     *entries = selected;
+}
+
+type SearchMetadata = (String, String, String, String, String);
+
+fn fetch_search_metadata(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, SearchMetadata>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ),
+        ))
+    })?;
+    let mut metadata = std::collections::HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, fields) = row?;
+        metadata.insert(id, fields);
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+fn materialization_size(
+    metadata: &std::collections::HashMap<String, SearchMetadata>,
+) -> (usize, usize) {
+    let bytes = metadata
+        .iter()
+        .map(|(id, (path, summary, content, tags, updated_at))| {
+            id.len() + path.len() + summary.len() + content.len() + tags.len() + updated_at.len()
+        })
+        .sum();
+    (metadata.len(), bytes)
 }
 
 pub fn search_entries(
@@ -2468,10 +2641,22 @@ pub fn search_entries(
     query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<SearchEntry>> {
+    let caps = clamp_search_caps(opts);
+    let mut effective_opts = opts.clone();
+    effective_opts.limit = caps.limit;
+    effective_opts.inline_verify_k = caps.inline_verify_k;
+    effective_opts.verify_pool_size = Some(caps.verify_pool_size);
+    let path_prefix = effective_opts.path_prefix.as_deref();
+    let tag_filter = effective_opts.tag_filter.as_deref();
+
     let mut entries: Vec<SearchEntry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    #[cfg(test)]
+    let mut semantic_materialized = (0usize, 0usize);
+    #[cfg(test)]
+    let mut cue_materialized = (0usize, 0usize);
 
-    if opts.do_fts {
+    if effective_opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
         // operator injection (AND/OR/NOT) while allowing multi-term recall.
         let safe_query: String = query
@@ -2482,24 +2667,32 @@ pub fn search_entries(
 
         let read_path = FtsReadPath::from_env();
         let rows = match read_path {
-            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, opts)?,
-            FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
+            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, &effective_opts)?,
+            FtsReadPath::ContentEntries => {
+                fts_query_content_entries(conn, &safe_query, &effective_opts)?
+            }
         };
 
-        // Divergence detection: compare both read paths and emit a warning when
-        // they disagree. In debug builds, assert equality to catch regressions
-        // early. In release builds, log only so production is never disrupted.
+        // Divergence detection compares ordered sequences. `ORDER BY rank,e.id`
+        // makes a tie crossing LIMIT deterministic without an unbounded debug
+        // query; geometric growth stops just past the complete boundary tie run,
+        // so ordinary parity overhead remains O(limit), not O(database size).
         #[cfg(debug_assertions)]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 debug_assert_eq!(
                     primary_ids, alt_ids,
                     "fts5_dual_write_divergence: primary={:?} alt={:?}",
@@ -2509,15 +2702,20 @@ pub fn search_entries(
         }
         #[cfg(not(debug_assertions))]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 if primary_ids != alt_ids {
                     eprintln!(
                         "kb: fts5_dual_write_divergence read_path={:?} \
@@ -2540,7 +2738,7 @@ pub fn search_entries(
             );
         }
 
-        for (id, path, summary, content, tags, updated_at) in rows {
+        for (id, path, summary, content, tags, updated_at, _rank) in rows {
             seen_ids.insert(id.clone());
             entries.push(SearchEntry {
                 id,
@@ -2560,14 +2758,18 @@ pub fn search_entries(
         }
     }
 
-    if opts.do_semantic && !embedder.is_noop() {
-        let q_emb = embedder.embed(query)?;
+    if effective_opts.do_semantic && !embedder.is_noop() {
+        let q_emb = validate_embedding(embedder.embed(query)?)?;
+        let path_prefix = effective_opts
+            .path_prefix
+            .as_deref()
+            .map(like_prefix_pattern);
         let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
+            "SELECT e.id, emb.embedding
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         )?;
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
@@ -2576,25 +2778,13 @@ pub fn search_entries(
         // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
         // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
         // decode_emb_blob fallback via length dispatch.
-        let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
-            .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Vec<u8>>(6)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
         let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
-        let mut candidates: Vec<(f32, String, String, String, String, String, String)> =
-            Vec::with_capacity(rows.len());
-        for (id, path, summary, content, tags, updated_at, blob) in rows {
+        let mut candidates: Vec<(f32, String)> = Vec::new();
+        let rows = stmt.query_map(params![path_prefix.clone(), tag_filter], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (id, blob) = row?;
             decode_f16_blob_into(&blob, &mut scratch);
             let sim = if scratch.is_empty() {
                 // blob was not canonical f16 — fall back to graceful decode
@@ -2603,72 +2793,78 @@ pub fn search_entries(
             } else {
                 cosine_similarity(&q_emb, &scratch)
             };
-            candidates.push((sim, id, path, summary, content, tags, updated_at));
+            candidates.push((sim, id));
         }
 
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
 
         // Cue lane (Memora pickup .4): score each live entry by its best-cosine
         // cue anchor. Ranked separately so RRF fuses it as a third source.
         // Best-effort: absence of the cues table (pre-migration DB) is not an
         // error, just an empty lane.
-        let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
-        if opts.do_fts {
+        let mut cue_ranked: Vec<(f32, String)> = Vec::new();
+        if effective_opts.do_fts {
             if let Ok(mut stmt) = conn.prepare(
-            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
+                "SELECT c.entry_id, c.cue, c.embedding
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
                AND c.embedding IS NOT NULL
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
-        ) {
-            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String, String)> = stmt
-                .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+            ) {
+                // Best cue score per entry.
+                let mut best: std::collections::HashMap<String, (f32, String)> =
+                    std::collections::HashMap::new();
+                let cue_rows = stmt.query_map(params![path_prefix, tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, String>(7)?,
                     ))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-
-            // Best cue score per entry.
-            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String)> =
-                std::collections::HashMap::new();
-            for (entry_id, blob, path, summary, content, tags, updated_at) in cue_rows {
-                decode_f16_blob_into(&blob, &mut scratch);
-                let sim = if scratch.is_empty() {
-                    let fallback = decode_emb_blob(&blob);
-                    cosine_similarity(&q_emb, &fallback)
-                } else {
-                    cosine_similarity(&q_emb, &scratch)
-                };
-                match best.get(&entry_id) {
-                    Some((prev, ..)) if *prev >= sim => {}
-                    _ => {
-                        best.insert(entry_id, (sim, path, summary, content, tags, updated_at));
+                })?;
+                for row in cue_rows {
+                    let (entry_id, cue, blob) = row?;
+                    decode_f16_blob_into(&blob, &mut scratch);
+                    let sim = if scratch.is_empty() {
+                        let fallback = decode_emb_blob(&blob);
+                        cosine_similarity(&q_emb, &fallback)
+                    } else {
+                        cosine_similarity(&q_emb, &scratch)
+                    };
+                    match best.get(&entry_id) {
+                        Some((prev, prev_cue, ..))
+                            if compare_rank(*prev, prev_cue, sim, &cue).is_lt() => {}
+                        _ => {
+                            best.insert(entry_id, (sim, cue));
+                        }
                     }
                 }
+                cue_ranked = best
+                    .into_iter()
+                    .map(|(id, (sim, _cue))| (sim, id))
+                    .collect();
+                cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
+                cue_ranked.truncate(effective_opts.limit.saturating_mul(2));
             }
-            cue_ranked = best
-                .into_iter()
-                .map(|(id, (sim, path, summary, content, tags, updated_at))| {
-                    (sim, id, path, summary, content, tags, updated_at)
-                })
-                .collect();
-            cue_ranked
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            cue_ranked.truncate(opts.limit.saturating_mul(2));
-        }
         }
 
-        if opts.do_fts {
+        let materialize_limit = effective_opts.limit.saturating_mul(2);
+        let semantic_ids: Vec<String> = candidates
+            .iter()
+            .take(materialize_limit)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let cue_ids: Vec<String> = cue_ranked.iter().map(|(_, id)| id.clone()).collect();
+        let semantic_meta = fetch_search_metadata(conn, &semantic_ids)?;
+        let cue_meta = fetch_search_metadata(conn, &cue_ids)?;
+        #[cfg(test)]
+        {
+            semantic_materialized = materialization_size(&semantic_meta);
+            cue_materialized = materialization_size(&cue_meta);
+        }
+
+        if effective_opts.do_fts {
             // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
             // FTS and semantic rankings. Each entry's RRF score is the sum of
             // 1/(k+rank) across all sources it appears in, where rank is 1-based.
@@ -2688,14 +2884,14 @@ pub fn search_entries(
             }
 
             // Second RRF source: semantic candidate ranks.
-            for (sem_rank, (_, id, ..)) in candidates.iter().enumerate() {
+            for (sem_rank, (_, id)) in candidates.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
             }
 
             // Third RRF source: cue-anchor lane (best cue cosine per entry).
-            for (cue_rank, (_, id, ..)) in cue_ranked.iter().enumerate() {
+            for (cue_rank, (_, id)) in cue_ranked.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
@@ -2711,10 +2907,15 @@ pub fn search_entries(
 
             // For semantic-only entries (not in FTS), create new SearchEntry values.
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
-            for (_, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit * 2)
+            for (_, id) in candidates
+                .into_iter()
+                .take(effective_opts.limit.saturating_mul(2))
             {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = semantic_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2736,8 +2937,12 @@ pub fn search_entries(
 
             // Cue-only entries (reached via a cue anchor, absent from both the
             // FTS and entry-embedding lanes) still need materializing.
-            for (_, id, path, summary, content, tags, updated_at) in cue_ranked.into_iter() {
+            for (_, id) in cue_ranked.into_iter() {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = cue_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("cue metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2767,22 +2972,18 @@ pub fn search_entries(
             // Sort by RRF score descending and cap at limit.
             // With MMR enabled, keep a 2×limit pool so diversification has
             // candidates to swap in; the final truncate happens after MMR.
-            entries.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let pool = if opts.mmr_lambda > 0.0 {
-                opts.limit.saturating_mul(2)
+            entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
+            let pool = if effective_opts.mmr_lambda > 0.0 {
+                effective_opts.limit.saturating_mul(2)
             } else {
-                opts.limit
+                effective_opts.limit
             };
             entries.truncate(pool);
 
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
             // preserve byte-identical behavior with pre-recency-bias code.
-            if opts.recency_lambda != 0.0 && !entries.is_empty() {
+            if effective_opts.recency_lambda != 0.0 && !entries.is_empty() {
                 let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
                 let placeholders: String = (1..=ids.len())
                     .map(|i| format!("?{}", i))
@@ -2810,7 +3011,7 @@ pub fn search_entries(
                                         (secs / 86400.0).max(0.0)
                                     })
                                     .unwrap_or(0.0);
-                                    let decay = (-opts.recency_lambda * days).exp();
+                                    let decay = (-effective_opts.recency_lambda * days).exp();
                                     (id, decay)
                                 })
                                 .collect()
@@ -2823,28 +3024,30 @@ pub fn search_entries(
                     entry.score *= decay;
                 }
                 // Re-sort: multiplication may change relative order.
-                entries.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
             }
 
             // MMR diversification pass (Memora pickup .6): greedy re-rank of
             // the pool penalizing similarity to already-selected results, then
             // cut to limit. Scores and score_kind are left untouched — MMR
             // changes ORDER and MEMBERSHIP, not the relevance signal.
-            if opts.mmr_lambda > 0.0 && entries.len() > 1 {
+            if effective_opts.mmr_lambda > 0.0 && entries.len() > 1 {
                 // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
                 // similarity REWARD, actively clustering duplicates.
-                mmr_rerank(conn, &mut entries, opts.mmr_lambda.clamp(0.0, 1.0));
-                entries.truncate(opts.limit);
+                mmr_rerank(
+                    conn,
+                    &mut entries,
+                    effective_opts.mmr_lambda.clamp(0.0, 1.0),
+                );
+                entries.truncate(effective_opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
-            for (sim, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit)
-            {
+            for (sim, id) in candidates.into_iter().take(effective_opts.limit) {
+                let (path, summary, content, tags, updated_at) = semantic_meta
+                    .get(&id)
+                    .cloned()
+                    .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                 entries.push(SearchEntry {
                     id,
                     path,
@@ -2917,19 +3120,16 @@ pub fn search_entries(
     // (config::Paths::root) instead of relying on a CWD-based `.git` walk,
     // which could silently disagree with the root `add`/`cite` hash evidence
     // against (e.g. inside a nested checkout). See docs/decisions/b3-root-derivation.md.
-    let repo_root: Option<PathBuf> = opts.repo_root.clone();
+    let repo_root: Option<PathBuf> = effective_opts.repo_root.clone();
 
-    let verify_count = opts.inline_verify_k.min(entries.len());
+    let verify_count = effective_opts.inline_verify_k.min(entries.len());
 
     // br-improvement-catalog-23b.13: bounded scoped pool.
     // ADR-C: explicit std::thread, not rayon.
     //
     // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
     // min(1) guards against systems returning 0 physical CPUs.
-    let pool_size = opts
-        .verify_pool_size
-        .unwrap_or_else(num_cpus::get_physical)
-        .max(1);
+    let pool_size = effective_opts.verify_pool_size.unwrap_or(1);
 
     // --- Phase 1: pre-collect per-entry evidence and byte-budget state ---
     // We need to move ev_rows out of evidence_map before the thread::scope so
@@ -2998,6 +3198,19 @@ pub fn search_entries(
 
     // --- Phase 3: run all verification tasks through the bounded pool ---
     let total_tasks = flat_tasks.len();
+    #[cfg(test)]
+    record_search_runtime_stats(SearchRuntimeStats {
+        effective_limit: effective_opts.limit,
+        effective_inline_verify_k: effective_opts.inline_verify_k,
+        effective_verify_pool_size: pool_size,
+        scheduled_verification_tasks: total_tasks,
+        spawned_verify_workers: if total_tasks > 0 { pool_size } else { 0 },
+        semantic_materialized_rows: semantic_materialized.0,
+        semantic_materialized_bytes: semantic_materialized.1,
+        cue_materialized_rows: cue_materialized.0,
+        cue_materialized_bytes: cue_materialized.1,
+    });
+
     let mut outcomes_flat: Vec<VerificationOutcome> = vec![
         VerificationOutcome {
             status: VerificationStatus::Unverified,
@@ -3017,8 +3230,9 @@ pub fn search_entries(
         // both channels are bounded and the main thread sends work while workers
         // try to enqueue results.
         //
-        // Total result count is bounded externally: at most
-        // MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY (br-h9g security I2).
+        // Total result count here is bounded by the requested verify set:
+        // verify_count * MAX_EVIDENCE_ROWS_PER_ENTRY, where
+        // verify_count = min(opts.inline_verify_k, entries.len()).
         let work_chan_cap = (pool_size * 2).max(1);
         std::thread::scope(|scope| {
             let (tx_work, rx_work) =
@@ -3119,10 +3333,29 @@ pub fn search_entries(
     Ok(entries)
 }
 
+/// Search plus the number of corrupt embedding blobs observed by this call.
+pub fn search_entries_with_stats(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    opts: &SearchOptions,
+) -> Result<(Vec<SearchEntry>, SearchStats)> {
+    let before = crate::models::corrupt_embedding_count();
+    let entries = search_entries(conn, embedder, query, opts)?;
+    let after = crate::models::corrupt_embedding_count();
+    Ok((
+        entries,
+        SearchStats {
+            corrupt_embeddings: after.saturating_sub(before),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use proptest::prelude::*;
     use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -3146,6 +3379,47 @@ mod tests {
         assert!(
             matches!(err, SqlError::InvalidPath(ref p) if *p == paths.db),
             "open_auxiliary must refuse a live repository db path, got: {err:?}"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ranking_total_order_and_shuffle_invariant(seed in any::<u64>()) {
+            use rand::{seq::SliceRandom, SeedableRng};
+            let original = vec![(f32::NAN,"nan"),(f32::INFINITY,"inf"),(f32::NEG_INFINITY,"neg-inf"),(-0.0,"a-zero"),(0.0,"b-zero"),(1.0,"one-a"),(1.0,"one-b")];
+            let mut expected = original.clone();
+            expected.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+            let expected_bytes = expected.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+            // Semantic, cue, RRF, post-recency, expansion and MMR argmax all
+            // delegate to this same ordering contract.
+            for lane in 0..6 {
+                let mut shuffled = original.clone();
+                shuffled.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed ^ lane));
+                shuffled.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+                let actual = shuffled.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+                prop_assert_eq!(&actual, &expected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_zero_ties_match_sql_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ranked(id TEXT, score REAL); INSERT INTO ranked VALUES('b',0.0),('a',-0.0);").unwrap();
+        let sql: Vec<String> = conn
+            .prepare("SELECT id FROM ranked ORDER BY score DESC,id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut rust = vec![(-0.0, "a"), (0.0, "b")];
+        rust.sort_by(|a, b| compare_rank(a.0, a.1, b.0, b.1));
+        assert_eq!(
+            sql,
+            rust.into_iter()
+                .map(|x| x.1.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3207,6 +3481,20 @@ mod tests {
         }
     }
 
+    fn seed_path_prefix_search_corpus(conn: &Connection, rows: &[(&str, &str)]) {
+        let embedder = NoopEmbedder;
+        for (id, path) in rows {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": path, "summary": "pathprefixneedle",
+                "content": "pathprefixneedle body", "tags": [],
+                "kind": "observation", "evidence_status": "missing",
+                "is_stale": false, "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(conn, &embedder, &event).unwrap();
+        }
+    }
+
     fn single_fetch_opts(do_fts: bool, do_semantic: bool, recency_lambda: f32) -> SearchOptions {
         SearchOptions {
             limit: 10,
@@ -3220,6 +3508,281 @@ mod tests {
             recency_lambda,
             mmr_lambda: 0.0,
         }
+    }
+
+    /// Post-S1/pre-P1 ordered-id baseline consumed by bd-21ef.3.12.
+    #[test]
+    fn post_s1_pre_p1_ordering_baseline() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let ids: Vec<String> = search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+        assert_eq!(ids, ["rank-a", "rank-b", "rank-c"]);
+    }
+
+    #[test]
+    fn p1_ordering_baseline_is_byte_identical_in_hybrid_and_semantic_modes() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        for (do_fts, expected) in [
+            (true, vec!["rank-a", "rank-b", "rank-c"]),
+            (false, vec!["rank-a", "rank-b", "rank-c"]),
+        ] {
+            let rows = search_entries(
+                &conn,
+                &SearchTestEmbedder,
+                "sealedwaiver",
+                &single_fetch_opts(do_fts, true, 0.0),
+            )
+            .unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, expected);
+            let actual_bytes: Vec<(String, u32, &'static str, &'static str)> = rows
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits(), row.source, row.score_kind))
+                .collect();
+            let expected_bytes = if do_fts {
+                vec![
+                    (
+                        "rank-a".into(),
+                        (1.0f32 / 61.0 + 1.0 / 61.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-b".into(),
+                        (1.0f32 / 62.0 + 1.0 / 62.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-c".into(),
+                        (1.0f32 / 63.0).to_bits(),
+                        "semantic",
+                        "rrf",
+                    ),
+                ]
+            } else {
+                vec![
+                    ("rank-a".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                    ("rank-b".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                    ("rank-c".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                ]
+            };
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn p1_metadata_materialization_is_bounded_to_twice_limit_per_lane() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let cue_blob = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        for id in ["rank-a", "rank-b", "rank-c"] {
+            conn.execute(
+                "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1, ?2, ?3)",
+                params![id, format!("cue-{id}"), &cue_blob],
+            )
+            .unwrap();
+        }
+        let mut opts = single_fetch_opts(true, true, 0.0);
+        opts.limit = 1;
+        search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+        assert_eq!(stats.semantic_materialized_rows, 2);
+        assert_eq!(stats.cue_materialized_rows, 2);
+    }
+
+    #[test]
+    fn semantic_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute("UPDATE entries_emb SET embedding = 7 WHERE rowid = (SELECT rowid FROM entries WHERE id='rank-a')", []).unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-a','best',7)",
+            [],
+        )
+        .unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_keeps_best_cue_per_entry() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let best = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','best',?1)",
+            [&best],
+        )
+        .unwrap();
+        let opts = single_fetch_opts(true, true, 0.0);
+        let before: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        let worse = f32s_to_blob(&[-0.9, (1.0_f32 - 0.9 * 0.9).sqrt()]);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','worse',?1)",
+            [&worse],
+        )
+        .unwrap();
+        let after: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        assert_eq!(
+            after, before,
+            "an inferior extra cue must not replace the entry's best cue"
+        );
+    }
+
+    #[test]
+    #[ignore = "10k materialization measurement; run explicitly on the host"]
+    fn p1_materialization_measurement_10k() {
+        let conn = open_db_memory().unwrap();
+        let embedder = crate::bench_fixture::BenchEmbedder::new(crate::bench_fixture::DEFAULT_SEED);
+        crate::bench_fixture::seed_db(&conn, &embedder, 10_000, crate::bench_fixture::DEFAULT_SEED)
+            .unwrap();
+        for (lane, do_fts) in [("semantic", false), ("cue", true)] {
+            let mut opts = single_fetch_opts(do_fts, true, 0.0);
+            opts.limit = 100;
+            search_entries(&conn, &embedder, "architecture vector", &opts).unwrap();
+            let stats = take_search_runtime_stats();
+            eprintln!(
+                "{lane}: semantic_rows={} semantic_bytes={} cue_rows={} cue_bytes={}",
+                stats.semantic_materialized_rows,
+                stats.semantic_materialized_bytes,
+                stats.cue_materialized_rows,
+                stats.cue_materialized_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn parity_gate_compares_ordered_tie_run_past_limit() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[("tie-c", "t/c"), ("tie-a", "t/a"), ("tie-b", "t/b")],
+        );
+        let mut opts = single_fetch_opts(true, false, 0.0);
+        opts.limit = 1;
+        let v1 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::Contentless,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
+        let v2 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::ContentEntries,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
+        assert!(v1.len() > opts.limit, "the boundary tie must be extended");
+        assert_eq!(
+            v1.iter().map(|r| &r.0).collect::<Vec<_>>(),
+            v2.iter().map(|r| &r.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// 384-dim analogue of `SearchTestEmbedder`. The shared 2-element test
+    /// embedder round-trips its blobs through `decode_emb_blob`'s legacy-f32
+    /// branch (any 4-byte-multiple length, including a 2-element f16 blob's 4
+    /// bytes), which reinterprets the bytes as a *different-length* vector and
+    /// always mismatches the query embedding's length — every candidate scores
+    /// 0.0 regardless of corruption, which would mask the behavior this test
+    /// exists to check. Padding to `EMB_DIMS` makes the stored blob exactly
+    /// `EMB_BLOB_BYTES`, so it takes the canonical f16 decode path and produces
+    /// a genuine, differentiated cosine score.
+    struct FullDimEmbedder;
+
+    impl crate::components::embedder::Embedder for FullDimEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let first = if text.contains("rank-c") {
+                0.7
+            } else if text.contains("rank-b") {
+                0.8
+            } else {
+                0.9
+            };
+            let mut v = vec![0.0f32; EMB_DIMS];
+            v[0] = first;
+            v[1] = (1.0_f32 - first * first).sqrt();
+            Ok(v)
+        }
+
+        fn is_noop(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn nan_blob_is_zero_scored_and_reported_in_search_stats() {
+        let conn = open_db_memory().unwrap();
+        for (id, summary) in [
+            ("rank-a", "sealedwaiver sealedwaiver rank-a"),
+            (
+                "rank-b",
+                "sealedwaiver rank-b with deliberately longer filler text",
+            ),
+            ("rank-c", "semantic-only rank-c"),
+        ] {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": format!("tests/{id}.md"), "summary": summary,
+                "content": "fixed corpus", "tags": [], "kind": "observation",
+                "evidence_status": "missing", "is_stale": false,
+                "ts": "2999-01-01 00:00:00"
+            });
+            apply_event(&conn, &FullDimEmbedder, &event).unwrap();
+        }
+        let blob = f32s_to_blob(&[f32::NAN, 1.0]);
+        conn.execute("UPDATE entries_emb SET embedding=?1 WHERE rowid=(SELECT rowid FROM entries WHERE id='rank-a')", [blob]).unwrap();
+        let (rows, stats) = search_entries_with_stats(
+            &conn,
+            &FullDimEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0),
+        )
+        .unwrap();
+        assert!(stats.corrupt_embeddings > 0);
+        assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
+        assert_eq!(rows.last().map(|r| r.score), Some(0.0));
     }
 
     #[test]
@@ -3292,6 +3855,95 @@ mod tests {
                 "every {mode} result must carry updated_at from its retrieval lane"
             );
         }
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_backslash() {
+        assert_eq!(like_prefix_pattern(r"src\dir"), r"src\\dir");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_percent() {
+        assert_eq!(like_prefix_pattern("src/%"), r"src/\%");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_underscore() {
+        assert_eq!(like_prefix_pattern("src/_"), r"src/\_");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_mixed_meta_chars() {
+        assert_eq!(like_prefix_pattern(r"src\_%\mix"), r"src\\\_\%\\mix");
+    }
+
+    #[test]
+    fn test_search_path_prefix_matches_literal_underscore_prefix_only() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-percent", "src/%y"),
+            ],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/_".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let ids: Vec<String> = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["pp-under".to_string()],
+            "path_prefix=src/_ must match only the literal underscore prefix"
+        );
+    }
+
+    #[test]
+    fn test_search_path_prefix_percent_is_literal_and_can_return_empty() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-doc", "docs/%y"),
+            ],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/%".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let rows = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts).unwrap();
+
+        assert!(
+            rows.is_empty(),
+            "path_prefix=src/% must not expand to every src/* path"
+        );
     }
 
     fn seed_entry_row(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
@@ -4866,6 +5518,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_fetch_evidence_for_entries_propagates_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "decode-host", "path": "src/decode.rs", "summary": "decode host",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, 'sha256:test', '2024-01-01T00:00:00Z')",
+            params![
+                "ev-decode-bad",
+                "decode-host",
+                rusqlite::types::Value::Blob(vec![0x80, 0x81, 0x82]),
+            ],
+        )
+        .unwrap();
+
+        let result = fetch_evidence_for_entries(&conn, &["decode-host".to_string()]);
+        assert!(
+            result.is_err(),
+            "corrupt evidence rows must surface as Err, never be dropped as absent"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // br-23b.12: batch evidence fetch order-equivalence.
     //
@@ -6108,6 +6791,122 @@ mod tests {
              pool_size={pool_size}, allowed={allowed}. \
              Old unbounded code peaks at 50+ threads (one per evidence row)."
         );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_limit_and_inline_verify_k_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        for i in 0..(MAX_LIMIT + 5) {
+            let entry_id = format!("caps-entry-{i:03}");
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": entry_id,
+                "path": format!("src/caps_{i}.rs"),
+                "summary": "boundary clamp needle",
+                "content": format!("content {i}"),
+                "tags": ["caps"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+            for j in 0..2usize {
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', 'sha256:caps', ?3)",
+                    params![
+                        format!("caps-ev-{i:03}-{j:02}"),
+                        format!("caps-entry-{i:03}"),
+                        format!("2024-01-01T00:00:{:02}Z", j)
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let opts = SearchOptions {
+            limit: 10_000,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10_000,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 10),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let results = search_entries(&conn, &embedder, "boundary clamp needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(
+            results.len(),
+            MAX_LIMIT,
+            "limit must be clamped at the boundary"
+        );
+        assert_eq!(stats.effective_limit, MAX_LIMIT);
+        assert_eq!(stats.effective_inline_verify_k, MAX_INLINE_VERIFY_K);
+        assert_eq!(
+            stats.scheduled_verification_tasks,
+            MAX_LIMIT * 2,
+            "scheduled verification tasks must be clamped to limit × evidence rows per returned entry"
+        );
+        assert_eq!(
+            stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE,
+            "worker count must use the clamped verify pool size"
+        );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_verify_pool_size_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "pool-cap-entry",
+            "path": "src/pool_cap.rs",
+            "summary": "pool cap needle",
+            "content": "pool cap body",
+            "tags": ["pool-cap"],
+            "kind": "observation",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+             VALUES('pool-cap-ev', 'pool-cap-entry', 'code', 'sha256:pool', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let opts = SearchOptions {
+            limit: 1,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 1,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 500),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let _results = search_entries(&conn, &embedder, "pool cap needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(stats.effective_verify_pool_size, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.scheduled_verification_tasks, 1);
     }
 
     #[test]

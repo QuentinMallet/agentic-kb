@@ -5,6 +5,7 @@ use crate::commands::add::make_embedder;
 use crate::commands::add_validation::compute_evidence_status_write;
 use crate::components::{kb_core, redactor, text_chunker};
 use crate::config;
+use crate::models::cosine_similarity;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::{params, OptionalExtension};
@@ -109,6 +110,10 @@ pub fn run(
         .iter()
         .map(|p| embedder.embed(p))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        embeddings.iter().flatten().all(|x| x.is_finite()),
+        "embedder returned a non-finite component"
+    );
 
     // Step 5: greedy cosine deduplication — keep first, drop subsequent near-duplicates.
     let cutoff = config.compress_cosine_cutoff;
@@ -121,7 +126,7 @@ pub fn run(
             if !keep[j] {
                 continue;
             }
-            if cosine_similarity(&embeddings[i], &embeddings[j]) > cutoff {
+            if is_near_duplicate(&embeddings[i], &embeddings[j], cutoff) {
                 keep[j] = false;
             }
         }
@@ -227,19 +232,8 @@ pub fn run(
     Ok(())
 }
 
-/// Compute cosine similarity between two f32 vectors.
-/// Returns 0.0 when either vector is zero-length or empty.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
+fn is_near_duplicate(a: &[f32], b: &[f32], cutoff: f32) -> bool {
+    cosine_similarity(a, b) > cutoff
 }
 
 #[cfg(test)]
@@ -373,6 +367,11 @@ mod tests {
     }
 
     #[test]
+    fn nan_embedding_is_not_promoted_by_compress_cutoff() {
+        assert!(!is_near_duplicate(&[f32::NAN, 1.0], &[1.0, 1.0], 0.9));
+    }
+
+    #[test]
     fn test_compress_propagates_evidence_row_decode_failure() {
         let dir = tempdir().unwrap();
         let (paths, conn) = db::test_db(dir.path());
@@ -436,6 +435,10 @@ mod tests {
     #[test]
     fn test_compress_strands_no_evidence_on_expired_entry_id() {
         let dir = tempdir().unwrap();
+        // add_locked resolves + re-verifies citation_path against a real repo
+        // file under the flock when carrying evidence into the new entry.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), b"12345\n").unwrap();
         let paths = make_paths(dir.path());
         let conn = db::open_db(&paths.db).unwrap();
         let emb = NoopEmbedder;
@@ -445,11 +448,20 @@ mod tests {
             "path": "docs/compress-gc", "summary": "entry", "content": content,
             "tags": [], "kind": "belief", "ts": "2024-01-01T00:00:00Z"
         });
+        // add_locked re-verifies the caller-supplied citation_hash against the
+        // real file when compress carries this evidence into the new entry,
+        // so the seeded hash must actually match "src/lib.rs" bytes 1-2.
+        let real_hash = crate::components::verification::compute_citation_hash(
+            dir.path(),
+            "src/lib.rs",
+            Some((1, 2)),
+        )
+        .unwrap();
         let evidence = serde_json::json!({
             "action": "evidence_add", "table": "evidence", "entry_id": "compress-old",
             "evidence": {
                 "id": "compress-old-ev", "kind": "code",
-                "citation_path": "src/lib.rs:1-2", "citation_hash": "sha256:ok"
+                "citation_path": "src/lib.rs:1-2", "citation_hash": real_hash
             }
         });
         // Through the applied-cursor writer, so the log exists and matches: a

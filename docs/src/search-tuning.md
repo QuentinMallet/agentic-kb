@@ -46,6 +46,14 @@ Recency bias adds a single batch SELECT on ≤ `limit` IDs after RRF. Measured o
 
 ### Federation (Multi-Peer Search)
 
+Under federation, `--limit` is a global cap across the local repository and all
+peers, not a per-repository cap. Results are merged and truncated once.
+
+Cross-repository ordering is by within-repository rank position with a
+deterministic `origin_repo`/entry-ID tie-break. It is not a comparison of
+absolute relevance between repositories: repositories can have different corpus
+sizes, and their RRF scores describe rank positions within those corpora.
+
 When `--peers` is set, `recency_lambda` is forced to `0.0` regardless of `kb.toml`. Each peer has its own clock; applying per-peer decay would make cross-peer scores incomparable. A warning is logged when `λ > 0` and peers are configured:
 
 ```

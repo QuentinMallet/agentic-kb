@@ -22,12 +22,21 @@ use std::path::Path;
 /// (`cursor::append_and_apply`) migrated several production and test call
 /// sites off `open_db` as it landed) without ever exceeding 74.
 ///
-/// Lowered 74 -> 69 here: this commit's own convergence-gate fix is the last
-/// piece of C1's D3 write-helper migration to land, and the real count has
-/// settled at 69 by this point — the same net drop from L1b's 72 that C1's
-/// rebase produces overall, once D3's migration off `open_db` outweighs the
-/// D4/D1 test fixtures that pushed the ceiling up in the first place.
-const OPEN_DB_CALLSITE_RATCHET: usize = 69;
+/// Lowered 74 -> 69 by C1's convergence-gate fix, the last piece of C1's D3
+/// write-helper migration to land — the same net drop from L1b's 72 that
+/// C1's rebase produces overall, once D3's migration off `open_db`
+/// outweighs the D4/D1 test fixtures that pushed the ceiling up in the
+/// first place.
+///
+/// Bumped 69 -> 70 when bd-21ef.3 (C3) rebased onto that aggregator tip:
+/// S3a's new
+/// `test_handle_provenance_is_deterministic_across_parent_insertion_order`
+/// test fixture in `src/commands/mcp.rs` opens its temp db with
+/// `db::open_db(&paths.db)`, matching every other test fixture in that file
+/// (only production handlers were migrated to `open_ro`/`open_rw`). Test
+/// convention, not new legacy debt in production code paths. Recounted
+/// directly against the post-rebase tree (70 call sites).
+const OPEN_DB_CALLSITE_RATCHET: usize = 70;
 
 fn src_rs_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
