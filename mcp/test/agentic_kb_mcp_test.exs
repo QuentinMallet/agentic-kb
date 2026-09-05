@@ -595,6 +595,18 @@ defmodule AgenticKbMcpTest do
       assert text =~ "score=0.91"
     end
 
+    # IMPORTANT (premium review of bd-21ef.2..bd-21ef.2.12b): `Map.get(resp,
+    # "similar_existing", [])` only supplies its default when the key is
+    # ABSENT — an explicit JSON `null` (a real possibility once similar_existing
+    # is derived from a Rust `Option`) makes `Map.get` return `nil`, and
+    # `Enum.map_join(nil, ...)` raises `Protocol.UndefinedError`.
+    test "kb_add renders fine when similar_existing is an explicit null" do
+      response = %{"type" => "ok", "entry_id" => "new-1", "similar_existing" => nil}
+      %{"content" => [%{"text" => text}]} = McpServer.render_result(response)
+
+      assert text == "Added entry new-1."
+    end
+
     test "every dispatched Rust success shape has a specific renderer" do
       for {method, shapes} <- @response_shapes,
           {shape, index} <- Enum.with_index(shapes) do

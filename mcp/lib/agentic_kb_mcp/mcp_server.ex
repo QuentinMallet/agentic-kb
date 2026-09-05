@@ -937,8 +937,7 @@ defmodule AgenticKbMcp.McpServer do
 
       %{"type" => "ok", "entry_id" => entry_id} = resp ->
         similar =
-          resp
-          |> Map.get("similar_existing", [])
+          (resp["similar_existing"] || [])
           |> Enum.map_join("\n", fn entry ->
             "- id=#{entry["id"]} path=#{entry["path"]} summary=#{entry["summary"]} score=#{entry["score"]}"
           end)
