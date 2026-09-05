@@ -1,6 +1,6 @@
 //! `peers` subcommand — manage peer repo graph edges
 
-#![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
+use crate::commands::add::acquire_lock;
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -98,7 +98,8 @@ impl PeersAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let source_repo = detect_source_repo(&paths.db);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -191,7 +192,7 @@ impl Runnable for PeersList {
 impl PeersList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         let source_repo = detect_source_repo(&paths.db);
 
         let rows = query_peers_for_repo(&conn, &source_repo, self.graph_type.as_deref())?;
@@ -223,7 +224,8 @@ impl Runnable for PeersRemove {
 impl PeersRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
         conn.execute("DELETE FROM peers WHERE id=?1", params![self.peer_id])?;
 
@@ -260,7 +262,7 @@ impl Runnable for PeersShow {
 impl PeersShow {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
 
         // Try as-is and canonicalized path.
         let canonical = std::fs::canonicalize(&self.repo_path)
@@ -428,7 +430,8 @@ impl PeersImport {
         let entries: Vec<PeerSeedEntry> = serde_json::from_slice(&file_bytes)
             .with_context(|| format!("parse seeds file: {}", self.seeds_file))?;
 
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut added = 0usize;
 
@@ -579,7 +582,8 @@ impl PeersEdgeAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let expires_at: Option<String> = if let Some(days) = self.ttl_days {
@@ -670,7 +674,7 @@ impl Runnable for PeersEdgeList {
 impl PeersEdgeList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
 
         let sql = "SELECT p.id, p.source_repo, p.target_repo, \
                    g.graph_type, p.epic_slug, p.created_at, p.expires_at \
@@ -732,7 +736,8 @@ impl Runnable for PeersEdgeRemove {
 impl PeersEdgeRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
         conn.execute("DELETE FROM peers WHERE id=?1", params![self.edge_id])?;
 
@@ -769,7 +774,8 @@ impl Runnable for PeersEdgeCleanupEpic {
 impl PeersEdgeCleanupEpic {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
         conn.execute("DELETE FROM peers WHERE epic_slug = ?1", params![self.slug])?;
 

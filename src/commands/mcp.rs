@@ -2349,7 +2349,11 @@ fn handle_kb_peers_add(req: &PeersAddRequest, paths: &config::Paths) -> Value {
         Err(e) => return parse_error(id, e),
     };
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2421,7 +2425,7 @@ fn handle_kb_peers_list(req: &PeersListRequest, paths: &config::Paths) -> Value 
     let id = &req.id;
     let graph_type_filter: Option<String> = req.graph_type.clone();
 
-    let conn = match db::open_db(&paths.db) {
+    let conn = match db::open_ro(&paths.db) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2468,7 +2472,11 @@ fn handle_kb_peers_remove(req: &PeersRemoveRequest, paths: &config::Paths) -> Va
     let id = &req.id;
     let peer_id = req.peer_id.clone();
 
-    let conn = match db::open_db(&paths.db) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
+    let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
