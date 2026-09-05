@@ -42,8 +42,8 @@ Start-time parallelism rises from 2 to 4. Before the waiver, all nine implementa
 
 Required at post-impl (`bd-21ef.3.14`) per the AGENTS.md TLA+ gate override clause:
 
-- [ ] code-reviewer confirms S3a, S3b and S4 introduced no state-machine logic, no event write, and no lock acquisition.
-- [ ] analyst confirms `CitationRelocation.tla` (as amended by T0) still covers every modified path, and that no invariant of it is reachable from the three waived tasks.
+- [x] code-reviewer confirms S3a, S3b and S4 introduced no state-machine logic, no event write, and no lock acquisition.
+- [x] analyst confirms `CitationRelocation.tla` (as amended by T0) still covers every modified path, and that no invariant of it is reachable from the three waived tasks.
 
 If either reviewer disagrees, the waiver is withdrawn for the disputed task and the T0 edge is restored before merge.
 
@@ -55,3 +55,16 @@ If either reviewer disagrees, the waiver is withdrawn for the disputed task and 
 - `.state/.omc/plans/open-questions.md` — C3-Q7, where the waiver was requested and granted.
 - `.state/agent-kb/tla/decisions/stale-check-no-spec.md` — the earlier waiver this follows in form.
 - C2's equivalent waiver for its lock contract (`bd-21ef.2.2`, `T1`) — the precedent the lead cited.
+
+## Sign-off record (2026-09-05)
+
+**Code-reviewer pass** (opus code-reviewer agent, `rev-waiver-c3`): S3a, S3b and S4 each
+**CONFIRMED** to introduce no state-machine logic, no event write, and no lock acquisition.
+**Verdict: SIGN-OFF GRANTED.** Caveat: `kb context`'s pre-existing
+`query_hits::record_injection` telemetry write predates S3b and is not repository state;
+noted for the record in case the gate is later read as the stricter "writes no file at all".
+Full report: `signoffs/c3-waiver-reviewer-2026-09-05.md`.
+
+**Analyst pass** (opus analyst agent, `audit-waiver-c3`): **SIGN-OFF GRANTED.**
+`CitationRelocation.tla` as amended by T0 covers every modified path, and no invariant of it
+is reachable from the three waived tasks. Full report: `signoffs/c3-waiver-analyst-2026-09-05.md`.
