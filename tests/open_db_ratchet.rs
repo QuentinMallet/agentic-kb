@@ -59,6 +59,12 @@ fn open_db_callsites_do_not_increase() {
 /// do, say) does not itself trip the gate. A `//` immediately preceded by
 /// `:` is treated as part of a `scheme://` URL rather than a comment
 /// introducer, so doc comments that link to something don't get truncated.
+///
+/// Known limitation: this is a line-based heuristic, not a lexer, so a `//`
+/// inside a string literal (e.g. a raw-string test fixture) is still
+/// treated as a comment introducer and truncates the rest of the line. That
+/// can only hide an offender inside a string, never manufacture a false
+/// one, and no such case exists in this codebase today.
 fn strip_line_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
