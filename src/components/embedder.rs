@@ -202,3 +202,99 @@ mod tests {
         assert!(!embedder.is_loaded());
     }
 }
+
+/// An embedder whose vectors were all resolved before a write transaction
+/// opened (C1/D3).
+///
+/// `apply_event` embeds inside its savepoint — entry text plus up to eight
+/// cues. Wrapping a batch in one outer transaction would otherwise hold a
+/// SQLite write transaction across up to nine model calls: hundreds of
+/// milliseconds, a growing WAL, and a worse busy-checkpoint problem for the
+/// rebuild swap.
+///
+/// [`PrefetchedEmbedder::seal`] is called immediately after `BEGIN`. After
+/// that a cache miss is a loud error rather than a silent model call, so "no
+/// write transaction is held across an embedder call" is enforced rather than
+/// documented.
+pub struct PrefetchedEmbedder<'a> {
+    inner: &'a dyn Embedder,
+    cache: std::collections::HashMap<String, std::result::Result<Vec<f32>, String>>,
+    sealed: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> PrefetchedEmbedder<'a> {
+    /// Resolve every text the caller expects to need. A no-op embedder skips
+    /// the work entirely — `apply_event` never calls it.
+    ///
+    /// Fails fast: on the write path an embedder outage must abort *before*
+    /// the log is appended, so no gap is created in the first place.
+    pub fn prefetch(inner: &'a dyn Embedder, texts: Vec<String>) -> Result<Self> {
+        let mut cache = std::collections::HashMap::new();
+        if !inner.is_noop() {
+            for text in texts {
+                if !cache.contains_key(&text) {
+                    let vector = inner.embed(&text)?;
+                    cache.insert(text, Ok(vector));
+                }
+            }
+        }
+        Ok(Self {
+            inner,
+            cache,
+            sealed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// [`Self::prefetch`], but a failure is recorded and re-raised from
+    /// `embed` instead of aborting the prefetch.
+    ///
+    /// Recovery needs this: the log is already durable, so a record that can
+    /// never be embedded has to reach `apply_event` and fail *there*, where the
+    /// poison policy can count the attempt and eventually quarantine it. Failing
+    /// during the prefetch would instead brick every entry point, which is the
+    /// exact outcome the policy exists to prevent (D3, Principle 4).
+    pub fn prefetch_deferring_errors(inner: &'a dyn Embedder, texts: Vec<String>) -> Self {
+        let mut cache = std::collections::HashMap::new();
+        if !inner.is_noop() {
+            for text in texts {
+                if !cache.contains_key(&text) {
+                    let resolved = inner.embed(&text).map_err(|e| e.to_string());
+                    cache.insert(text, resolved);
+                }
+            }
+        }
+        Self {
+            inner,
+            cache,
+            sealed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Forbid any further call into the wrapped embedder.
+    pub fn seal(&self) {
+        self.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Embedder for PrefetchedEmbedder<'_> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        match self.cache.get(text) {
+            Some(Ok(vector)) => return Ok(vector.clone()),
+            Some(Err(message)) => anyhow::bail!("{message}"),
+            None => {}
+        }
+        if self.sealed.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!(
+                "embedder called while the applied-cursor transaction is open: no vector was \
+                 pre-resolved for {:?}. Every text apply_event needs must be resolved before \
+                 BEGIN (C1/D3).",
+                text.chars().take(60).collect::<String>()
+            );
+        }
+        self.inner.embed(text)
+    }
+
+    fn is_noop(&self) -> bool {
+        self.inner.is_noop()
+    }
+}

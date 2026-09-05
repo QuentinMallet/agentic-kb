@@ -2,7 +2,7 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::acquire_lock;
-use crate::components::events;
+use crate::components::{events, fsync::sync_parent_dir};
 use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Context;
@@ -11,10 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-
-/// Maximum number of `run_history` events to retain after compaction.
-/// Older records beyond this tail are purged.
-const RUN_HISTORY_CAP: usize = 500;
 
 /// Persistent state for the compact command (JSON-serialized alongside the event log).
 ///
@@ -87,9 +83,51 @@ impl Compact {
         vacuum_cfg: &VacuumConfig,
     ) -> anyhow::Result<(usize, usize)> {
         let lock = acquire_lock(&paths.lock)?;
-        {
-            let conn = crate::components::db::open_rw(paths, &lock)?;
-            crate::components::db::sweep_expired_peers(&conn)?;
+        // Compaction rewrites the log of record and bumps its generation, so it
+        // is a write and takes the same gate as one (C1/D3). Proceeding while
+        // the database is not converged would turn a deferral into a generation
+        // mismatch: the deferral says nobody can tell what the log holds, and
+        // the bump would then assert that whatever survived the rewrite is the
+        // whole truth and force a full rebuild from it.
+        //
+        // Asymmetry with `kb add` (C1 notes): `kb add` and the other MCP
+        // mutating methods auto-recover first (`recover_if_needed`), so a
+        // database that is merely behind the log (D3 row 7, ReplayTail) is
+        // caught up and the write proceeds. `kb compact` does not go through
+        // `open_or_init`/`recover_if_needed` at entry, so the same row 7
+        // refuses here with "the database is behind the event log" instead of
+        // self-healing. Deliberate: compact is destructive to the log itself,
+        // so refusing and asking the caller to recover first (or run `kb
+        // rebuild`) is the safer default for this one write surface.
+        //
+        // `read_events` below only catches one of the four Defer causes, and
+        // only after the lock is held; this catches all four plus a missing log.
+        // Also gates the locked peer sweep below: that sweep is itself a
+        // write, and must not proceed while the database is not converged.
+        //
+        // No database is the exemption both share: nothing has been
+        // materialized from this log yet, so a rewrite cannot orphan
+        // anything, and there is nothing to sweep. Critically, this must NOT
+        // fall through to `open_rw` in that case — `open_rw` creates the
+        // schema when absent, and compact must stay a pure log rewrite when
+        // no database exists (a fresh clone's log, compacted before its first
+        // build, must not spontaneously materialize a database as a
+        // side effect of the peer sweep).
+        match crate::components::db::open_ro(&paths.db) {
+            Ok(conn) => {
+                let decision = crate::components::cursor::inspect(&conn, paths);
+                if decision.blocks_writes() {
+                    return Err(crate::components::cursor::NotConverged {
+                        reason: decision.describe(),
+                    }
+                    .into());
+                }
+                drop(conn);
+                let conn = crate::components::db::open_rw(paths, &lock)?;
+                crate::components::db::sweep_expired_peers(&conn)?;
+            }
+            Err(e) if crate::components::db::is_db_uninitialized(&e) => {}
+            Err(e) => return Err(e),
         }
         let read = events::read_events(&paths.events)?;
         let original_count = read.events.len();
@@ -219,9 +257,15 @@ impl Compact {
             retained_indices.push(i);
         }
 
-        // Run history: keep only the last RUN_HISTORY_CAP records (original order).
-        let run_start = run_indices.len().saturating_sub(RUN_HISTORY_CAP);
-        for i in run_indices[run_start..].iter().copied() {
+        // Run history: every run event is retained (D5.2 — the positional cap
+        // is removed outright, not shrunk). A cap made compaction NOT a
+        // materialization-preserving rewrite: DB rows for capped-away run
+        // events survived (apply_event's INSERT already ran) while the log
+        // could no longer reproduce them, so a rebuild silently diverged from
+        // a live DB (CompactMaterialize.tla CE5 / Critical 4). Retention here
+        // no longer bounds `run_history` growth; T3's keyed insertion (D5.1)
+        // bounds duplication instead.
+        for i in run_indices {
             retained_indices.push(i);
         }
 
@@ -281,7 +325,25 @@ impl Compact {
             }
             f.sync_data()?; // flush pages before rename to prevent truncation on crash
         }
+        // C1/D3: the log generation is bumped under the SAME lock as the
+        // rename, and BEFORE it. Compaction only removes lines, so a cursor
+        // whose bytes all survive still validates against the rewritten log and
+        // would replay the compacted tail onto a database that already holds
+        // the original tail — dropped orphan expires never re-applied, entries
+        // that should be stale staying live, no error. The generation makes
+        // that detection O(1) and total (CompactMaterialize.tla CE7).
+        //
+        // Bumping first is the safe order for a crash in this window: the log
+        // is still the pre-compaction one but reads as a newer generation, so
+        // recovery over-reports and costs one spurious rebuild. Bumping after
+        // the rename would leave a compacted log carrying its pre-compaction
+        // generation — the exact undetectable divergence the counter exists to
+        // catch.
+        let generation = crate::components::cursor::bump_generation(&paths.events)?;
+        crate::crash_sim::kill_point(crate::crash_sim::KillPoint::CompactAfterGenerationBump);
         fs::rename(&tmp, &paths.events)?;
+        sync_parent_dir(&paths.events)?;
+        eprintln!("compact: event log generation is now {generation}");
 
         // Optional VACUUM: fires AFTER the atomic rename so a crash during VACUUM
         // still leaves the compacted DB (already renamed into place) intact and readable.
@@ -362,6 +424,69 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    /// A crash between the generation bump and the rename must never leave a
+    /// compacted log carrying its pre-compaction generation — that is the one
+    /// state the counter cannot detect, and every later recovery would replay a
+    /// compacted tail onto a database holding the original one.
+    ///
+    /// Bumping first makes the crash window over-report instead: the log is
+    /// still pre-compaction but reads as a newer generation, which costs one
+    /// spurious rebuild and loses nothing.
+    #[test]
+    fn test_crash_between_generation_bump_and_rename_over_reports() {
+        use crate::components::cursor;
+        use std::process::Command;
+
+        if std::env::var("KB_COMPACT_CRASH_ROOT").is_ok() {
+            let root = std::env::var("KB_COMPACT_CRASH_ROOT").unwrap();
+            let paths = Paths::from_root(std::path::Path::new(&root));
+            let _ = Compact.execute_with_paths(&paths);
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        for i in 0..3 {
+            let ev = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": "e1", "path": "a.rs", "summary": format!("v{i}"),
+                "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+            });
+            append_event(&paths.events, &ev).unwrap();
+        }
+        let before_bytes = fs::read(&paths.events).unwrap();
+        let before_generation = cursor::read_generation(&paths.events);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("test_crash_between_generation_bump_and_rename_over_reports")
+            .arg("--nocapture")
+            .env("KB_COMPACT_CRASH_ROOT", root)
+            .env(
+                "KB_CRASH_AFTER",
+                crate::crash_sim::KillPoint::CompactAfterGenerationBump.as_str(),
+            )
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "the child did not reach the kill point"
+        );
+
+        assert_eq!(
+            fs::read(&paths.events).unwrap(),
+            before_bytes,
+            "the rename must not have happened"
+        );
+        assert_eq!(
+            cursor::read_generation(&paths.events),
+            before_generation + 1,
+            "the bump must be durable before the rename"
+        );
     }
 
     #[test]
@@ -541,20 +666,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_compact_run_history_capped() {
+    fn test_cmd_compact_run_history_uncapped_all_retained() {
+        // D5.2: the positional retention cap is removed outright, not
+        // shrunk. A cap made compaction NOT a materialization-preserving
+        // rewrite: DB rows for capped-away run events survived (apply_event
+        // already ran) while the log could no longer reproduce them
+        // (CompactMaterialize.tla CE5 / Critical 4). Well past the old
+        // RUN_HISTORY_CAP (500), every run event must still survive.
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
 
-        let over = RUN_HISTORY_CAP + 50;
-        for i in 0..over {
+        const OVER_OLD_CAP: usize = 550;
+        for i in 0..OVER_OLD_CAP {
             let ev = serde_json::json!({
                 "action": "insert", "table": "run_history",
-                // Encode insertion order in test_id so we can verify which
-                // records survive: the LAST RUN_HISTORY_CAP (oldest 50 trimmed).
                 "test_id": format!("{i}"), "result": "pass",
-                "ts": "2024-01-01T00:00:00Z"
+                "ts": "2024-01-01T00:00:00Z", "run_id": format!("run-{i}")
             });
             append_event(&paths.events, &ev).unwrap();
         }
@@ -564,51 +693,90 @@ mod tests {
         let after = events::read_events(&paths.events).unwrap();
         assert_eq!(
             after.events.len(),
-            RUN_HISTORY_CAP,
-            "compact must retain at most RUN_HISTORY_CAP run_history events"
-        );
-        // Verify the LAST RUN_HISTORY_CAP records are kept (oldest 50 trimmed).
-        assert_eq!(
-            after.events[0]["test_id"], "50",
-            "first retained must be event 50"
+            OVER_OLD_CAP,
+            "compaction must retain every run_history event, not a positional tail"
         );
         assert_eq!(
-            after.events[RUN_HISTORY_CAP - 1]["test_id"],
-            format!("{}", over - 1),
-            "last retained must be the most recent event"
+            after.events[0]["test_id"], "0",
+            "the oldest event, which the old cap would have trimmed, must survive"
+        );
+        assert_eq!(
+            after.events[OVER_OLD_CAP - 1]["test_id"],
+            format!("{}", OVER_OLD_CAP - 1),
+            "the newest event must survive"
         );
     }
 
     #[test]
-    fn test_cmd_compact_run_history_at_boundary_not_trimmed() {
-        // At exactly RUN_HISTORY_CAP events, no records should be trimmed.
-        // Guards against an off-by-one in the saturating_sub slice direction.
+    fn test_cmd_compact_run_history_materialization_preserving() {
+        // CompactMaterialize.tla run 10 (Safety_Current), the direct
+        // statement of CE5: compaction must not change what the log
+        // materializes to. A test that only counts post-compaction rows
+        // passes under the old cap and must not be accepted as coverage —
+        // this rebuilds from both logs and compares run_history row-for-row.
+        // Both rebuilds replay through `open_db_memory` (foreign_keys=ON),
+        // so this also exercises the run_history -> test_cases FK: it must
+        // still hold after cap removal retains older run events.
+        use crate::components::db::{apply_event, open_db_memory};
+        use crate::components::embedder::NoopEmbedder;
+
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
         let paths = Paths::from_root(root);
 
-        for i in 0..RUN_HISTORY_CAP {
+        let test_case = serde_json::json!({
+            "action": "upsert", "table": "test_cases",
+            "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
+            "config": "{}", "ts": "2024-01-01T00:00:00Z"
+        });
+        append_event(&paths.events, &test_case).unwrap();
+
+        const RUNS: usize = 501; // old RUN_HISTORY_CAP (500) + 1
+        for i in 0..RUNS {
             let ev = serde_json::json!({
                 "action": "insert", "table": "run_history",
-                "test_id": format!("{i}"), "result": "pass",
-                "ts": "2024-01-01T00:00:00Z"
+                "test_id": "t1", "result": "pass",
+                "ts": "2024-01-01T00:00:00Z", "run_id": format!("run-{i}")
             });
             append_event(&paths.events, &ev).unwrap();
         }
 
+        let embedder = NoopEmbedder;
+        let pre_compaction_log = events::read_events(&paths.events).unwrap().events;
+        let pre_compaction_db = open_db_memory().unwrap();
+        for ev in &pre_compaction_log {
+            apply_event(&pre_compaction_db, &embedder, ev).unwrap();
+        }
+
         Compact.execute_with_paths(&paths).unwrap();
 
-        let after = events::read_events(&paths.events).unwrap();
+        let compacted_log = events::read_events(&paths.events).unwrap().events;
+        let compacted_db = open_db_memory().unwrap();
+        for ev in &compacted_log {
+            apply_event(&compacted_db, &embedder, ev).unwrap();
+        }
+
+        fn dump(conn: &rusqlite::Connection) -> Vec<(String, String, Option<String>)> {
+            conn.prepare("SELECT test_id, result, run_id FROM run_history ORDER BY run_id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        let pre = dump(&pre_compaction_db);
+        let post = dump(&compacted_db);
         assert_eq!(
-            after.events.len(),
-            RUN_HISTORY_CAP,
-            "exactly RUN_HISTORY_CAP events must not be trimmed"
+            pre.len(),
+            RUNS,
+            "rebuild from the pre-compaction log must materialize every run"
         );
-        assert_eq!(after.events[0]["test_id"], "0");
         assert_eq!(
-            after.events[RUN_HISTORY_CAP - 1]["test_id"],
-            format!("{}", RUN_HISTORY_CAP - 1)
+            pre, post,
+            "compaction must be materialization-preserving: rebuild from the \
+             compacted log must equal rebuild from the pre-compaction log"
         );
     }
 
@@ -1517,6 +1685,8 @@ mod tests {
     const FULL_VACUUM_PADDING_BYTES: usize = 400;
     const FAST_VACUUM_ENTRIES: usize = 500;
     const FAST_VACUUM_PADDING_BYTES: usize = 16_000;
+    /// Events per applied-cursor write while seeding the vacuum fixture.
+    const VACUUM_SEED_BATCH: usize = 1_000;
 
     fn vacuum_fixture_size() -> (usize, usize) {
         if env::var("PROPTEST_CASES").is_ok() {
@@ -1535,35 +1705,54 @@ mod tests {
         use crate::components::{db, embedder::NoopEmbedder};
         let (paths, conn) = db::test_db(root);
         let embedder = NoopEmbedder;
+        // Through the applied-cursor writer: compaction now takes the same
+        // convergence gate as any other write, so a fixture that seeded the log
+        // and the database separately would be refused.
+        let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
 
         // Insert N entries with padded content each so that expiring them all
         // leaves at least 1024 SQLite free pages (see vacuum_fixture_size).
         let (n_entries, padding_bytes) = vacuum_fixture_size();
         let padding: String = "x".repeat(padding_bytes);
-        for i in 0..n_entries {
-            let ev = serde_json::json!({
-                "action": "upsert", "table": "entries",
-                "id": format!("bulk{i}"),
-                "path": format!("src/bulk{i}.rs"),
-                "summary": format!("bulk entry {i}"),
-                "content": format!("content {i} {padding}"),
-                "tags": [],
-                "ts": "2024-01-01T00:00:00Z"
-            });
-            db::apply_event(&conn, &embedder, &ev).unwrap();
-            append_event(&paths.events, &ev).unwrap();
-        }
+        let upserts: Vec<serde_json::Value> = (0..n_entries)
+            .map(|i| {
+                serde_json::json!({
+                    "action": "upsert", "table": "entries",
+                    "id": format!("bulk{i}"),
+                    "path": format!("src/bulk{i}.rs"),
+                    "summary": format!("bulk entry {i}"),
+                    "content": format!("content {i} {padding}"),
+                    "tags": [],
+                    "ts": "2024-01-01T00:00:00Z"
+                })
+            })
+            .collect();
         // Expire all entries to populate the SQLite freelist.
-        for i in 0..n_entries {
-            let ev = serde_json::json!({
-                "action": "expire", "table": "entries",
-                "id": format!("bulk{i}"),
-                "ts": "2024-01-02T00:00:00Z"
-            });
-            db::apply_event(&conn, &embedder, &ev).unwrap();
-            append_event(&paths.events, &ev).unwrap();
+        let expires: Vec<serde_json::Value> = (0..n_entries)
+            .map(|i| {
+                serde_json::json!({
+                    "action": "expire", "table": "entries",
+                    "id": format!("bulk{i}"),
+                    "ts": "2024-01-02T00:00:00Z"
+                })
+            })
+            .collect();
+
+        // In batches, not one write per entry. The gate is per WRITE — an
+        // inspect, two bounded fingerprint reads, an fsync and a cursor row —
+        // so a 12,000-entry fixture seeded one event at a time pays it 24,000
+        // times and runs for tens of minutes. Batching keeps the gate semantics
+        // exactly (each batch is a real converged-to-converged write) and pays
+        // it 24 times instead.
+        for chunk in upserts
+            .chunks(VACUUM_SEED_BATCH)
+            .chain(expires.chunks(VACUUM_SEED_BATCH))
+        {
+            crate::components::cursor::append_and_apply(&lock, &conn, &paths, &embedder, chunk)
+                .unwrap();
         }
         drop(conn); // close before compact opens it
+        drop(lock);
         paths
     }
 
@@ -1591,6 +1780,37 @@ mod tests {
 
     /// AC1 + AC4: after exactly 8 compacts with >=1024 free pages, VACUUM fires
     /// and the counter resets to 0.
+    /// Append and apply through the applied-cursor writer, so the repository
+    /// stays converged and compaction's gate is satisfied.
+    ///
+    /// A preceding compaction leaves the cursor's generation stale. In
+    /// production the next write recovers first, and the generation mismatch
+    /// means a full rebuild; here the database already equals the compacted
+    /// log's materialization — that is compaction's own invariant, checked by
+    /// its own tests — so only the cursor needs restamping, and doing it that
+    /// way keeps these already-slow vacuum fixtures from replaying their whole
+    /// corpus once per iteration.
+    fn seed_through_cursor(paths: &Paths, event: &serde_json::Value) {
+        use crate::components::cursor::{self, Decision, RebuildReason};
+        use crate::components::{db, embedder::NoopEmbedder};
+        let lock = crate::commands::add::acquire_lock(paths.lock.as_path()).unwrap();
+        let conn = db::open_rw(paths, &lock).unwrap();
+        if cursor::inspect(&conn, paths) == Decision::FullRebuild(RebuildReason::GenerationMismatch)
+        {
+            let committed_len = crate::components::events::committed_len(&paths.events).unwrap();
+            cursor::write(
+                &conn,
+                &cursor::Cursor {
+                    generation: cursor::read_generation(&paths.events),
+                    offset: committed_len,
+                    tail_sha: cursor::tail_sha(&paths.events, committed_len).unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event.clone()]).unwrap();
+    }
+
     #[test]
     fn test_vacuum_fires_after_n_compacts_and_counter_resets() {
         let dir = tempdir().unwrap();
@@ -1610,7 +1830,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();
@@ -1628,7 +1848,7 @@ mod tests {
             "summary": "s", "content": "c", "tags": [],
             "ts": "2024-01-01T00:00:00Z"
         });
-        append_event(&paths.events, &ev).unwrap();
+        seed_through_cursor(&paths, &ev);
         Compact
             .execute_with_paths_and_vacuum(&paths, &vcfg)
             .unwrap();
@@ -1695,7 +1915,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();
@@ -1739,7 +1959,7 @@ mod tests {
                 "summary": "s", "content": "c", "tags": [],
                 "ts": "2024-01-01T00:00:00Z"
             });
-            append_event(&paths.events, &ev).unwrap();
+            seed_through_cursor(&paths, &ev);
             Compact
                 .execute_with_paths_and_vacuum(&paths, &vcfg)
                 .unwrap();

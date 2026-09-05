@@ -70,7 +70,6 @@ impl Eval {
         }
         let paths = config::Paths::discover()?;
         let emb = crate::commands::add::make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
         self.execute_with(&paths, emb.as_ref())
     }
 
@@ -122,6 +121,8 @@ impl Eval {
         };
 
         let conn = db::open_db(&paths.db)?;
+        // A read: detect and warn, never recover (C2/ADR-7).
+        crate::components::cursor::warn_if_behind(&conn, paths);
         let report = evaluate_split(&conn, embedder, &cases, &opts, requested)?;
         let recall = report.recall_at_k();
         let mrr = report.mrr();

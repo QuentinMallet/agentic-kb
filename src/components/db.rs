@@ -11,6 +11,7 @@ use crate::models::{
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -168,7 +169,12 @@ pub fn live_peer_predicate(alias: &str) -> String {
 ///
 /// v1: implicit — every DB created before the stamp existed.
 /// v2: cues + kb_meta tables, cue rows materialized from upsert events.
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3: `run_history` keyed insertion (T3, `bd-21ef.1.8`) — a unique index on
+/// `run_id` plus `ON CONFLICT DO NOTHING` makes replay idempotent instead of
+/// duplicating a row per apply. A DB stamped below v3 may hold un-deduplicated
+/// rows from the old bare-INSERT arm; the forced rebuild replays the log
+/// through the new arm so the upgraded DB converges with a fresh one.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// True when the DB carries the current schema_version stamp.
 ///
@@ -259,6 +265,31 @@ pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
     Connection::open(db_path)
 }
 
+/// D4 swap step 1's opener: a raw connection against the *live* DB path, with
+/// none of `open_db`/`open_rw`'s side effects. `ensure_schema`'s ALTERs and
+/// `sweep_expired_peers`' DELETE would each write fresh frames into the very
+/// WAL this connection exists to drain via `wal_checkpoint(TRUNCATE)` — this
+/// opener is the only place in the crate the checkpoint may start from. The
+/// deliberate inverse of `open_auxiliary` and `open_scratch`, which both
+/// refuse the live path; this one refuses everything else.
+///
+/// TOCTOU, not reachable in practice: this inherits `Connection::open`'s
+/// default `SQLITE_OPEN_CREATE`, so between `rebuild.rs`'s `!db_path.exists()`
+/// guard and this call, a file created at `db_path` in that window would be
+/// opened (not created) here, and a path that still doesn't exist would be
+/// created empty. Both are unreachable because the caller holds the rebuild
+/// flock (`paths.lock`) across this entire step, and every writer that could
+/// create the live DB file — `open_rw`, `open_or_init` — takes that same lock
+/// first.
+pub(crate) fn open_live_for_checkpoint(db_path: &Path) -> rusqlite::Result<Connection> {
+    debug_assert!(
+        is_live_db_path(db_path),
+        "open_live_for_checkpoint is the live-path opener; use open_scratch or \
+         open_auxiliary for anything else"
+    );
+    Connection::open(db_path)
+}
+
 /// Raw file opener for tests that intentionally bypass production policy to
 /// inspect or manufacture database states.
 #[cfg(test)]
@@ -276,6 +307,11 @@ fn ensure_schema_and_stamp(conn: &Connection) -> Result<()> {
     ensure_schema(conn)?;
     if is_fresh {
         stamp_schema_version(conn)?;
+        // A brand-new database has applied nothing, so offset 0 is the truthful
+        // applied cursor (C1/D3). Seeding it here keeps a fresh database off the
+        // cursorless full-rebuild row: recovery replays the log incrementally
+        // instead, which is the same materialization for a fraction of the work.
+        crate::components::cursor::seed_fresh(conn)?;
     }
     Ok(())
 }
@@ -533,6 +569,24 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 /// escapes the split. Must not be called while this process already holds the
 /// write lock; the re-entrancy registry rejects that rather than deadlocking.
 pub fn open_or_init(paths: &config::Paths) -> Result<()> {
+    init_locked(paths)?; // released before recovery: its repairs take the lock
+                         // C1/D3 + C2/ADR-7: recovery fires at process entry, never on a read path.
+                         // `recover_if_needed` re-acquires the lock only when there is something to
+                         // repair, so the steady-state cost here is one cursor comparison.
+    let embedder = crate::commands::add::make_embedder(paths);
+    crate::commands::rebuild::recover_if_needed(paths, embedder.as_ref())?;
+    Ok(())
+}
+
+/// The initialization half of [`open_or_init`]: parent dirs, schema, stamp,
+/// and the seeded cursor. Separated so test fixtures can initialize a
+/// repository without dragging in recovery's production embedder.
+///
+/// Deliberately does NOT sweep expired peers: L1b's contract is that
+/// deletion happens only in locked writers (`tests/open_split.rs::
+/// open_or_init_does_not_sweep_expired_peers`), so init/recovery must leave
+/// them physically present.
+fn init_locked(paths: &config::Paths) -> Result<()> {
     let lock = crate::commands::add::acquire_lock(&paths.lock)?;
     let conn = open_rw(paths, &lock)?;
     drop(conn);
@@ -574,7 +628,7 @@ pub fn open_db(db_path: &Path) -> Result<Connection> {
 #[doc(hidden)]
 pub fn test_db(root: &Path) -> (config::Paths, Connection) {
     let paths = config::Paths::from_root(root);
-    open_or_init(&paths).expect("test_db: initialize the knowledge base");
+    init_locked(&paths).expect("test_db: initialize the knowledge base");
     let conn = open_conn_rw(&paths.db).expect("test_db: open the knowledge base");
     (paths, conn)
 }
@@ -582,6 +636,49 @@ pub fn test_db(root: &Path) -> (config::Paths, Connection) {
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    Ok(found)
+}
+
+/// Idempotent migration: ensure `source_weights.updated_at` exists (D6 R2).
+///
+/// A no-op on a fresh DB, whose `CREATE TABLE IF NOT EXISTS source_weights`
+/// already declares the column. On a pre-existing DB missing it, adds a
+/// plain nullable column (no non-constant `DEFAULT`, which SQLite rejects
+/// via `ADD COLUMN` once the table has rows) and backfills existing rows in
+/// a separate `UPDATE`. Unexpected errors propagate rather than being
+/// swallowed, so a schema divergence is loud instead of silent.
+fn migrate_source_weights_updated_at(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "source_weights") {
+        return Ok(());
+    }
+    if column_exists(conn, "source_weights", "updated_at")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE source_weights ADD COLUMN updated_at TEXT;")
+        .context("migrating source_weights: add updated_at column")?;
+    conn.execute(
+        "UPDATE source_weights SET updated_at = datetime('now') WHERE updated_at IS NULL",
+        [],
+    )
+    .context("migrating source_weights: backfill updated_at")?;
+    Ok(())
+}
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
         params![name],
         |_| Ok(()),
     )
@@ -711,6 +808,27 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
         "#,
     )?;
+    // T3 (bd-21ef.1.8, SCHEMA_VERSION 3): keyed idempotent insertion on
+    // run_history.run_id. Guarded by `index_exists` and run only once: a
+    // pre-existing DB may hold duplicate non-NULL run_id rows from the old
+    // bare-INSERT arm (double-apply before this fix, or a rebuild replaying
+    // a log against an already-populated DB), and creating the index over
+    // those would fail outright. Dedup keeps the earliest occurrence; NULL
+    // run_id rows are left untouched since SQLite never treats two NULLs as
+    // conflicting under a UNIQUE index. Once the index exists, `apply_event`
+    // never creates a new non-NULL duplicate (ON CONFLICT DO NOTHING), so
+    // this cleanup never needs to run again — subsequent opens see the index
+    // already present and skip straight to the (cheap, no-op) IF NOT EXISTS.
+    if !index_exists(conn, "idx_run_history_run_id") {
+        conn.execute_batch(
+            "DELETE FROM run_history WHERE run_id IS NOT NULL AND id NOT IN (
+                 SELECT MIN(id) FROM run_history WHERE run_id IS NOT NULL GROUP BY run_id
+             );",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_history_run_id ON run_history(run_id);",
+    )?;
     // Migration: add `permanent` column to existing DBs that pre-date this field.
     // SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.37; ignore "duplicate column" error.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN permanent INTEGER DEFAULT 0;");
@@ -730,10 +848,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
-    );
-    // Migration: add updated_at to source_weights for Phase 5 weight tracking.
-    let _ = conn.execute_batch(
-        "ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));",
     );
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
@@ -779,6 +893,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Migration: add updated_at to source_weights for Phase 5 weight tracking
+    // (D6 R2). Guarded by PRAGMA table_info instead of a blind
+    // `let _ = ALTER ... DEFAULT (datetime('now'))`: SQLite rejects a
+    // non-constant default on ADD COLUMN once the table already holds rows,
+    // so the old migration silently never ran against an upgraded DB while
+    // still swallowing the error. Fresh DBs already have the column from the
+    // CREATE TABLE above; this only fires for a pre-existing table missing it.
+    migrate_source_weights_updated_at(conn)?;
     // AC-P6: peer graph tables (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -1079,6 +1201,53 @@ pub fn entry_embed_text(
     }
 }
 
+/// Every text [`apply_event`] will hand to the embedder for one event.
+///
+/// The single source of truth for the D3 prefetch: it must mirror the
+/// `("upsert", "entries")` arm exactly, or a text the arm needs would miss the
+/// sealed cache and fail loudly inside the transaction. That loud failure is
+/// the intended feedback if the two ever drift.
+pub fn embed_texts_for_event(event: &serde_json::Value) -> Vec<String> {
+    if event["action"] != "upsert" || event["table"] != "entries" {
+        return Vec::new();
+    }
+    let (Some(id), Some(path), Some(summary), Some(content)) = (
+        event["id"].as_str(),
+        event["path"].as_str(),
+        event["summary"].as_str(),
+        event["content"].as_str(),
+    ) else {
+        return Vec::new();
+    };
+    let summary = clamp_chars(summary, MAX_SUMMARY_CHARS, "summary", id);
+    let content = clamp_chars(content, MAX_ENTRY_CONTENT_CHARS, "content", id);
+    let tags = event["tags"].to_string();
+    let mode = EmbedTextMode::from_env();
+    let mut texts = vec![entry_embed_text(
+        mode,
+        path,
+        summary.as_ref(),
+        content.as_ref(),
+        &tags,
+    )];
+    if let Some(cues) = event["cues"].as_array() {
+        texts.extend(cues.iter().filter_map(|c| c.as_str()).map(str::to_string));
+    }
+    texts
+}
+
+/// [`embed_texts_for_event`] over a batch.
+pub fn embed_texts_for_batch(batch: &[serde_json::Value]) -> Vec<String> {
+    batch.iter().flat_map(embed_texts_for_event).collect()
+}
+
+/// [`embed_texts_for_batch`] for a borrowed iterator (the recovery tail).
+pub fn embed_texts_for_batch_refs<'a>(
+    batch: impl Iterator<Item = &'a serde_json::Value>,
+) -> Vec<String> {
+    batch.flat_map(embed_texts_for_event).collect()
+}
+
 fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
     conn.execute_batch("SAVEPOINT apply_evt")?;
     match f() {
@@ -1146,6 +1315,73 @@ fn warn_cross_entry_evidence_id(ev_id: &str, owner_entry_id: &str, attempted_ent
     CROSS_ENTRY_EVIDENCE_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Extract an event's `ts` for a replay-deterministic `updated_at` write
+/// (D6 R1). `Materialize` must be a pure function of the log: stamping
+/// `datetime('now')` on apply makes replaying the same log on two different
+/// days produce different `updated_at` values and different recency-weighted
+/// rankings. Legacy events with no `ts` return `None` so the caller leaves
+/// the existing row value untouched instead of stamping wall-clock.
+fn event_ts(event: &serde_json::Value) -> Option<&str> {
+    event["ts"].as_str().filter(|s| !s.is_empty())
+}
+
+/// Content hash of a `run_history` event that predates `run_id`.
+///
+/// `None` for anything else — a real writer's event (`run.rs`, `mcp.rs` have
+/// always minted a uuid `run_id`) or a different action entirely. Callers use
+/// this to decide whether an event needs a log occurrence index at all.
+pub fn legacy_run_content_hash(event: &serde_json::Value) -> Option<String> {
+    if event["action"] != "insert" || event["table"] != "run_history" {
+        return None;
+    }
+    if event["run_id"].as_str().is_some() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for field in ["test_id", "result", "adapter", "detail", "ts"] {
+        hasher.update(event[field].as_str().unwrap_or("").as_bytes());
+        hasher.update([0u8]);
+    }
+    // Hex digest: only [0-9a-f], so the LIKE pattern below needs no escaping.
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Deterministic synthetic key for a `run_history` event that predates
+/// `run_id`.
+///
+/// The key is the event's content hash plus an ordinal, so two events with
+/// byte-identical content do not collapse into one row. Where the ordinal
+/// comes from decides whether replay is idempotent:
+///
+/// * `occurrence = Some(n)` — `n` is the event's index among identical-content
+///   events **in the log**, supplied by the replay driver. Re-applying an
+///   already-applied event then recomputes the same key and
+///   `ON CONFLICT DO NOTHING` makes it a no-op. This is what the applied-cursor
+///   tail replay passes (C1/T4), and it is the only ordinal that is a function
+///   of the log rather than of the replay boundary.
+/// * `occurrence = None` — fall back to counting rows already sharing the
+///   content hash. Correct for a materialization that starts from an empty
+///   table, which is every direct `apply_event` caller: `kb rebuild`'s replay,
+///   its catch-up onto the prefix it just replayed, and `kb compact`'s
+///   replay-and-compare. It is NOT idempotent against an already-populated
+///   table, which is exactly why the tail replay supplies the log index.
+fn synthetic_run_key(
+    conn: &Connection,
+    content_hash: &str,
+    occurrence: Option<u64>,
+) -> Result<String> {
+    let prefix = format!("legacy:{content_hash}:");
+    let ordinal = match occurrence {
+        Some(n) => n as i64,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM run_history WHERE run_id LIKE ?1",
+            params![format!("{prefix}%")],
+            |r| r.get(0),
+        )?,
+    };
+    Ok(format!("{prefix}{ordinal}"))
+}
+
 /// Apply a single event atomically.
 ///
 /// The operation uses a savepoint and therefore composes inside a caller-owned
@@ -1154,6 +1390,20 @@ pub fn apply_event(
     conn: &Connection,
     embedder: &dyn Embedder,
     event: &serde_json::Value,
+) -> Result<()> {
+    apply_event_at(conn, embedder, event, None)
+}
+
+/// [`apply_event`], with the event's occurrence index in the log.
+///
+/// Only the run_id-less `run_history` arm reads it; see `synthetic_run_key`
+/// for why an incremental replay must supply it and a from-empty
+/// materialization need not.
+pub fn apply_event_at(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    event: &serde_json::Value,
+    occurrence: Option<u64>,
 ) -> Result<()> {
     let action = event["action"].as_str().unwrap_or("");
     let table = event["table"].as_str().unwrap_or("");
@@ -1337,15 +1587,22 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
+            let ts = event_ts(event);
             // Single transaction: spec-conformant expire reset + FTS/emb/cue GC.
             // Resetting evidence_status to 'n/a' and deleting evidence mirrors
             // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
             with_apply_event_savepoint(conn, || -> Result<()> {
-                conn.execute(
-                    "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
-                    params![id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=?2 WHERE id=?1",
+                        params![id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET is_stale=1, evidence_status='n/a' WHERE id=?1",
+                        params![id],
+                    ),
+                }?;
                 // ADR-2 intentionally does not cascade through derived_from:
                 // provenance edges on other entries may still name this stale
                 // entry, whose row remains available to provenance traversal.
@@ -1391,11 +1648,26 @@ pub fn apply_event(
             let adapter = event["adapter"].as_str();
             let detail = event["detail"].as_str();
             let ts = event["ts"].as_str().unwrap_or("");
-            let run_id = event["run_id"].as_str();
+            // T3 (bd-21ef.1.8): keyed idempotent insertion (CompactMaterialize.tla
+            // D5.1). Real writers (run.rs, mcp.rs) have always minted a uuid
+            // run_id; a run_id-less event is legacy data predating that, so it
+            // gets a deterministic synthetic key instead — see
+            // `synthetic_run_key` for the derivation. Either way `key` is
+            // never NULL, so `ON CONFLICT(run_id) DO NOTHING` makes replaying
+            // the same event any number of times a no-op after the first.
+            let key = match event["run_id"].as_str() {
+                Some(id) => id.to_string(),
+                None => {
+                    let content_hash = legacy_run_content_hash(event)
+                        .context("run_history: cannot derive a synthetic key")?;
+                    synthetic_run_key(conn, &content_hash, occurrence)?
+                }
+            };
             conn.execute(
                 "INSERT INTO run_history(test_id,result,adapter,detail,ts,run_id)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![test_id, result, adapter, detail, ts, run_id],
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(run_id) DO NOTHING",
+                params![test_id, result, adapter, detail, ts, key],
             )?;
         }
 
@@ -1419,6 +1691,7 @@ pub fn apply_event(
             let citation_excerpt = ev["citation_excerpt"].as_str();
             let derived_from = ev["derived_from"].as_str();
             let recorded_at = ev["recorded_at"].as_str();
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 let existing_owner = conn
@@ -1469,10 +1742,16 @@ pub fn apply_event(
                 // The fix is to always call the soft-mandate helper after an evidence row
                 // change so both paths agree (br-f7y).
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -1507,6 +1786,7 @@ pub fn apply_event(
             let entry_id = event["entry_id"]
                 .as_str()
                 .context("evidence_expire: missing entry_id")?;
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 // Orphan-tolerant: absent and stale parents are equivalent under
@@ -1531,10 +1811,16 @@ pub fn apply_event(
                 )?;
 
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -3064,6 +3350,216 @@ mod tests {
         assert!(tables.contains(&"source_weights".to_string()));
     }
 
+    // -----------------------------------------------------------------
+    // T3 (bd-21ef.1.8): run_history keyed insertion — idempotent replay.
+    // CompactMaterialize.tla D5.1.
+    // -----------------------------------------------------------------
+
+    fn run_history_test_case_event() -> serde_json::Value {
+        serde_json::json!({
+            "action": "upsert", "table": "test_cases",
+            "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
+            "config": "{}", "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    fn run_history_rows(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        conn.prepare("SELECT test_id, result, run_id FROM run_history ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The model's fixed arm saturates counts at one; `ON CONFLICT(run_id)
+    /// DO NOTHING` is the same statement. Applying the identical event N
+    /// times must leave exactly one row.
+    #[test]
+    fn test_apply_event_run_history_keyed_insertion_is_n_replay_invariant() {
+        let conn = open_db_memory().unwrap();
+        let embedder = crate::components::embedder::NoopEmbedder;
+        apply_event(&conn, &embedder, &run_history_test_case_event()).unwrap();
+
+        let run_event = serde_json::json!({
+            "action": "insert", "table": "run_history",
+            "test_id": "t1", "result": "pass",
+            "ts": "2024-01-01T00:00:00Z", "run_id": "run-1"
+        });
+        for _ in 0..5 {
+            apply_event(&conn, &embedder, &run_event).unwrap();
+        }
+
+        let rows = run_history_rows(&conn);
+        assert_eq!(
+            rows.len(),
+            1,
+            "replaying the same run_id 5 times must leave exactly one row"
+        );
+        assert_eq!(
+            rows[0],
+            (
+                "t1".to_string(),
+                "pass".to_string(),
+                Some("run-1".to_string())
+            )
+        );
+    }
+
+    /// Legacy (run_id-less) events get a deterministic synthetic key: a
+    /// function of event content plus ordinal position, so two full
+    /// replays of one log into fresh DBs produce a row-for-row identical
+    /// `run_history` table — not just an identical row count, which would
+    /// also pass under a naive content-only hash that collapsed distinct
+    /// occurrences.
+    #[test]
+    fn test_apply_event_run_history_legacy_synthetic_key_replays_deterministically() {
+        let log = vec![
+            run_history_test_case_event(),
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "pass", "ts": "2024-01-01T00:00:00Z"
+            }),
+            // Same content as the previous run event: exercises the ordinal
+            // component of the synthetic key, not just the content hash.
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "pass", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "fail", "ts": "2024-01-01T00:01:00Z"
+            }),
+        ];
+
+        let replay = || {
+            let conn = open_db_memory().unwrap();
+            let embedder = crate::components::embedder::NoopEmbedder;
+            for ev in &log {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            run_history_rows(&conn)
+        };
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(
+            first.len(),
+            3,
+            "all three legacy run events must materialize (no accidental collapse)"
+        );
+        assert_eq!(
+            first, second,
+            "two replays of one log must produce an identical run_history table"
+        );
+    }
+
+    /// SCHEMA_VERSION 2 -> 3: a pre-T3 DB (old bare-INSERT arm) may already
+    /// hold duplicate non-NULL run_id rows from a double-apply. The migration
+    /// must deduplicate before creating the unique index rather than fail
+    /// outright — NULL run_id rows (also legacy) are left alone since SQLite
+    /// never treats two NULLs as conflicting.
+    #[test]
+    fn test_ensure_schema_dedupes_legacy_run_history_duplicates_before_indexing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE test_cases (id TEXT PRIMARY KEY, app TEXT, name TEXT, protocol TEXT, config TEXT);
+             INSERT INTO test_cases(id,app,name,protocol,config) VALUES('t1','kb','n','rust_tool','{}');
+             CREATE TABLE run_history (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 test_id  TEXT NOT NULL REFERENCES test_cases(id),
+                 result   TEXT NOT NULL CHECK(result IN ('pass','fail')),
+                 adapter  TEXT,
+                 detail   TEXT,
+                 ts       TEXT DEFAULT (datetime('now')),
+                 run_id   TEXT
+             );
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','2024-01-01T00:00:00Z','run-dup');
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','2024-01-01T00:00:00Z','run-dup');
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','fail','2024-01-01T00:01:00Z',NULL);
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','fail','2024-01-01T00:01:00Z',NULL);",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let dup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_history WHERE run_id='run-dup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dup_count, 1,
+            "duplicate non-NULL run_id rows must be deduped before indexing"
+        );
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_history WHERE run_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_count, 2,
+            "NULL run_id rows are untouched — SQLite never treats two NULLs as conflicting"
+        );
+
+        // The index now exists and enforces uniqueness on future inserts.
+        let err = conn
+            .execute(
+                "INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','x','run-dup')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "index must now enforce uniqueness: {err}"
+        );
+    }
+
+    /// T3 acceptance: the upgraded DB's `run_history` column shape must equal
+    /// a fresh DB's. SCHEMA_VERSION 3 adds an index, not a column, so this
+    /// holds by construction, but the property is exactly what the upgrade
+    /// path promises.
+    #[test]
+    fn test_run_history_table_info_matches_after_v3_migration() {
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE test_cases (id TEXT PRIMARY KEY, app TEXT, name TEXT, protocol TEXT, config TEXT);
+                 CREATE TABLE run_history (
+                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     test_id  TEXT NOT NULL REFERENCES test_cases(id),
+                     result   TEXT NOT NULL CHECK(result IN ('pass','fail')),
+                     adapter  TEXT,
+                     detail   TEXT,
+                     ts       TEXT DEFAULT (datetime('now')),
+                     run_id   TEXT
+                 );",
+            )
+            .unwrap();
+        ensure_schema(&legacy).unwrap();
+
+        let fresh = open_db_memory().unwrap();
+
+        fn cols(conn: &Connection) -> Vec<(String, String)> {
+            conn.prepare("PRAGMA table_info(run_history)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        assert_eq!(
+            cols(&legacy),
+            cols(&fresh),
+            "migrated DB's run_history column shape must equal a fresh DB's"
+        );
+    }
+
     #[test]
     fn test_init_creates_source_weights_table() {
         let conn = open_db_memory().unwrap();
@@ -3078,6 +3574,99 @@ mod tests {
         assert!(cols.contains(&"session_id".to_string()));
         assert!(cols.contains(&"successes".to_string()));
         assert!(cols.contains(&"failures".to_string()));
+    }
+
+    #[test]
+    fn test_source_weights_migration_matches_fresh_schema_on_upgraded_db() {
+        // D6 R2 (failing-test-first regression): simulate a pre-migration
+        // DB where `source_weights` exists WITH ROWS but lacks
+        // `updated_at` (the column was added after the table's original
+        // release). SQLite rejects `ALTER TABLE ... ADD COLUMN ... DEFAULT
+        // (datetime('now'))` once a table has existing rows (non-constant
+        // default), so the prior `let _ =`-swallowed migration silently
+        // never added the column here — an upgraded DB's schema diverged
+        // from a fresh DB's while the swallow hid the failure.
+        let legacy = rusqlite::Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE source_weights (
+                    kind        TEXT NOT NULL,
+                    session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                    successes   INTEGER NOT NULL DEFAULT 0,
+                    failures    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, session_id)
+                );
+                INSERT INTO source_weights(kind, successes, failures) VALUES ('code', 3, 1);",
+            )
+            .unwrap();
+
+        ensure_schema(&legacy).unwrap();
+
+        let fresh = open_db_memory().unwrap();
+        let table_info = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("PRAGMA table_info(source_weights)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            table_info(&legacy),
+            table_info(&fresh),
+            "an upgraded DB must expose identical PRAGMA table_info for source_weights as a fresh DB"
+        );
+
+        let updated_at: Option<String> = legacy
+            .query_row(
+                "SELECT updated_at FROM source_weights WHERE kind='code'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            updated_at.is_some(),
+            "existing rows must be backfilled with a non-null updated_at"
+        );
+    }
+
+    #[test]
+    fn test_source_weights_migration_is_noop_when_column_already_present() {
+        // Idempotency: running the migration twice (e.g. two `open_db` calls
+        // against the same file) must not error or clobber the column.
+        let conn = open_db_memory().unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_source_weights_migration_propagates_unexpected_errors() {
+        // D6 R2 acceptance: an unexpected migration error propagates rather
+        // than being swallowed. Force the backfill UPDATE to fail via a
+        // trigger and confirm the caller observes an Err, not a silent Ok.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_weights (
+                kind        TEXT NOT NULL,
+                session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                successes   INTEGER NOT NULL DEFAULT 0,
+                failures    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (kind, session_id)
+            );
+            INSERT INTO source_weights(kind) VALUES ('code');
+            CREATE TRIGGER source_weights_reject_backfill
+            BEFORE UPDATE ON source_weights
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated backfill failure');
+            END;",
+        )
+        .unwrap();
+
+        let result = migrate_source_weights_updated_at(&conn);
+        assert!(
+            result.is_err(),
+            "an unexpected migration error must propagate, not be swallowed"
+        );
     }
 
     #[test]
@@ -3592,6 +4181,205 @@ mod tests {
             .unwrap();
         assert_eq!(is_stale, 1);
         assert_eq!(evidence_status, "n/a");
+    }
+
+    /// D6 R1 (failing-test-first regression): replaying the identical log
+    /// must materialize identical `updated_at` values no matter when the
+    /// replay runs. `updated_at` is derived from the event's own `ts`, not
+    /// wall-clock, on every arm that writes it (expire, evidence_add,
+    /// evidence_expire) — Materialize being a pure function of the log is
+    /// an assumption every spec in `.state/agent-kb/tla/` already makes.
+    #[test]
+    fn test_replay_expire_updated_at_is_derived_from_event_ts_not_wall_clock() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-expire-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "expire", "table": "entries", "id": "replay-expire-ts",
+                "ts": "2024-06-01T12:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-06-01T12:00:00Z");
+
+        // Replay the identical log again as if hours had passed on the wall
+        // clock — the materialized value must be byte-identical.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_expire_event_without_ts_leaves_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-expire-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy expire event carries no "ts" field.
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "legacy-expire-ts"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a legacy event with no ts must leave the existing updated_at untouched"
+        );
+    }
+
+    #[test]
+    fn test_replay_evidence_add_and_evidence_expire_updated_at_derived_from_event_ts() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-evidence-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_add", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence": {
+                    "id": "ev-replay-evidence-ts", "entry_id": "replay-evidence-ts",
+                    "kind": "code", "citation_path": "src/lib.rs:1-1",
+                    "citation_sha": null, "citation_hash": "sha256:abc",
+                    "citation_excerpt": null, "derived_from": null,
+                    "recorded_at": "2024-03-01T00:00:00Z"
+                },
+                "ts": "2024-03-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_expire", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence_id": "ev-replay-evidence-ts", "reason": "test",
+                "ts": "2024-09-01T00:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-09-01T00:00:00Z");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_evidence_add_and_evidence_expire_without_ts_leave_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-evidence-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy evidence_add event carries no "ts" field.
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence": {
+                "id": "ev-legacy-evidence-ts", "entry_id": "legacy-evidence-ts",
+                "kind": "code", "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null, "citation_hash": "sha256:abc",
+                "citation_excerpt": null, "derived_from": null,
+                "recorded_at": "2024-03-01T00:00:00Z"
+            }
+        });
+        apply_event(&conn, &embedder, &evidence_add).unwrap();
+        let after_add: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_add,
+            "a legacy evidence_add with no ts must leave updated_at untouched"
+        );
+
+        // Legacy evidence_expire event carries no "ts" field.
+        let evidence_expire = serde_json::json!({
+            "action": "evidence_expire", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence_id": "ev-legacy-evidence-ts", "reason": "test"
+        });
+        apply_event(&conn, &embedder, &evidence_expire).unwrap();
+        let after_expire: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_expire,
+            "a legacy evidence_expire with no ts must leave updated_at untouched"
+        );
     }
 
     #[test]

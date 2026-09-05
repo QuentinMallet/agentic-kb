@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::{Embedder, NoopEmbedder};
-use crate::components::{db, events};
+use crate::components::{cursor, db};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -74,8 +74,8 @@ impl Expire {
             "session_id": omc_session_id,
         });
 
-        events::append_event(&paths.events, &event)?;
-        db::apply_event(&conn, embedder, &event)?;
+        // Writer 2 of 10.
+        cursor::append_and_apply(&lock, &conn, paths, embedder, &[event])?;
 
         println!("expired {}", self.id);
         Ok(())

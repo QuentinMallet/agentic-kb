@@ -95,8 +95,42 @@ pub struct EntryPoint {
     pub config: Option<String>,
 }
 
+impl KbCmd {
+    /// Whether this subcommand may mutate the knowledge base.
+    ///
+    /// Drives the C1/D3 recovery point at CLI dispatch. `rebuild` is excluded
+    /// because it *is* the repair, and `mcp` because it derives its paths from
+    /// `--db` and initializes itself at startup.
+    fn mutates(&self) -> bool {
+        !matches!(
+            self,
+            KbCmd::Search(_)
+                | KbCmd::CitedBy(_)
+                | KbCmd::Cite(_)
+                | KbCmd::Context(_)
+                | KbCmd::Eval(_)
+                | KbCmd::Tests(_)
+                | KbCmd::OlderThan(_)
+                | KbCmd::Rebuild(_)
+                | KbCmd::Mcp(_)
+        )
+    }
+}
+
 impl Runnable for EntryPoint {
     fn run(&self) {
+        // C1/D3 + C2/ADR-7: recovery fires at CLI dispatch for mutating
+        // subcommands only. `open_or_init` takes the write lock, which a read
+        // must never do; reads detect the same condition on their own
+        // read-only connection and warn. Best-effort — outside a repository
+        // `discover` fails and the subcommand reports that itself.
+        if self.cmd.mutates() {
+            if let Ok(paths) = crate::config::Paths::discover() {
+                if let Err(e) = crate::components::db::open_or_init(&paths) {
+                    eprintln!("kb: WARNING event-log recovery failed at startup: {e}");
+                }
+            }
+        }
         self.cmd.run()
     }
 }

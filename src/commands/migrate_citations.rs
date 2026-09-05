@@ -6,6 +6,7 @@
 
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, make_embedder};
+use crate::components::cursor;
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
 use crate::components::events;
@@ -74,7 +75,7 @@ impl MigrateCitations {
     pub fn execute(&self) -> Result<()> {
         let paths = config::Paths::discover()?;
         let embedder = make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with_paths(&paths)?;
         Ok(())
     }
@@ -295,11 +296,11 @@ fn apply_heals(
                     &verify_row.citation_hash,
                     version_ref.as_deref(),
                 );
-                events::append_event(&paths.events, &event)?;
-                // If append succeeds but apply fails, a rerun may append a
-                // second citation_healed event. Applying the same target is a
-                // state-idempotent no-op; deterministic op IDs are deferred.
-                db::apply_event(conn, &NoopEmbedder, &event)?;
+                // Writer 6 of 10. If append succeeds but apply fails, a rerun
+                // may append a second citation_healed event. Applying the same
+                // target is a state-idempotent no-op; deterministic op IDs are
+                // deferred.
+                cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event])?;
                 report.emitted_events += 1;
                 report.would_heal.push(MigrationRow {
                     new_path: Some(new_path),
@@ -415,8 +416,8 @@ mod tests {
             "is_stale": false,
             "ts": "2024-01-01T00:00:00Z"
         });
-        events::append_event(&paths.events, &upsert).unwrap();
-        apply_event(conn, &NoopEmbedder, &upsert).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[upsert]).unwrap();
     }
 
     fn seed_evidence(
@@ -439,8 +440,8 @@ mod tests {
             recorded_at: Some("2026-09-02T00:00:00Z".to_string()),
         };
         let event = evidence_add_event(entry_id, &evidence, Some("deadbeef"));
-        events::append_event(&paths.events, &event).unwrap();
-        apply_event(conn, &NoopEmbedder, &event).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event]).unwrap();
     }
 
     #[test]
@@ -497,6 +498,15 @@ mod tests {
         assert_eq!(events[2]["old_path"], format!("src/lib.rs:0-{end}"));
         assert_eq!(events[2]["new_path"], "src/lib.rs");
         assert_eq!(events[2]["citation_hash"], hash);
+
+        // C1/T4: the heal writer must leave the applied cursor caught up, or
+        // every later open replays its events.
+        let ro = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&ro, &paths),
+            cursor::Decision::NoOp,
+            "the citation_healed writer left the applied cursor behind the log"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
 use crate::commands::cite::compute_citation_fields;
-use crate::components::{db, embedder, events, kb_core, query_hits};
+use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Application, Command, Runnable};
@@ -84,8 +84,11 @@ impl Mcp {
         // interaction with a pre-v2 DB replays the log once so new derived
         // state (cue rows, vintage stamp) materializes. Steady state: one
         // stamp read. Best-effort — a failed upgrade must not kill the port.
-        if let Err(e) = crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref()) {
-            eprintln!("warn: schema upgrade rebuild failed (serving current DB): {e}");
+        // C1/D3 + C2/ADR-7: recovery fires at MCP startup, through the same
+        // initialization entry point the CLI uses. Best-effort — a failed
+        // recovery must not kill the port.
+        if let Err(e) = db::open_or_init(&paths) {
+            eprintln!("warn: event-log recovery failed (serving current DB): {e}");
         }
 
         let ready = json!({
@@ -659,6 +662,23 @@ fn parse_error(id: &Value, message: impl std::fmt::Display) -> Value {
     })
 }
 
+/// Methods that append to the event log or otherwise mutate the database, and
+/// therefore run C1/D3 recovery before dispatch.
+const MUTATING_METHODS: &[&str] = &[
+    "add",
+    "import",
+    "expire",
+    "stale_check",
+    "compact",
+    "reembed",
+    "run",
+    "test_add",
+    "audit_run",
+    "audit_record",
+    "kb_peers_add",
+    "kb_peers_remove",
+];
+
 fn handle_request(
     line: &str,
     paths: &config::Paths,
@@ -704,6 +724,17 @@ fn handle_request(
                 Err(e) => return parse_error(&id, e),
             }
         };
+    }
+
+    // C1/D3: the server is long-lived, so recovering only at startup is not
+    // enough — an external `kb compact` or another process's crash gap can open
+    // at any point during a session. Every mutating method re-checks before it
+    // takes the lock. `rebuild` is excluded because it is the repair itself, and
+    // the read methods detect and report staleness instead (ADR-7).
+    if MUTATING_METHODS.contains(&method.as_str()) {
+        if let Err(e) = crate::commands::rebuild::recover_if_needed(paths, emb) {
+            eprintln!("warn: event-log recovery before {method} failed: {e}");
+        }
     }
 
     match method.as_str() {
@@ -877,10 +908,37 @@ fn handle_search(
             let meta = search_meta(paths, &results);
             record_query_results(paths, &results);
             let entries = entries_to_json(results);
-            json!({"id": id, "type": "result", "entries": entries, "_meta": meta})
+            with_stale_note(
+                json!({"id": id, "type": "result", "entries": entries, "_meta": meta}),
+                &conn,
+                paths,
+            )
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
+}
+
+/// The staleness reason to attach to a read response, if any.
+///
+/// The server writes its warnings to stderr, which never reaches the agent on
+/// the other end of the port, so a read that is serving a database behind the
+/// log has to say so in the response itself. Additive: the field is absent when
+/// the database is converged, and no existing field changes shape.
+fn stale_note(conn: &rusqlite::Connection, paths: &config::Paths) -> Option<String> {
+    let decision = cursor::inspect(conn, paths);
+    decision.is_behind().then(|| decision.describe())
+}
+
+/// Attach a `stale` field to `response` when `conn`'s database is behind the log.
+fn with_stale_note(
+    mut response: Value,
+    conn: &rusqlite::Connection,
+    paths: &config::Paths,
+) -> Value {
+    if let (Some(note), Some(object)) = (stale_note(conn, paths), response.as_object_mut()) {
+        object.insert("stale".to_string(), Value::String(note));
+    }
+    response
 }
 
 fn record_query_results(paths: &config::Paths, results: &[db::SearchEntry]) {
@@ -1092,7 +1150,8 @@ fn handle_kb_get(req: &KbGetRequest, paths: &config::Paths) -> Value {
     };
 
     match db::fetch_entry_by_id(&conn, entry_id) {
-        Ok(Some(entry)) => json!({
+        Ok(Some(entry)) => with_stale_note(
+            json!({
             "id": id,
             "type": "result",
             "entry": {
@@ -1110,7 +1169,10 @@ fn handle_kb_get(req: &KbGetRequest, paths: &config::Paths) -> Value {
                 "evidence_status": entry.evidence_status,
                 "evidence": full_evidence_to_json(entry.evidence),
             }
-        }),
+            }),
+            &conn,
+            paths,
+        ),
         Ok(None) => json!({
             "id": id,
             "type": "error",
@@ -1441,14 +1503,12 @@ fn handle_run(req: &RunRequest, paths: &config::Paths, emb: &dyn embedder::Embed
         "ts": ts, "run_id": run_id, "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 7 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1490,14 +1550,12 @@ fn handle_test_add(
         "version_ref": null, "ts": ts, "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 8 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1728,10 +1786,8 @@ fn handle_expire(
         "session": "mcp",
     });
 
-    if let Err(e) = events::append_event(&paths.events, &event) {
-        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-    }
-    if let Err(e) = db::apply_event(&conn, emb, &event) {
+    // Writer 9 of 10.
+    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -2039,27 +2095,20 @@ fn handle_audit_record(
         let verdict = verdict_obj.verdict;
         let note = verdict_obj.note.clone();
 
-        // The expire event, if any, is appended to the JSONL log here, before
-        // the transactional boundary below. That append is the one part of
-        // this operation A1 does NOT claim atomicity over: a crash between
-        // this append and the savepoint below leaves the log ahead of the DB.
-        // Closing that residual window is C1's fsync-ordering work (ADR-5's
-        // D2, bd-21ef.1.7) — A1 only guarantees that apply_event, the
-        // audit_runs row and the source_weights delta land or roll back
-        // together, never that the append itself is crash-atomic.
-        let expire_event = if !verdict {
-            let ev = json!({
+        // Writer 10 of 10. The expire event, if any, rides the D3 write helper:
+        // append + sync + apply + cursor. Once C1/D2 landed, this append is
+        // durable before any DB write, and the residual "log ahead of DB"
+        // window ADR-5 documented is closed by the applied cursor.
+        let batch: Vec<Value> = if !verdict {
+            vec![json!({
                 "action": "expire", "table": "entries",
                 "id": entry_id, "reason": "audit verdict=false",
                 "ts": ts, "session": "mcp",
-            });
-            if let Err(e) = events::append_event(&paths.events, &ev) {
-                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
-            }
-            Some(ev)
+            })]
         } else {
-            None
+            vec![]
         };
+        let exp = batch.len() as u32;
 
         // ADR-5 / A1: apply_event(expire) + the audit_runs insert + the
         // source_weights upsert run inside one SAVEPOINT, so a failure
@@ -2068,25 +2117,22 @@ fn handle_audit_record(
         // because both happened or neither did.
         //
         // Transaction ownership (Q2, settled 2026-09-04): C1's D3 owns the
-        // outer transaction that will wrap append+sync+apply+cursor once its
-        // helper (bd-21ef.1.9) lands; this SAVEPOINT joins that transaction
-        // when it exists and, called standalone as it is today, opens SQLite's
-        // implicit top-level transaction itself — either way the three
-        // statements commit or roll back as one unit.
-        let atomic: Result<(u32, u32)> = db::with_savepoint(
+        // outer transaction that wraps append+sync+apply+cursor, and this
+        // SAVEPOINT joins it. `unchecked_transaction` issues BEGIN DEFERRED
+        // and SQLite rejects a nested transaction, so A1 must nest as a
+        // savepoint rather than open its own.
+        let atomic: Result<(u32, u32)> = cursor::append_and_apply_with(
+            &lock,
             &conn,
-            "audit_record",
-            || -> Result<(u32, u32)> {
-                let mut rec = 0u32;
-                let mut exp = 0u32;
+            paths,
+            emb,
+            &batch,
+            |conn| -> Result<(u32, u32)> {
+                db::with_savepoint(conn, "audit_record", || -> Result<(u32, u32)> {
+                    let mut rec = 0u32;
 
-                if let Some(ev) = &expire_event {
-                    db::apply_event(&conn, emb, ev)?;
-                    exp = 1;
-                }
-
-                // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
-                let inserted = conn.execute(
+                    // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
+                    let inserted = conn.execute(
                     "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
                      VALUES(?1,?2,?3,?4,?5)",
                     params![
@@ -2098,15 +2144,15 @@ fn handle_audit_record(
                     ],
                 )?;
 
-                // Fault-injection point for the A1 crash test: kills the
-                // process between the audit_runs row insert and the
-                // source_weights upsert, so a crash test can assert the
-                // savepoint above leaves neither committed.
-                kill_point(KillPoint::AuditAfterRunInsert);
+                    // Fault-injection point for the A1 crash test: kills the
+                    // process between the audit_runs row insert and the
+                    // source_weights upsert, so a crash test can assert the
+                    // savepoint above leaves neither committed.
+                    kill_point(KillPoint::AuditAfterRunInsert);
 
-                if inserted > 0 {
-                    // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
-                    let (entry_kind, entry_session_id): (String, String) = conn
+                    if inserted > 0 {
+                        // source_weights upsert using COALESCE(session_id, '__GLOBAL__')
+                        let (entry_kind, entry_session_id): (String, String) = conn
                         .query_row(
                             "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
                             params![entry_id],
@@ -2114,18 +2160,19 @@ fn handle_audit_record(
                         )
                         .unwrap_or_else(|_| ("belief".to_string(), "__GLOBAL__".to_string()));
 
-                    let weight_sql = if verdict {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                        let weight_sql = if verdict {
+                            "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
                          ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
-                    } else {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                        } else {
+                            "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
                          ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
-                    };
-                    conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
-                    rec = 1;
-                }
+                        };
+                        conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
+                        rec = 1;
+                    }
 
-                Ok((rec, exp))
+                    Ok((rec, exp))
+                })
             },
         );
 
@@ -3729,6 +3776,7 @@ mod tests {
         let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["expired"].as_str().unwrap(), entry_id);
+        assert_cursor_converged(&paths, "handle_expire");
     }
 
     #[test]
@@ -3751,6 +3799,176 @@ mod tests {
         assert_eq!(resp2["type"], "ok");
     }
 
+    /// A long-lived MCP server recovers at startup and then serves for hours.
+    /// An external `kb compact` (or another process's crash gap) opening
+    /// mid-session must be recovered before the next mutating request, not
+    /// erased by it.
+    #[test]
+    fn test_mutating_request_recovers_an_externally_diverged_database() {
+        struct FixedEmbedder;
+        impl embedder::Embedder for FixedEmbedder {
+            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![0.1; 384])
+            }
+        }
+        let (_dir, paths, _noop) = setup();
+        let emb = FixedEmbedder;
+        let id = json!("m1");
+        let req = json!({"method":"add","id":"m1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+
+        // Another process compacts the log: the generation moves under us.
+        cursor::bump_generation(&paths.events).unwrap();
+        {
+            let conn = db::open_ro(&paths.db).unwrap();
+            assert!(cursor::inspect(&conn, &paths).is_behind());
+        }
+
+        // The next mutating request recovers first, then writes.
+        let req2 = json!({"method":"add","id":"m2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "ok", "{resp}");
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, &paths),
+            cursor::Decision::NoOp,
+            "the server must converge rather than re-baseline"
+        );
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(live, 2, "neither entry may be lost by the recovery");
+        let _ = id;
+    }
+
+    /// Same situation, but the server has no embedder, so the rebuild defers.
+    /// It must serve on and refuse the write, never re-baseline.
+    #[test]
+    fn test_mutating_request_refuses_rather_than_rebaselining_when_recovery_defers() {
+        let (_dir, paths, emb) = setup();
+        let req = json!({"method":"add","id":"m1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+        cursor::bump_generation(&paths.events).unwrap();
+
+        let req2 = json!({"method":"add","id":"m2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "error", "{resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not converged"),
+            "the error must name the divergence: {resp}"
+        );
+
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert!(
+            cursor::inspect(&conn, &paths).is_behind(),
+            "the divergence must survive the refused write"
+        );
+    }
+
+    /// C1/T4: every MCP write handler must leave the applied cursor caught up
+    /// with the log. A handler that appends and applies without advancing it
+    /// puts every later open into a replay loop.
+    fn assert_cursor_converged(paths: &config::Paths, handler: &str) {
+        let conn = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&conn, paths),
+            cursor::Decision::NoOp,
+            "{handler} left the applied cursor behind the log"
+        );
+    }
+
+    /// A read served from a database behind the log must say so in the
+    /// response. Server stderr never reaches the agent on the other end of the
+    /// port, so without this a KB_NO_EMBED session serves stale results in
+    /// silence.
+    #[test]
+    fn test_reads_report_staleness_in_the_response() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("s1");
+        let req_add =
+            json!({"path":"t/s","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        let entry_id = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb)
+            ["entry_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Converged: the field is absent, and no existing field changed.
+        let search = json!({"method":"search","id":"s2","query":"one"});
+        let fresh = dispatch(&paths, &emb, &search);
+        assert_eq!(fresh["type"], "result");
+        assert!(fresh.get("stale").is_none(), "{fresh}");
+        let get = json!({"method":"kb_get","id":"s3","entry_id":entry_id});
+        let fresh_get = dispatch(&paths, &emb, &get);
+        assert_eq!(fresh_get["type"], "result");
+        assert!(fresh_get.get("stale").is_none(), "{fresh_get}");
+
+        // Behind: both reads carry a reason, and both still return results.
+        cursor::bump_generation(&paths.events).unwrap();
+        let stale = dispatch(&paths, &emb, &search);
+        assert_eq!(stale["type"], "result");
+        assert!(
+            stale["stale"].as_str().unwrap_or("").contains("generation"),
+            "{stale}"
+        );
+        let stale_get = dispatch(&paths, &emb, &get);
+        assert_eq!(stale_get["type"], "result");
+        assert!(stale_get["stale"].as_str().is_some(), "{stale_get}");
+        assert!(
+            stale_get["entry"]["id"].as_str().is_some(),
+            "the entry must still be served: {stale_get}"
+        );
+    }
+
+    /// The port surface of the deferral contract: a write is refused with the
+    /// convergence error, and reads are still served with a staleness note.
+    #[test]
+    fn test_mutating_request_refused_while_the_log_is_unreadable() {
+        let (_dir, paths, emb) = setup();
+        let id = json!("d1");
+        let req = json!({"method":"add","id":"d1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
+        assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
+
+        // A malformed line past the cursor, with the log still ending on a
+        // closed span so `committed_len` takes its shortcut.
+        let mut raw = fs::read_to_string(&paths.events).unwrap();
+        raw.push_str("{ not json at all }\n");
+        raw.push_str(&format!(
+            "{}\n{}\n{}\n",
+            json!({"action": "batch_begin", "batch_id": "hand-written", "n": 1}),
+            json!({"action":"upsert","table":"entries","id":"later","path":"t/l",
+                   "summary":"s","content":"c","tags":[],"kind":"belief",
+                   "ts":"2026-09-05T00:00:00Z"}),
+            json!({"action": "batch_commit", "batch_id": "hand-written", "n": 1}),
+        ));
+        fs::write(&paths.events, raw).unwrap();
+
+        let req2 = json!({"method":"add","id":"d2","path":"t/b","summary":"two","content":"c","tags":["a"],"kind":"convention"});
+        let resp = dispatch(&paths, &emb, &req2);
+        assert_eq!(resp["type"], "error", "{resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not converged"),
+            "{resp}"
+        );
+
+        let search = dispatch(
+            &paths,
+            &emb,
+            &json!({"method":"search","id":"d3","query":"one"}),
+        );
+        assert_eq!(search["type"], "result", "reads stay served: {search}");
+        assert!(search["stale"].as_str().is_some(), "{search}");
+    }
+
     #[test]
     fn test_handle_compact() {
         let (_dir, paths, emb) = setup();
@@ -3758,9 +3976,11 @@ mod tests {
         // Add 3 entries with same id → compact should squash
         for i in 0..3 {
             let ev = json!({"action":"upsert","table":"entries","id":"dup","path":"a","summary":format!("v{i}"),"content":"c","tags":[],"ts":"2024-01-01T00:00:00Z"});
-            events::append_event(&paths.events, &ev).unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
-            db::apply_event(&conn, &emb, &ev).unwrap();
+            // Through the applied-cursor writer: compaction takes the same
+            // convergence gate as any other write.
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[ev]).unwrap();
         }
 
         let resp = handle_compact(
@@ -3781,6 +4001,7 @@ mod tests {
         let resp = handle_test_add(&tr::<TestAddRequest>("test_add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["test_id"].as_str().is_some());
+        assert_cursor_converged(&paths, "handle_test_add");
 
         // List tests
         let req2 = json!({"method":"tests","id":"ta2","app":"myapp"});
@@ -3806,6 +4027,27 @@ mod tests {
         let resp = handle_run(&tr::<RunRequest>("run", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["result"], "pass");
+        assert_cursor_converged(&paths, "handle_run");
+        // T3 (bd-21ef.1.8): the mcp `run` emitter must always carry a
+        // run_id — the keyed-insertion apply arm relies on it for
+        // idempotent replay (CompactMaterialize.tla D5.1).
+        let run_id = resp["run_id"].as_str().expect("run_id must be present");
+        assert!(
+            uuid::Uuid::parse_str(run_id).is_ok(),
+            "run_id must be a uuid, got {run_id}"
+        );
+        let logged = crate::components::events::read_events(&paths.events)
+            .unwrap()
+            .events;
+        let run_event = logged
+            .iter()
+            .find(|e| e["action"] == "insert" && e["table"] == "run_history")
+            .expect("run event must be logged");
+        assert_eq!(
+            run_event["run_id"].as_str(),
+            Some(run_id),
+            "logged event must carry the same run_id returned to the caller"
+        );
     }
 
     #[test]
@@ -4403,6 +4645,7 @@ mod tests {
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["recorded"], 1);
         assert_eq!(resp["expired"], 0);
+        assert_cursor_converged(&paths, "handle_audit_record");
 
         let conn = db::open_db(&paths.db).unwrap();
         let n: i64 = conn

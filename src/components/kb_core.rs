@@ -38,7 +38,7 @@
 #![allow(deprecated)] // db::open_db (ADR-1) — remaining call sites migrate in C2/L1b, L2, L3, L1c
 use crate::commands::add::{acquire_lock, Lock};
 use crate::components::verification::{compute_citation_hash, parse_citation_path};
-use crate::components::{db, embedder, events, redactor};
+use crate::components::{cursor, db, embedder, events, redactor};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
@@ -156,8 +156,8 @@ pub fn add(
 /// 1. Validates, redacts, and caps the inputs.
 /// 2. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
 /// 3. Builds expire events + the upsert event + evidence-add events.
-/// 4. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
-/// 5. Applies each event to the DB in order, all under the caller's flock.
+/// 4. Appends ALL events in ONE span and applies them under the caller's flock,
+///    through the single applied-cursor writer (`cursor::append_and_apply`).
 ///
 /// Input preparation runs inside the critical section rather than ahead of it,
 /// which is a deliberate trade: one code path for both entry points is worth
@@ -419,12 +419,9 @@ pub fn add_locked(
     let mut batch: Vec<Value> = expire_events;
     batch.push(add_event);
     batch.extend(evidence_events);
-    events::append_events_batch(&paths.events, &batch)?;
-    kill_point(KillPoint::AfterLogBatch);
-
-    for ev in &batch {
-        db::apply_event(&conn, embedder, ev)?;
-    }
+    // Writer 1 of 10. Append + sync + apply + cursor as one unit (C1/D3): the
+    // helper owns the kill points, the embedding prefetch, and the transaction.
+    cursor::append_and_apply(lock, conn, paths, embedder, &batch)?;
 
     if args.evidence_status == "missing"
         && matches!(args.kind.as_str(), "observation" | "belief" | "procedure")
@@ -562,20 +559,20 @@ mod tests {
     }
 
     #[test]
-    fn test_add_crash_after_log_batch_leaves_db_behind_log() {
-        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-log-batch") {
+    fn test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-sync") {
             run_crash_gap_child();
         }
 
         let (dir, paths) = setup();
         let entry_id = "crash-gap-entry";
         let status = Command::new(std::env::current_exe().unwrap())
-            .arg("test_add_crash_after_log_batch_leaves_db_behind_log")
+            .arg("test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched")
             .arg("--nocapture")
             .current_dir(dir.path())
-            .env("KB_CRASH_TEST_CASE", "after-log-batch")
+            .env("KB_CRASH_TEST_CASE", "after-sync")
             .env("KB_CRASH_TEST_ROOT", dir.path())
-            .env("KB_CRASH_AFTER", KillPoint::AfterLogBatch.to_string())
+            .env("KB_CRASH_AFTER", KillPoint::AfterSync.to_string())
             .status()
             .unwrap();
 
@@ -590,18 +587,26 @@ mod tests {
             events.contains(entry_id),
             "event log should contain the appended entry after the simulated crash"
         );
+        let read = ev_mod::read_events(&paths.events).unwrap();
+        assert!(
+            read.events.iter().any(|event| event["id"] == entry_id),
+            "the synced span must be reader-accepted and committed"
+        );
+        assert_eq!(
+            read.committed_len,
+            fs::metadata(&paths.events).unwrap().len()
+        );
 
-        if paths.db.exists() {
-            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
-            let rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE id=?1",
-                    [entry_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(rows, 0, "DB must not contain the entry after the crash");
-        }
+        assert!(paths.db.exists(), "add opens the DB before appending");
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id=?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "DB must not contain the entry after the crash");
     }
 
     #[test]
@@ -638,9 +643,7 @@ mod tests {
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
 
-        let event_log = fs::read_to_string(&paths.events).unwrap();
-        let evidence_event: Value =
-            serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
+        let evidence_event = ev_mod::read_events(&paths.events).unwrap().events.remove(1);
         assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
         assert_eq!(
             evidence_event["evidence"]["citation_sha"],
@@ -782,13 +785,13 @@ mod tests {
                 "summary": "old", "content": "old", "tags": [],
                 "ts": "2024-01-01T00:00:00Z",
             });
-            ev_mod::append_event(&paths.events, &ev).unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
-            db::apply_event(&conn, &emb, &ev).unwrap();
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[ev]).unwrap();
         }
 
         // Count lines before.
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
         assert_eq!(before_lines, 2, "seeded 2 events");
 
         let args = AddArgs {
@@ -813,24 +816,23 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
-        // 2 seed events + 2 expire + 1 upsert = 5 total lines.
+        // 2 seed events + 2 expire + 1 upsert = 5 total events.
         assert_eq!(
             lines.len(),
             5,
-            "expected 5 lines (2 seed + 2 expire + 1 upsert), got {}",
+            "expected 5 events (2 seed + 2 expire + 1 upsert), got {}",
             lines.len()
         );
 
-        // Lines 2 and 3 (0-indexed) must be expire events.
-        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
-        let ev3: Value = serde_json::from_str(lines[3]).unwrap();
-        let ev4: Value = serde_json::from_str(lines[4]).unwrap();
-        assert_eq!(ev2["action"], "expire", "line[2] must be expire");
-        assert_eq!(ev3["action"], "expire", "line[3] must be expire");
-        assert_eq!(ev4["action"], "upsert", "line[4] must be upsert");
+        // Events 2 and 3 (0-indexed) must be expire events.
+        let ev2 = &lines[2];
+        let ev3 = &lines[3];
+        let ev4 = &lines[4];
+        assert_eq!(ev2["action"], "expire", "event[2] must be expire");
+        assert_eq!(ev3["action"], "expire", "event[3] must be expire");
+        assert_eq!(ev4["action"], "upsert", "event[4] must be upsert");
         assert_eq!(ev4["id"], "new-1");
 
         // DB: old entries must be stale, new entry active.
@@ -972,7 +974,7 @@ mod tests {
         };
         seed_cmd.execute_with(&paths, &emb).unwrap();
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         // Now add with replace_path — all events must land in one batch.
         let cmd = Add {
@@ -991,8 +993,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &emb).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
@@ -1003,8 +1004,8 @@ mod tests {
             lines.len()
         );
         // The expire must appear BEFORE the upsert.
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire");
         assert_eq!(upsert_ev["action"], "upsert");
         assert_eq!(upsert_ev["id"], "conv-new-1");
@@ -1025,12 +1026,13 @@ mod tests {
             "summary": "old", "content": "old", "tags": [],
             "ts": "2024-01-01T00:00:00Z",
         });
-        ev_mod::append_event(&paths.events, &seed_ev).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
-        db::apply_event(&conn, &emb, &seed_ev).unwrap();
-        drop(conn);
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[seed_ev]).unwrap();
+        }
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         let id = serde_json::json!("mcp-test");
         let req = serde_json::json!({
@@ -1041,8 +1043,7 @@ mod tests {
         let resp = handle_add_for_test(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok", "resp: {resp}");
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
             lines.len(),
@@ -1051,8 +1052,8 @@ mod tests {
             before_lines + 2,
             lines.len()
         );
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire", "expire must come first");
         assert_eq!(upsert_ev["action"], "upsert");
     }

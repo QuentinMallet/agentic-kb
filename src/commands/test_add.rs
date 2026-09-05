@@ -1,7 +1,7 @@
 //! `test-add` subcommand
 
 use crate::commands::add::{acquire_lock, read_omc_session};
-use crate::components::{db, events};
+use crate::components::{cursor, db};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -42,6 +42,13 @@ impl TestAdd {
     /// Execute the test-add command.
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
+        self.execute_with_paths(&paths)
+    }
+
+    /// Execute with explicit paths, so tests can drive this entry point rather
+    /// than the applied-cursor helper it delegates to (matching `run.rs`).
+    pub fn execute_with_paths(&self, paths: &config::Paths) -> anyhow::Result<()> {
+        let paths = paths.clone();
         let lock = acquire_lock(&paths.lock)?;
         let id = self
             .id
@@ -65,10 +72,10 @@ impl TestAdd {
             "session_id": omc_session_id,
         });
 
-        events::append_event(&paths.events, &event)?;
+        // Writer 4 of 10.
         let conn = db::open_rw(&paths, &lock)?;
         let embedder = crate::components::embedder::NoopEmbedder;
-        db::apply_event(&conn, &embedder, &event)?;
+        cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[event])?;
 
         println!("added test case  {}/{} ({})", self.app, self.name, id);
         Ok(())

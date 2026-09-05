@@ -1,7 +1,8 @@
 //! `run` subcommand
 
 use crate::commands::add::{acquire_lock, read_omc_session};
-use crate::components::{db, events};
+use crate::components::embedder::Embedder;
+use crate::components::{cursor, db};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use anyhow::bail;
@@ -35,10 +36,20 @@ impl Runnable for Run {
 impl Run {
     /// Execute the run command.
     pub fn execute(&self) -> anyhow::Result<()> {
+        let paths = config::Paths::discover()?;
+        let embedder = crate::components::embedder::NoopEmbedder;
+        self.execute_with_paths(&paths, &embedder)
+    }
+
+    /// Execute with explicit paths and embedder (for testing).
+    pub fn execute_with_paths(
+        &self,
+        paths: &config::Paths,
+        embedder: &dyn Embedder,
+    ) -> anyhow::Result<()> {
         if self.result != "pass" && self.result != "fail" {
             bail!("--result must be 'pass' or 'fail', got: {}", self.result);
         }
-        let paths = config::Paths::discover()?;
         let lock = acquire_lock(&paths.lock)?;
         let ts = chrono::Utc::now().to_rfc3339();
         let (session, omc_session_id) = read_omc_session();
@@ -57,10 +68,9 @@ impl Run {
             "session_id": omc_session_id,
         });
 
-        events::append_event(&paths.events, &event)?;
-        let conn = db::open_rw(&paths, &lock)?;
-        let embedder = crate::components::embedder::NoopEmbedder;
-        db::apply_event(&conn, &embedder, &event)?;
+        // Writer 3 of 10.
+        let conn = db::open_rw(paths, &lock)?;
+        cursor::append_and_apply(&lock, &conn, paths, embedder, &[event])?;
 
         println!(
             "recorded run {}  {} -> {}",
@@ -69,5 +79,59 @@ impl Run {
             self.result
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::embedder::NoopEmbedder;
+    use crate::components::events;
+    use crate::config::Paths;
+    use std::fs;
+
+    /// T3 (bd-21ef.1.8): the `run` CLI emitter must always carry a `run_id`
+    /// on the appended event — the mechanism the keyed-insertion apply arm
+    /// (`db.rs`'s `("insert", "run_history")`) relies on for idempotent
+    /// replay (CompactMaterialize.tla D5.1).
+    #[test]
+    fn test_run_execute_emits_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+
+        let test_case = serde_json::json!({
+            "action": "upsert", "table": "test_cases",
+            "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
+            "config": "{}", "ts": "2024-01-01T00:00:00Z"
+        });
+        {
+            let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &NoopEmbedder, &[test_case]).unwrap();
+        }
+
+        let cmd = Run {
+            test_id: "t1".to_string(),
+            result: "pass".to_string(),
+            adapter: None,
+            detail: None,
+        };
+        cmd.execute_with_paths(&paths, &NoopEmbedder).unwrap();
+
+        let logged = events::read_events(&paths.events).unwrap().events;
+        let run_event = logged
+            .iter()
+            .find(|e| e["action"] == "insert" && e["table"] == "run_history")
+            .expect("run event must be logged");
+        let run_id = run_event["run_id"]
+            .as_str()
+            .expect("run event must carry a non-null run_id");
+        assert!(!run_id.is_empty(), "run_id must not be empty");
+        assert!(
+            uuid::Uuid::parse_str(run_id).is_ok(),
+            "run_id must be a uuid, got {run_id}"
+        );
     }
 }

@@ -445,7 +445,6 @@ mod tests {
             "path": "docs/compress-gc", "summary": "entry", "content": content,
             "tags": [], "kind": "belief", "ts": "2024-01-01T00:00:00Z"
         });
-        db::apply_event(&conn, &emb, &upsert).unwrap();
         let evidence = serde_json::json!({
             "action": "evidence_add", "table": "evidence", "entry_id": "compress-old",
             "evidence": {
@@ -453,8 +452,21 @@ mod tests {
                 "citation_path": "src/lib.rs:1-2", "citation_hash": "sha256:ok"
             }
         });
-        db::apply_event(&conn, &emb, &evidence).unwrap();
+        // Through the applied-cursor writer, so the log exists and matches: a
+        // populated database with no log at all is refused by the write guard.
         drop(conn);
+        {
+            let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            crate::components::cursor::append_and_apply(
+                &lock,
+                &conn,
+                &paths,
+                &emb,
+                &[upsert, evidence],
+            )
+            .unwrap();
+        }
 
         run(
             &Compress {

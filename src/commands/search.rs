@@ -84,7 +84,6 @@ impl Search {
             config::Paths::discover()?
         };
         let emb = crate::commands::add::make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
         self.execute_with(&paths, emb.as_ref())
     }
 
@@ -134,6 +133,12 @@ impl Search {
             }
             Err(e) => return Err(e),
         };
+        // C2/ADR-7 + C1/D3: a read DETECTS that the database is behind the log
+        // and says so on stderr. It never repairs, and never takes the write
+        // lock — under open_ro's `PRAGMA query_only` it could not anyway.
+        if let Some(conn) = &conn {
+            crate::components::cursor::warn_if_behind(conn, paths);
+        }
         let local_results = match &conn {
             Some(conn) => db::search_entries(conn, embedder, &self.query, &opts)?,
             None => Vec::new(),
