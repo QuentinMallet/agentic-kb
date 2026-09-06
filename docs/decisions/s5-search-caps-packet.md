@@ -8,7 +8,16 @@ Status: prepared for lead ruling before clamp lands
 
 This packet is derived from the current code path:
 
-- `src/commands/search.rs:108` sets CLI `inline_verify_k = limit`.
+- `src/commands/search.rs:108` sets CLI `inline_verify_k = limit`, **except**
+  under federation (`--peers` or `--reachable-from`), where `execute_with`
+  zeroes `inline_verify_k` before the per-repository search and instead
+  calls `db::verify_search_entries` once, after the global merge and
+  truncate, verifying up to `self.limit` of the already-selected results
+  against each row's own `origin_repo`. This exception postdates the ruling
+  below and does not change the O1 conclusion: verification is still applied
+  to every result up to the same bound, just at a different point in the
+  pipeline. See "Federation (Multi-Peer Search)" in
+  `docs/src/search-tuning.md`.
 - `src/commands/mcp.rs:284-287` already clamps MCP `limit` to `MAX_LIMIT` and `inline_verify_k` to `MAX_INLINE_VERIFY_K`.
 - `src/components/db.rs:1738+` `search_entries` had no boundary clamp before this prepared change.
 - `src/components/db.rs:2194+` verification flattens all evidence rows for the first `verify_count = min(inline_verify_k, entries.len())` entries into `flat_tasks`, then schedules one verification task per evidence row.
