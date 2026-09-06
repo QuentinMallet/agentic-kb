@@ -535,10 +535,7 @@ mod tests {
         let blob: Vec<u8> = conn.query_row(
             "SELECT emb.embedding FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id='race'",
             [], |r| r.get(0)).unwrap();
-        assert_eq!(
-            blob,
-            normalized_f32s_to_f16_blob(&vec![0.75; 384]).unwrap()
-        );
+        assert_eq!(blob, normalized_f32s_to_f16_blob(&vec![0.75; 384]).unwrap());
     }
 
     #[test]

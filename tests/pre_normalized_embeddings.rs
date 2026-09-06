@@ -8,7 +8,8 @@
 
 use kb::commands::migrate_embeddings::MigrateEmbeddings;
 use kb::components::db::{
-    apply_event, migrate_embeddings, open_db, open_db_memory, search_entries, SearchOptions,
+    apply_event, migrate_embeddings, open_db_memory, open_unchecked_for_test, search_entries,
+    SearchOptions,
 };
 use kb::components::embedder::Embedder;
 use kb::config::Paths;
@@ -318,6 +319,7 @@ fn disk_paths() -> (tempfile::TempDir, Paths) {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
     let paths = Paths::from_root(dir.path());
+    kb::components::db::open_or_init(&paths).unwrap();
     (dir, paths)
 }
 
@@ -349,7 +351,7 @@ fn database_digest(path: &std::path::Path) -> String {
 #[test]
 fn file_migration_is_idempotent_after_publish_with_retained_backup() {
     let (_dir, paths) = disk_paths();
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let noop = kb::components::embedder::NoopEmbedder;
     apply_event(&conn, &noop, &entry_event("disk-row")).unwrap();
     conn.execute(
@@ -382,7 +384,7 @@ fn file_migration_is_idempotent_after_publish_with_retained_backup() {
 #[test]
 fn file_migration_resumes_a_pre_publish_staged_copy_without_losing_live_rows() {
     let (_dir, paths) = disk_paths();
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let noop = kb::components::embedder::NoopEmbedder;
     apply_event(&conn, &noop, &entry_event("survives-crash")).unwrap();
     conn.execute(
@@ -406,7 +408,7 @@ fn file_migration_resumes_a_pre_publish_staged_copy_without_losing_live_rows() {
         .unwrap();
     drop(conn);
 
-    let staged_conn = open_db(&staging).unwrap();
+    let staged_conn = open_unchecked_for_test(&staging).unwrap();
     assert_eq!(migrate_embeddings(&staged_conn).unwrap(), 1);
     staged_conn
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -418,7 +420,7 @@ fn file_migration_resumes_a_pre_publish_staged_copy_without_losing_live_rows() {
     // This is the crash window the migration must protect: the stage is ready
     // but the live DB has gained a committed row. Recovery may not publish the
     // old stage over it, even after checkpointing the live WAL.
-    let late_conn = open_db(&paths.db).unwrap();
+    let late_conn = open_unchecked_for_test(&paths.db).unwrap();
     apply_event(&late_conn, &noop, &entry_event("committed-after-stage")).unwrap();
     late_conn
         .execute(
@@ -434,7 +436,7 @@ fn file_migration_resumes_a_pre_publish_staged_copy_without_losing_live_rows() {
     let command = MigrateEmbeddings;
     assert_eq!(command.execute_with(&paths).unwrap(), 2);
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     let (_, normalized) = stored_entry_embedding(&conn, "survives-crash");
     assert_eq!(normalized, 1);
     let (_, normalized) = stored_entry_embedding(&conn, "committed-after-stage");

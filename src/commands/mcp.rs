@@ -10,10 +10,11 @@ use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, warn_nested_worktree_citations,
     wrap_citation_excerpt,
 };
-use crate::commands::cite::{compute_citation_fields, with_citation_fields};
+use crate::commands::cite::with_citation_fields;
 use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
 use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
+use crate::config::root_from_db;
 use crate::models::Evidence;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
@@ -3522,27 +3523,24 @@ mod tests {
     fn test_handle_add_rejects_mismatched_explicit_citation_hash_without_writes() {
         let (dir, paths, emb) = setup();
         fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let before_events = fs::read(&paths.events).unwrap_or_default();
 
-        let resp = handle_add(
-            &json!("bad-citation-hash"),
-            &json!({
-                "method": "add",
-                "path": "test/mismatched-citation-hash",
-                "summary": "must not persist",
-                "content": "body",
-                "tags": [],
-                "kind": "belief",
-                "evidence": [{
-                    "kind": "code",
-                    "citation_path": "cited.rs",
-                    "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                }]
-            }),
-            &paths,
-            &emb,
-        );
+        let id = json!("bad-citation-hash");
+        let req = json!({
+            "method": "add",
+            "path": "test/mismatched-citation-hash",
+            "summary": "must not persist",
+            "content": "body",
+            "tags": [],
+            "kind": "belief",
+            "evidence": [{
+                "kind": "code",
+                "citation_path": "cited.rs",
+                "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        });
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
 
         assert_eq!(resp["type"], "error", "response: {resp}");
         assert_eq!(resp["code"], "validation_error", "response: {resp}");
@@ -3581,27 +3579,24 @@ mod tests {
         ] {
             let (dir, paths, emb) = setup();
             fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let before_events = fs::read(&paths.events).unwrap_or_default();
 
-            let resp = handle_add(
-                &json!("unverifiable-citation-hash"),
-                &json!({
-                    "method": "add",
-                    "path": "test/unverifiable-citation-hash",
-                    "summary": "must not persist",
-                    "content": "body",
-                    "tags": [],
-                    "kind": "belief",
-                    "evidence": [{
-                        "kind": "code",
-                        "citation_path": citation_path,
-                        "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    }]
-                }),
-                &paths,
-                &emb,
-            );
+            let id = json!("unverifiable-citation-hash");
+            let req = json!({
+                "method": "add",
+                "path": "test/unverifiable-citation-hash",
+                "summary": "must not persist",
+                "content": "body",
+                "tags": [],
+                "kind": "belief",
+                "evidence": [{
+                    "kind": "code",
+                    "citation_path": citation_path,
+                    "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            });
+            let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
 
             assert_eq!(
                 resp["type"], "error",
@@ -3641,23 +3636,20 @@ mod tests {
         fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
         let expected = compute_citation_hash(dir.path(), "cited.rs", None).unwrap();
 
-        let resp = handle_add(
-            &json!("missing-citation-hash"),
-            &json!({
-                "method": "add",
-                "path": "test/missing-citation-hash",
-                "summary": "computed hash",
-                "content": "body",
-                "tags": [],
-                "kind": "belief",
-                "evidence": [{"kind": "code", "citation_path": "cited.rs"}]
-            }),
-            &paths,
-            &emb,
-        );
+        let id = json!("missing-citation-hash");
+        let req = json!({
+            "method": "add",
+            "path": "test/missing-citation-hash",
+            "summary": "computed hash",
+            "content": "body",
+            "tags": [],
+            "kind": "belief",
+            "evidence": [{"kind": "code", "citation_path": "cited.rs"}]
+        });
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
 
         assert_eq!(resp["type"], "ok", "response: {resp}");
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let stored: String = conn
             .query_row("SELECT citation_hash FROM evidence", [], |row| row.get(0))
             .unwrap();
@@ -3681,12 +3673,11 @@ mod tests {
             let computed = compute_citation_hash(dir.path(), "cited.bin", None).unwrap();
             let mut wrong = computed.clone();
             wrong.replace_range(0..1, if &computed[0..1] == "0" { "1" } else { "0" });
-            let conn = db::open_db(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let before_events = fs::read(&paths.events).unwrap_or_default();
 
-            let resp = handle_add(
-                &json!("property-mismatched-citation-hash"),
-                &json!({
+            let id = json!("property-mismatched-citation-hash");
+            let req = json!({
                     "method": "add",
                     "path": "test/property-mismatched-citation-hash",
                     "summary": "must not persist",
@@ -3698,10 +3689,8 @@ mod tests {
                         "citation_path": "cited.bin",
                         "citation_hash": format!("sha256:{wrong}")
                     }]
-                }),
-                &paths,
-                &emb,
-            );
+                });
+            let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
 
             proptest::prop_assert_eq!(
                 resp["type"].as_str(),
@@ -3730,9 +3719,7 @@ mod tests {
     #[test]
     fn test_handle_add_accepts_nested_worktree_citation() {
         let (dir, paths, emb) = setup();
-        let citation = dir
-            .path()
-            .join(".state/worktrees/feature/src/lib.rs");
+        let citation = dir.path().join(".state/worktrees/feature/src/lib.rs");
         fs::create_dir_all(citation.parent().unwrap()).unwrap();
         fs::write(&citation, "fn warning_fixture() {}\n").unwrap();
         let id = json!("nested-worktree-citation");
@@ -7535,22 +7522,42 @@ mod tests {
         let rebuild = json!({"method":"rebuild","id":"pin-rebuild"});
         let kb_get = json!({"method":"kb_get","id":"pin-kb-get","entry_id":"nope"});
 
-        let contract: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
-            .expect("shared MCP schema contract fixture must be valid JSON");
+        let contract: Value =
+            serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
+                .expect("shared MCP schema contract fixture must be valid JSON");
         let requests = [
-            ("kb_search", &search), ("kb_add", &add), ("kb_cite", &cite),
-            ("kb_import", &import), ("kb_stale_check", &stale), ("kb_expire", &expire),
-            ("kb_run", &run), ("kb_test_add", &test_add), ("kb_tests", &tests),
-            ("kb_reembed", &reembed), ("kb_compact", &compact), ("kb_rebuild", &rebuild),
+            ("kb_search", &search),
+            ("kb_add", &add),
+            ("kb_cite", &cite),
+            ("kb_import", &import),
+            ("kb_stale_check", &stale),
+            ("kb_expire", &expire),
+            ("kb_run", &run),
+            ("kb_test_add", &test_add),
+            ("kb_tests", &tests),
+            ("kb_reembed", &reembed),
+            ("kb_compact", &compact),
+            ("kb_rebuild", &rebuild),
             ("kb_get", &kb_get),
         ];
         for (tool, request) in requests {
-            let actual: std::collections::BTreeSet<_> = request.as_object().unwrap().keys()
+            let actual: std::collections::BTreeSet<_> = request
+                .as_object()
+                .unwrap()
+                .keys()
                 .filter(|key| key.as_str() != "method" && key.as_str() != "id")
-                .cloned().collect();
+                .cloned()
+                .collect();
             let expected: std::collections::BTreeSet<_> = contract["pin_fields"][tool]
-                .as_array().unwrap().iter().map(|field| field.as_str().unwrap().to_owned()).collect();
-            assert_eq!(actual, expected, "{tool} request drifted from shared deployed-pin field table");
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| field.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{tool} request drifted from shared deployed-pin field table"
+            );
         }
 
         pin_accepted::<SearchRequest>(&search);
@@ -7597,12 +7604,17 @@ mod tests {
 
     #[test]
     fn test_schema_bounds_match_shared_contract_fixture() {
-        let contract: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
-            .expect("shared MCP schema contract fixture must be valid JSON");
+        let contract: Value =
+            serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
+                .expect("shared MCP schema contract fixture must be valid JSON");
         let bounds = &contract["bounds"];
         let expected = [
             ("kb_search.limit", 1, db::MAX_LIMIT as u64),
-            ("kb_search.inline_verify_k", 0, db::MAX_INLINE_VERIFY_K as u64),
+            (
+                "kb_search.inline_verify_k",
+                0,
+                db::MAX_INLINE_VERIFY_K as u64,
+            ),
             ("kb_reembed.max_chars", 1, MAX_REEMBED_MAX_CHARS),
         ];
         for (field, minimum, maximum) in expected {

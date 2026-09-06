@@ -47,9 +47,9 @@ impl MigrateEmbeddings {
     /// later invocation resumes that exact publish only if the source is
     /// unchanged; otherwise it discards the stale stage and starts again.
     pub fn execute_with(&self, paths: &config::Paths) -> anyhow::Result<usize> {
-        let _lock = acquire_lock(&paths.lock)?;
+        let lock = acquire_lock(&paths.lock)?;
 
-        if let Some(migrated) = recover_ready_stage(paths)? {
+        if let Some(migrated) = recover_ready_stage(paths, &lock)? {
             return Ok(migrated);
         }
 
@@ -59,7 +59,7 @@ impl MigrateEmbeddings {
         remove_staging_artifacts(paths)?;
 
         let source_digest = checkpoint_database(&paths.db, "live")?;
-        let live = db::open_db(&paths.db)?;
+        let live = db::open_rw(paths, &lock)?;
         if pending_embeddings(&live)? == 0 {
             return Ok(0);
         }
@@ -73,7 +73,7 @@ impl MigrateEmbeddings {
         drop(live);
 
         let migration = (|| -> anyhow::Result<usize> {
-            let staged_conn = db::open_db(&staged)?;
+            let staged_conn = db::open_scratch(&staged)?;
             let migrated = db::migrate_embeddings(&staged_conn)?;
             drop(staged_conn);
             verify_staged_database(&staged)?;
@@ -138,7 +138,11 @@ fn vacuum_into(
 /// sidecar is removed. The caller holds the application write lock; a busy
 /// checkpoint is a hard failure rather than a potentially lossy publish.
 fn checkpoint_database(path: &Path, label: &str) -> anyhow::Result<String> {
-    let conn = db::open_db(path)?;
+    let conn = if db::is_live_db_path(path) {
+        db::open_live_for_checkpoint(path)?
+    } else {
+        db::open_scratch(path)?
+    };
     let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -186,7 +190,7 @@ fn database_digest(path: &Path) -> anyhow::Result<String> {
 
 fn verify_staged_database(staged: &Path) -> anyhow::Result<()> {
     checkpoint_database(staged, "staged")?;
-    let conn = db::open_db(staged)?;
+    let conn = db::open_scratch(staged)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         bail!("staged migration DB failed integrity_check: {integrity}");
@@ -238,7 +242,10 @@ fn sync_parent(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("sync {}", parent.display()))
 }
 
-fn recover_ready_stage(paths: &config::Paths) -> anyhow::Result<Option<usize>> {
+fn recover_ready_stage(
+    paths: &config::Paths,
+    lock: &crate::commands::add::Lock,
+) -> anyhow::Result<Option<usize>> {
     let state = state_path(paths);
     if !state.exists() {
         return Ok(None);
@@ -253,7 +260,7 @@ fn recover_ready_stage(paths: &config::Paths) -> anyhow::Result<Option<usize>> {
     };
 
     if !staged.exists() {
-        let live = db::open_db(&paths.db)?;
+        let live = db::open_rw(paths, lock)?;
         let pending = pending_embeddings(&live)?;
         drop(live);
         if pending == 0 {
