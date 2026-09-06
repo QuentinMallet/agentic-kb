@@ -690,7 +690,7 @@ fn handle_add(
     // A caller-supplied hash is an assertion about the cited bytes. Validate
     // that assertion before kb_core::add can append its JSONL batch or apply
     // any database writes. `verify_evidence` is the authoritative path/range
-    // and hashing policy; only an in-root byte mismatch is rejected here.
+    // and hashing policy, so every non-verified assertion is rejected here.
     if let Err(e) = validate_explicit_citation_hashes(&root_from_db(&paths.db), &evidence_rows) {
         return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
     }
@@ -769,9 +769,14 @@ fn validate_explicit_citation_hashes(repo_root: &Path, evidence_rows: &[Value]) 
             recorded_at: None,
         };
         let outcome = verify_evidence(&evidence, repo_root, RelocationPolicy::Never);
-        if outcome.reason == Some(UnverifiedReason::HashMismatch) {
+        if !outcome.is_verified() {
+            let reason = outcome
+                .reason
+                .as_ref()
+                .map(UnverifiedReason::as_str)
+                .unwrap_or("not_verified");
             anyhow::bail!(
-                "evidence[{index}] citation_hash does not match citation_path {citation_path:?}"
+                "evidence[{index}] citation_hash failed verification for citation_path {citation_path:?}: {reason}"
             );
         }
     }
@@ -2730,6 +2735,68 @@ mod tests {
             before_events,
             "a rejected request must not append events"
         );
+    }
+
+    #[test]
+    fn test_handle_add_rejects_unverifiable_explicit_citation_hash_without_writes() {
+        for citation_path in [
+            "cited.rs:not-a-range",
+            "missing.rs",
+            "cited.rs:0-999",
+            "../outside.rs",
+        ] {
+            let (dir, paths, emb) = setup();
+            fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
+            let conn = db::open_db(&paths.db).unwrap();
+            let before_events = fs::read(&paths.events).unwrap_or_default();
+
+            let resp = handle_add(
+                &json!("unverifiable-citation-hash"),
+                &json!({
+                    "method": "add",
+                    "path": "test/unverifiable-citation-hash",
+                    "summary": "must not persist",
+                    "content": "body",
+                    "tags": [],
+                    "kind": "belief",
+                    "evidence": [{
+                        "kind": "code",
+                        "citation_path": citation_path,
+                        "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    }]
+                }),
+                &paths,
+                &emb,
+            );
+
+            assert_eq!(
+                resp["type"], "error",
+                "path={citation_path}, response: {resp}"
+            );
+            assert_eq!(
+                resp["code"], "validation_error",
+                "path={citation_path}, response: {resp}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "path={citation_path}: a rejected request must not create an entry"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "path={citation_path}: a rejected request must not create evidence"
+            );
+            assert_eq!(
+                fs::read(&paths.events).unwrap_or_default(),
+                before_events,
+                "path={citation_path}: a rejected request must not append events"
+            );
+        }
     }
 
     #[test]
