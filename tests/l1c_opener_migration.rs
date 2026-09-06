@@ -14,6 +14,46 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Path to the built `kb` binary, provided by Cargo for integration tests.
+/// Driving these checks through the real compiled CLI -- argv parsing,
+/// `EntryPoint::run`'s dispatch gate, `main()` -- rather than calling
+/// `execute_with` in-process is what actually exercises dispatch, which is
+/// where the C2/L1c and pre-existing stale-check/compress/reembed
+/// classification bugs lived; `execute_with` alone would have passed before
+/// any of those fixes too. A subprocess also sidesteps the process-global
+/// state (cwd, stdio fds) an in-process dispatch call would otherwise force
+/// onto this test file, at the cost of one process spawn per case (well
+/// within `TIMEOUT`).
+const KB_BIN: &str = env!("CARGO_BIN_EXE_kb");
+
+/// Run `kb <args>` in `root` and require it to finish within [`TIMEOUT`]
+/// with a clean exit, so a subcommand that took the write lock at dispatch
+/// (or errored while it was held) fails this assertion instead of hanging
+/// or panicking the test suite. Returns captured stdout on success.
+fn require_unblocked_dispatch(label: &str, root: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let (tx, rx) = mpsc::channel();
+    let root = root.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    thread::spawn(move || {
+        let result = std::process::Command::new(KB_BIN)
+            .args(&args)
+            .current_dir(&root)
+            .env("KB_NO_EMBED", "1")
+            .output();
+        tx.send(result).unwrap();
+    });
+    let output = rx
+        .recv_timeout(TIMEOUT)
+        .unwrap_or_else(|_| panic!("{label} blocked on paths.lock"))
+        .unwrap_or_else(|e| panic!("{label} failed to spawn: {e}"));
+    assert!(
+        output.status.success(),
+        "{label} failed while paths.lock was held: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
 /// The portion of `source` before its own `#[cfg(test)] mod ... { ... }`
 /// unit-test module (every file below has exactly one, the file's own unit
 /// tests), so a grep against it cannot be satisfied by a mention inside the
@@ -39,6 +79,10 @@ fn migrated_read_surfaces_are_pinned_to_open_ro() {
         ("tests list", include_str!("../src/commands/tests.rs")),
         ("compress", include_str!("../src/commands/compress.rs")),
         (
+            "peers list/show/edge-list",
+            include_str!("../src/commands/peers.rs"),
+        ),
+        (
             "mcp (handle_audit_report)",
             include_str!("../src/commands/mcp.rs"),
         ),
@@ -58,6 +102,17 @@ fn migrated_read_surfaces_are_pinned_to_open_ro() {
             "{name} revived the legacy opener"
         );
     }
+
+    // peers.rs is a mixed file holding three readers (list, show, edge list)
+    // alongside six writers, so a bare "contains open_ro(" pin above would
+    // still pass if a reader regressed to open_rw as long as one other
+    // reader kept its open_ro call. Require all three occurrences by name.
+    let peers_production = production_source(include_str!("../src/commands/peers.rs"));
+    assert_eq!(
+        peers_production.matches("open_ro(").count(),
+        3,
+        "peers.rs must keep exactly three open_ro readers (list, show, edge list)"
+    );
 }
 
 /// Seed one real entry through the production `Add` CLI path, matching the
@@ -115,7 +170,96 @@ fn migrated_readers_serve_data_while_the_write_lock_is_held() {
         .unwrap();
     assert_eq!(entries_before, 1, "the seed must have landed");
 
+    // Seed one live peer row so each peer reader must return actual data.
+    {
+        let source_repo = paths.root.to_string_lossy().into_owned();
+        let seed_lock = acquire_lock(&paths.lock).unwrap();
+        let conn = db::open_rw(&paths, &seed_lock).unwrap();
+        conn.execute(
+            "INSERT INTO graphs (id, graph_type, epic_slug, source_repo, created_at) VALUES ('g1', 'dep', NULL, ?1, '2026-09-05T00:00:00Z')",
+            [&source_repo],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers (id, graph_id, source_repo, target_repo, edge_type, created_at) VALUES ('p1', 'g1', ?1, 'target-repo', 'member', '2026-09-05T00:00:00Z')",
+            [&source_repo],
+        )
+        .unwrap();
+    }
+
     let lock = acquire_lock(&paths.lock).unwrap();
+
+    // Driven through the real CLI dispatch path (`EntryPoint::run`), not
+    // `execute_with` -- dispatch's own `if self.cmd.mutates() { open_or_init
+    // }` gate is where the bug this branch fixes lived, so a reader whose
+    // classification regressed to `true` would deadlock here against the
+    // held `paths.lock` even though its `execute_with` body never changed.
+    let root = paths.root.clone();
+    for (label, args) in [
+        ("kb peers list", vec!["peers", "list"]),
+        (
+            "kb peers show",
+            vec!["peers", "show", root.to_str().unwrap()],
+        ),
+        ("kb peers edge list", vec!["peers", "edge", "list"]),
+    ] {
+        let stdout = require_unblocked_dispatch(label, &root, &args);
+        let rows: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert!(
+            rows.as_array().is_some_and(|rows| rows.len() == 1),
+            "{label} must return the seeded row, got: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+
+    // `stale-check` (default flags), `compress --dry-run`, `reembed
+    // --dry-run`, `ingest --dry-run`, and `import --dry-run` are the other
+    // five subcommands whose dispatch classification this branch corrects
+    // (pre-existing bugs, same shape as the peers one above): each must
+    // skip `open_or_init` at dispatch and therefore must not block on the
+    // held write lock either.
+    require_unblocked_dispatch(
+        "kb stale-check (default)",
+        &root,
+        &["stale-check", "src/auth.rs"],
+    );
+    require_unblocked_dispatch(
+        "kb compress --dry-run",
+        &root,
+        &["compress", "src/auth.rs", "--dry-run"],
+    );
+    require_unblocked_dispatch("kb reembed --dry-run", &root, &["reembed", "--dry-run"]);
+
+    let doc_file = root.join("l1c-ingest-doc.md");
+    std::fs::write(&doc_file, "some document text").unwrap();
+    require_unblocked_dispatch(
+        "kb ingest --dry-run",
+        &root,
+        &[
+            "ingest",
+            "--path",
+            "docs/l1c",
+            "--summary",
+            "s",
+            "--tags",
+            "t",
+            "--file",
+            doc_file.to_str().unwrap(),
+            "--dry-run",
+        ],
+    );
+
+    let seeds_file = root.join("l1c-import-seeds.json");
+    std::fs::write(
+        &seeds_file,
+        r#"[{"path":"p","summary":"s","content":"c","tags":["t"]}]"#,
+    )
+    .unwrap();
+    require_unblocked_dispatch(
+        "kb import --dry-run",
+        &root,
+        &["import", seeds_file.to_str().unwrap(), "--dry-run"],
+    );
 
     // Tests::execute_with: a pure read, must not block or error.
     {

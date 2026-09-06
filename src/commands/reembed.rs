@@ -164,7 +164,30 @@ where
     A: FnMut(usize),
 {
     // Selection is unlocked and read-only.
-    let conn = db::open_ro(&paths.db)?;
+    let conn = match db::open_ro(&paths.db) {
+        Ok(conn) => conn,
+        Err(e) if db::is_db_uninitialized(&e) => {
+            if dry_run {
+                // A fresh repository (no database yet) has nothing to
+                // re-embed -- match the other first-run-safe readers and
+                // report zero rather than erroring, since `--dry-run`
+                // dispatch no longer initializes the database up front
+                // (C2/L1c).
+                db::note_uninitialized(&paths.db);
+                return Ok(ReembedReport::default());
+            }
+            // Non-dry-run `reembed` is a writer: dispatch already
+            // initializes it (best-effort, warning on failure rather than
+            // erroring). If that startup recovery failed or was skipped,
+            // self-heal here instead of silently reporting empty success --
+            // the same pattern `stale_check.rs`'s `heal_relocations` uses
+            // for its own write path, which calls `open_or_init` itself
+            // rather than trusting the caller to have done so.
+            db::open_or_init(paths)?;
+            db::open_ro(&paths.db)?
+        }
+        Err(e) => return Err(e),
+    };
     let mut stmt = conn.prepare(
         "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at FROM entries e
          WHERE e.is_stale = 0 AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
