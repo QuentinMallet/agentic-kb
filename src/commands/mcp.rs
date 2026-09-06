@@ -9,8 +9,8 @@ use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
-use crate::commands::cite::with_citation_fields;
-use crate::components::verification::RelocationPolicy;
+use crate::commands::cite::{compute_citation_fields, with_citation_fields};
+use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
 use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
@@ -1284,6 +1284,14 @@ fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embed
         return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
     }
 
+    // A caller-supplied hash is an assertion about the cited bytes. Validate
+    // that assertion before kb_core::add can append its JSONL batch or apply
+    // any database writes. `verify_evidence` is the authoritative path/range
+    // and hashing policy, so every non-verified assertion is rejected here.
+    if let Err(e) = validate_explicit_citation_hashes(&root_from_db(&paths.db), &evidence_rows) {
+        return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
+    }
+
     let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
     let ts = Utc::now().to_rfc3339();
     let version_ref = config::git_head_sha();
@@ -1324,6 +1332,53 @@ fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embed
         }
         Err(e) => json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     }
+}
+
+fn validate_explicit_citation_hashes(repo_root: &Path, evidence_rows: &[Value]) -> Result<()> {
+    for (index, row) in evidence_rows.iter().enumerate() {
+        let Some(citation_hash) = row
+            .get("citation_hash")
+            .and_then(Value::as_str)
+            .filter(|hash| !hash.is_empty())
+        else {
+            continue;
+        };
+        let Some(citation_path) = row
+            .get("citation_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+
+        let evidence = Evidence {
+            id: format!("kb-add-hash-check-{index}"),
+            entry_id: "kb-add-hash-check".to_string(),
+            // The write-time check validates cited bytes regardless of the
+            // row's storage kind; verifier support for derived evidence is a
+            // separate Phase 2 concern.
+            kind: "code".to_string(),
+            citation_path: Some(citation_path.to_string()),
+            citation_sha: None,
+            citation_hash: citation_hash.to_string(),
+            citation_excerpt: None,
+            derived_from: None,
+            recorded_at: None,
+        };
+        let outcome = verify_evidence(&evidence, repo_root, RelocationPolicy::Never);
+        if !outcome.is_verified() {
+            let reason = outcome
+                .reason
+                .as_ref()
+                .map(UnverifiedReason::as_str)
+                .unwrap_or("not_verified");
+            anyhow::bail!(
+                "evidence[{index}] citation_hash failed verification for citation_path {citation_path:?}: {reason}"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_import(
@@ -3346,6 +3401,215 @@ mod tests {
         let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert!(resp["entry_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_handle_add_rejects_mismatched_explicit_citation_hash_without_writes() {
+        let (dir, paths, emb) = setup();
+        fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
+        let conn = db::open_db(&paths.db).unwrap();
+        let before_events = fs::read(&paths.events).unwrap_or_default();
+
+        let resp = handle_add(
+            &json!("bad-citation-hash"),
+            &json!({
+                "method": "add",
+                "path": "test/mismatched-citation-hash",
+                "summary": "must not persist",
+                "content": "body",
+                "tags": [],
+                "kind": "belief",
+                "evidence": [{
+                    "kind": "code",
+                    "citation_path": "cited.rs",
+                    "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                }]
+            }),
+            &paths,
+            &emb,
+        );
+
+        assert_eq!(resp["type"], "error", "response: {resp}");
+        assert_eq!(resp["code"], "validation_error", "response: {resp}");
+        assert!(resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("citation_hash"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a rejected request must not create an entry"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "a rejected request must not create evidence"
+        );
+        assert_eq!(
+            fs::read(&paths.events).unwrap_or_default(),
+            before_events,
+            "a rejected request must not append events"
+        );
+    }
+
+    #[test]
+    fn test_handle_add_rejects_unverifiable_explicit_citation_hash_without_writes() {
+        for citation_path in [
+            "cited.rs:not-a-range",
+            "missing.rs",
+            "cited.rs:0-999",
+            "../outside.rs",
+        ] {
+            let (dir, paths, emb) = setup();
+            fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
+            let conn = db::open_db(&paths.db).unwrap();
+            let before_events = fs::read(&paths.events).unwrap_or_default();
+
+            let resp = handle_add(
+                &json!("unverifiable-citation-hash"),
+                &json!({
+                    "method": "add",
+                    "path": "test/unverifiable-citation-hash",
+                    "summary": "must not persist",
+                    "content": "body",
+                    "tags": [],
+                    "kind": "belief",
+                    "evidence": [{
+                        "kind": "code",
+                        "citation_path": citation_path,
+                        "citation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    }]
+                }),
+                &paths,
+                &emb,
+            );
+
+            assert_eq!(
+                resp["type"], "error",
+                "path={citation_path}, response: {resp}"
+            );
+            assert_eq!(
+                resp["code"], "validation_error",
+                "path={citation_path}, response: {resp}"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "path={citation_path}: a rejected request must not create an entry"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM evidence", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "path={citation_path}: a rejected request must not create evidence"
+            );
+            assert_eq!(
+                fs::read(&paths.events).unwrap_or_default(),
+                before_events,
+                "path={citation_path}: a rejected request must not append events"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_add_computes_citation_hash_when_omitted() {
+        use crate::components::verification::compute_citation_hash;
+
+        let (dir, paths, emb) = setup();
+        fs::write(dir.path().join("cited.rs"), b"fn cited() {}\n").unwrap();
+        let expected = compute_citation_hash(dir.path(), "cited.rs", None).unwrap();
+
+        let resp = handle_add(
+            &json!("missing-citation-hash"),
+            &json!({
+                "method": "add",
+                "path": "test/missing-citation-hash",
+                "summary": "computed hash",
+                "content": "body",
+                "tags": [],
+                "kind": "belief",
+                "evidence": [{"kind": "code", "citation_path": "cited.rs"}]
+            }),
+            &paths,
+            &emb,
+        );
+
+        assert_eq!(resp["type"], "ok", "response: {resp}");
+        let conn = db::open_db(&paths.db).unwrap();
+        let stored: String = conn
+            .query_row("SELECT citation_hash FROM evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, expected);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: proptest_cases(128),
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_handle_add_rejects_every_mismatching_explicit_hash_without_writes(
+            content in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..128),
+        ) {
+            use crate::components::verification::compute_citation_hash;
+
+            let (dir, paths, emb) = setup();
+            fs::write(dir.path().join("cited.bin"), &content).unwrap();
+            let computed = compute_citation_hash(dir.path(), "cited.bin", None).unwrap();
+            let mut wrong = computed.clone();
+            wrong.replace_range(0..1, if &computed[0..1] == "0" { "1" } else { "0" });
+            let conn = db::open_db(&paths.db).unwrap();
+            let before_events = fs::read(&paths.events).unwrap_or_default();
+
+            let resp = handle_add(
+                &json!("property-mismatched-citation-hash"),
+                &json!({
+                    "method": "add",
+                    "path": "test/property-mismatched-citation-hash",
+                    "summary": "must not persist",
+                    "content": "body",
+                    "tags": [],
+                    "kind": "belief",
+                    "evidence": [{
+                        "kind": "code",
+                        "citation_path": "cited.bin",
+                        "citation_hash": format!("sha256:{wrong}")
+                    }]
+                }),
+                &paths,
+                &emb,
+            );
+
+            proptest::prop_assert_eq!(
+                resp["type"].as_str(),
+                Some("error"),
+                "response: {:?}",
+                resp
+            );
+            proptest::prop_assert_eq!(
+                resp["code"].as_str(),
+                Some("validation_error"),
+                "response: {:?}",
+                resp
+            );
+            let entry_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .unwrap();
+            let evidence_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM evidence", [], |row| row.get(0))
+                .unwrap();
+            proptest::prop_assert_eq!(entry_count, 0);
+            proptest::prop_assert_eq!(evidence_count, 0);
+            proptest::prop_assert_eq!(fs::read(&paths.events).unwrap_or_default(), before_events);
+        }
     }
 
     #[test]
