@@ -142,7 +142,7 @@ defmodule AgenticKbMcpTest do
   alias AgenticKbMcp.RenderFixture
 
   test "shared Rust/Elixir schema contract fixture is present" do
-    fixture = Path.join(__DIR__, "schema_contract.json") |> File.read!() |> Jason.decode!()
+    fixture = Path.join(__DIR__, "schema_contract.json") |> File.read!() |> :json.decode()
     assert is_map(fixture["pin_fields"])
     assert is_map(fixture["bounds"])
   end
@@ -542,7 +542,7 @@ defmodule AgenticKbMcpTest do
   # docs/decisions/b1-request-contract.md. The pin is agentic-kb rev
   # 058f82bdb650a1de44de167adea0672c54f1f2c1 (machines_conf flake.lock) whose
   # `dispatch_tool/3` clauses are byte-identical to this branch's.
-  @schema_contract Path.join(__DIR__, "schema_contract.json") |> File.read!() |> Jason.decode!()
+  @schema_contract Path.join(__DIR__, "schema_contract.json") |> File.read!() |> :json.decode()
   @deployed_pin_args @schema_contract["pin_fields"]
 
   @s1_tool_args %{
