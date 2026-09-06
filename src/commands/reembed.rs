@@ -13,7 +13,7 @@ use std::os::unix::fs::MetadataExt;
 /// Writes per lock acquisition, in one transaction per batch (a single
 /// commit, not one implicit commit per row — see `write_batches`). Budget:
 /// <= 50 ms lock-hold per batch on an idle host, timed from lock
-/// acquisition to the batch's connection being dropped after commit.
+/// acquisition to the batch connection being dropped after commit.
 /// `test_reembed_batch_lock_hold_budget` (ignored by default — see its doc
 /// comment) times this exact window on a real batch and prints the
 /// observed duration; it is a measurement to be taken on a quiet host, not
@@ -37,6 +37,13 @@ use std::os::unix::fs::MetadataExt;
 /// The release-profile idle-host result still exceeds the 50 ms budget, so
 /// this obligation remains open pending a smaller batch or moving embedding
 /// work fully outside the lock.
+///
+/// Re-measured 2026-09-06 after one-time schema/stamp preflight plus a fresh
+/// locked live-path reopen for each 32-row batch. Three warm release samples
+/// were 81.982865 ms, 77.634364 ms, and 71.449899 ms. Correctness and swap
+/// regressions pass, but all samples still miss the <= 50 ms gate; retain the
+/// universal lock and durable transaction semantics while investigating a
+/// structurally different reduction in per-batch SQLite work.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +141,7 @@ pub(crate) fn run_reembed(
     dry_run: bool,
     max_chars: usize,
 ) -> anyhow::Result<ReembedReport> {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_| {}, |_| {})
 }
 
 #[cfg(test)]
@@ -148,27 +155,27 @@ fn run_reembed_with_hook<B>(
 where
     B: FnMut(usize, &[PendingWrite]),
 {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_| {}, |_| {})
 }
 
 /// `before_batch(batch_index, batch)` fires right before a batch's write
-/// lock is acquired; `after_batch(batch_index)` fires right after that
-/// batch's connection is dropped (commit already applied), but the lock
-/// itself is still held until the enclosing loop iteration ends right
-/// after the hook returns — so `after_batch` runs just before, not after,
-/// the lock is released. Tests use these to observe batching (which ids
-/// land in which batch) and to time the real lock-hold window from the
-/// outside.
-fn run_reembed_with_hooks<B, A>(
+/// lock is acquired. `lock_acquired(batch_index)` fires immediately after
+/// acquisition. `after_batch(batch_index)` fires immediately after that
+/// batch's transaction commits and its connection is dropped, while the lock
+/// is still held. Tests use these to observe batching and time the real
+/// acquire-to-connection-drop window.
+fn run_reembed_with_hooks<B, L, A>(
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
     dry_run: bool,
     max_chars: usize,
     mut before_batch: B,
+    mut lock_acquired: L,
     mut after_batch: A,
 ) -> anyhow::Result<ReembedReport>
 where
     B: FnMut(usize, &[PendingWrite]),
+    L: FnMut(usize),
     A: FnMut(usize),
 {
     // Selection is unlocked and read-only.
@@ -237,6 +244,12 @@ where
         }
     }
 
+    // Establish schema and metadata once outside the timed per-batch
+    // critical section. Every batch below still opens the current live
+    // pathname under the universal lock, but can safely skip this repeated
+    // DDL/stamp work.
+    preflight_reembed_schema(paths)?;
+
     let mut embedded_ids = HashSet::new();
     let initial_db_identity = db_identity(&paths.db);
     write_batches(
@@ -246,6 +259,7 @@ where
         &mut report,
         &mut embedded_ids,
         &mut before_batch,
+        &mut lock_acquired,
         &mut after_batch,
     );
     // Reconcile once against the live pathname. If rebuild atomically replaced
@@ -268,6 +282,7 @@ where
         report.failures.clear();
         report.raced = 0;
         let mut no_before = |_: usize, _: &[PendingWrite]| {};
+        let mut no_lock_acquired = |_: usize| {};
         let mut no_after = |_: usize| {};
         write_batches(
             paths,
@@ -276,6 +291,7 @@ where
             &mut report,
             &mut embedded_ids,
             &mut no_before,
+            &mut no_lock_acquired,
             &mut no_after,
         );
     }
@@ -332,16 +348,18 @@ fn confirm_embedded_ids_are_live(
     Ok(confirmed)
 }
 
-fn write_batches<B, A>(
+fn write_batches<B, L, A>(
     paths: &config::Paths,
     mode: db::EmbedTextMode,
     writes: &[PendingWrite],
     report: &mut ReembedReport,
     embedded_ids: &mut HashSet<String>,
     before_batch: &mut B,
+    lock_acquired: &mut L,
     after_batch: &mut A,
 ) where
     B: FnMut(usize, &[PendingWrite]),
+    L: FnMut(usize),
     A: FnMut(usize),
 {
     for (batch_index, batch) in writes.chunks(REEMBED_WRITE_BATCH_SIZE).enumerate() {
@@ -353,7 +371,8 @@ fn write_batches<B, A>(
                 continue;
             }
         };
-        let conn = match db::open_rw(paths, &lock) {
+        lock_acquired(batch_index);
+        let conn = match db::open_rw_existing(paths, &lock) {
             Ok(conn) => conn,
             Err(error) => {
                 record_batch_failure(report, batch, format!("open live database: {error}"));
@@ -415,6 +434,13 @@ fn write_batches<B, A>(
         drop(conn);
         after_batch(batch_index);
     }
+}
+
+fn preflight_reembed_schema(paths: &config::Paths) -> anyhow::Result<()> {
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = db::open_rw(paths, &lock)?;
+    drop(conn);
+    Ok(())
 }
 
 fn record_failure(report: &mut ReembedReport, id: String, cause: String) {
@@ -569,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reembed_database_swap_between_batches_reconciles_live_db() {
+    fn test_reembed_database_swap_between_batches_reopens_before_write() {
         let dir = tempfile::tempdir().unwrap();
         let paths = config::Paths::from_root(dir.path());
         db::open_or_init(&paths).unwrap();
@@ -584,11 +610,19 @@ mod tests {
         }
         let replacement = paths.db.with_extension("replacement");
         std::fs::copy(&paths.db, &replacement).unwrap();
-        let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch, _| {
-            if batch == 1 {
-                std::fs::rename(&replacement, &paths.db).unwrap();
-            }
-        })
+        let report = run_reembed_with_hooks(
+            &paths,
+            &FixedEmbedder(0.5),
+            false,
+            1800,
+            |batch, _| {
+                if batch == 1 {
+                    std::fs::rename(&replacement, &paths.db).unwrap();
+                }
+            },
+            |_| {},
+            |_| {},
+        )
         .unwrap();
         assert_eq!(report.embedded, REEMBED_WRITE_BATCH_SIZE + 3);
         assert_eq!(
@@ -707,6 +741,7 @@ mod tests {
                     .unwrap();
                 }
             },
+            |_| {},
             |batch| {
                 if batch == 0 {
                     // Swap in the pre-write snapshot only after pass one's
@@ -809,8 +844,8 @@ mod tests {
         }
     }
 
-    /// Times the real batch — lock acquisition through the connection being
-    /// dropped after commit, via the before/after hooks — against the
+    /// Times the real batch — lock acquisition through transaction commit and
+    /// drop, via the before/after hooks — against the
     /// <= 50 ms budget documented on `REEMBED_WRITE_BATCH_SIZE`. This is a
     /// measurement to be taken on a quiet host, not a CI gate: on a machine
     /// with concurrent builds or tests competing for disk/CPU, the same
@@ -840,7 +875,8 @@ mod tests {
             &FixedEmbedder(0.5),
             false,
             1800,
-            |_batch_index, _batch| start.set(Some(std::time::Instant::now())),
+            |_batch_index, _batch| {},
+            |_batch_index| start.set(Some(std::time::Instant::now())),
             |_batch_index| {
                 if let Some(s) = start.get() {
                     elapsed.set(Some(s.elapsed()));

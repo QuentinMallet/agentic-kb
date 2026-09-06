@@ -309,12 +309,19 @@ fn open_rw_rejects_a_lock_on_the_wrong_path() {
     let other_lock_path = paths.lock.with_extension("other.lock");
     let other_lock = acquire_lock(&other_lock_path).unwrap();
 
-    let err = db::open_rw(&paths, &other_lock).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("lock"),
-        "open_rw must reject a token whose path is not paths.lock, got: {msg}"
-    );
+    for (opener, err) in [
+        ("open_rw", db::open_rw(&paths, &other_lock).unwrap_err()),
+        (
+            "open_rw_existing",
+            db::open_rw_existing(&paths, &other_lock).unwrap_err(),
+        ),
+    ] {
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lock"),
+            "{opener} must reject a token whose path is not paths.lock, got: {msg}"
+        );
+    }
 }
 
 #[test]
