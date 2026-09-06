@@ -188,7 +188,12 @@ impl Search {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        let opts = self.build_search_options(&kb_config, paths);
+        let federated = !self.local_only && (self.peers || self.reachable_from.is_some());
+        let mut opts = self.build_search_options(&kb_config, paths);
+        if federated {
+            // Federation verifies only after the global merge/truncate below.
+            opts.inline_verify_k = 0;
+        }
 
         // A pure read: open_ro, never the write lock (ADR-7). An uninitialized
         // repository serves an empty result plus a one-line stderr note, which
@@ -214,10 +219,7 @@ impl Search {
         };
 
         // Peer federation: collect results from peer DBs and merge.
-        let results = if let (Some(conn), true) = (
-            conn.as_ref(),
-            !self.local_only && (self.peers || self.reachable_from.is_some()),
-        ) {
+        let mut results = if let (Some(conn), true) = (conn.as_ref(), federated) {
             let peer_paths = collect_peer_paths(
                 conn,
                 self.reachable_from.as_deref(),
@@ -266,6 +268,10 @@ impl Search {
         } else {
             local_results
         };
+
+        if federated {
+            db::verify_search_entries(&mut results, self.limit, Some(&paths.root));
+        }
 
         // Determine display mode: RRF hybrid produces unified results;
         // single-lane modes keep separate FTS / semantic sections.
@@ -470,6 +476,54 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn federated_results_are_ranked_and_truncated_before_verification() {
+        let merged = merge_federated_results(
+            vec![
+                (
+                    None,
+                    vec![crate::components::db::SearchEntry {
+                        id: "low".into(),
+                        path: "low".into(),
+                        summary: String::new(),
+                        content: String::new(),
+                        tags: "[]".into(),
+                        score: 0.1,
+                        source: "fts",
+                        score_kind: "fts",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                        updated_at: String::new(),
+                    }],
+                ),
+                (
+                    Some("peer".into()),
+                    vec![crate::components::db::SearchEntry {
+                        id: "high".into(),
+                        path: "high".into(),
+                        summary: String::new(),
+                        content: String::new(),
+                        tags: "[]".into(),
+                        score: 0.9,
+                        source: "fts",
+                        score_kind: "fts",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: Some("peer".into()),
+                        updated_at: String::new(),
+                    }],
+                ),
+            ],
+            1,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "high");
+    }
 
     const FAST_PROPTEST_CASES: u32 = 16;
 
