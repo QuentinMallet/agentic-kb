@@ -101,7 +101,11 @@ result set. `decode_emb_blob` and `decode_f16_blob_into` detect the bad blob,
 log a `kb: decode_emb_blob: unexpected blob length ...` or `kb:
 cosine_similarity dimension mismatch` diagnostic to stderr, increment the
 process-wide `models::corrupt_embedding_count` counter, and return an empty
-vector; `cosine_similarity` then treats the resulting length mismatch as
+vector. A row marked canonical f16 whose blob length is not exactly
+`EMB_BLOB_BYTES` is a separate corrupt case handled by `decode_f16_blob_into`
+itself, which logs `kb: decode_f16_blob_into: expected N bytes, got M —
+corrupt embedding?` and increments the same counter before returning an
+empty vector; `cosine_similarity` then treats the resulting length mismatch as
 similarity `0.0`, so the row stays in the ranked output and remains
 deterministically sortable. The counter is exposed as
 `db::SearchStats.corrupt_embeddings` by `search_entries_with_stats`, but no CLI
@@ -116,8 +120,9 @@ Semantic and cue scoring may scan their indices, but full entry metadata is
 materialized only for the first `2 * limit` ranked IDs in each lane. The bound
 is implemented by `fetch_search_metadata` in `search_entries` and pinned by
 `p1_metadata_materialization_is_bounded_to_twice_limit_per_lane`. See the
-[S5 search caps decision packet](../decisions/s5-search-caps-packet.md) for the
-resource-cap ruling and rationale.
+S5 search caps decision packet (`docs/decisions/s5-search-caps-packet.md`)
+for the resource-cap ruling and rationale, including the federated
+verification-order exception.
 
 Evidence metadata is fetched in bounded per-entry batches by
 `fetch_evidence_for_entries`. A malformed database value is returned as a
@@ -165,8 +170,7 @@ echo 'recency_lambda = 0.0' >> kb.toml
 
 ### See Also
 
-- [Hybrid Search](./architecture/hybrid-search.md) — RRF scoring before recency decay
-- [Stale Entries](./concepts/staleness.md) — how entries age and are filtered
+- [MCP Surfaces](./mcp.md) — `inline_verify_k` boundary and rendered search context
 
 ## MMR Diversification
 
