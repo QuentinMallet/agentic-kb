@@ -493,6 +493,12 @@ fn write_batches<B, P>(
             }
         };
         phase(batch_index, BatchPhase::LockAcquired);
+        // Bound before `conn` so that the implicit drop order at every exit
+        // from this iteration — including the error paths below, which cannot
+        // move `conn` while the transaction borrows it — closes the writer
+        // first and releases the deferral second. Filled in after `conn` is
+        // open, because the writer is what creates `-shm`.
+        let deferred_checkpoints;
         let conn = match db::open_rw_existing(paths, &lock) {
             Ok(conn) => conn,
             Err(error) => {
@@ -500,14 +506,14 @@ fn write_batches<B, P>(
                 continue;
             }
         };
-        // Held for exactly as long as `conn`, and dropped with it below: this
-        // is what keeps SQLite's close-time checkpoint (two fsyncs) and its
-        // sidecar unlink (which costs the next batch a directory fsync) out of
-        // the lock window, and disables the automatic checkpoint that would
-        // otherwise fire from inside one COMMIT in every few dozen. See
-        // `db::defer_checkpoints` for why that is safe against a `rebuild`
-        // swap, and `drain_wal` below for where the backfill happens instead.
-        let deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
+        // Held for exactly as long as `conn`: this is what keeps SQLite's
+        // close-time checkpoint (two fsyncs) and its sidecar unlink (which
+        // costs the next batch a directory fsync) out of the lock window, and
+        // disables the automatic checkpoint that would otherwise fire from
+        // inside one COMMIT in every few dozen. See `db::defer_checkpoints`
+        // for why that is safe against a `rebuild` swap, and `drain_wal` for
+        // where the backfill happens instead.
+        deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
         phase(batch_index, BatchPhase::Opened);
         db::check_embed_mode_vintage(&conn, mode);
         phase(batch_index, BatchPhase::VintageChecked);
@@ -1225,6 +1231,11 @@ mod tests {
         for index in 0..total {
             seed(&paths, &format!("nockpt-{index}"), "seed");
         }
+        assert!(
+            db::defer_checkpoints(&db::open_ro(&paths.db).unwrap(), &paths.db).is_some(),
+            "checkpoint deferral is unavailable in this environment, so this test \
+             cannot tell a regression from a missing read-only handle"
+        );
         let observed = std::cell::Cell::new(None::<u64>);
         let report = run_reembed_with_hook(
             &paths,
