@@ -66,6 +66,14 @@ use std::os::unix::fs::MetadataExt;
 /// a newly created WAL rather than reusing one.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
+/// How often `write_batches` drains the WAL between batches. Deferring both of
+/// SQLite's checkpoints means nothing else bounds it, so this replaces the
+/// `wal_autocheckpoint` threshold that would otherwise fire from inside a
+/// commit. At roughly 24 pages per 32-row batch this caps the WAL near 1.5 MiB,
+/// comfortably under SQLite's own 1000-page default, and amortizes one drain's
+/// two or three fsyncs over sixteen batches.
+pub(crate) const REEMBED_DRAIN_EVERY_BATCHES: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReembedFailure {
     pub id: String,
@@ -462,6 +470,14 @@ fn write_batches<B, P>(
     P: FnMut(usize, BatchPhase),
 {
     for (batch_index, batch) in writes.chunks(REEMBED_WRITE_BATCH_SIZE).enumerate() {
+        // Between batches, never inside one: with both of SQLite's own
+        // checkpoints deferred (`db::defer_checkpoints`), this is the only
+        // thing bounding the WAL, and it must not land in a window it exists
+        // to protect. It takes the write lock itself, so it cannot race a
+        // `rebuild` swap either.
+        if batch_index > 0 && batch_index.is_multiple_of(REEMBED_DRAIN_EVERY_BATCHES) {
+            drain_wal(paths);
+        }
         before_batch(batch_index, batch);
         phase(batch_index, BatchPhase::BatchStart);
         let lock = match acquire_lock(&paths.lock) {
@@ -482,10 +498,11 @@ fn write_batches<B, P>(
         // Held for exactly as long as `conn`, and dropped with it below: this
         // is what keeps SQLite's close-time checkpoint (two fsyncs) and its
         // sidecar unlink (which costs the next batch a directory fsync) out of
-        // the lock window. See `db::suppress_close_checkpoint` for why that is
-        // safe against a `rebuild` swap, and `drain_wal` below for where the
-        // deferred backfill happens instead.
-        let no_close_checkpoint = db::suppress_close_checkpoint(&paths.db);
+        // the lock window, and disables the automatic checkpoint that would
+        // otherwise fire from inside one COMMIT in every few dozen. See
+        // `db::defer_checkpoints` for why that is safe against a `rebuild`
+        // swap, and `drain_wal` below for where the backfill happens instead.
+        let deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
         phase(batch_index, BatchPhase::Opened);
         db::check_embed_mode_vintage(&conn, mode);
         phase(batch_index, BatchPhase::VintageChecked);
@@ -539,7 +556,7 @@ fn write_batches<B, P>(
         // and everything that follows is process-local. Keeping it here also
         // makes ConnDropped a clean measurement of the close itself.
         drop(conn);
-        drop(no_close_checkpoint);
+        drop(deferred_checkpoints);
         phase(batch_index, BatchPhase::ConnDropped);
         for id in successes {
             if embedded_ids.insert(id) {
@@ -556,23 +573,51 @@ fn write_batches<B, P>(
     }
 }
 
-/// Backfill the WAL that the per-batch writers deliberately left unbackfilled
-/// (see `db::suppress_close_checkpoint`) so the database is self-contained
-/// again at rest, and take its own hold of the write lock to do it — after
-/// every batch's window has closed, so it cannot widen one.
+/// Backfill and truncate the WAL that the per-batch writers deliberately left
+/// unbackfilled (see `db::defer_checkpoints`), in its own hold of the write
+/// lock, so the database is self-contained again at rest.
 ///
-/// Best-effort by design: leaving the WAL longer than necessary costs later
-/// readers a little and costs `rebuild` one drained checkpoint, both of which
-/// already happen on their own. It never costs a committed write, which is
-/// durable in the WAL whether or not this runs.
+/// Deferring both of SQLite's checkpoints hands this function the entire job
+/// of bounding the WAL, so it also holds its own [`db::defer_checkpoints`]
+/// guard: without one, the connection's close would checkpoint and unlink the
+/// sidecars, and this pragma could be deleted without any test noticing.
+///
+/// Best-effort in its outcome, not silent about it. A WAL left undrained costs
+/// later readers a little and costs `rebuild` one drained checkpoint, both of
+/// which already happen on their own, and it never costs a committed write,
+/// which is durable in the WAL whether or not this runs. But an operator whose
+/// database keeps growing a WAL should be able to see why, so every way this
+/// can fail says so on stderr — including a busy checkpoint, which
+/// `wal_checkpoint` reports in its first column rather than as an error
+/// (`rebuild.rs` gates on the same ambiguity with `verify_live_wal_drained`).
 fn drain_wal(paths: &config::Paths) {
-    let Ok(lock) = acquire_lock(&paths.lock) else {
-        return;
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(error) => return warn_undrained(format!("acquire write lock: {error}")),
     };
-    let Ok(conn) = db::open_rw_existing(paths, &lock) else {
-        return;
+    let conn = match db::open_rw_existing(paths, &lock) {
+        Ok(conn) => conn,
+        Err(error) => return warn_undrained(format!("open live database: {error}")),
     };
-    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    let deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
+    let drained = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    });
+    match drained {
+        Ok(0) => {}
+        Ok(busy) => warn_undrained(format!(
+            "checkpoint reported busy ({busy}); another connection still holds the WAL"
+        )),
+        Err(error) => warn_undrained(format!("checkpoint: {error}")),
+    }
+    drop(conn);
+    drop(deferred_checkpoints);
+}
+
+fn warn_undrained(cause: String) {
+    eprintln!(
+        "kb: WARNING reembed could not drain the write-ahead log ({cause});          committed embeddings are safe, but the database is not self-contained          until the next writer or `kb rebuild` checkpoints it"
+    );
 }
 
 fn preflight_reembed_schema(paths: &config::Paths, mode: db::EmbedTextMode) -> anyhow::Result<()> {
@@ -632,9 +677,12 @@ mod tests {
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
     }
 
-    /// Warm batches the lock-hold budget measurement averages over. More than
-    /// one so a single cold-cache batch cannot decide the verdict.
-    const BUDGET_SAMPLE_BATCHES: usize = 5;
+    /// Warm batches the lock-hold budget measurement averages over. Enough to
+    /// cross `REEMBED_DRAIN_EVERY_BATCHES` at least once, so the samples cover
+    /// a run long enough for the WAL policy to act: five batches would only
+    /// ever measure a WAL that never needed draining, which is not what a real
+    /// `kb reembed` over a full knowledge base looks like.
+    const BUDGET_SAMPLE_BATCHES: usize = REEMBED_DRAIN_EVERY_BATCHES + 8;
 
     /// Runs a real `reembed` over exactly `batches` full batches and returns,
     /// per batch, the duration of every span in [`BatchPhase::ORDER`] (so
@@ -1133,7 +1181,7 @@ mod tests {
     #[test]
     #[ignore = "lock-hold phase breakdown measurement; run explicitly on a quiet host"]
     fn test_reembed_batch_lock_hold_phase_breakdown() {
-        let samples = measure_batch_phases("phases", 8);
+        let samples = measure_batch_phases("phases", REEMBED_DRAIN_EVERY_BATCHES + 8);
         eprintln!(
             "reembed batch lock-hold phase breakdown ({} batches x {} rows)\n{}",
             samples.len(),
@@ -1185,6 +1233,44 @@ mod tests {
             "batch 0's frames must still be in the WAL when batch 1 starts \
              (found a {observed}-byte WAL): a checkpoint ran inside the lock window, \
              which costs the batch two fsyncs and the next batch a directory fsync"
+        );
+    }
+
+    /// The end-to-end drain test below cannot tell `drain_wal`'s pragma from
+    /// the connection close that follows it, because `run_reembed` ends with a
+    /// `confirm_embedded_ids_are_live` read whose own close checkpoints and
+    /// unlinks the WAL. Exercise the pragma on its own: `drain_wal` holds a
+    /// deferral guard, so nothing but `wal_checkpoint(TRUNCATE)` can empty the
+    /// WAL, and the truncated file is still there afterwards to prove it.
+    #[test]
+    fn test_drain_wal_truncates_the_wal_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw_existing(&paths, &lock).unwrap();
+            let deferred = db::defer_checkpoints(&conn, &paths.db);
+            conn.execute(
+                "INSERT INTO kb_meta(key, value) VALUES('drain-fixture', 'x')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            drop(deferred);
+        }
+        assert!(
+            wal_len(&paths).is_some_and(|len| len > 32),
+            "fixture must leave frames in the WAL for the drain to find"
+        );
+
+        drain_wal(&paths);
+
+        assert_eq!(
+            wal_len(&paths),
+            Some(0),
+            "drain_wal must truncate the WAL in place; an absent WAL would mean \
+             a connection close did the work and the checkpoint pragma is dead"
         );
     }
 

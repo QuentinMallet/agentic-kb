@@ -287,7 +287,7 @@ pub fn note_uninitialized(db_path: &Path) {
 /// bundled amalgamation's compile-time default today, but a system SQLite or a
 /// build carrying `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` would drop every WAL
 /// commit's fsync and make writers silently non-durable across power loss.
-/// That premise carries more weight since `suppress_close_checkpoint`: a
+/// That premise carries more weight since `defer_checkpoints`: a
 /// batched writer's close no longer performs a checkpoint whose own fsyncs
 /// used to make each batch durable regardless of this setting, so the commit's
 /// own fsync is now the only thing standing behind a committed row.
@@ -544,9 +544,10 @@ pub fn open_rw_existing(
     open_conn_rw(&paths.db)
 }
 
-/// A second, read-only handle on the live database, held for exactly as long
-/// as a locked writer's connection so that SQLite does not checkpoint when
-/// that writer closes.
+/// Keeps SQLite's own checkpoints out of a locked writer's lock window: the
+/// close-time one, by holding a second read-only handle on the live database
+/// for exactly as long as the writer's connection, and the automatic one, by
+/// setting `wal_autocheckpoint=0` on the writer.
 ///
 /// Why this exists. `sqlite3WalClose` opportunistically checkpoints whenever
 /// it can take an EXCLUSIVE lock on the database file, which is whenever the
@@ -573,6 +574,19 @@ pub fn open_rw_existing(
 /// under `synchronous=FULL`, and a crash replays those frames. What is
 /// deferred is only the backfill of committed frames into the database file.
 ///
+/// The automatic checkpoint has to go with it. Once the WAL is no longer reset
+/// at every close it grows across batches, and SQLite's default
+/// `wal_autocheckpoint` of 1000 pages would eventually fire a passive
+/// checkpoint from inside a COMMIT — putting the very fsyncs this removes back
+/// into a lock window, on one unlucky batch in every few dozen. Deferring one
+/// checkpoint and not the other would just make the cost periodic instead of
+/// constant, so this disables it and hands the caller the whole obligation.
+///
+/// That obligation is real: with both deferred, nothing bounds the WAL except
+/// the caller. Drain it (`wal_checkpoint(TRUNCATE)`) on an interval of the
+/// caller's choosing, under the write lock but outside the windows it is
+/// protecting, and again before the run ends.
+///
 /// Swap safety. This handle is opened and dropped inside a single hold of the
 /// write lock, so no connection is open on the live inode when the lock is
 /// released and `rebuild` may replace the file — the invariant that rules out
@@ -581,21 +595,25 @@ pub fn open_rw_existing(
 /// built for exactly that: step 1 drains the live WAL with
 /// `wal_checkpoint(TRUNCATE)` under this same lock, step 2 gates the swap on
 /// the resulting zero-length `-wal`, and step 5 unlinks the replaced inode's
-/// sidecars. Callers should still drain once per run outside their timed
-/// windows so the database at rest is self-contained.
-pub struct CloseCheckpointSuppressor {
-    #[allow(dead_code)]
-    conn: Connection,
+/// sidecars.
+pub struct DeferredCheckpoints {
+    /// Never read. Its lifetime is the whole mechanism: SQLite consults the
+    /// database file's lock state, not this value.
+    _conn: Connection,
 }
 
-/// Open a [`CloseCheckpointSuppressor`] on `db_path`. Call it only while
-/// holding the write lock and only after the writer connection is open: the
-/// writer is what creates `-shm`, which a read-only handle cannot.
+/// Defer `writer`'s checkpoints. Call it only while holding the write lock and
+/// only after `writer` is open: the writer is what creates `-shm`, which a
+/// read-only handle cannot. Drop the returned guard immediately after
+/// `writer`, never before.
 ///
 /// Returns `None` when the read-only handle cannot be opened or cannot take
-/// its shared lock. That costs the optimization — the writer's close
-/// checkpoints as before — and never correctness, so it is not an error.
-pub fn suppress_close_checkpoint(db_path: &Path) -> Option<CloseCheckpointSuppressor> {
+/// its shared lock. `wal_autocheckpoint=0` is still applied in that case,
+/// which is harmless: without close-checkpoint suppression the WAL is reset at
+/// every close and never reaches any threshold. Losing the optimization costs
+/// latency, never correctness, so neither half is an error.
+pub fn defer_checkpoints(writer: &Connection, db_path: &Path) -> Option<DeferredCheckpoints> {
+    let _ = writer.pragma_update(None, "wal_autocheckpoint", 0);
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -607,7 +625,7 @@ pub fn suppress_close_checkpoint(db_path: &Path) -> Option<CloseCheckpointSuppre
     // schema, so this is the cheapest read that still takes the lock.
     conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
         .ok()?;
-    Some(CloseCheckpointSuppressor { conn })
+    Some(DeferredCheckpoints { _conn: conn })
 }
 
 fn require_live_write_lock(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<()> {
