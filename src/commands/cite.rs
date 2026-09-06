@@ -78,9 +78,13 @@ where
     let file_size = computed.file_size;
     let citation_path = format_citation_path(rel_path, range, file_size);
     let citation_hash = format!("sha256:{}", computed.sha256_hex);
+    let citation_sha = repo_root
+        .join(rel_path)
+        .parent()
+        .and_then(config::git_head_sha_at);
     let fields = CitationFields {
         citation_path: citation_path.clone(),
-        citation_sha: config::git_head_sha_at(repo_root),
+        citation_sha,
         citation_hash,
         file_size,
     };
@@ -288,6 +292,63 @@ mod tests {
 
         let expected_sha = config::git_head_sha_at(dir.path());
         let fields = compute_citation_fields(dir.path(), "sample.rs", None).unwrap();
+
+        assert_eq!(fields.citation_sha, expected_sha);
+    }
+
+    #[test]
+    fn test_compute_citation_fields_uses_nested_worktree_head() {
+        let outer = tempfile::tempdir().unwrap();
+        fs::write(outer.path().join("root.rs"), b"fn root() {}\n").unwrap();
+
+        for args in [
+            ["init"].as_slice(),
+            ["config", "user.email", "cite-test@example.invalid"].as_slice(),
+            ["config", "user.name", "Citation Test"].as_slice(),
+            ["add", "root.rs"].as_slice(),
+            ["commit", "-m", "add outer file"].as_slice(),
+        ] {
+            assert!(ProcessCommand::new("git")
+                .args(args)
+                .current_dir(outer.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let worktree = outer.path().join(".state/worktrees/cited");
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        assert!(ProcessCommand::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "cited-worktree",
+                worktree.to_str().unwrap(),
+            ])
+            .current_dir(outer.path())
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(worktree.join("sample.rs"), b"fn cited() {}\n").unwrap();
+        for args in [
+            ["add", "sample.rs"].as_slice(),
+            ["commit", "-m", "add cited file"].as_slice(),
+        ] {
+            assert!(ProcessCommand::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let expected_sha = config::git_head_sha_at(&worktree);
+        assert_ne!(expected_sha, config::git_head_sha_at(outer.path()));
+        let fields =
+            compute_citation_fields(outer.path(), ".state/worktrees/cited/sample.rs", None)
+                .unwrap();
 
         assert_eq!(fields.citation_sha, expected_sha);
     }
