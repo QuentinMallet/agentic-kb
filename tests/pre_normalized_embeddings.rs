@@ -7,7 +7,9 @@
 //! `kb_meta`: a mixed database must continue to score legacy rows as cosine.
 
 use kb::commands::migrate_embeddings::MigrateEmbeddings;
-use kb::components::db::{apply_event, migrate_embeddings, open_db, open_db_memory};
+use kb::components::db::{
+    apply_event, migrate_embeddings, open_db, open_db_memory, search_entries, SearchOptions,
+};
 use kb::components::embedder::Embedder;
 use kb::config::Paths;
 use kb::models::{decode_emb_blob, f32s_to_blob, normalize_embedding, EMB_BLOB_BYTES, EMB_DIMS};
@@ -194,6 +196,98 @@ fn migration_rejects_wrong_dimension_legacy_blobs() {
     assert!(migrate_embeddings(&conn).is_err());
     let (_, normalized) = stored_entry_embedding(&conn, "wrong-dimension");
     assert_eq!(normalized, 0);
+}
+
+/// A 192-element f32 legacy blob is exactly 768 bytes, so generic
+/// length-dispatch mistakes it for a canonical 384-element f16 blob. Migration
+/// must require the legacy f32 wire length, not merely a decodable blob.
+#[test]
+fn migration_rejects_ambiguous_half_dimension_entry_blob() {
+    let conn = open_db_memory().unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event("ambiguous-entry")).unwrap();
+    let ambiguous = f32s_to_blob(&vec![1.0; EMB_DIMS / 2]);
+    assert_eq!(ambiguous.len(), EMB_BLOB_BYTES);
+    conn.execute(
+        "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+        params![embedding_rowid(&conn, "ambiguous-entry"), ambiguous],
+    )
+    .unwrap();
+
+    assert!(migrate_embeddings(&conn).is_err());
+    let (blob, normalized) = stored_entry_embedding(&conn, "ambiguous-entry");
+    assert_eq!(blob.len(), EMB_BLOB_BYTES);
+    assert_eq!(normalized, 0);
+}
+
+/// Cue rows use the same persisted wire contract as entry embeddings. The
+/// ambiguous half-dimension f32 shape must fail closed here too.
+#[test]
+fn migration_rejects_ambiguous_half_dimension_cue_blob() {
+    let conn = open_db_memory().unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event_with_cue("ambiguous-cue")).unwrap();
+    let ambiguous = f32s_to_blob(&vec![1.0; EMB_DIMS / 2]);
+    assert_eq!(ambiguous.len(), EMB_BLOB_BYTES);
+    conn.execute(
+        "UPDATE cues SET embedding=?1, normalized=0 WHERE entry_id='ambiguous-cue'",
+        params![ambiguous],
+    )
+    .unwrap();
+
+    assert!(migrate_embeddings(&conn).is_err());
+    let (blob, normalized): (Vec<u8>, i64) = conn
+        .query_row(
+            "SELECT embedding, normalized FROM cues WHERE entry_id='ambiguous-cue'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(blob.len(), EMB_BLOB_BYTES);
+    assert_eq!(normalized, 0);
+}
+
+/// An unmarked 768-byte blob is legacy-state input, not proof that its bytes
+/// are canonical f16. Semantic fallback must reject the ambiguous f32 shape
+/// rather than manufacture a non-zero cosine score from its f16 interpretation.
+#[test]
+fn semantic_fallback_rejects_ambiguous_unmarked_blob() {
+    let conn = open_db_memory().unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event("ambiguous-semantic")).unwrap();
+    let ambiguous = f32s_to_blob(&vec![1.0; EMB_DIMS / 2]);
+    conn.execute(
+        "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+        params![embedding_rowid(&conn, "ambiguous-semantic"), ambiguous],
+    )
+    .unwrap();
+
+    let mut query = vec![0.0; EMB_DIMS];
+    query[1] = 1.0;
+    let results = search_entries(
+        &conn,
+        &FixedEmbedder(query),
+        "ambiguous semantic fallback",
+        &SearchOptions {
+            limit: 10,
+            do_fts: false,
+            do_semantic: true,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        },
+    )
+    .unwrap();
+
+    let result = results
+        .iter()
+        .find(|result| result.id == "ambiguous-semantic")
+        .unwrap();
+    assert_eq!(result.score, 0.0);
 }
 
 /// An embedder with a different model dimension must fail before it can write

@@ -181,3 +181,7 @@ source digest is unchanged, otherwise it discards the stale stage and retries
 from the live database. A corrupt blob aborts the migration without marking any
 live row; restore the retained backup if an operator needs to roll back after
 publication.
+
+Legacy migration accepts only the exact 384-element f32 wire format (1536
+bytes). In particular, an unmarked 768-byte blob is rejected rather than
+guessed to be f16: it can also represent a malformed 192-element f32 vector.

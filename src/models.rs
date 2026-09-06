@@ -3,6 +3,7 @@
 use anyhow::{bail, Result};
 use half::f16;
 use serde::{Deserialize, Serialize};
+use std::mem::size_of;
 
 // ---------------------------------------------------------------------------
 // Wire-format constants — single source of truth for entries_emb blob encoding
@@ -14,6 +15,8 @@ pub const EMB_DIMS: usize = 384;
 pub const EMB_ELEMENT_BYTES: usize = 2;
 /// Total byte length of one entries_emb blob.
 pub const EMB_BLOB_BYTES: usize = EMB_DIMS * EMB_ELEMENT_BYTES; // 768
+/// Exact byte length of the legacy f32 persisted embedding format.
+pub const LEGACY_EMB_BLOB_BYTES: usize = EMB_DIMS * size_of::<f32>(); // 1536
 
 /// Compute cosine similarity between two vectors.
 /// Returns 0.0 if vectors have different lengths (dimension mismatch from
@@ -106,6 +109,32 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
         decoded
     } else {
         eprintln!("kb: decode_emb_blob: non-finite embedding values — corrupt embedding?");
+        Vec::new()
+    }
+}
+
+/// Decode an unmarked legacy f32 persisted embedding.
+///
+/// Unlike [`decode_emb_blob`], this intentionally does not dispatch by a
+/// merely divisible length: a 192-element f32 blob is 768 bytes and therefore
+/// indistinguishable from canonical f16 by byte length alone. Unmarked rows
+/// must use this exact legacy wire contract until migration marks them.
+pub fn decode_legacy_f32_embedding(blob: &[u8]) -> Vec<f32> {
+    if blob.len() != LEGACY_EMB_BLOB_BYTES {
+        eprintln!(
+            "kb: legacy f32 embedding must be {LEGACY_EMB_BLOB_BYTES} bytes, got {}",
+            blob.len()
+        );
+        return Vec::new();
+    }
+    let decoded: Vec<f32> = blob
+        .chunks_exact(size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    if decoded.iter().all(|value| value.is_finite()) {
+        decoded
+    } else {
+        eprintln!("kb: legacy f32 embedding contains non-finite values — corrupt embedding?");
         Vec::new()
     }
 }

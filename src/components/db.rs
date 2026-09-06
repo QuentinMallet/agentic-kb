@@ -3,8 +3,9 @@
 use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
 use crate::models::{
-    cosine_similarity, decode_emb_blob, decode_f16_blob_into, normalize_embedding,
-    normalized_f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
+    cosine_similarity, decode_emb_blob, decode_f16_blob_into, decode_legacy_f32_embedding,
+    normalize_embedding, normalized_f32s_to_f16_blob, Evidence, VerificationStatus, EMB_BLOB_BYTES,
+    EMB_DIMS,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -454,7 +455,7 @@ pub fn migrate_embeddings(conn: &Connection) -> Result<usize> {
         })?;
         for row in rows {
             let (rowid, blob) = row?;
-            let vector = decode_emb_blob(&blob);
+            let vector = decode_legacy_f32_embedding(&blob);
             if vector.is_empty() {
                 anyhow::bail!("cannot migrate corrupt entry embedding row {rowid}");
             }
@@ -471,7 +472,7 @@ pub fn migrate_embeddings(conn: &Connection) -> Result<usize> {
         })?;
         for row in rows {
             let (id, blob) = row?;
-            let vector = decode_emb_blob(&blob);
+            let vector = decode_legacy_f32_embedding(&blob);
             if vector.is_empty() {
                 anyhow::bail!("cannot migrate corrupt cue embedding row {id}");
             }
@@ -1791,7 +1792,16 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
             })
             .map(|rows| {
                 rows.filter_map(|r| r.ok())
-                    .map(|(id, blob, normalized)| (id, (decode_emb_blob(&blob), normalized)))
+                    .map(|(id, blob, normalized)| {
+                        let vector = if normalized && blob.len() == EMB_BLOB_BYTES {
+                            decode_emb_blob(&blob)
+                        } else if normalized {
+                            Vec::new()
+                        } else {
+                            decode_legacy_f32_embedding(&blob)
+                        };
+                        (id, (vector, normalized))
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -1947,9 +1957,9 @@ pub fn search_entries(
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
         //
         // Scratch buffer allocated ONCE outside the loop — no per-row Vec allocation.
-        // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
-        // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
-        // decode_emb_blob fallback via length dispatch.
+        // Marked rows decode through the canonical f16 path; unmarked rows
+        // decode only through the exact legacy f32 wire contract. This keeps a
+        // 768-byte half-dimension f32 blob from being misread as canonical f16.
         let rows: Vec<(
             String,
             String,
@@ -1979,13 +1989,12 @@ pub fn search_entries(
         let mut candidates: Vec<(f32, String, String, String, String, String, String)> =
             Vec::with_capacity(rows.len());
         for (id, path, summary, content, tags, updated_at, blob, normalized) in rows {
-            decode_f16_blob_into(&blob, &mut scratch);
-            let sim = if scratch.is_empty() {
-                // blob was not canonical f16 — fall back to graceful decode
-                let fallback = decode_emb_blob(&blob);
-                persisted_similarity(&q_emb, true, &fallback, normalized)
+            let sim = if normalized {
+                decode_f16_blob_into(&blob, &mut scratch);
+                persisted_similarity(&q_emb, true, &scratch, true)
             } else {
-                persisted_similarity(&q_emb, true, &scratch, normalized)
+                let fallback = decode_legacy_f32_embedding(&blob);
+                persisted_similarity(&q_emb, true, &fallback, false)
             };
             candidates.push((sim, id, path, summary, content, tags, updated_at));
         }
@@ -2027,12 +2036,12 @@ pub fn search_entries(
             let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String)> =
                 std::collections::HashMap::new();
             for (entry_id, blob, normalized, path, summary, content, tags, updated_at) in cue_rows {
-                decode_f16_blob_into(&blob, &mut scratch);
-                let sim = if scratch.is_empty() {
-                    let fallback = decode_emb_blob(&blob);
-                    persisted_similarity(&q_emb, true, &fallback, normalized)
+                let sim = if normalized {
+                    decode_f16_blob_into(&blob, &mut scratch);
+                    persisted_similarity(&q_emb, true, &scratch, true)
                 } else {
-                    persisted_similarity(&q_emb, true, &scratch, normalized)
+                    let fallback = decode_legacy_f32_embedding(&blob);
+                    persisted_similarity(&q_emb, true, &fallback, false)
                 };
                 match best.get(&entry_id) {
                     Some((prev, ..)) if *prev >= sim => {}
