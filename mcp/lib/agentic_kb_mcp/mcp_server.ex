@@ -662,7 +662,8 @@ defmodule AgenticKbMcp.McpServer do
     result =
       with false <- match?(%{db_path: nil}, state),
            {:ok, args} <- tool_args(params),
-           :ok <- validate_tool_args(tool, args) do
+           :ok <- validate_tool_args(tool, args),
+           :ok <- authorize_tool(state, tool, args) do
         dispatch_tool(tool, args, state)
       else
         true -> dispatch_tool(tool, %{}, state)
@@ -754,9 +755,10 @@ defmodule AgenticKbMcp.McpServer do
     port_call_to_content(req)
   end
 
-  defp dispatch_tool("kb_expire", args, _state) do
+  defp dispatch_tool("kb_expire", args, state) do
     req =
       %{"method" => "expire", "id" => gen_id()}
+      |> put_if_present("caller_id", trusted_caller(state))
       |> put_if_present("entry_id", args["entry_id"])
       |> put_if_present("reason", args["reason"])
       |> put_if_present("force", args["force"])
@@ -829,18 +831,20 @@ defmodule AgenticKbMcp.McpServer do
     }
   end
 
-  defp dispatch_tool("kb_audit_run", args, _state) do
+  defp dispatch_tool("kb_audit_run", args, state) do
     req =
       %{"method" => "audit_run", "id" => gen_id()}
+      |> put_if_present("caller_id", trusted_caller(state))
       |> put_if_present("sample_size", args["sample_size"])
       |> put_if_present("mode", args["mode"])
 
     port_call_to_content(req)
   end
 
-  defp dispatch_tool("kb_audit_record", args, _state) do
+  defp dispatch_tool("kb_audit_record", args, state) do
     req =
       %{"method" => "audit_record", "id" => gen_id()}
+      |> put_if_present("caller_id", trusted_caller(state))
       |> put_if_present("run_id", args["run_id"])
       |> put_if_present("verdicts", args["verdicts"])
 
@@ -879,6 +883,37 @@ defmodule AgenticKbMcp.McpServer do
   defp port_call_to_content(req) do
     AgenticKbMcp.PortManager.call_port(req) |> render_result()
   end
+
+  defp authorize_tool(%{authorization: authorization}, tool, args) when not is_nil(authorization) do
+    case authz_actions(tool, args) do
+      [] -> :ok
+      actions ->
+        Enum.reduce_while(actions, :ok, fn action, :ok ->
+          case AgenticKbMcp.Authorization.authorize(authorization, action, args) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, "authorization denied: #{reason}"}}
+          end
+        end)
+    end
+  end
+
+  defp authorize_tool(_state, _tool, _args), do: :ok
+
+  defp authz_actions("kb_audit_run", %{"mode" => "traffic"}), do: ["kb.audit.traffic"]
+  defp authz_actions("kb_audit_run", _args), do: ["kb.audit.run"]
+  defp authz_actions("kb_audit_record", %{"verdicts" => verdicts}) when is_list(verdicts) do
+    if Enum.any?(verdicts, &(&1["verdict"] == false)),
+      do: ["kb.audit.record", "kb.audit.expire"],
+      else: ["kb.audit.record"]
+  end
+  defp authz_actions("kb_audit_record", _args), do: ["kb.audit.record"]
+  defp authz_actions("kb_expire", %{"force" => true}), do: ["kb.entry.expire.force"]
+  defp authz_actions("kb_expire", _args), do: ["kb.entry.expire"]
+  defp authz_actions(_tool, _args), do: []
+
+  defp trusted_caller(%{authorization: nil}), do: nil
+  defp trusted_caller(%{authorization: authorization}), do: AgenticKbMcp.Authorization.caller_id(authorization)
+  defp trusted_caller(_state), do: nil
 
   @doc """
   Renders a decoded port response envelope into MCP tool-call content.

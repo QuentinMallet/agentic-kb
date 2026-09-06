@@ -1,5 +1,20 @@
 # AgenticKbMcp
 
+## Authorization boundary
+
+The stdio entry point accepts a single host-launch principal:
+
+```text
+agentic-kb-mcp --caller-id <host-principal>
+```
+
+Mutating audit and expiry tools are denied unless this launch value is present,
+passes the bundled default-deny Rego policy, and stays within its per-caller
+action quota. MCP `initialize.clientInfo` and tool arguments are never used as
+identity. Runtime OPA evaluation uses a short-lived supervised port with both
+OPA and host deadlines; a missing binary, timeout, undefined decision, or
+evaluation error denies the request.
+
 **TODO: Add description**
 
 ## Installation

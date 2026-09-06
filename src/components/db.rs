@@ -864,6 +864,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE audit_run_candidates ADD COLUMN arm TEXT NOT NULL DEFAULT 'uniform';",
     );
+    // MCP audit authorization (bd-1orr): every sampled run and recorded
+    // verdict carries the host-bound caller from the private port boundary.
+    // Existing rows are retained as legacy data but can never satisfy a new
+    // caller-owned record request.
+    let _ = conn.execute_batch("ALTER TABLE audit_runs ADD COLUMN caller_id TEXT NOT NULL DEFAULT ''; ");
+    let _ = conn.execute_batch(
+        "ALTER TABLE audit_run_candidates ADD COLUMN caller_id TEXT NOT NULL DEFAULT '';",
+    );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
@@ -890,7 +898,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id     TEXT NOT NULL,
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
-            evidence_ref TEXT
+            evidence_ref TEXT,
+            caller_id    TEXT NOT NULL DEFAULT ''
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry
             ON audit_runs(run_id, entry_id);
@@ -907,6 +916,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id   TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             arm        TEXT NOT NULL DEFAULT 'uniform',
+            caller_id  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, entry_id)
         );
         "#,

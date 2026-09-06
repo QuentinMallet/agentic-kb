@@ -29,6 +29,10 @@ use std::time::SystemTime;
 // Keep audit_record batches bounded to audit_run's maximum sample size.
 const MAX_AUDIT_VERDICTS: usize = 50;
 
+fn valid_caller_id(caller: &str) -> bool {
+    !caller.is_empty() && caller.len() <= 128 && !caller.bytes().any(|byte| byte < 0x20)
+}
+
 /// Run MCP port protocol server (line-delimited JSON over stdio)
 #[derive(Command, Debug, Parser)]
 pub struct Mcp {
@@ -331,6 +335,7 @@ request_struct!(
 request_struct!(
     /// `expire` — mark one entry stale.
     ExpireRequest {
+        caller_id: Option<String>,
         #[serde(deserialize_with = "de_entry_id")]
         entry_id: String,
         reason: Option<String>,
@@ -402,6 +407,7 @@ request_struct!(
 request_struct!(
     /// `audit_run` — draw an audit sample.
     AuditRunRequest {
+        caller_id: Option<String>,
         sample_size: Option<NumField>,
         mode: Option<String>,
     }
@@ -429,6 +435,7 @@ struct AuditVerdict {
 request_struct!(
     /// `audit_record` — record audit verdicts.
     AuditRecordRequest {
+        caller_id: Option<String>,
         #[serde(deserialize_with = "de_run_id")]
         run_id: String,
         verdicts: Option<Vec<AuditVerdict>>,
@@ -750,7 +757,13 @@ fn handle_request(
         ),
         "add" => handle_add(&typed!(AddRequest), paths, emb),
         "import" => handle_import(&typed!(ImportRequest), paths, emb),
-        "expire" => handle_expire(&typed!(ExpireRequest), paths, emb),
+        "expire" => {
+            let req = typed!(ExpireRequest);
+            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
+                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
+            }
+            handle_expire(&req, paths, emb)
+        }
         "stale_check" => handle_stale_check(&typed!(StaleCheckRequest), paths),
         "compact" => {
             let req = typed!(CompactRequest);
@@ -766,8 +779,20 @@ fn handle_request(
         "test_add" => handle_test_add(&typed!(TestAddRequest), paths, emb),
         "tests" => handle_tests(&typed!(TestsRequest), paths),
         "rebuild" => handle_rebuild(&typed!(RebuildRequest), paths, emb),
-        "audit_run" => handle_audit_run(&typed!(AuditRunRequest), paths),
-        "audit_record" => handle_audit_record(&typed!(AuditRecordRequest), paths, emb),
+        "audit_run" => {
+            let req = typed!(AuditRunRequest);
+            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
+                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
+            }
+            handle_audit_run(&req, paths)
+        }
+        "audit_record" => {
+            let req = typed!(AuditRecordRequest);
+            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
+                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
+            }
+            handle_audit_record(&req, paths, emb)
+        }
         "audit_report" => handle_audit_report(&typed!(AuditReportRequest), paths),
         "provenance" => handle_provenance(&typed!(ProvenanceRequest), paths),
         "kb_get" => handle_kb_get(&typed!(KbGetRequest), paths),
@@ -1774,6 +1799,10 @@ fn handle_expire(
     let entry_id = req.entry_id.clone();
     let reason = req.reason.clone();
     let force = req.force.unwrap_or(false);
+    // Direct unit fixtures intentionally call the handler after the public
+    // port boundary. Real port frames are rejected above unless caller_id is
+    // present and valid.
+    let caller_id = req.caller_id.as_deref().unwrap_or("mcp-test");
 
     let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
@@ -1799,7 +1828,7 @@ fn handle_expire(
         "id": entry_id,
         "reason": reason,
         "ts": ts,
-        "session": "mcp",
+        "session": caller_id,
     });
 
     // Writer 9 of 10.
@@ -1920,6 +1949,7 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
 
 fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let id = &req.id;
+    let caller_id = req.caller_id.as_deref().unwrap_or("mcp-test");
     let sample_size = match NumField::non_negative(&req.sample_size, "sample_size") {
         Ok(v) => v.unwrap_or(5).clamp(1, MAX_AUDIT_VERDICTS as u64) as usize,
         Err(e) => return parse_error(id, e),
@@ -1993,8 +2023,8 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
         .iter()
         .map(|((eid, path, summary, kind, evidence_status), arm)| {
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,arm) VALUES(?1,?2,?3,?4)",
-                params![run_id, eid, ts, arm],
+                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id) VALUES(?1,?2,?3,?4,?5)",
+                params![run_id, eid, ts, arm, caller_id],
             );
             let evidence = audit_evidence_rows(&conn, eid);
             json!({
@@ -2018,6 +2048,7 @@ fn handle_audit_record(
     emb: &dyn embedder::Embedder,
 ) -> Value {
     let id = &req.id;
+    let caller_id = req.caller_id.as_deref().unwrap_or("mcp-test");
     let run_id = req.run_id.clone();
     if run_id.is_empty() || run_id.len() > 128 || run_id.bytes().any(|b| b < 0x20) {
         return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
@@ -2080,7 +2111,7 @@ fn handle_audit_record(
     for v in &verdicts {
         let in_candidates: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+            "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
                 params![run_id, v.entry_id],
                 |r| r.get::<_, i64>(0),
             )
@@ -2089,6 +2120,18 @@ fn handle_audit_record(
         if !in_candidates {
             return json!({"id":id,"type":"error","code":"unknown_run_candidates",
                 "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", v.entry_id, run_id)});
+        }
+
+        let owner: String = conn
+            .query_row(
+                "SELECT caller_id FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, v.entry_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if owner != caller_id {
+            return json!({"id":id,"type":"error","code":"run_owner_mismatch",
+                "message": format!("run_id '{}' belongs to a different caller", run_id)});
         }
     }
 
@@ -2100,6 +2143,52 @@ fn handle_audit_record(
             return json!({"id":id,"type":"error","code":"permanent_guard",
                 "message":format!("entry '{}' cannot be expired: permanent", v.entry_id)});
         }
+    }
+
+    // Probe the complete audit-row mutation under a savepoint before the
+    // JSONL-first expiry helper writes anything durable.  A constraint or
+    // trigger failure on verdict N must therefore reject the entire request
+    // before a leading false verdict can append an irrevocable expiry event.
+    // The probe is rolled back unconditionally; the real idempotent writes
+    // below remain the only durable audit rows.
+    if let Err(e) = conn.execute_batch("SAVEPOINT audit_record_preflight") {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    let preflight: rusqlite::Result<()> = (|| {
+        for verdict_obj in &verdicts {
+            let already_recorded: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, verdict_obj.entry_id],
+                    |row| row.get::<_, i64>(0),
+                )?
+                > 0;
+            if !already_recorded {
+                // Do not use `INSERT OR IGNORE` here: its conflict policy can
+                // mask a trigger/constraint failure, which would reintroduce
+                // the exact mid-batch prefix this preflight prevents.
+                conn.execute(
+                    "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        run_id,
+                        verdict_obj.entry_id,
+                        if verdict_obj.verdict { "true" } else { "false" },
+                        verdict_obj.note,
+                        ts,
+                        caller_id,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    let rollback = conn.execute_batch("ROLLBACK TO SAVEPOINT audit_record_preflight; RELEASE SAVEPOINT audit_record_preflight");
+    if let Err(e) = preflight {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+    }
+    if let Err(e) = rollback {
+        return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
     // Process each verdict individually: for false verdicts, append+apply the expire
@@ -2119,7 +2208,7 @@ fn handle_audit_record(
             vec![json!({
                 "action": "expire", "table": "entries",
                 "id": entry_id, "reason": "audit verdict=false",
-                "ts": ts, "session": "mcp",
+                "ts": ts, "session": caller_id,
             })]
         } else {
             vec![]
@@ -2149,14 +2238,15 @@ fn handle_audit_record(
 
                     // Idempotent insert: UNIQUE(run_id, entry_id) → INSERT OR IGNORE
                     let inserted = conn.execute(
-                    "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
-                     VALUES(?1,?2,?3,?4,?5)",
+                    "INSERT OR IGNORE INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
                         run_id,
                         entry_id,
                         if verdict { "true" } else { "false" },
                         note,
-                        ts
+                        ts,
+                        caller_id
                     ],
                 )?;
 
@@ -7019,6 +7109,7 @@ pub mod tests_api {
     pub struct AuditRunRequest {
         pub id: Value,
         method: &'static str,
+        pub caller_id: &'static str,
         pub sample_size: Option<u64>,
         pub mode: Option<String>,
     }
@@ -7028,6 +7119,7 @@ pub mod tests_api {
             Self {
                 id,
                 method: "audit_run",
+                caller_id: "mcp-test",
                 sample_size,
                 mode: mode.map(str::to_owned),
             }
@@ -7046,6 +7138,7 @@ pub mod tests_api {
     pub struct AuditRecordRequest {
         pub id: Value,
         method: &'static str,
+        pub caller_id: &'static str,
         pub run_id: String,
         pub verdicts: Vec<AuditVerdict>,
     }
@@ -7055,6 +7148,7 @@ pub mod tests_api {
             Self {
                 id,
                 method: "audit_record",
+                caller_id: "mcp-test",
                 run_id: run_id.into(),
                 verdicts,
             }
