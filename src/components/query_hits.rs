@@ -291,7 +291,7 @@ fn open(path: &Path, create: bool) -> rusqlite::Result<Connection> {
             let _ = fs::create_dir_all(parent);
         }
     }
-    let conn = crate::components::db::open_auxiliary(path).map_err(|err| {
+    let conn = crate::components::db::open_auxiliary(path).inspect_err(|_err| {
         // open_auxiliary refuses a genuine repository db path outright; that
         // is a caller bug (telemetry is meant to open only its own
         // query-hits.db), not an ordinary operational failure, so it must
@@ -303,7 +303,6 @@ fn open(path: &Path, create: bool) -> rusqlite::Result<Connection> {
                 path.display()
             );
         }
-        err
     })?;
     configure(&conn)?;
     Ok(conn)

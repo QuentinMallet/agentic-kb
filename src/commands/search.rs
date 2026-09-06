@@ -1184,9 +1184,9 @@ mod tests {
             ]
         }
 
-        /// Invariant: arbitrary FTS queries don't panic and FTS keywords
-        /// are treated as literals, not operators. Quote/backslash escaping
-        /// preserves valid FTS5 syntax.
+        // Invariant: arbitrary FTS queries don't panic and FTS keywords
+        // are treated as literals, not operators. Quote/backslash escaping
+        // preserves valid FTS5 syntax.
         proptest! {
             #![proptest_config(proptest::prelude::ProptestConfig {
                 cases: proptest_cases(256),

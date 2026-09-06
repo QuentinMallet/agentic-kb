@@ -409,11 +409,11 @@ mod tests {
     fn test_evidence_status_present() {
         let ev = json!({"kind": "code", "citation_hash": "sha256:abc"});
         assert_eq!(
-            compute_evidence_status_write("observation", &[ev.clone()]),
+            compute_evidence_status_write("observation", std::slice::from_ref(&ev)),
             "present"
         );
         assert_eq!(
-            compute_evidence_status_write("belief", &[ev.clone()]),
+            compute_evidence_status_write("belief", std::slice::from_ref(&ev)),
             "present"
         );
         assert_eq!(compute_evidence_status_write("procedure", &[ev]), "present");

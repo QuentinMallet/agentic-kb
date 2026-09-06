@@ -99,7 +99,7 @@ fn open_db_callsites_do_not_increase() {
     }
 
     assert!(
-        count <= OPEN_DB_CALLSITE_RATCHET,
+        count == OPEN_DB_CALLSITE_RATCHET,
         "open_db call sites increased: found {count}, ratchet is {OPEN_DB_CALLSITE_RATCHET}"
     );
 }

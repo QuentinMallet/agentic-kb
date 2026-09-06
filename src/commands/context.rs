@@ -40,8 +40,6 @@ pub struct Context {
 #[derive(Clone, Debug)]
 struct Candidate {
     id: String,
-    path: String,
-    summary: String,
     rendered: String,
     score: f32,
     has_signal: bool,
@@ -296,8 +294,6 @@ fn build_candidates(
         };
         out.push(Candidate {
             id,
-            path,
-            summary,
             rendered,
             score: overlap + fts,
             has_signal: overlap > 0.0 || fts > 0.0,
@@ -370,8 +366,6 @@ pub fn benchmark_greedy_select(
         .iter()
         .map(|(id, tokens, score, has_signal)| Candidate {
             id: id.clone(),
-            path: id.clone(),
-            summary: id.clone(),
             rendered: "x".repeat(tokens.saturating_mul(4)),
             score: *score,
             has_signal: *has_signal,
@@ -520,8 +514,6 @@ mod tests {
         let rendered = "x".repeat(bytes);
         Candidate {
             id: id.into(),
-            path: id.into(),
-            summary: id.into(),
             rendered,
             score,
             has_signal: signal,
@@ -680,7 +672,7 @@ mod tests {
         fn emitted_multibyte_chunks_are_utf8_valid(chars in prop::collection::vec(prop_oneof![Just('é'), Just('界'), Just('🦀')], 1..30)) {
             let content: String = chars.into_iter().collect();
             let rendered = entry_text("utf8", "résumé", &content);
-            let input = vec![Candidate { id: "utf8".into(), path: "p".into(), summary: "résumé".into(), rendered, score: 1.0, has_signal: true, cited_file: None }];
+            let input = vec![Candidate { id: "utf8".into(), rendered, score: 1.0, has_signal: true, cited_file: None }];
             let (selected, _) = greedy_select(input, usize::MAX, None, OutputMode::Text);
             for entry in selected.entries { prop_assert!(String::from_utf8(entry.rendered.into_bytes()).is_ok()); }
         }
@@ -794,8 +786,6 @@ mod tests {
 
         let json_candidate = Candidate {
             id: "json-1".into(),
-            path: "docs/json.md".into(),
-            summary: summary.into(),
             rendered: json_row_string("json-1", "docs/json.md", summary, 1.0)
                 .unwrap()
                 .0,
@@ -813,8 +803,6 @@ mod tests {
         let json_budget = approx_tokens(&format!("[{json_rendered}]\n"));
         let json_candidate = Candidate {
             id: "json-1".into(),
-            path: "docs/json.md".into(),
-            summary: summary.into(),
             rendered: json_rendered,
             score: 1.0,
             has_signal: true,
@@ -840,8 +828,6 @@ mod tests {
         let budget = approx_tokens(&rendered);
         let input = vec![Candidate {
             id: "text-1".into(),
-            path: "docs/text.md".into(),
-            summary: "summary".into(),
             rendered,
             score: 1.0,
             has_signal: true,

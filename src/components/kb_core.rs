@@ -37,17 +37,19 @@
 
 use crate::commands::add::{acquire_lock, Lock};
 use crate::components::verification::{
-    compute_citation_hash, compute_citation_hash_and_size_from, open_citation_descriptor,
-    parse_citation_path, FileIdentity,
+    compute_citation_hash_and_size_from, open_citation_descriptor, parse_citation_path,
+    FileIdentity,
 };
 use crate::components::{cursor, db, embedder, events, redactor};
 use crate::config;
-use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
+
+type CitationRange = Option<(usize, usize)>;
+type ResolvedCitationHashes = HashMap<(FileIdentity, CitationRange), String>;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -231,8 +233,7 @@ pub fn add_locked(
 
     // Resolve and validate all in-repository path evidence while holding the
     // flock. File identity, rather than path spelling, is the memoization key.
-    let mut resolved_hashes: HashMap<(FileIdentity, Option<(usize, usize)>), String> =
-        HashMap::new();
+    let mut resolved_hashes = ResolvedCitationHashes::new();
     let mut resolved_citations = Vec::new();
     for evidence in &mut args.evidence_rows {
         let hash_missing = evidence
@@ -291,7 +292,7 @@ pub fn add_locked(
             "citation_hash".to_string(),
             Value::String(citation_hash.clone()),
         );
-        if object.get("citation_sha").map_or(true, Value::is_null) {
+        if object.get("citation_sha").is_none_or(Value::is_null) {
             let cited_dir = absolute_path.parent().unwrap_or(repo_root);
             if let Some(head) = config::git_head_sha_at(cited_dir) {
                 object.insert("citation_sha".to_string(), Value::String(head));
@@ -372,7 +373,7 @@ pub fn add_locked(
                 recency_lambda: 0.0,
                 mmr_lambda: 0.0,
             };
-            match db::search_entries(&conn, embedder, &probe_text, &opts) {
+            match db::search_entries(conn, embedder, &probe_text, &opts) {
                 Ok(results) => results
                     .into_iter()
                     .filter(|r| r.score >= cutoff)
@@ -408,8 +409,7 @@ pub fn add_locked(
     };
 
     run_before_citation_reverify_hook();
-    let mut verified_identities: HashMap<(FileIdentity, Option<(usize, usize)>), String> =
-        HashMap::new();
+    let mut verified_identities = ResolvedCitationHashes::new();
     for resolved in &resolved_citations {
         let (file_rel, range) = parse_citation_path(&resolved.citation_path)?;
         // Same reasoning as the resolve loop above: open first so a

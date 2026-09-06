@@ -4,7 +4,7 @@ use crate::components::db;
 use crate::components::embedder;
 use crate::components::retrieval_eval::{
     compare_reports, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, EvalReport,
-    Split, SplitManifest,
+    Split, SplitManifest, Verdict,
 };
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -147,7 +147,7 @@ impl Eval {
                 recall_at_k: f64,
                 mrr: f64,
                 #[serde(flatten)]
-                report: &'a crate::components::retrieval_eval::EvalReport,
+                report: &'a EvalReport,
             }
             println!(
                 "{}",
@@ -197,7 +197,7 @@ impl Eval {
         let before: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[0])?)?;
         let after: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[1])?)?;
         let comparison = compare_reports(&before, &after)?;
-        if comparison.verdict == crate::components::retrieval_eval::Verdict::Inconclusive {
+        if comparison.verdict == Verdict::Inconclusive {
             println!("INCONCLUSIVE: no information — NOT evidence of no regression (discordant_pairs={})", comparison.discordant_pairs);
         } else {
             println!(
@@ -213,12 +213,11 @@ impl Eval {
     }
 }
 
-fn compare_exit_code(verdict: crate::components::retrieval_eval::Verdict) -> Option<i32> {
+fn compare_exit_code(verdict: Verdict) -> Option<i32> {
     match verdict {
         // `kb eval --compare` is a CI gate only for a demonstrated regression.
-        crate::components::retrieval_eval::Verdict::Regression => Some(EXIT_COMPARE_REGRESSION),
-        crate::components::retrieval_eval::Verdict::Significant
-        | crate::components::retrieval_eval::Verdict::Inconclusive => None,
+        Verdict::Regression => Some(EXIT_COMPARE_REGRESSION),
+        Verdict::Significant | Verdict::Inconclusive => None,
     }
 }
 

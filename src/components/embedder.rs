@@ -232,9 +232,9 @@ impl<'a> PrefetchedEmbedder<'a> {
         let mut cache = std::collections::HashMap::new();
         if !inner.is_noop() {
             for text in texts {
-                if !cache.contains_key(&text) {
-                    let vector = inner.embed(&text)?;
-                    cache.insert(text, Ok(vector));
+                if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(text) {
+                    let vector = inner.embed(entry.key())?;
+                    entry.insert(Ok(vector));
                 }
             }
         }
@@ -257,9 +257,9 @@ impl<'a> PrefetchedEmbedder<'a> {
         let mut cache = std::collections::HashMap::new();
         if !inner.is_noop() {
             for text in texts {
-                if !cache.contains_key(&text) {
-                    let resolved = inner.embed(&text).map_err(|e| e.to_string());
-                    cache.insert(text, resolved);
+                if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(text) {
+                    let resolved = inner.embed(entry.key()).map_err(|e| e.to_string());
+                    entry.insert(resolved);
                 }
             }
         }

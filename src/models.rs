@@ -73,7 +73,7 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
         blob.chunks_exact(EMB_ELEMENT_BYTES)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
-    } else if blob.len() % 4 == 0 {
+    } else if blob.len().is_multiple_of(4) {
         // Legacy f32 path
         blob.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -341,7 +341,7 @@ mod tests {
         ) {
             let len = a.len().min(b.len());
             let sim = cosine_similarity(&a[..len], &b[..len]);
-            prop_assert!(sim >= -1.0001 && sim <= 1.0001, "sim out of range: {sim}");
+            prop_assert!((-1.0001..=1.0001).contains(&sim), "sim out of range: {sim}");
         }
     }
 

@@ -94,7 +94,7 @@ fn fixture_events(i: usize, rng: &mut StdRng) -> [serde_json::Value; 2] {
     let cat = CATEGORIES[i % CATEGORIES.len()];
     let word = LOREM_WORDS[i % LOREM_WORDS.len()];
     let word2 = LOREM_WORDS[(i + 3) % LOREM_WORDS.len()];
-    let hot = i % 100 == 0;
+    let hot = i.is_multiple_of(100);
     let citation_path = if hot {
         "src/hot.rs:1-3"
     } else {

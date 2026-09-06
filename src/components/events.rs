@@ -378,6 +378,7 @@ fn repair_uncommitted_tail_before_append(events_path: &Path) -> Result<()> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(events_path)
         .with_context(|| format!("open events {} for tail repair", events_path.display()))?;
     let len = file.metadata()?.len();
@@ -824,10 +825,7 @@ mod tests {
             &[serde_json::json!({"action": "upsert", "id": "sync-fail"})],
             move |_| {
                 *attempts.borrow_mut() += 1;
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected sync failure",
-                ))
+                Err(io::Error::other("injected sync failure"))
             },
             |_| Ok(()),
         );

@@ -16,17 +16,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Split {
+    #[default]
     Dev,
     Sealed,
-}
-
-impl Default for Split {
-    fn default() -> Self {
-        Self::Dev
-    }
 }
 
 /// One golden case: a query and the entry ids a good retriever must return.

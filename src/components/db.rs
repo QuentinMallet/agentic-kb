@@ -4,8 +4,8 @@ use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
 use crate::config;
 use crate::models::{
-    blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
-    f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
+    cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_f16_blob, Evidence,
+    VerificationStatus, EMB_DIMS,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
@@ -2137,7 +2137,8 @@ pub fn fetch_evidence_for_entries(
         // Bind entry_id strings first, then the probe_limit.
         let rows_raw: Vec<Evidence> = {
             use rusqlite::types::ToSql;
-            let mut params_vec: Vec<&dyn ToSql> = chunk.iter().map(|s| s as &dyn ToSql).collect();
+            let mut params_vec: Vec<&dyn ToSql> =
+                chunk.iter().map(|s| -> &dyn ToSql { s }).collect();
             params_vec.push(&probe_limit);
 
             stmt.query_map(params_vec.as_slice(), |r| {
@@ -2426,7 +2427,8 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
     let mut stmt = conn.prepare(
         "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE is_stale = 0",
     )?;
-    let candidates: Vec<(String, String, String, String, String, String)> = stmt
+    type ExpandCandidate = (String, String, String, String, String, String);
+    let candidates: Vec<ExpandCandidate> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -2619,7 +2621,6 @@ pub fn search_entries(
     effective_opts.limit = caps.limit;
     effective_opts.inline_verify_k = caps.inline_verify_k;
     effective_opts.verify_pool_size = Some(caps.verify_pool_size);
-    let path_prefix = effective_opts.path_prefix.as_deref();
     let tag_filter = effective_opts.tag_filter.as_deref();
 
     let mut entries: Vec<SearchEntry> = Vec::new();
@@ -3110,7 +3111,7 @@ pub fn search_entries(
 
     struct EntryWork {
         entry_idx: usize,
-        ev_rows: Vec<crate::models::Evidence>,
+        ev_rows: Vec<Evidence>,
         do_verify: bool,
         budget_exceeded: bool,
     }
@@ -3159,7 +3160,7 @@ pub fn search_entries(
 
     // --- Phase 2: flatten all verification tasks across entries ---
     // task_ranges[entry_idx] = Some(start..end) within outcomes_flat, or None.
-    let mut flat_tasks: Vec<crate::models::Evidence> = Vec::new();
+    let mut flat_tasks: Vec<Evidence> = Vec::new();
     let mut task_ranges: Vec<Option<std::ops::Range<usize>>> = vec![None; entries.len()];
     for item in &work_items {
         if item.do_verify && !item.budget_exceeded && !item.ev_rows.is_empty() {
@@ -3208,8 +3209,7 @@ pub fn search_entries(
         // verify_count = min(opts.inline_verify_k, entries.len()).
         let work_chan_cap = (pool_size * 2).max(1);
         std::thread::scope(|scope| {
-            let (tx_work, rx_work) =
-                crossbeam_channel::bounded::<(usize, crate::models::Evidence)>(work_chan_cap);
+            let (tx_work, rx_work) = crossbeam_channel::bounded::<(usize, Evidence)>(work_chan_cap);
             let (tx_result, rx_result) =
                 crossbeam_channel::unbounded::<(usize, VerificationOutcome)>();
 
@@ -3328,6 +3328,7 @@ pub fn search_entries_with_stats(
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use crate::models::f32s_to_blob;
     use proptest::prelude::*;
     use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -6085,8 +6086,6 @@ mod tests {
     /// embeddings directly via the entries_emb table so we control both lanes.
     #[test]
     fn test_rrf_fusion_dual_source_beats_high_raw_semantic_score() {
-        use crate::models::{blob_to_f32s, f32s_to_blob};
-
         let conn = open_db_memory().unwrap();
         let embedder = NoopEmbedder;
 
@@ -6227,8 +6226,6 @@ mod tests {
     /// actual entries_emb row on upsert. After expire the row must be gone.
     #[test]
     fn test_expire_deletes_entries_emb_row() {
-        use crate::models::f32s_to_blob;
-
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
@@ -6297,8 +6294,6 @@ mod tests {
     /// replays a stale upsert — the embedding orphan must be cleaned up.
     #[test]
     fn test_stale_upsert_deletes_entries_emb_row() {
-        use crate::models::f32s_to_blob;
-
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {

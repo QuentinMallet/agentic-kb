@@ -8,7 +8,6 @@ use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
 
 /// Persistent state for the compact command (JSON-serialized alongside the event log).
 ///
@@ -288,7 +287,7 @@ impl Compact {
                 && is_effective_add
                 && expire_last
                     .get(entry_id)
-                    .map_or(true, |&expire_i| i > expire_i)
+                    .is_none_or(|&expire_i| i > expire_i)
             {
                 evidence_by_entry
                     .entry(entry_id.to_string())
@@ -1623,9 +1622,14 @@ mod tests {
         ops
     }
 
+    /// (entry id, evidence id, citation path) rows produced by [`materialize`].
+    type MaterializedEvidence = (String, String);
+    /// (entry id, evidence status, sorted evidence rows) produced by [`materialize`].
+    type MaterializedEntry = (String, String, Vec<MaterializedEvidence>);
+
     /// Replay the current event log into a fresh in-memory DB and return each
     /// live entry's ID, derived evidence status, and sorted evidence rows.
-    fn materialize(paths: &Paths) -> Vec<(String, String, Vec<(String, String)>)> {
+    fn materialize(paths: &Paths) -> Vec<MaterializedEntry> {
         use crate::components::{db, embedder::NoopEmbedder};
 
         let conn = db::open_db_memory().unwrap();
@@ -1806,7 +1810,14 @@ mod tests {
             )
             .unwrap();
         }
-        cursor::append_and_apply(&lock, &conn, paths, &NoopEmbedder, &[event.clone()]).unwrap();
+        cursor::append_and_apply(
+            &lock,
+            &conn,
+            paths,
+            &NoopEmbedder,
+            std::slice::from_ref(event),
+        )
+        .unwrap();
     }
 
     #[test]
