@@ -82,6 +82,61 @@ struct PendingWrite {
     blob: Vec<u8>,
 }
 
+/// Ordered boundary markers inside one batch's lock window, from the moment
+/// the universal write lock is held to the moment it is about to be
+/// released. The measurement tests subtract consecutive marks to attribute
+/// lock-hold time to a phase; production passes a closure that ignores them,
+/// so no clock is read on the real write path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatchPhase {
+    /// Before `acquire_lock`. The only mark outside the lock window; it
+    /// exists so the flock acquisition itself is attributable.
+    BatchStart,
+    /// The universal write lock is held and nothing else has run yet.
+    LockAcquired,
+    /// `open_rw_existing` returned a connection on the live pathname.
+    Opened,
+    /// The embed-text-mode vintage check finished.
+    VintageChecked,
+    /// `BEGIN` returned.
+    Begun,
+    /// Every row in the batch has been executed, but not yet committed.
+    Inserted,
+    /// The durable commit returned.
+    Committed,
+    /// The connection has been dropped; the lock is released next.
+    ConnDropped,
+}
+
+impl BatchPhase {
+    /// The phases in the order `write_batches` emits them. The first is a
+    /// start marker, so there are `ORDER.len() - 1` measurable spans.
+    pub(crate) const ORDER: [BatchPhase; 8] = [
+        BatchPhase::BatchStart,
+        BatchPhase::LockAcquired,
+        BatchPhase::Opened,
+        BatchPhase::VintageChecked,
+        BatchPhase::Begun,
+        BatchPhase::Inserted,
+        BatchPhase::Committed,
+        BatchPhase::ConnDropped,
+    ];
+
+    /// Label for the span that ENDS at this phase.
+    pub(crate) fn span_label(self) -> &'static str {
+        match self {
+            BatchPhase::BatchStart => "(start marker)",
+            BatchPhase::LockAcquired => "flock acquire",
+            BatchPhase::Opened => "open_rw_existing",
+            BatchPhase::VintageChecked => "vintage check",
+            BatchPhase::Begun => "BEGIN",
+            BatchPhase::Inserted => "inserts",
+            BatchPhase::Committed => "COMMIT (durable)",
+            BatchPhase::ConnDropped => "connection drop",
+        }
+    }
+}
+
 #[derive(Command, Debug, Parser)]
 pub struct Reembed {
     #[arg(long)]
@@ -141,7 +196,7 @@ pub(crate) fn run_reembed(
     dry_run: bool,
     max_chars: usize,
 ) -> anyhow::Result<ReembedReport> {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_, _| {})
 }
 
 #[cfg(test)]
@@ -155,28 +210,27 @@ fn run_reembed_with_hook<B>(
 where
     B: FnMut(usize, &[PendingWrite]),
 {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_, _| {})
 }
 
 /// `before_batch(batch_index, batch)` fires right before a batch's write
-/// lock is acquired. `lock_acquired(batch_index)` fires immediately after
-/// acquisition. `after_batch(batch_index)` fires immediately after that
-/// batch's transaction commits and its connection is dropped, while the lock
-/// is still held. Tests use these to observe batching and time the real
-/// acquire-to-connection-drop window.
-fn run_reembed_with_hooks<B, L, A>(
+/// lock is acquired, with the rows that batch will write.
+/// `phase(batch_index, phase)` fires at every [`BatchPhase`] boundary of that
+/// batch, in [`BatchPhase::ORDER`]. Tests use `before_batch` to observe
+/// batching and inject races, and `phase` both to act at a precise point
+/// (notably [`BatchPhase::ConnDropped`], which is still inside the lock) and
+/// to time the real acquire-to-connection-drop window phase by phase.
+fn run_reembed_with_hooks<B, P>(
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
     dry_run: bool,
     max_chars: usize,
     mut before_batch: B,
-    mut lock_acquired: L,
-    mut after_batch: A,
+    mut phase: P,
 ) -> anyhow::Result<ReembedReport>
 where
     B: FnMut(usize, &[PendingWrite]),
-    L: FnMut(usize),
-    A: FnMut(usize),
+    P: FnMut(usize, BatchPhase),
 {
     // Selection is unlocked and read-only.
     let conn = match db::open_ro(&paths.db) {
@@ -285,8 +339,7 @@ where
         &mut report,
         &mut embedded_ids,
         &mut before_batch,
-        &mut lock_acquired,
-        &mut after_batch,
+        &mut phase,
     );
     // Reconcile once against the live pathname. If rebuild atomically replaced
     // the database between batches, rows committed to the old inode are
@@ -308,8 +361,7 @@ where
         report.failures.clear();
         report.raced = 0;
         let mut no_before = |_: usize, _: &[PendingWrite]| {};
-        let mut no_lock_acquired = |_: usize| {};
-        let mut no_after = |_: usize| {};
+        let mut no_phase = |_: usize, _: BatchPhase| {};
         write_batches(
             paths,
             mode,
@@ -317,8 +369,7 @@ where
             &mut report,
             &mut embedded_ids,
             &mut no_before,
-            &mut no_lock_acquired,
-            &mut no_after,
+            &mut no_phase,
         );
     }
 
@@ -374,22 +425,21 @@ fn confirm_embedded_ids_are_live(
     Ok(confirmed)
 }
 
-fn write_batches<B, L, A>(
+fn write_batches<B, P>(
     paths: &config::Paths,
     mode: db::EmbedTextMode,
     writes: &[PendingWrite],
     report: &mut ReembedReport,
     embedded_ids: &mut HashSet<String>,
     before_batch: &mut B,
-    lock_acquired: &mut L,
-    after_batch: &mut A,
+    phase: &mut P,
 ) where
     B: FnMut(usize, &[PendingWrite]),
-    L: FnMut(usize),
-    A: FnMut(usize),
+    P: FnMut(usize, BatchPhase),
 {
     for (batch_index, batch) in writes.chunks(REEMBED_WRITE_BATCH_SIZE).enumerate() {
         before_batch(batch_index, batch);
+        phase(batch_index, BatchPhase::BatchStart);
         let lock = match acquire_lock(&paths.lock) {
             Ok(lock) => lock,
             Err(error) => {
@@ -397,7 +447,7 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
-        lock_acquired(batch_index);
+        phase(batch_index, BatchPhase::LockAcquired);
         let conn = match db::open_rw_existing(paths, &lock) {
             Ok(conn) => conn,
             Err(error) => {
@@ -405,7 +455,9 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
+        phase(batch_index, BatchPhase::Opened);
         db::check_embed_mode_vintage(&conn, mode);
+        phase(batch_index, BatchPhase::VintageChecked);
 
         // One transaction per batch: without it, each INSERT is its own
         // implicit commit — REEMBED_WRITE_BATCH_SIZE fsync-durable WAL
@@ -422,6 +474,7 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
+        phase(batch_index, BatchPhase::Begun);
         let mut successes = Vec::new();
         let mut stmt_failures = Vec::new();
         let mut raced = 0usize;
@@ -444,10 +497,18 @@ fn write_batches<B, L, A>(
                 Err(error) => stmt_failures.push((write.id.clone(), error.to_string())),
             }
         }
+        phase(batch_index, BatchPhase::Inserted);
         if let Err(error) = txn.commit() {
             record_batch_failure(report, batch, format!("commit batch: {error}"));
             continue;
         }
+        phase(batch_index, BatchPhase::Committed);
+        // Dropped before the in-memory bookkeeping below, not after: closing
+        // the connection is the last thing this batch needs the database for,
+        // and everything that follows is process-local. Keeping it here also
+        // makes ConnDropped a clean measurement of the close itself.
+        drop(conn);
+        phase(batch_index, BatchPhase::ConnDropped);
         for id in successes {
             if embedded_ids.insert(id) {
                 report.embedded += 1;
@@ -457,8 +518,6 @@ fn write_batches<B, L, A>(
         for (id, cause) in stmt_failures {
             record_failure(report, id, cause);
         }
-        drop(conn);
-        after_batch(batch_index);
     }
 }
 
@@ -510,6 +569,98 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    /// Warm batches the lock-hold budget measurement averages over. More than
+    /// one so a single cold-cache batch cannot decide the verdict.
+    const BUDGET_SAMPLE_BATCHES: usize = 5;
+
+    /// Runs a real `reembed` over exactly `batches` full batches and returns,
+    /// per batch, the duration of every span in [`BatchPhase::ORDER`] (so
+    /// `ORDER.len() - 1` durations, in that order).
+    fn measure_batch_phases(prefix: &str, batches: usize) -> Vec<Vec<std::time::Duration>> {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        for index in 0..(batches * REEMBED_WRITE_BATCH_SIZE) {
+            seed(&paths, &format!("{prefix}-{index}"), "seed");
+        }
+        let marks = std::cell::RefCell::new(Vec::new());
+        run_reembed_with_hooks(
+            &paths,
+            &FixedEmbedder(0.5),
+            false,
+            1800,
+            |_batch_index, _batch| {},
+            |batch_index, phase| {
+                marks
+                    .borrow_mut()
+                    .push((batch_index, phase, std::time::Instant::now()));
+            },
+        )
+        .unwrap();
+        let marks = marks.into_inner();
+        (0..batches)
+            .map(|batch| {
+                let stamps: Vec<std::time::Instant> = marks
+                    .iter()
+                    .filter(|(index, _, _)| *index == batch)
+                    .map(|(_, _, at)| *at)
+                    .collect();
+                assert_eq!(
+                    stamps.len(),
+                    BatchPhase::ORDER.len(),
+                    "batch {batch} must emit every phase exactly once"
+                );
+                stamps
+                    .windows(2)
+                    .map(|pair| pair[1].duration_since(pair[0]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The measured budget window per batch: lock acquisition through the
+    /// connection drop, i.e. every span after `flock acquire`.
+    fn lock_windows(samples: &[Vec<std::time::Duration>]) -> Vec<std::time::Duration> {
+        samples
+            .iter()
+            .map(|spans| spans[1..].iter().sum())
+            .collect()
+    }
+
+    fn median(mut values: Vec<std::time::Duration>) -> std::time::Duration {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn millis(value: std::time::Duration) -> String {
+        format!("{:.3}", value.as_secs_f64() * 1000.0)
+    }
+
+    /// Renders per-phase medians plus every raw sample, in batch order.
+    fn phase_table(samples: &[Vec<std::time::Duration>]) -> String {
+        let mut out = format!("{:<20} {:>10}  samples (ms, in batch order)\n", "phase", "median");
+        for (span, phase) in BatchPhase::ORDER.iter().enumerate().skip(1) {
+            let column: Vec<std::time::Duration> =
+                samples.iter().map(|spans| spans[span - 1]).collect();
+            let raw: Vec<String> = column.iter().map(|d| millis(*d)).collect();
+            out.push_str(&format!(
+                "{:<20} {:>10}  {}\n",
+                phase.span_label(),
+                millis(median(column)),
+                raw.join(" ")
+            ));
+        }
+        let windows = lock_windows(samples);
+        let raw: Vec<String> = windows.iter().map(|d| millis(*d)).collect();
+        out.push_str(&format!(
+            "{:<20} {:>10}  {}\n",
+            "LOCK WINDOW TOTAL",
+            millis(median(windows)),
+            raw.join(" ")
+        ));
+        out
     }
 
     fn seed(paths: &config::Paths, id: &str, summary: &str) {
@@ -646,8 +797,7 @@ mod tests {
                     std::fs::rename(&replacement, &paths.db).unwrap();
                 }
             },
-            |_| {},
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         assert_eq!(report.embedded, REEMBED_WRITE_BATCH_SIZE + 3);
@@ -767,9 +917,8 @@ mod tests {
                     .unwrap();
                 }
             },
-            |_| {},
-            |batch| {
-                if batch == 0 {
+            |batch, phase| {
+                if batch == 0 && phase == BatchPhase::ConnDropped {
                     // Swap in the pre-write snapshot only after pass one's
                     // batch has fully committed against the original db, so
                     // the reconcile pass starts from a live db with none
@@ -888,31 +1037,32 @@ mod tests {
     #[test]
     #[ignore = "lock-hold budget measurement; run explicitly on a quiet host"]
     fn test_reembed_batch_lock_hold_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = config::Paths::from_root(dir.path());
-        db::open_or_init(&paths).unwrap();
-        for index in 0..REEMBED_WRITE_BATCH_SIZE {
-            seed(&paths, &format!("budget-{index}"), "seed");
-        }
-        let start = std::cell::Cell::new(None::<std::time::Instant>);
-        let elapsed = std::cell::Cell::new(None::<std::time::Duration>);
-        run_reembed_with_hooks(
-            &paths,
-            &FixedEmbedder(0.5),
-            false,
-            1800,
-            |_batch_index, _batch| {},
-            |_batch_index| start.set(Some(std::time::Instant::now())),
-            |_batch_index| {
-                if let Some(s) = start.get() {
-                    elapsed.set(Some(s.elapsed()));
-                }
-            },
-        )
-        .unwrap();
-        let elapsed = elapsed.get().expect("after_batch hook must have fired");
-        eprintln!("reembed batch lock hold measurement: {elapsed:?}");
-        assert!(elapsed <= std::time::Duration::from_millis(50));
+        let samples = measure_batch_phases("budget", BUDGET_SAMPLE_BATCHES);
+        let windows = lock_windows(&samples);
+        let table = phase_table(&samples);
+        eprintln!("reembed batch lock hold measurement (acquire -> connection drop)\n{table}");
+        let worst = windows.iter().copied().max().expect("at least one batch");
+        assert!(
+            worst <= std::time::Duration::from_millis(50),
+            "lock-hold budget exceeded: worst sample {worst:?} > 50ms\n{table}"
+        );
+    }
+
+    /// Attributes the same acquire-to-drop window to its phases, so a budget
+    /// miss can be blamed on a specific operation rather than guessed at.
+    /// Run explicitly with
+    /// `cargo test --release -p kb test_reembed_batch_lock_hold_phase_breakdown -- --ignored --nocapture`
+    /// on a quiet host.
+    #[test]
+    #[ignore = "lock-hold phase breakdown measurement; run explicitly on a quiet host"]
+    fn test_reembed_batch_lock_hold_phase_breakdown() {
+        let samples = measure_batch_phases("phases", 8);
+        eprintln!(
+            "reembed batch lock-hold phase breakdown ({} batches x {} rows)\n{}",
+            samples.len(),
+            REEMBED_WRITE_BATCH_SIZE,
+            phase_table(&samples)
+        );
     }
 
     /// Non-ignored structural companion to the budget measurement above:
