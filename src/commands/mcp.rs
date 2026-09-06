@@ -6042,6 +6042,121 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_preserves_reupsert_after_sampled_evidence_order() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(
+            &paths,
+            &emb,
+            "p/compact-reupsert-candidate",
+            Some("candidate-session"),
+        );
+
+        let seeded_events = events::read_events(&paths.events).unwrap().events;
+        let mut later_upsert = seeded_events
+            .iter()
+            .find(|event| event["action"] == "upsert" && event["table"] == "entries")
+            .unwrap()
+            .clone();
+
+        let run = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","sample_size": 1}),
+            ),
+            &paths,
+        );
+        assert_eq!(run["type"], "ok");
+        let run_id = run["run_id"].as_str().unwrap();
+        assert_eq!(run["samples"][0]["id"], eid);
+
+        later_upsert["path"] = json!("p/compact-reupsert-candidate-later");
+        later_upsert["summary"] = json!("later");
+        later_upsert["content"] = json!("later content");
+        later_upsert["is_stale"] = json!(false);
+        later_upsert["evidence_status"] = json!("present");
+        later_upsert["ts"] = json!("2999-01-01T00:00:00Z");
+
+        events::append_event(&paths.events, &later_upsert).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        db::apply_event(&conn, &emb, &later_upsert).unwrap();
+        let appended_len = fs::metadata(&paths.events).unwrap().len();
+        cursor::write(
+            &conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&paths.events),
+                offset: appended_len,
+                tail_sha: cursor::tail_sha(&paths.events, appended_len).unwrap(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        crate::commands::compact::Compact
+            .execute_with_paths(&paths)
+            .unwrap();
+        let compacted = events::read_events(&paths.events).unwrap().events;
+
+        let (replay_dir, replay_paths, replay_emb) = setup();
+        fs::write(
+            &replay_paths.events,
+            compacted
+                .iter()
+                .map(|event| format!("{}\n", serde_json::to_string(event).unwrap()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let replay_conn = db::open_unchecked_for_test(&replay_paths.db).unwrap();
+        for event in &compacted {
+            db::apply_event(&replay_conn, &replay_emb, event).unwrap();
+        }
+        let event_len = fs::metadata(&replay_paths.events).unwrap().len();
+        cursor::write(
+            &replay_conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&replay_paths.events),
+                offset: event_len,
+                tail_sha: cursor::tail_sha(&replay_paths.events, event_len).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (updated_at, evidence_status, evidence_count, candidates): (String, String, i64, i64) =
+            replay_conn
+                .query_row(
+                    "SELECT
+                        (SELECT updated_at FROM entries WHERE id=?1),
+                        (SELECT evidence_status FROM entries WHERE id=?1),
+                        (SELECT COUNT(*) FROM evidence WHERE entry_id=?1),
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    params![eid, run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            updated_at, "2999-01-01T00:00:00Z",
+            "evidence replay must not run after the later retained upsert and regress updated_at"
+        );
+        assert_eq!(evidence_status, "present");
+        assert_eq!(evidence_count, 1);
+        assert_eq!(candidates, 1);
+
+        let accepted = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(accepted["type"], "ok");
+        assert_eq!(accepted["recorded"], 1);
+        assert_eq!(accepted["expired"], 0);
+        drop(replay_dir);
+    }
+
+    #[test]
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);

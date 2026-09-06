@@ -152,6 +152,7 @@ impl Compact {
         let mut audit_candidate_entry_ids: HashSet<String> = HashSet::new();
         let mut audit_required_entry_upserts: HashSet<usize> = HashSet::new();
         let mut audit_required_expire_indices: HashSet<usize> = HashSet::new();
+        let mut entry_upsert_indices: Vec<(usize, String)> = Vec::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
         let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
         let mut effective_evidence_add_indices: HashSet<usize> = HashSet::new();
@@ -169,6 +170,7 @@ impl Compact {
             }
             match (action, table) {
                 ("upsert", "entries") => {
+                    entry_upsert_indices.push((i, id.clone()));
                     entry_last.insert(id.clone(), i);
                     if audit_candidate_entry_ids.contains(&id) {
                         audit_required_entry_upserts.insert(i);
@@ -305,15 +307,6 @@ impl Compact {
         }
         retained_entry_upserts.sort_unstable();
         retained_entry_upserts.dedup();
-        let mut evidence_target_upsert_by_entry: HashMap<String, usize> = HashMap::new();
-        for (upsert_i, entry_id) in &retained_entry_upserts {
-            if expire_last
-                .get(entry_id.as_str())
-                .is_none_or(|&expire_i| *upsert_i > expire_i)
-            {
-                evidence_target_upsert_by_entry.insert(entry_id.clone(), *upsert_i);
-            }
-        }
         for i in audit_required_expire_indices {
             retained_indices.push(i);
         }
@@ -351,6 +344,8 @@ impl Compact {
         // exactly LiveAtIdx in AgentKbEvidence.tla. This drops orphan events both
         // before the first upsert and between expire and revival. The old explicit
         // first-upsert bound is redundant because LiveAtIdx implies one precedes i.
+        let mut retained_entry_upsert_indices: HashSet<usize> =
+            retained_entry_upserts.iter().map(|(i, _)| *i).collect();
         let mut evidence_by_upsert: HashMap<usize, Vec<usize>> = HashMap::new();
         for i in evidence_indices {
             let ev = &evts[i];
@@ -367,7 +362,22 @@ impl Compact {
                     .get(entry_id)
                     .is_none_or(|&expire_i| i > expire_i)
             {
-                if let Some(upsert_i) = evidence_target_upsert_by_entry.get(entry_id) {
+                let last_expire_i = expire_last.get(entry_id).copied();
+                if let Some((upsert_i, upsert_entry_id)) =
+                    entry_upsert_indices
+                        .iter()
+                        .rev()
+                        .find(|(upsert_i, upsert_entry_id)| {
+                            upsert_entry_id == entry_id
+                                && *upsert_i <= i
+                                && !evts[*upsert_i]["is_stale"].as_bool().unwrap_or(false)
+                                && last_expire_i.is_none_or(|expire_i| *upsert_i > expire_i)
+                        })
+                {
+                    if retained_entry_upsert_indices.insert(*upsert_i) {
+                        retained_entry_upserts.push((*upsert_i, upsert_entry_id.clone()));
+                        retained_indices.push(*upsert_i);
+                    }
                     evidence_by_upsert.entry(*upsert_i).or_default().push(i);
                 }
             }
