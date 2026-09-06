@@ -750,6 +750,16 @@ defmodule AgenticKbMcpTest do
       expected = Map.keys(@deployed_pin_args) ++ Map.keys(@s1_tool_args)
       assert registered == Enum.sort(expected)
     end
+
+    test "deployed-pin field table exactly matches each Elixir tool schema" do
+      for {tool_name, expected_fields} <- @deployed_pin_args do
+        tool = Enum.find(McpServer.tools(), &(&1["name"] == tool_name))
+        actual_fields = tool["inputSchema"]["properties"] |> Map.keys()
+
+        assert MapSet.new(actual_fields) == MapSet.new(expected_fields),
+               "#{tool_name} schema fields drifted from the shared deployed-pin table"
+      end
+    end
   end
 
   describe "validate_tool_args/2 (B1)" do
