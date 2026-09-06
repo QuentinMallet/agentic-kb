@@ -78,3 +78,15 @@ Usage: `kb peers import peer-seeds/<slug>.json` from machines_conf via `agentic-
 Per-query override: `kb search --dep-depth N` to use N instead of the config default.
 
 **Note:** epic-type edges are never auto-included in search; they exist only for explicit inspection via `kb peers edge list --epic-slug <slug>`.
+
+## Verification order under federation
+
+With `--peers` or `--reachable-from`, evidence verification is not applied
+per repository during retrieval. `Search::execute_with` zeroes
+`inline_verify_k` before running each repository's local search, merges and
+truncates the combined results to `--limit`, and only then calls
+`db::verify_search_entries` once against the final, already-selected result
+set. Each entry is verified against its own `origin_repo` rather than the
+local root, so a peer's evidence is checked against that peer's working
+tree. See "Federation (Multi-Peer Search)" in `docs/src/search-tuning.md`
+and the federated exception noted in `docs/decisions/s5-search-caps-packet.md`.

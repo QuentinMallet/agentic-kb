@@ -9,13 +9,17 @@ agentic-kb-mcp --caller-id <host-principal>
 ```
 
 Mutating audit and expiry tools are denied unless this launch value is present,
-passes the bundled default-deny Rego policy, and stays within its per-caller
-action quota. MCP `initialize.clientInfo` and tool arguments are never used as
+passes the bundled Rego policy, and stays within its per-caller
+action quota. The bundled policy is default-deny for any caller not listed in
+`trusted_callers`, but it ships with one principal already trusted:
+`agentic-kb-host`. Operators deploying under a different launch identity must
+replace `trusted_callers` in `priv/policies/agentic_kb.rego` with their own.
+MCP `initialize.clientInfo` and tool arguments are never used as
 identity. Runtime OPA evaluation uses a short-lived supervised port with both
 OPA and host deadlines; a missing binary, timeout, undefined decision, or
-evaluation error denies the request.
-
-**TODO: Add description**
+evaluation error denies the request. See
+[MCP Authorization](../docs/src/security/mcp-authorization.md) for the full
+boundary, including rate limits and denial reasons.
 
 ## Installation
 
@@ -49,6 +53,4 @@ batches to `MAX_AUDIT_VERDICTS` (50). Typed `AuditVerdict` rows require a
 boolean verdict, `handle_audit_record` requires a non-empty note when it is
 false, and `db::expire_guard` preserves permanent entries. Any one invalid
 verdict rejects the whole `kb_audit_record` batch before any write — the
-other, valid verdicts in that call are not applied either. Caller identity,
-rate limits, and OPA policy enforcement remain deferred follow-ups in beads
-`bd-1orr`.
+other, valid verdicts in that call are not applied either.

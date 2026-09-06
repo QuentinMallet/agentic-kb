@@ -112,9 +112,16 @@ Response: `{ "roots": [...], "dangling": [...], "graph": [{ "from": "B", "to": "
 
 When the queried entry has no provenance parents, it is itself the root and appears in `roots`. Missing parent ids referenced by `derived_from` appear in `dangling` instead of `roots`.
 
-## Durability warning
+## Durability
 
-`audit_runs` and `source_weights` are DB-only tables — they are **not** replayed from JSONL events.
-Running `kb_rebuild` recreates the DB from the events file and **erases all audit history and confidence
-weights**. After a rebuild, confidence reverts to the Beta(1,1) bootstrap value (0.5) until audit cycles
-are re-run. Plan accordingly before running `kb_rebuild` on a production KB.
+`audit_record` and `audit_run` append durable events (`audit_record_batch`,
+`audit_run_candidates_batch`), and `apply_event` has arms for both that
+populate `audit_runs`, `source_weights`, and `audit_run_candidates` on
+replay. Running `kb_rebuild` therefore reconstructs audit history and
+confidence weights recorded by this release, the same as any other table —
+it does not erase them.
+
+Only rows written by an older binary that predates these event arms — audit
+mutations that landed directly in the database with no corresponding
+JSONL event — are lost on rebuild, because there is no event to replay them
+from. There is no such gap for audit cycles run against this release.

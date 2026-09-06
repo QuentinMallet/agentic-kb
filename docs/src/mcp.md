@@ -27,16 +27,16 @@ MCP tool column also records which port methods are deliberately internal.
 | `add` | `kb_add` | `path: string`, `summary: string`, `content: string` | `tags: JSON`, `permanent: boolean`, `replace_path: boolean`, `kind: string`, `evidence: JSON[]`, `cues: string[]`, `session_id: string` |
 | `cite` | `kb_cite` | `path: string` | `start: integer`, `end: integer` |
 | `import` | `kb_import` | `path: string` | `upsert: boolean` |
-| `expire` | `kb_expire` | `entry_id: string` | `reason: string`, `force: boolean` |
+| `expire` | `kb_expire` | `entry_id: string`, `caller_id: string` | `reason: string`, `force: boolean` |
 | `stale_check` | `kb_stale_check` | — | `files: string[]`, `commits: string[]`, `blame: boolean` |
 | `compact` | `kb_compact` | — | — |
 | `rebuild` | `kb_rebuild` | — | — |
-| `reembed` | `kb_reembed` | — | `dry_run: boolean`, `max_chars: integer` |
+| `reembed` | `kb_reembed` | — | `dry_run: boolean`, `max_chars: integer` (`1..=100000`) |
 | `run` | `kb_run` | `test_id: string`, `result: string` | `adapter: string`, `detail: string` |
 | `test_add` | `kb_test_add` | `app: string`, `name: string`, `protocol: string`, `config: string` | `test_id: string` |
 | `tests` | `kb_tests` | — | `app: string` |
-| `audit_run` | `kb_audit_run` | — | `sample_size: integer`, `mode: string` |
-| `audit_record` | `kb_audit_record` | `run_id: string` | `verdicts: AuditVerdict[]` |
+| `audit_run` | `kb_audit_run` | `caller_id: string` | `sample_size: integer`, `mode: string` |
+| `audit_record` | `kb_audit_record` | `run_id: string`, `caller_id: string` | `verdicts: AuditVerdict[]` |
 | `audit_report` | `kb_audit_report` | — | — |
 | `provenance` | `kb_provenance` | `entry_id: string` | `max_depth: integer` |
 | `kb_get` | `kb_get` | `entry_id: string` | — |
@@ -47,9 +47,17 @@ MCP tool column also records which port methods are deliberately internal.
 `AuditVerdict` is itself closed to unknown fields and requires
 `entry_id: string` and `verdict: boolean`, with optional `note: string`.
 For the exact field enumeration sent by the deployed fleet pin, including the
-accepted Rust-only superset, see [B1 — MCP request contract vs the deployed
-machines_conf pin](../decisions/b1-request-contract.md); it is not duplicated
-here.
+accepted Rust-only superset, see `docs/decisions/b1-request-contract.md`; it
+is not duplicated here.
+
+`caller_id` on `expire`, `audit_run`, and `audit_record` is never a public
+MCP tool argument: the Elixir host bridge injects it from the launch-time
+`--caller-id` principal (`trusted_caller/1` in
+`mcp/lib/agentic_kb_mcp/mcp_server.ex`) before the port request is sent, and
+the Rust dispatcher rejects any of those three methods whose `caller_id` is
+absent or fails `1..=128` printable-char validation. See
+[MCP Authorization](./security/mcp-authorization.md) for the full boundary,
+including the OPA policy and rate limits enforced ahead of that check.
 
 `handle_search` rejects `limit` outside `1..=db::MAX_LIMIT` and
 `inline_verify_k` outside `0..=db::MAX_INLINE_VERIFY_K`; `NumField::bounded`
@@ -65,8 +73,8 @@ The limit and `inline_verify_k` boundary cases are pinned by
 **MCP-visible change:** `inline_verify_k`'s accepted maximum rose from `20` to
 `100`. `db::MAX_INLINE_VERIFY_K` is now defined as `db::MAX_LIMIT`, matching the
 CLI's existing `--limit <= 100` verify-all contract instead of capping MCP
-verification below it. This was ruling O1 of the
-[S5 search caps decision packet](../decisions/s5-search-caps-packet.md): a
+verification below it. This was ruling O1 of the S5 search caps decision
+packet (`docs/decisions/s5-search-caps-packet.md`): a
 caller that previously had `inline_verify_k` rejected above 20 can now request
 verification up to 100, at the cost of a worst-case bounded fan-out of
 `100 * 200 = 20,000` scheduled verification tasks.
@@ -169,8 +177,8 @@ The Elixir text renderer currently prints roots, graph edges, and the
 
 ## Root selection
 
-Root and database selection follows [B3 — Repository-root derivation
-parity](../decisions/b3-root-derivation.md). `config::root_from_db` reconstructs
+Root and database selection follows B3 — Repository-root derivation parity
+(`docs/decisions/b3-root-derivation.md`). `config::root_from_db` reconstructs
 the repository root for both supported layouts and `config::Paths::from_db`
 stores it in `Paths.root`. In `Paths::discover_from`, the canonical
 `.state/agent-kb/agent-kb.db` wins; a bare `.state` marker selects that canonical
@@ -190,4 +198,13 @@ nix develop <worktree> -c mix test
 
 In `.github/workflows/ci.yml`, the `ci` job runs `Elixir compile (mcp)`,
 `Elixir test (mcp)`, and `Elixir format check (mcp)` through `nix develop`, in
-addition to the Rust checks.
+addition to the Rust checks. The dev shell also wraps the escript with
+`open-policy-agent` on `PATH` so OPA-backed authorization can be exercised
+locally; see [MCP Authorization](./security/mcp-authorization.md).
+
+`mcp/test/schema_contract.json` is a shared fixture cross-checked from both
+suites: the Rust `test_deployed_machines_conf_pin_fields_are_all_accepted`
+(`src/commands/mcp.rs`) and the Elixir `"every field the deployed
+machines_conf pin sends is accepted"` (`mcp/test/agentic_kb_mcp_test.exs`)
+both load it, so the two languages cannot silently diverge on accepted
+fields or numeric bounds like `kb_reembed.max_chars`.

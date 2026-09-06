@@ -23,7 +23,9 @@
 - [`kb context`](./commands/context.md)
 - [`kb compress`](./commands/compress.md)
 - [`kb hook`](./commands/hook.md)
+- [`kb migrate-embeddings`](./commands/migrate-embeddings.md)
 
 ## Security
 
 - [Credential Redaction](./security/credential-redaction.md)
+- [MCP Authorization](./security/mcp-authorization.md)
