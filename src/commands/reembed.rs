@@ -12,8 +12,8 @@ use std::os::unix::fs::MetadataExt;
 
 /// Writes per lock acquisition, in one transaction per batch (a single
 /// commit, not one implicit commit per row — see `write_batches`). Budget:
-/// <= 50 ms lock-hold per batch on an idle host, timed from lock
-/// acquisition to the batch connection being dropped after commit.
+/// <= 50 ms lock-hold per batch on an idle host, timed from the flock
+/// being acquired to the flock being released.
 /// `test_reembed_batch_lock_hold_budget` (ignored by default — see its doc
 /// comment) times this exact window on a real batch and prints the
 /// observed duration; it is a measurement to be taken on a quiet host, not
@@ -44,7 +44,45 @@ use std::os::unix::fs::MetadataExt;
 /// regressions pass, but all samples still miss the <= 50 ms gate; retain the
 /// universal lock and durable transaction semantics while investigating a
 /// structurally different reduction in per-batch SQLite work.
+///
+/// Resolved 2026-09-06. Attributing the window phase by phase
+/// (`test_reembed_batch_lock_hold_phase_breakdown`) showed the batch's own
+/// work — lock, open, vintage read, BEGIN, 32 inserts — costs about 2 ms in
+/// total, and everything else was fsync. A syscall trace found five per
+/// batch: the fresh WAL's header, the containing directory (because SQLite's
+/// close had unlinked `-wal`/`-shm`, so this batch recreated them), the
+/// durable commit, and the close-time checkpoint's WAL and database syncs.
+/// Only the commit is durability. `db::defer_checkpoints` keeps that
+/// checkpoint and its unlink out of the window, which leaves two, and moving
+/// the `embed_text_mode` stamp into the preflight removed a sixth fsync that
+/// the very first batch paid as its own implicit commit. Deferring the
+/// close-time checkpoint also means deferring the automatic one, or it would
+/// fire from inside a commit once the WAL passed `wal_autocheckpoint`; see
+/// `REEMBED_DRAIN_EVERY_BATCHES` for what bounds the WAL instead.
+///
+/// Measured at `load1` 4.9, over 16 batches so the run crosses a drain:
+/// per-phase medians were 0.037 ms flock, 1.127 ms open, 0.065 ms vintage
+/// read, 0.005 ms BEGIN, 1.108 ms inserts, 9.708 ms commit, 0.260 ms
+/// connection drop, 0.015 ms bookkeeping and unlock, for a 13.664 ms window
+/// against 102.616 ms for the same table before the change. All 16 samples
+/// were within the gate, from 11.098 ms to 22.996 ms, and the batch after a
+/// drain shows no spike. The drain's own flock holds, held to the same
+/// budget, were 20.207 ms and 20.668 ms.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
+
+/// How often `write_batches` drains the WAL between batches. Deferring both of
+/// SQLite's checkpoints means nothing else bounds it, so this replaces the
+/// `wal_autocheckpoint` threshold that would otherwise fire from inside a
+/// commit.
+///
+/// Sized so the drain is not the worst lock hold in a run. A drain backfills
+/// every frame written since the last one, so its hold grows with this
+/// interval: at 16 batches it measured 45.9 ms, inside the 50 ms budget but the
+/// longest hold anywhere in the run. Eight halves that while still amortizing
+/// one drain's two or three fsyncs eight ways, and at roughly 24 pages per
+/// 32-row batch it caps the WAL near 0.75 MiB, well under SQLite's own
+/// 1000-page default.
+pub(crate) const REEMBED_DRAIN_EVERY_BATCHES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReembedFailure {
@@ -80,6 +118,70 @@ struct PendingWrite {
     id: String,
     updated_at: String,
     blob: Vec<u8>,
+}
+
+/// Ordered boundary markers inside one batch's lock window, from the moment
+/// the universal write lock is held to the moment it is about to be
+/// released. The measurement tests subtract consecutive marks to attribute
+/// lock-hold time to a phase; production passes a closure that ignores them,
+/// so no clock is read on the real write path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatchPhase {
+    /// Before `acquire_lock`. The only mark outside the lock window; it
+    /// exists so the flock acquisition itself is attributable.
+    BatchStart,
+    /// The universal write lock is held and nothing else has run yet.
+    LockAcquired,
+    /// `open_rw_existing` returned a connection on the live pathname.
+    Opened,
+    /// The embed-text-mode vintage check finished.
+    VintageChecked,
+    /// `BEGIN` returned.
+    Begun,
+    /// Every row in the batch has been executed, but not yet committed.
+    Inserted,
+    /// The durable commit returned.
+    Committed,
+    /// The connection has been dropped; the lock is released next.
+    ConnDropped,
+    /// The universal write lock has been released. The end of the hold, and
+    /// therefore the end of the window the budget is stated against.
+    LockReleased,
+}
+
+// Only the measurement tests enumerate or name the phases; production just
+// passes the variants to a closure that ignores them, so this metadata is
+// test-only rather than dead.
+#[cfg(test)]
+impl BatchPhase {
+    /// The phases in the order `write_batches` emits them. The first is a
+    /// start marker, so there are `ORDER.len() - 1` measurable spans.
+    pub(crate) const ORDER: [BatchPhase; 9] = [
+        BatchPhase::BatchStart,
+        BatchPhase::LockAcquired,
+        BatchPhase::Opened,
+        BatchPhase::VintageChecked,
+        BatchPhase::Begun,
+        BatchPhase::Inserted,
+        BatchPhase::Committed,
+        BatchPhase::ConnDropped,
+        BatchPhase::LockReleased,
+    ];
+
+    /// Label for the span that ENDS at this phase.
+    pub(crate) fn span_label(self) -> &'static str {
+        match self {
+            BatchPhase::BatchStart => "(start marker)",
+            BatchPhase::LockAcquired => "flock acquire",
+            BatchPhase::Opened => "open_rw_existing",
+            BatchPhase::VintageChecked => "vintage check",
+            BatchPhase::Begun => "BEGIN",
+            BatchPhase::Inserted => "inserts",
+            BatchPhase::Committed => "COMMIT (durable)",
+            BatchPhase::ConnDropped => "connection drop",
+            BatchPhase::LockReleased => "bookkeeping + unlock",
+        }
+    }
 }
 
 #[derive(Command, Debug, Parser)]
@@ -141,7 +243,7 @@ pub(crate) fn run_reembed(
     dry_run: bool,
     max_chars: usize,
 ) -> anyhow::Result<ReembedReport> {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, |_, _| {}, |_, _| {})
 }
 
 #[cfg(test)]
@@ -155,28 +257,27 @@ fn run_reembed_with_hook<B>(
 where
     B: FnMut(usize, &[PendingWrite]),
 {
-    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_| {}, |_| {})
+    run_reembed_with_hooks(paths, emb, dry_run, max_chars, before_batch, |_, _| {})
 }
 
 /// `before_batch(batch_index, batch)` fires right before a batch's write
-/// lock is acquired. `lock_acquired(batch_index)` fires immediately after
-/// acquisition. `after_batch(batch_index)` fires immediately after that
-/// batch's transaction commits and its connection is dropped, while the lock
-/// is still held. Tests use these to observe batching and time the real
-/// acquire-to-connection-drop window.
-fn run_reembed_with_hooks<B, L, A>(
+/// lock is acquired, with the rows that batch will write.
+/// `phase(batch_index, phase)` fires at every [`BatchPhase`] boundary of that
+/// batch, in [`BatchPhase::ORDER`]. Tests use `before_batch` to observe
+/// batching and inject races, and `phase` both to act at a precise point
+/// (notably [`BatchPhase::ConnDropped`], which is still inside the lock) and
+/// to time the real acquire-to-connection-drop window phase by phase.
+fn run_reembed_with_hooks<B, P>(
     paths: &config::Paths,
     emb: &dyn embedder::Embedder,
     dry_run: bool,
     max_chars: usize,
     mut before_batch: B,
-    mut lock_acquired: L,
-    mut after_batch: A,
+    mut phase: P,
 ) -> anyhow::Result<ReembedReport>
 where
     B: FnMut(usize, &[PendingWrite]),
-    L: FnMut(usize),
-    A: FnMut(usize),
+    P: FnMut(usize, BatchPhase),
 {
     // Selection is unlocked and read-only.
     let conn = match db::open_ro(&paths.db) {
@@ -274,7 +375,7 @@ where
     // critical section. Every batch below still opens the current live
     // pathname under the universal lock, but can safely skip this repeated
     // DDL/stamp work.
-    preflight_reembed_schema(paths)?;
+    preflight_reembed_schema(paths, mode)?;
 
     let mut embedded_ids = HashSet::new();
     let initial_db_identity = db_identity(&paths.db);
@@ -285,8 +386,7 @@ where
         &mut report,
         &mut embedded_ids,
         &mut before_batch,
-        &mut lock_acquired,
-        &mut after_batch,
+        &mut phase,
     );
     // Reconcile once against the live pathname. If rebuild atomically replaced
     // the database between batches, rows committed to the old inode are
@@ -308,8 +408,7 @@ where
         report.failures.clear();
         report.raced = 0;
         let mut no_before = |_: usize, _: &[PendingWrite]| {};
-        let mut no_lock_acquired = |_: usize| {};
-        let mut no_after = |_: usize| {};
+        let mut no_phase = |_: usize, _: BatchPhase| {};
         write_batches(
             paths,
             mode,
@@ -317,8 +416,7 @@ where
             &mut report,
             &mut embedded_ids,
             &mut no_before,
-            &mut no_lock_acquired,
-            &mut no_after,
+            &mut no_phase,
         );
     }
 
@@ -374,22 +472,29 @@ fn confirm_embedded_ids_are_live(
     Ok(confirmed)
 }
 
-fn write_batches<B, L, A>(
+fn write_batches<B, P>(
     paths: &config::Paths,
     mode: db::EmbedTextMode,
     writes: &[PendingWrite],
     report: &mut ReembedReport,
     embedded_ids: &mut HashSet<String>,
     before_batch: &mut B,
-    lock_acquired: &mut L,
-    after_batch: &mut A,
+    phase: &mut P,
 ) where
     B: FnMut(usize, &[PendingWrite]),
-    L: FnMut(usize),
-    A: FnMut(usize),
+    P: FnMut(usize, BatchPhase),
 {
     for (batch_index, batch) in writes.chunks(REEMBED_WRITE_BATCH_SIZE).enumerate() {
+        // Between batches, never inside one: with both of SQLite's own
+        // checkpoints deferred (`db::defer_checkpoints`), this is the only
+        // thing bounding the WAL, and it must not land in a window it exists
+        // to protect. It takes the write lock itself, so it cannot race a
+        // `rebuild` swap either.
+        if batch_index > 0 && batch_index.is_multiple_of(REEMBED_DRAIN_EVERY_BATCHES) {
+            drain_wal(paths, DrainMode::Passive);
+        }
         before_batch(batch_index, batch);
+        phase(batch_index, BatchPhase::BatchStart);
         let lock = match acquire_lock(&paths.lock) {
             Ok(lock) => lock,
             Err(error) => {
@@ -397,7 +502,13 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
-        lock_acquired(batch_index);
+        phase(batch_index, BatchPhase::LockAcquired);
+        // Bound before `conn` so that the implicit drop order at every exit
+        // from this iteration — including the error paths below, which cannot
+        // move `conn` while the transaction borrows it — closes the writer
+        // first and releases the deferral second. Filled in after `conn` is
+        // open, because the writer is what creates `-shm`.
+        let deferred_checkpoints;
         let conn = match db::open_rw_existing(paths, &lock) {
             Ok(conn) => conn,
             Err(error) => {
@@ -405,7 +516,17 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
+        // Held for exactly as long as `conn`: this is what keeps SQLite's
+        // close-time checkpoint (two fsyncs) and its sidecar unlink (which
+        // costs the next batch a directory fsync) out of the lock window, and
+        // disables the automatic checkpoint that would otherwise fire from
+        // inside one COMMIT in every few dozen. See `db::defer_checkpoints`
+        // for why that is safe against a `rebuild` swap, and `drain_wal` for
+        // where the backfill happens instead.
+        deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
+        phase(batch_index, BatchPhase::Opened);
         db::check_embed_mode_vintage(&conn, mode);
+        phase(batch_index, BatchPhase::VintageChecked);
 
         // One transaction per batch: without it, each INSERT is its own
         // implicit commit — REEMBED_WRITE_BATCH_SIZE fsync-durable WAL
@@ -422,6 +543,7 @@ fn write_batches<B, L, A>(
                 continue;
             }
         };
+        phase(batch_index, BatchPhase::Begun);
         let mut successes = Vec::new();
         let mut stmt_failures = Vec::new();
         let mut raced = 0usize;
@@ -444,10 +566,19 @@ fn write_batches<B, L, A>(
                 Err(error) => stmt_failures.push((write.id.clone(), error.to_string())),
             }
         }
+        phase(batch_index, BatchPhase::Inserted);
         if let Err(error) = txn.commit() {
             record_batch_failure(report, batch, format!("commit batch: {error}"));
             continue;
         }
+        phase(batch_index, BatchPhase::Committed);
+        // Dropped before the in-memory bookkeeping below, not after: closing
+        // the connection is the last thing this batch needs the database for,
+        // and everything that follows is process-local. Keeping it here also
+        // makes ConnDropped a clean measurement of the close itself.
+        drop(conn);
+        drop(deferred_checkpoints);
+        phase(batch_index, BatchPhase::ConnDropped);
         for id in successes {
             if embedded_ids.insert(id) {
                 report.embedded += 1;
@@ -457,14 +588,111 @@ fn write_batches<B, L, A>(
         for (id, cause) in stmt_failures {
             record_failure(report, id, cause);
         }
-        drop(conn);
-        after_batch(batch_index);
+        // Explicit, so the lock-hold window the budget is stated against ends
+        // where the hold actually ends. Letting the guard fall out of scope
+        // would leave the bookkeeping above inside the hold but outside the
+        // measurement.
+        drop(lock);
+        phase(batch_index, BatchPhase::LockReleased);
+    }
+    if !writes.is_empty() {
+        drain_wal(paths, DrainMode::Truncate);
     }
 }
 
-fn preflight_reembed_schema(paths: &config::Paths) -> anyhow::Result<()> {
+/// Backfill and truncate the WAL that the per-batch writers deliberately left
+/// unbackfilled (see `db::defer_checkpoints`), in its own hold of the write
+/// lock, so the database is self-contained again at rest.
+///
+/// Deferring both of SQLite's checkpoints hands this function the entire job
+/// of bounding the WAL, so it also holds its own [`db::defer_checkpoints`]
+/// guard: without one, the connection's close would checkpoint and unlink the
+/// sidecars, and this pragma could be deleted without any test noticing.
+///
+/// Best-effort in its outcome, not silent about it. A WAL left undrained costs
+/// later readers a little and costs `rebuild` one drained checkpoint, both of
+/// which already happen on their own, and it never costs a committed write,
+/// which is durable in the WAL whether or not this runs. But an operator whose
+/// database keeps growing a WAL should be able to see why, so every way this
+/// can fail says so on stderr — including a busy checkpoint, which
+/// `wal_checkpoint` reports in its first column rather than as an error
+/// (`rebuild.rs` gates on the same ambiguity with `verify_live_wal_drained`).
+/// How far a drain goes. Between batches the WAL is only backfilled, never
+/// truncated: `TRUNCATE` leaves a zero-length file, and the next batch's commit
+/// then has to write a fresh header into freshly allocated blocks, which
+/// measured as roughly double a steady-state batch — the cost of a run's first
+/// batch, paid again after every drain. `PASSIVE` backfills the same frames and
+/// leaves the file at its high-water mark for the next commit to reuse in
+/// place, which is what actually bounds the WAL. The run's last drain truncates,
+/// so the database at rest is self-contained with nothing left to replay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DrainMode {
+    Passive,
+    Truncate,
+}
+
+impl DrainMode {
+    fn pragma(self) -> &'static str {
+        match self {
+            DrainMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            DrainMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        }
+    }
+}
+
+fn drain_wal(paths: &config::Paths, mode: DrainMode) {
+    let lock = match acquire_lock(&paths.lock) {
+        Ok(lock) => lock,
+        Err(error) => return warn_undrained(format!("acquire write lock: {error}")),
+    };
+    let held_since = std::time::Instant::now();
+    let conn = match db::open_rw_existing(paths, &lock) {
+        Ok(conn) => conn,
+        Err(error) => return warn_undrained(format!("open live database: {error}")),
+    };
+    let deferred_checkpoints = db::defer_checkpoints(&conn, &paths.db);
+    let drained = conn.query_row(mode.pragma(), [], |row| row.get::<_, i64>(0));
+    match drained {
+        Ok(0) => {}
+        Ok(busy) => warn_undrained(format!(
+            "checkpoint reported busy ({busy}); another connection still holds the WAL"
+        )),
+        Err(error) => warn_undrained(format!("checkpoint: {error}")),
+    }
+    drop(conn);
+    drop(deferred_checkpoints);
+    // Explicit, so the recorded span covers the whole hold. This is a lock
+    // window like any batch's and is measured against the same budget.
+    drop(lock);
+    record_drain_hold(held_since);
+}
+
+/// Hand a completed drain's flock hold to the measurement tests. Two clock
+/// reads per drain, once every `REEMBED_DRAIN_EVERY_BATCHES` batches, against
+/// a function that fsyncs; the per-batch path still reads no clock at all.
+fn record_drain_hold(_held_since: std::time::Instant) {
+    #[cfg(test)]
+    tests::DRAIN_HOLDS.with(|holds| holds.borrow_mut().push(_held_since.elapsed()));
+}
+
+fn warn_undrained(cause: String) {
+    eprintln!(
+        "kb: WARNING reembed could not drain the write-ahead log ({cause}); \
+         committed embeddings are safe, but the database is not self-contained \
+         until the next writer or `kb rebuild` checkpoints it"
+    );
+}
+
+fn preflight_reembed_schema(paths: &config::Paths, mode: db::EmbedTextMode) -> anyhow::Result<()> {
     let lock = acquire_lock(&paths.lock)?;
     let conn = db::open_rw(paths, &lock)?;
+    // Also here, not only per batch: on a database that has never recorded an
+    // `embed_text_mode`, this check INSERTs it, and outside a transaction that
+    // is its own durable commit — a second fsync inside the first batch's lock
+    // window, on top of the batch's own. Stamping it once up front leaves the
+    // per-batch call a pure read, which is all it needs to be to warn about a
+    // vintage mismatch on a database swapped in mid-run.
+    db::check_embed_mode_vintage(&conn, mode);
     drop(conn);
     Ok(())
 }
@@ -510,6 +738,132 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    thread_local! {
+        /// Flock holds taken by `drain_wal`, in order. Thread-local because
+        /// the test harness runs tests in parallel and each has its own
+        /// repository; `measure_batch_phases` clears it before it starts.
+        pub(super) static DRAIN_HOLDS: std::cell::RefCell<Vec<std::time::Duration>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn drain_holds() -> Vec<std::time::Duration> {
+        DRAIN_HOLDS.with(|holds| holds.borrow().clone())
+    }
+
+    /// Warm batches the lock-hold budget measurement averages over. Enough to
+    /// cross `REEMBED_DRAIN_EVERY_BATCHES` at least once, so the samples cover
+    /// a run long enough for the WAL policy to act: five batches would only
+    /// ever measure a WAL that never needed draining, which is not what a real
+    /// `kb reembed` over a full knowledge base looks like.
+    const BUDGET_SAMPLE_BATCHES: usize = REEMBED_DRAIN_EVERY_BATCHES + 8;
+
+    /// Runs a real `reembed` over exactly `batches` full batches and returns,
+    /// per batch, the duration of every span in [`BatchPhase::ORDER`] (so
+    /// `ORDER.len() - 1` durations, in that order).
+    fn measure_batch_phases(prefix: &str, batches: usize) -> Vec<Vec<std::time::Duration>> {
+        DRAIN_HOLDS.with(|holds| holds.borrow_mut().clear());
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        for index in 0..(batches * REEMBED_WRITE_BATCH_SIZE) {
+            seed(&paths, &format!("{prefix}-{index}"), "seed");
+        }
+        let marks = std::cell::RefCell::new(Vec::new());
+        run_reembed_with_hooks(
+            &paths,
+            &FixedEmbedder(0.5),
+            false,
+            1800,
+            |_batch_index, _batch| {},
+            |batch_index, phase| {
+                marks
+                    .borrow_mut()
+                    .push((batch_index, phase, std::time::Instant::now()));
+            },
+        )
+        .unwrap();
+        let marks = marks.into_inner();
+        (0..batches)
+            .map(|batch| {
+                let stamps: Vec<std::time::Instant> = marks
+                    .iter()
+                    .filter(|(index, _, _)| *index == batch)
+                    .map(|(_, _, at)| *at)
+                    .collect();
+                assert_eq!(
+                    stamps.len(),
+                    BatchPhase::ORDER.len(),
+                    "batch {batch} must emit every phase exactly once"
+                );
+                stamps
+                    .windows(2)
+                    .map(|pair| pair[1].duration_since(pair[0]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The measured budget window per batch: flock acquisition through flock
+    /// release, i.e. every span after `flock acquire`. It ends at the release
+    /// and not at the connection drop, so nothing done while the lock is still
+    /// held falls outside the number the budget is stated against.
+    fn lock_windows(samples: &[Vec<std::time::Duration>]) -> Vec<std::time::Duration> {
+        samples
+            .iter()
+            .map(|spans| spans[1..].iter().sum())
+            .collect()
+    }
+
+    fn median(mut values: Vec<std::time::Duration>) -> std::time::Duration {
+        values.sort_unstable();
+        values[values.len() / 2]
+    }
+
+    fn millis(value: std::time::Duration) -> String {
+        format!("{:.3}", value.as_secs_f64() * 1000.0)
+    }
+
+    /// Renders per-phase medians plus every raw sample, in batch order.
+    fn phase_table(samples: &[Vec<std::time::Duration>]) -> String {
+        let mut out = format!(
+            "{:<20} {:>10}  samples (ms, in batch order)\n",
+            "phase", "median"
+        );
+        for (span, phase) in BatchPhase::ORDER.iter().enumerate().skip(1) {
+            let column: Vec<std::time::Duration> =
+                samples.iter().map(|spans| spans[span - 1]).collect();
+            let raw: Vec<String> = column.iter().map(|d| millis(*d)).collect();
+            out.push_str(&format!(
+                "{:<20} {:>10}  {}\n",
+                phase.span_label(),
+                millis(median(column)),
+                raw.join(" ")
+            ));
+        }
+        let windows = lock_windows(samples);
+        let raw: Vec<String> = windows.iter().map(|d| millis(*d)).collect();
+        out.push_str(&format!(
+            "{:<20} {:>10}  {}\n",
+            "LOCK WINDOW TOTAL",
+            millis(median(windows)),
+            raw.join(" ")
+        ));
+        out
+    }
+
+    /// Swap `replacement` in over the live database the way `rebuild` does:
+    /// the atomic rename (D4 step 4) followed by the unlink of the replaced
+    /// inode's `-wal`/`-shm` (D4 step 5). A bare rename is not a faithful
+    /// model of a rebuild swap — it would leave the old inode's sidecars
+    /// bound to the new file's name, which is the state rebuild's steps 1, 2
+    /// and 5 exist to rule out.
+    fn swap_live_db(paths: &config::Paths, replacement: &std::path::Path) {
+        std::fs::rename(replacement, &paths.db).unwrap();
+        let db = paths.db.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(format!("{db}-wal"));
+        let _ = std::fs::remove_file(format!("{db}-shm"));
     }
 
     fn seed(paths: &config::Paths, id: &str, summary: &str) {
@@ -643,11 +997,10 @@ mod tests {
             1800,
             |batch, _| {
                 if batch == 1 {
-                    std::fs::rename(&replacement, &paths.db).unwrap();
+                    swap_live_db(&paths, &replacement);
                 }
             },
-            |_| {},
-            |_| {},
+            |_, _| {},
         )
         .unwrap();
         assert_eq!(report.embedded, REEMBED_WRITE_BATCH_SIZE + 3);
@@ -694,7 +1047,7 @@ mod tests {
         }
         let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch, _| {
             if batch == 1 {
-                std::fs::rename(&replacement, &paths.db).unwrap();
+                swap_live_db(&paths, &replacement);
             }
         })
         .unwrap();
@@ -767,14 +1120,13 @@ mod tests {
                     .unwrap();
                 }
             },
-            |_| {},
-            |batch| {
-                if batch == 0 {
+            |batch, phase| {
+                if batch == 0 && phase == BatchPhase::ConnDropped {
                     // Swap in the pre-write snapshot only after pass one's
                     // batch has fully committed against the original db, so
                     // the reconcile pass starts from a live db with none
                     // of pass one's writes already present in it.
-                    std::fs::rename(&replacement, &paths.db).unwrap();
+                    swap_live_db(&paths, &replacement);
                 }
             },
         )
@@ -888,31 +1240,176 @@ mod tests {
     #[test]
     #[ignore = "lock-hold budget measurement; run explicitly on a quiet host"]
     fn test_reembed_batch_lock_hold_budget() {
+        let samples = measure_batch_phases("budget", BUDGET_SAMPLE_BATCHES);
+        let windows = lock_windows(&samples);
+        let table = phase_table(&samples);
+        eprintln!("reembed batch lock hold measurement (flock acquire -> flock release)\n{table}");
+        let worst = windows.iter().copied().max().expect("at least one batch");
+        assert!(
+            worst <= std::time::Duration::from_millis(50),
+            "lock-hold budget exceeded: worst sample {worst:?} > 50ms\n{table}"
+        );
+
+        // The periodic drain takes the same universal lock and is held to the
+        // same budget: a run long enough to need one must not have a lock hold
+        // that a batch would have been failed for.
+        let drains = drain_holds();
+        let raw: Vec<String> = drains.iter().map(|hold| millis(*hold)).collect();
+        eprintln!(
+            "drain flock holds (acquire -> release), one every {} batches: {}",
+            REEMBED_DRAIN_EVERY_BATCHES,
+            raw.join(" ")
+        );
+        assert!(
+            !drains.is_empty(),
+            "the budget run must cross at least one drain, or it does not \
+             characterize a run long enough for the WAL policy to act"
+        );
+        let worst_drain = drains.iter().copied().max().expect("checked non-empty");
+        assert!(
+            worst_drain <= std::time::Duration::from_millis(50),
+            "drain lock-hold budget exceeded: worst drain {worst_drain:?} > 50ms"
+        );
+    }
+
+    /// Attributes the same acquire-to-drop window to its phases, so a budget
+    /// miss can be blamed on a specific operation rather than guessed at.
+    /// Run explicitly with
+    /// `cargo test --release -p kb test_reembed_batch_lock_hold_phase_breakdown -- --ignored --nocapture`
+    /// on a quiet host.
+    #[test]
+    #[ignore = "lock-hold phase breakdown measurement; run explicitly on a quiet host"]
+    fn test_reembed_batch_lock_hold_phase_breakdown() {
+        let samples = measure_batch_phases("phases", REEMBED_DRAIN_EVERY_BATCHES + 8);
+        eprintln!(
+            "reembed batch lock-hold phase breakdown ({} batches x {} rows)\n{}",
+            samples.len(),
+            REEMBED_WRITE_BATCH_SIZE,
+            phase_table(&samples)
+        );
+    }
+
+    /// Both WAL tests below read a property that only holds while checkpoint
+    /// deferral is available; `db::defer_checkpoints` returns `None` by design
+    /// where the read-only handle cannot open or cannot take its shared lock.
+    /// Check that first so such a platform reports the missing precondition
+    /// rather than a regression that has not happened.
+    fn assert_deferral_is_available(paths: &config::Paths) {
+        let probe = db::open_ro(&paths.db).unwrap();
+        assert!(
+            db::defer_checkpoints(&probe, &paths.db).is_some(),
+            "checkpoint deferral is unavailable in this environment, so this \
+             test cannot tell a regression from a missing read-only handle"
+        );
+    }
+
+    fn wal_len(paths: &config::Paths) -> Option<u64> {
+        std::fs::metadata(format!("{}-wal", paths.db.to_string_lossy()))
+            .ok()
+            .map(|meta| meta.len())
+    }
+
+    /// The lock-hold budget now depends on a code-level property, not just on
+    /// how fast the host's storage is: no checkpoint may run inside a batch's
+    /// lock window. A checkpoint there would backfill the WAL into the
+    /// database and unlink `-wal`, so an intact WAL still carrying batch 0's
+    /// frames when batch 1 starts is direct evidence that none ran. Guarded
+    /// here without wall-clock timing so a regression fails in the default
+    /// suite rather than only in the ignored measurement.
+    #[test]
+    fn test_no_checkpoint_runs_inside_a_batch_lock_window() {
         let dir = tempfile::tempdir().unwrap();
         let paths = config::Paths::from_root(dir.path());
         db::open_or_init(&paths).unwrap();
-        for index in 0..REEMBED_WRITE_BATCH_SIZE {
-            seed(&paths, &format!("budget-{index}"), "seed");
+        let total = 2 * REEMBED_WRITE_BATCH_SIZE;
+        for index in 0..total {
+            seed(&paths, &format!("nockpt-{index}"), "seed");
         }
-        let start = std::cell::Cell::new(None::<std::time::Instant>);
-        let elapsed = std::cell::Cell::new(None::<std::time::Duration>);
-        run_reembed_with_hooks(
+        assert_deferral_is_available(&paths);
+        let observed = std::cell::Cell::new(None::<u64>);
+        let report = run_reembed_with_hook(
             &paths,
             &FixedEmbedder(0.5),
             false,
             1800,
-            |_batch_index, _batch| {},
-            |_batch_index| start.set(Some(std::time::Instant::now())),
-            |_batch_index| {
-                if let Some(s) = start.get() {
-                    elapsed.set(Some(s.elapsed()));
+            |batch_index, _| {
+                if batch_index == 1 {
+                    observed.set(Some(wal_len(&paths).unwrap_or(0)));
                 }
             },
         )
         .unwrap();
-        let elapsed = elapsed.get().expect("after_batch hook must have fired");
-        eprintln!("reembed batch lock hold measurement: {elapsed:?}");
-        assert!(elapsed <= std::time::Duration::from_millis(50));
+        assert_eq!(report.embedded, total);
+        // 32 bytes is a bare WAL header; batch 0's frames make it longer.
+        let observed = observed.get().expect("batch 1 must have run");
+        assert!(
+            observed > 32,
+            "batch 0's frames must still be in the WAL when batch 1 starts \
+             (found a {observed}-byte WAL): a checkpoint ran inside the lock window, \
+             which costs the batch two fsyncs and the next batch a directory fsync"
+        );
+    }
+
+    /// The end-to-end drain test below cannot tell `drain_wal`'s pragma from
+    /// the connection close that follows it, because `run_reembed` ends with a
+    /// `confirm_embedded_ids_are_live` read whose own close checkpoints and
+    /// unlinks the WAL. Exercise the pragma on its own: `drain_wal` holds a
+    /// deferral guard, so nothing but `wal_checkpoint(TRUNCATE)` can empty the
+    /// WAL, and the truncated file is still there afterwards to prove it.
+    #[test]
+    fn test_drain_wal_truncates_the_wal_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        assert_deferral_is_available(&paths);
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw_existing(&paths, &lock).unwrap();
+            let deferred = db::defer_checkpoints(&conn, &paths.db);
+            conn.execute(
+                "INSERT INTO kb_meta(key, value) VALUES('drain-fixture', 'x')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            drop(deferred);
+        }
+        assert!(
+            wal_len(&paths).is_some_and(|len| len > 32),
+            "fixture must leave frames in the WAL for the drain to find"
+        );
+
+        drain_wal(&paths, DrainMode::Truncate);
+
+        assert_eq!(
+            wal_len(&paths),
+            Some(0),
+            "drain_wal must truncate the WAL in place; an absent WAL would mean \
+             a connection close did the work and the checkpoint pragma is dead"
+        );
+    }
+
+    /// The flip side of the property above: deferring the backfill must not
+    /// leave it undone. `run_reembed` drains the WAL in its own hold of the
+    /// lock, after the last batch's window has closed, so the database at rest
+    /// is self-contained.
+    #[test]
+    fn test_reembed_drains_the_wal_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = 2 * REEMBED_WRITE_BATCH_SIZE;
+        for index in 0..total {
+            seed(&paths, &format!("drain-{index}"), "seed");
+        }
+        let report = run_reembed(&paths, &FixedEmbedder(0.5), false, 1800).unwrap();
+        assert_eq!(report.embedded, total);
+        assert_eq!(
+            wal_len(&paths).unwrap_or(0),
+            0,
+            "reembed must leave the live database self-contained: any WAL left \
+             behind must be drained and truncated"
+        );
     }
 
     /// Non-ignored structural companion to the budget measurement above:

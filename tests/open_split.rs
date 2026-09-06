@@ -697,3 +697,34 @@ fn test_db_fixture_returns_paths_and_a_writable_connection() {
     )
     .expect("the fixture connection must be writable");
 }
+
+/// Every locked writer commits durably. `synchronous` is read back rather than
+/// assumed: FULL is the bundled amalgamation's compile-time default, but a
+/// system SQLite or a `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` build would make WAL
+/// commits skip their fsync, and nothing else in the suite would notice.
+///
+/// This matters more since `db::defer_checkpoints`: a batched writer's
+/// close used to run a checkpoint whose fsyncs made each batch durable whatever
+/// this setting was, and that belt is gone. 2 is `SQLITE_CHECKPOINT_FULL`'s
+/// numeric encoding of FULL.
+#[test]
+fn locked_writers_commit_durably() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = repo(dir.path());
+    db::open_or_init(&paths).unwrap();
+
+    let lock = acquire_lock(&paths.lock).unwrap();
+    for conn in [
+        db::open_rw(&paths, &lock).unwrap(),
+        db::open_rw_existing(&paths, &lock).unwrap(),
+    ] {
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "locked writers must run with synchronous=FULL; a committed row's \
+             only remaining fsync is the commit's own"
+        );
+    }
+}

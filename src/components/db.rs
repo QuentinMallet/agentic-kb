@@ -279,15 +279,28 @@ pub fn note_uninitialized(db_path: &Path) {
     eprintln!("{}", uninitialized_note(db_path));
 }
 
-/// Open a read-write connection: WAL, foreign keys, parent dirs. No DDL, no
-/// stamp, no sweep, no lock. Shared by the openers that are allowed to mutate.
+/// Open a read-write connection: WAL, durable commits, foreign keys, parent
+/// dirs. No DDL, no stamp, no sweep, no lock. Shared by the openers that are
+/// allowed to mutate.
+///
+/// `synchronous=FULL` is set explicitly rather than inherited. It is the
+/// bundled amalgamation's compile-time default today, but a system SQLite or a
+/// build carrying `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` would drop every WAL
+/// commit's fsync and make writers silently non-durable across power loss.
+/// That premise carries more weight since `defer_checkpoints`: a
+/// batched writer's close no longer performs a checkpoint whose own fsyncs
+/// used to make each batch durable regardless of this setting, so the commit's
+/// own fsync is now the only thing standing behind a committed row.
+/// `open_split.rs`'s `locked_writers_commit_durably` reads it back.
 fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
         fs::create_dir_all(p)?;
     }
     let conn =
         Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
     Ok(conn)
 }
 
@@ -529,6 +542,95 @@ pub fn open_rw_existing(
 ) -> Result<Connection> {
     require_live_write_lock(paths, lock)?;
     open_conn_rw(&paths.db)
+}
+
+/// Keeps SQLite's own checkpoints out of a locked writer's lock window: the
+/// close-time one, by holding a second read-only handle on the live database
+/// for exactly as long as the writer's connection, and the automatic one, by
+/// setting `wal_autocheckpoint=0` on the writer.
+///
+/// Why this exists. `sqlite3WalClose` opportunistically checkpoints whenever
+/// it can take an EXCLUSIVE lock on the database file, which is whenever the
+/// closing connection is the last one open, and then unlinks `-wal`/`-shm`.
+/// For a writer that opens and closes once per batch — which the reembed lock
+/// contract requires, so that a `rebuild` swap is always picked up by
+/// pathname — that turns one durable commit into five fsyncs: the fresh WAL's
+/// header, the directory (because `-wal` and `-shm` were just created), the
+/// commit itself, the checkpoint's WAL sync, and the checkpoint's database
+/// sync. Only the third is durability. A syscall trace of the reembed batch
+/// path showed exactly that sequence, and the four non-commit fsyncs are the
+/// bulk of the measured lock-hold time.
+///
+/// The handle is opened `SQLITE_OPEN_READ_ONLY` on purpose, and that flag is
+/// load-bearing twice over: while it is alive the writer cannot take the
+/// EXCLUSIVE lock, so the writer skips both the checkpoint and the unlink;
+/// and when this handle is dropped it cannot take that lock either, because
+/// a POSIX write lock on a descriptor opened `O_RDONLY` fails, so it does not
+/// simply perform the checkpoint in the writer's place. This is the one place
+/// in the crate that wants a genuinely read-only file handle; [`open_ro`] is
+/// deliberately not one (it must be able to recover a hot WAL).
+///
+/// Durability is untouched. The writer's own commit still fsyncs the WAL
+/// under `synchronous=FULL`, and a crash replays those frames. What is
+/// deferred is only the backfill of committed frames into the database file.
+///
+/// The automatic checkpoint has to go with it. Once the WAL is no longer reset
+/// at every close it grows across batches, and SQLite's default
+/// `wal_autocheckpoint` of 1000 pages would eventually fire a passive
+/// checkpoint from inside a COMMIT — putting the very fsyncs this removes back
+/// into a lock window, on one unlucky batch in every few dozen. Deferring one
+/// checkpoint and not the other would just make the cost periodic instead of
+/// constant, so this disables it and hands the caller the whole obligation.
+///
+/// That obligation is real: with both deferred, nothing bounds the WAL except
+/// the caller. Drain it (`wal_checkpoint(TRUNCATE)`) on an interval of the
+/// caller's choosing, under the write lock but outside the windows it is
+/// protecting, and again before the run ends.
+///
+/// Swap safety. This handle is opened and dropped inside a single hold of the
+/// write lock, so no connection is open on the live inode when the lock is
+/// released and `rebuild` may replace the file — the invariant that rules out
+/// a connection retained across batches still holds. What it does leave at
+/// rest is a `-wal` carrying unbackfilled frames. `rebuild`'s D4 sequence is
+/// built for exactly that: step 1 drains the live WAL with
+/// `wal_checkpoint(TRUNCATE)` under this same lock, step 2 gates the swap on
+/// the resulting zero-length `-wal`, and step 5 unlinks the replaced inode's
+/// sidecars.
+pub struct DeferredCheckpoints {
+    /// Never read. Its lifetime is the whole mechanism: SQLite consults the
+    /// database file's lock state, not this value.
+    _conn: Connection,
+}
+
+/// Defer `writer`'s checkpoints. Call it only while holding the write lock and
+/// only after `writer` is open: the writer is what creates `-shm`, which a
+/// read-only handle cannot. Drop the returned guard immediately after
+/// `writer`, never before.
+///
+/// Returns `None` when either half fails: the pragma, or opening the read-only
+/// handle and taking its shared lock. Both halves are refused together on
+/// purpose — suppressing the close-time checkpoint while the automatic one is
+/// still armed is worse than deferring nothing, because the WAL then grows
+/// into a checkpoint fired from inside a COMMIT. Falling back to SQLite's own
+/// behaviour costs latency, never correctness, so this is not an error.
+pub fn defer_checkpoints(writer: &Connection, db_path: &Path) -> Option<DeferredCheckpoints> {
+    // Not discarded: a failure here would silently restore the 1000-page
+    // threshold, and the close-time suppression below would then let the WAL
+    // grow into an automatic checkpoint fired from inside a COMMIT — the exact
+    // in-window checkpoint this exists to prevent. Better to defer nothing.
+    writer.pragma_update(None, "wal_autocheckpoint", 0).ok()?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // A statement, not merely the open: in WAL mode SQLite takes the shared
+    // lock on the database file when the WAL is first opened, which happens on
+    // first access. `schema_version` reads the header rather than the parsed
+    // schema, so this is the cheapest read that still takes the lock.
+    conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
+        .ok()?;
+    Some(DeferredCheckpoints { _conn: conn })
 }
 
 fn require_live_write_lock(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<()> {
@@ -2741,7 +2843,11 @@ fn dot_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     let dot: f32 = a.iter().zip(b).map(|(left, right)| left * right).sum();
-    dot.is_finite().then_some(dot).unwrap_or(0.0)
+    if dot.is_finite() {
+        dot
+    } else {
+        0.0
+    }
 }
 
 /// Use the dot kernel only when each participating persisted blob was marked
