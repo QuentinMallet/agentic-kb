@@ -1751,7 +1751,7 @@ fn dot_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Use the dot kernel only when each participating persisted blob was marked
 /// normalized in the same transaction that wrote its bytes.
 fn persisted_similarity(a: &[f32], a_normalized: bool, b: &[f32], b_normalized: bool) -> f32 {
-    if a_normalized && b_normalized {
+    if a_normalized && b_normalized && a.len() == EMB_DIMS && b.len() == EMB_DIMS {
         dot_similarity(a, b)
     } else {
         cosine_similarity(a, b)

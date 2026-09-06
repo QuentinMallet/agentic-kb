@@ -173,6 +173,11 @@ does not silently change ranking.
 Run `kb migrate-embeddings` to convert existing blobs. It creates and retains
 `agent-kb.db.pre-normalized-embeddings.bak`, validates a staged copy, and
 atomically publishes the staged database only after every legacy entry and cue
-blob is finite and non-zero. A corrupt blob aborts the migration without
-marking any live row; restore the retained backup if an operator needs to roll
-back after publication.
+blob is finite, non-zero, and exactly the configured embedding dimension. The
+live WAL is checkpointed and verified before publication, so its committed
+pages are never discarded during the swap. A durable staging-state file makes
+an interruption before publication resumable; it publishes only when the live
+source digest is unchanged, otherwise it discards the stale stage and retries
+from the live database. A corrupt blob aborts the migration without marking any
+live row; restore the retained backup if an operator needs to roll back after
+publication.

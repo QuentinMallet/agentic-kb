@@ -44,8 +44,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// normalizing the zero vector manufactures NaNs, which are byte-valid blobs
 /// but invalid similarity inputs.
 pub fn normalize_embedding(v: &[f32]) -> Result<Vec<f32>> {
-    if v.is_empty() {
-        bail!("embedding must not be empty");
+    if v.len() != EMB_DIMS {
+        bail!("embedding dimension must be {EMB_DIMS}, got {}", v.len());
     }
     if !v.iter().all(|value| value.is_finite()) {
         bail!("embedding contains non-finite values");

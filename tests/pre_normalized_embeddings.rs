@@ -6,12 +6,16 @@
 //! on both embedding tables.  The marker belongs to the blob row, not only to
 //! `kb_meta`: a mixed database must continue to score legacy rows as cosine.
 
-use kb::components::db::{apply_event, migrate_embeddings, open_db_memory};
+use kb::commands::migrate_embeddings::MigrateEmbeddings;
+use kb::components::db::{apply_event, migrate_embeddings, open_db, open_db_memory};
 use kb::components::embedder::Embedder;
+use kb::config::Paths;
 use kb::models::{decode_emb_blob, f32s_to_blob, normalize_embedding, EMB_BLOB_BYTES, EMB_DIMS};
 use proptest::prelude::*;
 use rusqlite::params;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::fs;
 
 struct FixedEmbedder(Vec<f32>);
 
@@ -162,9 +166,187 @@ fn non_finite_and_zero_norm_outputs_are_rejected() {
         vec![f32::INFINITY; EMB_DIMS],
         vec![f32::NEG_INFINITY; EMB_DIMS],
         vec![0.0; EMB_DIMS],
+        vec![1.0; EMB_DIMS - 1],
+        vec![1.0; EMB_DIMS + 1],
     ] {
         assert!(normalize_embedding(&invalid).is_err());
     }
+}
+
+/// A legacy f32 blob must carry the configured embedding dimension before it
+/// is eligible for migration.  Otherwise format length alone permits a model
+/// upgrade to become a marked dot-product row with incomparable rankings.
+#[test]
+fn migration_rejects_wrong_dimension_legacy_blobs() {
+    let conn = open_db_memory().unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event("wrong-dimension")).unwrap();
+    let wrong_dimension = vec![1.0; EMB_DIMS - 1];
+    conn.execute(
+        "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+        params![
+            embedding_rowid(&conn, "wrong-dimension"),
+            f32s_to_blob(&wrong_dimension)
+        ],
+    )
+    .unwrap();
+
+    assert!(migrate_embeddings(&conn).is_err());
+    let (_, normalized) = stored_entry_embedding(&conn, "wrong-dimension");
+    assert_eq!(normalized, 0);
+}
+
+/// An embedder with a different model dimension must fail before it can write
+/// a normalized marker.  This protects future model upgrades from silently
+/// turning incomparable vectors into dot-product candidates.
+#[test]
+fn wrong_dimension_embedder_output_is_rejected_before_persistence() {
+    let conn = open_db_memory().unwrap();
+    let error = apply_event(
+        &conn,
+        &FixedEmbedder(vec![1.0; EMB_DIMS - 1]),
+        &entry_event("wrong-dimension-writer"),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("dimension"));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE id='wrong-dimension-writer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "the event transaction must roll back");
+}
+
+fn disk_paths() -> (tempfile::TempDir, Paths) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+    let paths = Paths::from_root(dir.path());
+    (dir, paths)
+}
+
+fn migration_backup_path(paths: &Paths) -> std::path::PathBuf {
+    paths.db.with_extension("db.pre-normalized-embeddings.bak")
+}
+
+fn migration_staging_path(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .db
+        .with_extension("db.pre-normalized-embeddings.stage")
+}
+
+fn migration_state_path(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .db
+        .with_extension("db.pre-normalized-embeddings.state")
+}
+
+fn database_digest(path: &std::path::Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(fs::read(path).unwrap());
+    format!("{:x}", hasher.finalize())
+}
+
+/// A retained backup is recovery state, not a permanent one-shot lockout.
+/// Re-running after a completed publish must be idempotent and preserve the
+/// backup for operator rollback.
+#[test]
+fn file_migration_is_idempotent_after_publish_with_retained_backup() {
+    let (_dir, paths) = disk_paths();
+    let conn = open_db(&paths.db).unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event("disk-row")).unwrap();
+    conn.execute(
+        "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+        params![
+            embedding_rowid(&conn, "disk-row"),
+            f32s_to_blob(&vec![1.0; EMB_DIMS])
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let command = MigrateEmbeddings;
+    assert_eq!(command.execute_with(&paths).unwrap(), 1);
+    let backup = migration_backup_path(&paths);
+    assert!(
+        backup.exists(),
+        "successful migration retains a rollback backup"
+    );
+    assert_eq!(command.execute_with(&paths).unwrap(), 0);
+    assert!(
+        backup.exists(),
+        "idempotent resume must not discard the backup"
+    );
+}
+
+/// A pre-publish crash leaves the live DB intact and a resumable staged copy.
+/// If a committed write reaches the live WAL before recovery, the manifest
+/// must reject that stale staged copy and rebuild from the live database.
+#[test]
+fn file_migration_resumes_a_pre_publish_staged_copy_without_losing_live_rows() {
+    let (_dir, paths) = disk_paths();
+    let conn = open_db(&paths.db).unwrap();
+    let noop = kb::components::embedder::NoopEmbedder;
+    apply_event(&conn, &noop, &entry_event("survives-crash")).unwrap();
+    conn.execute(
+        "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+        params![
+            embedding_rowid(&conn, "survives-crash"),
+            f32s_to_blob(&vec![1.0; EMB_DIMS])
+        ],
+    )
+    .unwrap();
+    let staging = migration_staging_path(&paths);
+    let backup = migration_backup_path(&paths);
+    let state = migration_state_path(&paths);
+    let escaped_staging = staging.to_string_lossy().replace('\'', "''");
+    let escaped_backup = backup.to_string_lossy().replace('\'', "''");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.execute_batch(&format!("VACUUM INTO '{escaped_backup}'"))
+        .unwrap();
+    conn.execute_batch(&format!("VACUUM INTO '{escaped_staging}'"))
+        .unwrap();
+    drop(conn);
+
+    let staged_conn = open_db(&staging).unwrap();
+    assert_eq!(migrate_embeddings(&staged_conn).unwrap(), 1);
+    staged_conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(staged_conn);
+    fs::write(&state, format!("{}\\t1\\n", database_digest(&paths.db))).unwrap();
+    assert!(staging.exists());
+
+    // This is the crash window the migration must protect: the stage is ready
+    // but the live DB has gained a committed row. Recovery may not publish the
+    // old stage over it, even after checkpointing the live WAL.
+    let late_conn = open_db(&paths.db).unwrap();
+    apply_event(&late_conn, &noop, &entry_event("committed-after-stage")).unwrap();
+    late_conn
+        .execute(
+            "INSERT INTO entries_emb(rowid, embedding, normalized) VALUES(?1, ?2, 0)",
+            params![
+                embedding_rowid(&late_conn, "committed-after-stage"),
+                f32s_to_blob(&vec![1.0; EMB_DIMS])
+            ],
+        )
+        .unwrap();
+    drop(late_conn);
+
+    let command = MigrateEmbeddings;
+    assert_eq!(command.execute_with(&paths).unwrap(), 2);
+
+    let conn = open_db(&paths.db).unwrap();
+    let (_, normalized) = stored_entry_embedding(&conn, "survives-crash");
+    assert_eq!(normalized, 1);
+    let (_, normalized) = stored_entry_embedding(&conn, "committed-after-stage");
+    assert_eq!(normalized, 1);
+    assert!(!staging.exists());
+    assert!(!state.exists());
 }
 
 /// Migration is fail-closed: one corrupt legacy blob aborts without marking
