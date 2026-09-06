@@ -99,13 +99,15 @@ impl Search {
         // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
         // via root_from_db (mcp.rs:40-45) because MCP CWD is typically '/' and CWD
         // discovery would fail.
+        let federated = !self.local_only && (self.peers || self.reachable_from.is_some());
         let opts = db::SearchOptions {
             limit: self.limit,
             do_fts: self.fts || !self.semantic,
             do_semantic: self.semantic || !self.fts,
             path_prefix: self.path_prefix.clone(),
             tag_filter: self.tag.clone(),
-            inline_verify_k: self.limit, // verify all results by default
+            // Federation verifies only after the global merge/truncate below.
+            inline_verify_k: if federated { 0 } else { self.limit },
             repo_root: None,
             verify_pool_size: kb_config.verify_pool_size,
             recency_lambda: kb_config.recency_lambda,
@@ -116,7 +118,7 @@ impl Search {
         let local_results = db::search_entries(&conn, embedder, &self.query, &opts)?;
 
         // Peer federation: collect results from peer DBs and merge.
-        let results = if !self.local_only && (self.peers || self.reachable_from.is_some()) {
+        let mut results = if federated {
             let peer_paths = collect_peer_paths(
                 &conn,
                 self.reachable_from.as_deref(),
@@ -170,6 +172,16 @@ impl Search {
         } else {
             local_results
         };
+
+        if federated {
+            finalize_federated_results(&mut results, self.limit);
+            let local_root = paths
+                .db
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent());
+            db::verify_search_entries(&mut results, self.limit, local_root);
+        }
 
         // Determine display mode: RRF hybrid produces unified results;
         // single-lane modes keep separate FTS / semantic sections.
@@ -235,6 +247,15 @@ impl Search {
 
         Ok(())
     }
+}
+
+fn finalize_federated_results(results: &mut Vec<db::SearchEntry>, limit: usize) {
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
 }
 
 fn citation_file_component(path: &str) -> String {
@@ -358,6 +379,27 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn federated_results_are_ranked_and_truncated_before_verification() {
+        let mut merged = vec![
+            crate::components::db::SearchEntry {
+                id: "low".into(), path: "low".into(), summary: String::new(), content: String::new(), tags: "[]".into(),
+                score: 0.1, source: "fts", score_kind: "fts", evidence: vec![], confidence: 0.5,
+                audit_n: 0, origin_repo: None, updated_at: String::new(),
+            },
+            crate::components::db::SearchEntry {
+                id: "high".into(), path: "high".into(), summary: String::new(), content: String::new(), tags: "[]".into(),
+                score: 0.9, source: "fts", score_kind: "fts", evidence: vec![], confidence: 0.5,
+                audit_n: 0, origin_repo: Some("peer".into()), updated_at: String::new(),
+            },
+        ];
+
+        finalize_federated_results(&mut merged, 1);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "high");
+    }
 
     const FAST_PROPTEST_CASES: u32 = 16;
 

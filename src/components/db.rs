@@ -2391,6 +2391,50 @@ pub fn search_entries(
     Ok(entries)
 }
 
+/// Verify already-selected search results against the repository that produced
+/// each result. Federation calls this only after its global ranking and limit
+/// have been applied, so discarded peer rows never incur verification work.
+pub fn verify_search_entries(
+    entries: &mut [SearchEntry],
+    inline_verify_k: usize,
+    local_repo_root: Option<&Path>,
+) {
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        if idx >= inline_verify_k {
+            continue;
+        }
+        let Some(root) = entry
+            .origin_repo
+            .as_deref()
+            .map(Path::new)
+            .or(local_repo_root)
+        else {
+            continue;
+        };
+
+        for ev in &mut entry.evidence {
+            let model_ev = Evidence {
+                id: ev.id.clone(),
+                entry_id: entry.id.clone(),
+                kind: ev.kind.clone(),
+                citation_path: ev.citation_path.clone(),
+                citation_sha: ev.citation_sha.clone(),
+                citation_hash: ev.citation_hash.clone(),
+                citation_excerpt: ev.citation_excerpt.clone(),
+                derived_from: None,
+                recorded_at: None,
+            };
+            let outcome = crate::components::verification::verify_evidence(
+                &model_ev,
+                root,
+                SEARCH_PATH_RELOCATION_POLICY,
+            );
+            ev.verified = Some(outcome.is_verified());
+            ev.verification_status = Some(outcome.status);
+        }
+    }
+}
+
 /// Walk up from CWD to find a directory containing `.git`.
 /// Returns None if not found (e.g. in tempdir tests).
 fn find_repo_root() -> Option<PathBuf> {
