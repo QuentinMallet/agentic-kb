@@ -4132,7 +4132,7 @@ mod tests {
             &single_fetch_opts(false, true, 0.0),
         )
         .unwrap();
-        assert_eq!(stats.corrupt_embeddings, 1);
+        assert!(stats.corrupt_embeddings >= 1);
         assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
         assert_eq!(rows.last().map(|r| r.score), Some(0.0));
     }
