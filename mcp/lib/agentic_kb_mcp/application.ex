@@ -50,12 +50,18 @@ defmodule AgenticKbMcp.Application do
       if db_path do
         [
           {AgenticKbMcp.PortManager, db_path: db_path, kb_bin: kb_bin},
-          {AgenticKbMcp.Authorization, caller_id: caller_id, opa_opts: [policy_dir: policy_dir]},
+          {AgenticKbMcp.Authorization,
+           name: AgenticKbMcp.Authorization,
+           caller_id: caller_id,
+           opa_opts: [policy_dir: policy_dir]},
           {AgenticKbMcp.McpServer, db_path: db_path, authorization: AgenticKbMcp.Authorization}
         ]
       else
         [
-          {AgenticKbMcp.Authorization, caller_id: caller_id, opa_opts: [policy_dir: policy_dir]},
+          {AgenticKbMcp.Authorization,
+           name: AgenticKbMcp.Authorization,
+           caller_id: caller_id,
+           opa_opts: [policy_dir: policy_dir]},
           {AgenticKbMcp.McpServer, db_path: nil, authorization: AgenticKbMcp.Authorization}
         ]
       end

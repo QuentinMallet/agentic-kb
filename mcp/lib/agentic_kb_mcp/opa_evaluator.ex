@@ -2,13 +2,15 @@ defmodule AgenticKbMcp.OpaEvaluator do
   @moduledoc false
 
   def evaluate(input, opts) do
-    opa_bin = Keyword.get(opts, :opa_bin, System.get_env("OPA_BIN") || System.find_executable("opa"))
+    opa_bin =
+      Keyword.get(opts, :opa_bin, System.get_env("OPA_BIN") || System.find_executable("opa"))
+
     policy_dir = Keyword.get(opts, :policy_dir, Path.expand("../priv/policies", __DIR__))
     timeout_ms = Keyword.fetch!(opts, :timeout_ms)
 
     with true <- is_binary(opa_bin) and File.regular?(opa_bin),
          true <- File.dir?(policy_dir) do
-      with {:ok, input_path} <- write_input_file(input) do
+      with {:ok, input_file} <- write_input_file(input, opts) do
         try do
           args = [
             "eval",
@@ -18,7 +20,7 @@ defmodule AgenticKbMcp.OpaEvaluator do
             "--data",
             policy_dir,
             "--input",
-            input_path,
+            input_file.path,
             "--timeout",
             "#{timeout_ms}ms",
             "data.authz.allow"
@@ -29,7 +31,7 @@ defmodule AgenticKbMcp.OpaEvaluator do
             {_stdout, _status} -> {:error, :runtime}
           end
         after
-          File.rm(input_path)
+          remove_input_file(input_file)
         end
       end
     else
@@ -49,12 +51,51 @@ defmodule AgenticKbMcp.OpaEvaluator do
     _ -> {:error, :runtime}
   end
 
-  defp write_input_file(input) do
-    path = Path.join(System.tmp_dir!(), "agentic-kb-opa-#{System.unique_integer([:positive])}.json")
+  defp write_input_file(input, opts) do
+    parent = Keyword.get(opts, :tmp_dir, System.tmp_dir!())
+    forced_suffix = Keyword.get(opts, :tmp_suffix)
 
-    case File.write(path, IO.iodata_to_binary(:json.encode(input)) <> "\n") do
-      :ok -> {:ok, path}
-      {:error, _reason} -> {:error, :runtime}
+    suffixes =
+      if forced_suffix do
+        [forced_suffix]
+      else
+        for _ <- 1..8 do
+          Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+        end
+      end
+
+    Enum.reduce_while(suffixes, {:error, :runtime}, fn suffix, _ ->
+      dir = Path.join(parent, "agentic-kb-opa-#{suffix}")
+
+      with :ok <- File.mkdir(dir),
+           :ok <- File.chmod(dir, 0o700),
+           {:ok, path} <- write_exclusive_input(Path.join(dir, "input.json"), input) do
+        {:halt, {:ok, %{path: path, dir: dir}}}
+      else
+        {:error, :eexist} -> {:cont, {:error, :runtime}}
+        _ -> {:halt, {:error, :runtime}}
+      end
+    end)
+  end
+
+  defp write_exclusive_input(path, input) do
+    bytes = IO.iodata_to_binary(:json.encode(input)) <> "\n"
+
+    case File.open(path, [:write, :exclusive, :binary], fn io ->
+           with :ok <- File.chmod(path, 0o600),
+                :ok <- IO.binwrite(io, bytes) do
+             :ok
+           else
+             _ -> {:error, :runtime}
+           end
+         end) do
+      {:ok, :ok} -> {:ok, path}
+      _ -> {:error, :runtime}
     end
+  end
+
+  defp remove_input_file(%{path: path, dir: dir}) do
+    File.rm(path)
+    File.rmdir(dir)
   end
 end

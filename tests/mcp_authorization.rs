@@ -158,10 +158,13 @@ fn false_verdict_events_use_the_launch_caller_not_the_legacy_mcp_label() {
         .events
         .into_iter()
         .rev()
-        .find(|event| event["action"] == "expire")
-        .expect("false verdict must append an expire event");
-    assert_eq!(event["session"], "host-agent-a");
-    assert_ne!(event["session"], "mcp");
+        .find(|event| event["action"] == "audit_record_batch")
+        .expect("false verdict must append a durable audit batch event");
+    assert_eq!(event["caller_id"], "host-agent-a");
+    assert_ne!(event["caller_id"], "mcp");
+    assert_eq!(event["run_id"], run_id);
+    assert_eq!(event["verdicts"][0]["entry_id"], entry_id);
+    assert_eq!(event["verdicts"][0]["verdict"], false);
 }
 
 #[test]

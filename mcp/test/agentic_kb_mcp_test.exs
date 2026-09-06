@@ -587,24 +587,66 @@ defmodule AgenticKbMcpTest do
     ],
     "add" => [
       %{"type" => "ok", "entry_id" => "new-1"},
-      %{"type" => "ok", "entry_id" => "new-1", "similar_existing" => [%{"id" => "old-1", "path" => "p", "summary" => "s", "score" => 0.91}]}
+      %{
+        "type" => "ok",
+        "entry_id" => "new-1",
+        "similar_existing" => [
+          %{"id" => "old-1", "path" => "p", "summary" => "s", "score" => 0.91}
+        ]
+      }
     ],
-    "cite" => [%{"type" => "result", "citation_path" => "a.ex", "citation_sha" => nil, "citation_hash" => "h", "file_size" => 12}],
+    "cite" => [
+      %{
+        "type" => "result",
+        "citation_path" => "a.ex",
+        "citation_sha" => nil,
+        "citation_hash" => "h",
+        "file_size" => 12
+      }
+    ],
     "import" => [%{"type" => "ok", "imported" => 1, "skipped" => 0}],
-    "stale_check" => [%{"type" => "result", "stale" => [], "review" => [], "unreachable" => [], "checked" => 0}],
+    "stale_check" => [
+      %{"type" => "result", "stale" => [], "review" => [], "unreachable" => [], "checked" => 0}
+    ],
     "expire" => [%{"type" => "ok", "expired" => "entry-1"}],
     "run" => [%{"type" => "ok", "run_id" => "run-1", "test_id" => "test-1", "result" => "pass"}],
     "test_add" => [%{"type" => "ok", "test_id" => "test-1"}],
     "tests" => [%{"type" => "result", "test_cases" => [], "count" => 0}],
     "reembed" => [
-      %{"type" => "ok", "embedded" => 0, "failed" => 0, "failures" => [], "skipped" => 0,
-        "missing" => 1, "raced" => 0, "dry_run" => false, "noop_embedder" => true,
-        "message" => "KB_NO_EMBED is set — no embedder available"},
-      %{"type" => "ok", "embedded" => 0, "failed" => 0, "failures" => [], "skipped" => 1,
-        "missing" => 2, "raced" => 0, "dry_run" => true, "noop_embedder" => false},
-      %{"type" => "ok", "embedded" => 2, "failed" => 1,
-        "failures" => [%{"id" => "bad", "cause" => "boom"}], "skipped" => 1, "missing" => 4,
-        "raced" => 1, "dry_run" => false, "noop_embedder" => false}
+      %{
+        "type" => "ok",
+        "embedded" => 0,
+        "failed" => 0,
+        "failures" => [],
+        "skipped" => 0,
+        "missing" => 1,
+        "raced" => 0,
+        "dry_run" => false,
+        "noop_embedder" => true,
+        "message" => "KB_NO_EMBED is set — no embedder available"
+      },
+      %{
+        "type" => "ok",
+        "embedded" => 0,
+        "failed" => 0,
+        "failures" => [],
+        "skipped" => 1,
+        "missing" => 2,
+        "raced" => 0,
+        "dry_run" => true,
+        "noop_embedder" => false
+      },
+      %{
+        "type" => "ok",
+        "embedded" => 2,
+        "failed" => 1,
+        "failures" => [%{"id" => "bad", "cause" => "boom"}],
+        "skipped" => 1,
+        "missing" => 4,
+        "raced" => 1,
+        "dry_run" => false,
+        "noop_embedder" => false
+      }
     ],
     "compact" => [%{"type" => "ok", "before" => 4, "after" => 2}],
     "rebuild" => [%{"type" => "ok", "rebuilt" => 3, "truncated_tail" => nil}],
@@ -629,10 +671,25 @@ defmodule AgenticKbMcpTest do
     ],
     "audit_record" => [%{"type" => "ok", "recorded" => 1, "expired" => 0}],
     "audit_report" => [
-      %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => nil, "total_runs" => 0, "per_arm_precision" => []},
-      %{"type" => "result", "per_kind_session_precision" => [], "last_run_at" => "2026-09-05T00:00:00Z", "total_runs" => 1, "per_arm_precision" => [], "injection_telemetry" => %{"eligible" => 1}}
+      %{
+        "type" => "result",
+        "per_kind_session_precision" => [],
+        "last_run_at" => nil,
+        "total_runs" => 0,
+        "per_arm_precision" => []
+      },
+      %{
+        "type" => "result",
+        "per_kind_session_precision" => [],
+        "last_run_at" => "2026-09-05T00:00:00Z",
+        "total_runs" => 1,
+        "per_arm_precision" => [],
+        "injection_telemetry" => %{"eligible" => 1}
+      }
     ],
-    "provenance" => [%{"type" => "result", "roots" => ["root-1"], "graph" => [], "truncated" => false}]
+    "provenance" => [
+      %{"type" => "result", "roots" => ["root-1"], "graph" => [], "truncated" => false}
+    ]
   }
 
   # IMPORTANT (premium review of bd-21ef.2..bd-21ef.2.12b): the shape-table
@@ -737,7 +794,9 @@ defmodule AgenticKbMcpTest do
       end
 
       error = %{"type" => "error", "code" => "db_error", "message" => "boom"}
-      assert %{"isError" => true, "content" => [%{"text" => "boom"}]} = McpServer.render_result(error)
+
+      assert %{"isError" => true, "content" => [%{"text" => "boom"}]} =
+               McpServer.render_result(error)
     end
   end
 
@@ -1007,9 +1066,7 @@ defmodule AgenticKbMcpTest do
 
       start_supervised!(
         {AgenticKbMcp.Authorization,
-         name: name,
-         caller_id: "host-agent-a",
-         opa: fn _input, _opts -> {:ok, true} end},
+         name: name, caller_id: "host-agent-a", opa: fn _input, _opts -> {:ok, true} end},
         id: name
       )
 
@@ -1032,21 +1089,65 @@ defmodule AgenticKbMcpTest do
       assert text =~ "missing_authorizer"
     end
 
+    test "production module-atom authorizer is reachable from tools/call" do
+      start_fake_port()
+      test_pid = self()
+
+      start_supervised!(
+        {AgenticKbMcp.Authorization,
+         name: AgenticKbMcp.Authorization,
+         caller_id: "host-agent-a",
+         opa: fn input, _opts ->
+           send(test_pid, {:authz_input, input})
+           {:ok, true}
+         end},
+        id: :production_named_authorization
+      )
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}),
+          %{db_path: "/nonexistent/agent-kb.db", authorization: AgenticKbMcp.Authorization}
+        )
+
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
+      assert_receive {:authz_input, %{"action" => "kb.audit.run", "caller" => "host-agent-a"}}
+    end
+
     test "kb_audit_run dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}), with_authorizer(@with_db))
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}),
+          with_authorizer(@with_db)
+        )
+
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
     end
 
     test "kb_audit_record dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}), with_authorizer(@with_db))
-      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Recorded 0 audit verdict"
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}),
+          with_authorizer(@with_db)
+        )
+
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~
+               "Recorded 0 audit verdict"
     end
 
     test "kb_audit_report dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_report","arguments":{}}}), @with_db)
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_report","arguments":{}}}),
+          @with_db
+        )
+
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit report: 0"
     end
 
@@ -1089,7 +1190,9 @@ defmodule AgenticKbMcpTest do
           state
         )
 
-      assert %{"result" => %{"isError" => true, "content" => [%{"text" => unknown_text}]}} = unknown
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => unknown_text}]}} =
+               unknown
+
       assert unknown_text =~ "surprise"
       assert unknown_text =~ "unknown argument"
 
@@ -1134,8 +1237,15 @@ defmodule AgenticKbMcpTest do
 
     test "kb_provenance dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_provenance","arguments":{"entry_id":"entry-1","max_depth":64}}}), @with_db)
-      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Provenance roots: root-1"
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_provenance","arguments":{"entry_id":"entry-1","max_depth":64}}}),
+          @with_db
+        )
+
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~
+               "Provenance roots: root-1"
     end
 
     # L3 gating fix: with KB_NO_EMBED set, run_reembed returns early with no
@@ -1147,7 +1257,13 @@ defmodule AgenticKbMcpTest do
     # is caught here too.
     test "kb_reembed dispatches through the real tools/call and port paths and surfaces the noop message" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_reembed","arguments":{}}}), @with_db)
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_reembed","arguments":{}}}),
+          @with_db
+        )
+
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "KB_NO_EMBED is set"
     end
 

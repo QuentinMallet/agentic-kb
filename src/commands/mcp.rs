@@ -13,7 +13,6 @@ use crate::commands::cite::with_citation_fields;
 use crate::components::verification::RelocationPolicy;
 use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
-use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
@@ -25,6 +24,9 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+#[cfg(test)]
+use crate::crash_sim::KillPoint;
 
 // Keep audit_record batches bounded to audit_run's maximum sample size.
 const MAX_AUDIT_VERDICTS: usize = 50;
@@ -2245,21 +2247,32 @@ fn handle_audit_record(
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
-    // Writer 10 of 10. All false-verdict expire events ride one D3 write
-    // helper call. The paired audit rows and source_weights updates below
-    // are inside the same callback, so a verdict-N failure cannot leave a
-    // durable proper prefix in JSONL, entries, audit_runs, or source_weights.
-    let batch: Vec<Value> = pending_verdicts
+    // Writer 10 of 10. The durable log carries the full audit batch, not just
+    // the destructive expire effects, so crash recovery replays audit_runs,
+    // source_weights, and expiries as one atomic materialization unit.
+    let event_verdicts: Vec<Value> = pending_verdicts
         .iter()
-        .filter(|verdict_obj| !verdict_obj.verdict)
         .map(|verdict_obj| {
             json!({
-                "action": "expire", "table": "entries",
-                "id": &verdict_obj.entry_id, "reason": "audit verdict=false",
-                "ts": ts, "session": caller_id,
+                "entry_id": &verdict_obj.entry_id,
+                "verdict": verdict_obj.verdict,
+                "note": &verdict_obj.note,
             })
         })
         .collect();
+    let expire_count = pending_verdicts
+        .iter()
+        .filter(|verdict_obj| !verdict_obj.verdict)
+        .count() as u32;
+    let batch = vec![json!({
+        "action": "audit_record_batch",
+        "table": "audit_runs",
+        "run_id": run_id,
+        "caller_id": caller_id,
+        "audited_at": ts,
+        "ts": ts,
+        "verdicts": event_verdicts,
+    })];
 
     let atomic: Result<(u32, u32)> = cursor::append_and_apply_with(
         &lock,
@@ -2267,50 +2280,7 @@ fn handle_audit_record(
         paths,
         emb,
         &batch,
-        |conn| -> Result<(u32, u32)> {
-            db::with_savepoint(conn, "audit_record", || -> Result<(u32, u32)> {
-                let mut rec = 0u32;
-                let mut exp = 0u32;
-
-                for verdict_obj in &pending_verdicts {
-                    conn.execute(
-                        "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
-                         VALUES(?1,?2,?3,?4,?5,?6)",
-                        params![
-                            &run_id,
-                            &verdict_obj.entry_id,
-                            if verdict_obj.verdict { "true" } else { "false" },
-                            &verdict_obj.note,
-                            &ts,
-                            caller_id
-                        ],
-                    )?;
-
-                    kill_point(KillPoint::AuditAfterRunInsert);
-
-                    let (entry_kind, entry_session_id): (String, String) = conn.query_row(
-                        "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
-                        params![&verdict_obj.entry_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )?;
-
-                    let weight_sql = if verdict_obj.verdict {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
-                         ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
-                    } else {
-                        "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
-                         ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
-                    };
-                    conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
-                    rec += 1;
-                    if !verdict_obj.verdict {
-                        exp += 1;
-                    }
-                }
-
-                Ok((rec, exp))
-            })
-        },
+        |_| -> Result<(u32, u32)> { Ok((pending_verdicts.len() as u32, expire_count)) },
     );
 
     match atomic {
@@ -5340,10 +5310,16 @@ mod tests {
         let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
         let run_id = std::env::var("KB_CRASH_TEST_RUN_ID").unwrap();
         let entry_id = std::env::var("KB_CRASH_TEST_ENTRY_ID").unwrap();
+        let verdict = std::env::var("KB_CRASH_TEST_VERDICT").ok().as_deref() == Some("false");
         let paths = config::Paths::from_root(std::path::Path::new(&root));
         let emb = NoopEmbedder;
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": entry_id, "verdict": true}]});
+        let verdict_item = if verdict {
+            json!({"entry_id": entry_id, "verdict": false, "note": "invalid evidence"})
+        } else {
+            json!({"entry_id": entry_id, "verdict": true})
+        };
+        let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [verdict_item]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5409,8 +5385,13 @@ mod tests {
             "source_weights delta must not survive a crash mid-savepoint"
         );
 
-        // Retry: replaying the request against the same DB must record both
-        // halves of the pair together.
+        let lock = acquire_lock(&paths.lock).unwrap();
+        let replayed = cursor::replay_tail_locked(&lock, &conn, &paths, &emb).unwrap();
+        assert_eq!(replayed, 1, "recovery must replay the durable audit batch");
+        drop(lock);
+
+        // Retry: the already-recovered request is now an exact duplicate and
+        // must not double-count either half of the pair.
         let id = json!(null);
         let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
         let resp = handle_audit_record(
@@ -5419,7 +5400,7 @@ mod tests {
             &emb,
         );
         assert_eq!(resp["type"], "ok");
-        assert_eq!(resp["recorded"], 1);
+        assert_eq!(resp["recorded"], 0);
 
         let audit_rows_after: i64 = conn
             .query_row(
@@ -5438,8 +5419,102 @@ mod tests {
         assert_eq!(audit_rows_after, 1, "retry must record the audit_runs row");
         assert_eq!(
             weight_successes_after, 1,
-            "retry must record the paired weight delta"
+            "recovery must record exactly one paired weight delta"
         );
+    }
+
+    #[test]
+    fn test_audit_record_replay_recovers_false_verdict_with_rows_weights_and_conflict_guard() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref()
+            == Some("audit-before-apply-false-batch")
+        {
+            run_audit_crash_child();
+        }
+
+        let (dir, paths, emb) = setup();
+        let eid = add_live_entry(&paths, &emb, "p/crash-audit-false", None);
+        let run_id = "run-crash-audit-false";
+        seed_audit_candidate(&paths, run_id, &eid);
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_audit_record_replay_recovers_false_verdict_with_rows_weights_and_conflict_guard")
+            .arg("--nocapture")
+            .current_dir(dir.path())
+            .env("KB_CRASH_TEST_CASE", "audit-before-apply-false-batch")
+            .env("KB_CRASH_TEST_ROOT", dir.path())
+            .env("KB_CRASH_TEST_RUN_ID", run_id)
+            .env("KB_CRASH_TEST_ENTRY_ID", &eid)
+            .env("KB_CRASH_TEST_VERDICT", "false")
+            .env("KB_CRASH_AFTER", KillPoint::BeforeApply.to_string())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "crash simulation should terminate after the JSONL batch append and before apply"
+        );
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let stale_before: i64 = conn
+            .query_row(
+                "SELECT is_stale FROM entries WHERE id=?1",
+                params![eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let audit_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                params![run_id, eid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_before, 0,
+            "crash before apply must not expire immediately"
+        );
+        assert_eq!(
+            audit_before, 0,
+            "crash before apply must not write audit rows immediately"
+        );
+
+        let lock = acquire_lock(&paths.lock).unwrap();
+        let replayed = cursor::replay_tail_locked(&lock, &conn, &paths, &emb).unwrap();
+        assert_eq!(replayed, 1, "recovery must replay the durable audit batch");
+        drop(lock);
+
+        let (stale_after, audit_after, weight_failures): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT is_stale FROM entries WHERE id=?1),
+                    (SELECT COUNT(*) FROM audit_runs WHERE run_id=?2 AND entry_id=?1),
+                    (SELECT COALESCE(SUM(failures),0) FROM source_weights WHERE session_id='__GLOBAL__')",
+                params![eid, run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stale_after, 1, "replay must apply the false-verdict expiry");
+        assert_eq!(
+            audit_after, 1,
+            "replay must not expire without the matching audit_runs row"
+        );
+        assert_eq!(
+            weight_failures, 1,
+            "replay must not expire without the matching source_weights delta"
+        );
+
+        let changed_retry = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(changed_retry["type"], "error");
+        assert_eq!(changed_retry["code"], "audit_record_conflict");
     }
 
     #[test]

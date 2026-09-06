@@ -93,7 +93,11 @@ defmodule AgenticKbMcp.AuthorizationTest do
       {_clock, monotonic_ms} = clock_agent()
 
       authorizer =
-        start_authorizer(caller_id: "host-agent-a", clock: monotonic_ms, opa: fn _, _ -> unquote(Macro.escape(response)) end)
+        start_authorizer(
+          caller_id: "host-agent-a",
+          clock: monotonic_ms,
+          opa: fn _, _ -> unquote(Macro.escape(response)) end
+        )
 
       assert {:error, :policy_unavailable} =
                Authorization.authorize(authorizer, "kb.audit.record", %{})
@@ -123,6 +127,79 @@ defmodule AgenticKbMcp.AuthorizationTest do
     end
   end
 
+  test "OPA evaluator writes input in a private directory with an exclusive 0600 file" do
+    root =
+      Path.join(System.tmp_dir!(), "agentic-kb-opa-test-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(root)
+
+    opa = Path.join(root, "fake-opa.sh")
+    marker = Path.join(root, "marker")
+
+    File.write!(opa, """
+    #!/bin/sh
+    input=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--input" ]; then
+        input="$arg"
+        break
+      fi
+      prev="$arg"
+    done
+    dir=$(dirname "$input")
+    {
+      printf 'file=%s\\n' "$input"
+      printf 'file_mode=%s\\n' "$(stat -c %a "$input")"
+      printf 'dir_mode=%s\\n' "$(stat -c %a "$dir")"
+    } > "#{marker}"
+    printf '{"result":[{"expressions":[{"value":true}]}]}\\n'
+    """)
+
+    File.chmod!(opa, 0o700)
+
+    assert {:ok, true} =
+             AgenticKbMcp.OpaEvaluator.evaluate(%{"caller" => "host-agent-a"},
+               opa_bin: opa,
+               policy_dir: root,
+               timeout_ms: 100,
+               tmp_dir: root
+             )
+
+    facts =
+      marker
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Map.new(&List.to_tuple(String.split(&1, "=", parts: 2)))
+
+    assert facts["file_mode"] == "600"
+    assert facts["dir_mode"] == "700"
+    refute File.exists?(facts["file"])
+    refute File.exists?(Path.dirname(facts["file"]))
+  end
+
+  test "OPA evaluator refuses a preexisting temp path instead of following a symlink" do
+    root =
+      Path.join(System.tmp_dir!(), "agentic-kb-opa-race-#{System.unique_integer([:positive])}")
+
+    attacker = Path.join(root, "attacker")
+    File.mkdir_p!(attacker)
+    File.ln_s!(attacker, Path.join(root, "agentic-kb-opa-hostile"))
+
+    true_bin = System.find_executable("true") || "/bin/true"
+
+    assert {:error, :runtime} =
+             AgenticKbMcp.OpaEvaluator.evaluate(%{"caller" => "host-agent-a"},
+               opa_bin: true_bin,
+               policy_dir: root,
+               timeout_ms: 100,
+               tmp_dir: root,
+               tmp_suffix: "hostile"
+             )
+
+    assert File.ls!(attacker) == []
+  end
+
   test "OPA absolute deadline fails closed without waiting for a late answer" do
     {_clock, monotonic_ms} = clock_agent()
 
@@ -138,7 +215,10 @@ defmodule AgenticKbMcp.AuthorizationTest do
       )
 
     started = System.monotonic_time(:millisecond)
-    assert {:error, :policy_unavailable} = Authorization.authorize(authorizer, "kb.audit.record", %{})
+
+    assert {:error, :policy_unavailable} =
+             Authorization.authorize(authorizer, "kb.audit.record", %{})
+
     assert System.monotonic_time(:millisecond) - started < 75
   end
 
@@ -149,17 +229,22 @@ defmodule AgenticKbMcp.AuthorizationTest do
       start_authorizer(
         caller_id: "host-agent-a",
         clock: monotonic_ms,
-        opa: fn %{"action" => action}, _ -> {:ok, action in ["kb.audit.run", "kb.audit.record"]} end
+        opa: fn %{"action" => action}, _ ->
+          {:ok, action in ["kb.audit.run", "kb.audit.record"]}
+        end
       )
 
     assert :ok = Authorization.authorize(authorizer, "kb.audit.run", %{"mode" => "uniform"})
     assert :ok = Authorization.authorize(authorizer, "kb.audit.record", %{})
+
     assert {:error, :policy_denied} =
              Authorization.authorize(authorizer, "kb.audit.traffic", %{"mode" => "traffic"})
 
     assert {:error, :policy_denied} = Authorization.authorize(authorizer, "kb.audit.expire", %{})
     assert {:error, :policy_denied} = Authorization.authorize(authorizer, "kb.entry.expire", %{})
-    assert {:error, :policy_denied} = Authorization.authorize(authorizer, "kb.entry.expire.force", %{})
+
+    assert {:error, :policy_denied} =
+             Authorization.authorize(authorizer, "kb.entry.expire.force", %{})
   end
 
   test "per-caller action buckets isolate callers and make traffic stricter" do
@@ -174,10 +259,20 @@ defmodule AgenticKbMcp.AuthorizationTest do
     allow = fn _, _ -> {:ok, true} end
 
     caller_a =
-      start_authorizer(caller_id: "host-agent-a", clock: monotonic_ms, limiter: limiter, opa: allow)
+      start_authorizer(
+        caller_id: "host-agent-a",
+        clock: monotonic_ms,
+        limiter: limiter,
+        opa: allow
+      )
 
     caller_b =
-      start_authorizer(caller_id: "host-agent-b", clock: monotonic_ms, limiter: limiter, opa: allow)
+      start_authorizer(
+        caller_id: "host-agent-b",
+        clock: monotonic_ms,
+        limiter: limiter,
+        opa: allow
+      )
 
     assert :ok = Authorization.authorize(caller_a, "kb.audit.run", %{})
     assert :ok = Authorization.authorize(caller_a, "kb.audit.run", %{})
@@ -186,6 +281,7 @@ defmodule AgenticKbMcp.AuthorizationTest do
     assert :ok = Authorization.authorize(caller_b, "kb.audit.run", %{})
 
     assert :ok = Authorization.authorize(caller_a, "kb.audit.traffic", %{"mode" => "traffic"})
+
     assert {:error, :rate_limited} =
              Authorization.authorize(caller_a, "kb.audit.traffic", %{"mode" => "traffic"})
   end
