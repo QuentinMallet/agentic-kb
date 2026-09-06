@@ -89,9 +89,7 @@ mod tests {
     }
 
     fn collect_sql_output(conn: &rusqlite::Connection, days: i64) -> Vec<(String, String)> {
-        let mut stmt = conn
-            .prepare(OLDER_THAN_QUERY)
-            .unwrap();
+        let mut stmt = conn.prepare(OLDER_THAN_QUERY).unwrap();
         let rows = stmt
             .query_map(params![days], |row| {
                 let path: String = row.get(0)?;
