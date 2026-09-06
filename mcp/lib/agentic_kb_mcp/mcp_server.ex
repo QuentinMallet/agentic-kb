@@ -590,9 +590,10 @@ defmodule AgenticKbMcp.McpServer do
   @impl true
   def init(opts) do
     db_path = Keyword.get(opts, :db_path)
+    authorization = Keyword.get(opts, :authorization)
     parent = self()
     Task.start_link(fn -> read_stdin(parent) end)
-    {:ok, %{db_path: db_path}}
+    {:ok, %{db_path: db_path, authorization: authorization}}
   end
 
   @impl true
@@ -897,7 +898,12 @@ defmodule AgenticKbMcp.McpServer do
     end
   end
 
-  defp authorize_tool(_state, _tool, _args), do: :ok
+  defp authorize_tool(_state, tool, args) do
+    case authz_actions(tool, args) do
+      [] -> :ok
+      _ -> {:error, "authorization denied: missing_authorizer"}
+    end
+  end
 
   defp authz_actions("kb_audit_run", %{"mode" => "traffic"}), do: ["kb.audit.traffic"]
   defp authz_actions("kb_audit_run", _args), do: ["kb.audit.run"]

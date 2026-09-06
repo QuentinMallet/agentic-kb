@@ -21,4 +21,26 @@ defmodule AgenticKbMcp.OpaPolicyContractTest do
       assert policy =~ ~s("#{scope}"), "missing explicit default-deny scope #{scope}"
     end
   end
+
+  test "the shipped policy allows only the trusted launch caller and known scopes" do
+    opts = [policy_dir: Path.dirname(@policy), timeout_ms: 1_000]
+
+    assert {:ok, true} =
+             AgenticKbMcp.OpaEvaluator.evaluate(
+               %{"caller" => "agentic-kb-host", "action" => "kb.audit.record"},
+               opts
+             )
+
+    assert {:ok, false} =
+             AgenticKbMcp.OpaEvaluator.evaluate(
+               %{"caller" => "agentic-kb-host", "action" => "kb.unknown"},
+               opts
+             )
+
+    assert {:ok, false} =
+             AgenticKbMcp.OpaEvaluator.evaluate(
+               %{"caller" => "attacker", "caller_id" => "agentic-kb-host", "action" => "kb.audit.record"},
+               opts
+             )
+  end
 end

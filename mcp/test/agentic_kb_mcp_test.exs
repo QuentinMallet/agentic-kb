@@ -1002,15 +1002,45 @@ defmodule AgenticKbMcpTest do
       )
     end
 
+    defp start_allowing_authorizer do
+      name = :"mcp_authz_#{System.unique_integer([:positive, :monotonic])}"
+
+      start_supervised!(
+        {AgenticKbMcp.Authorization,
+         name: name,
+         caller_id: "host-agent-a",
+         opa: fn _input, _opts -> {:ok, true} end},
+        id: name
+      )
+
+      name
+    end
+
+    defp with_authorizer(state), do: Map.put(state, :authorization, start_allowing_authorizer())
+
+    test "mutating tools fail closed when authorization is missing" do
+      start_fake_port()
+
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}),
+          @with_db
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
+      assert text =~ "authorization denied"
+      assert text =~ "missing_authorizer"
+    end
+
     test "kb_audit_run dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}), @with_db)
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}), with_authorizer(@with_db))
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
     end
 
     test "kb_audit_record dispatches through the real tools/call and port paths" do
       start_fake_port()
-      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}), @with_db)
+      response = call_line(~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}), with_authorizer(@with_db))
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Recorded 0 audit verdict"
     end
 
@@ -1022,11 +1052,12 @@ defmodule AgenticKbMcpTest do
 
     test "audit run, verdict recording, and report compose through tools/call" do
       start_fake_port()
+      state = with_authorizer(@with_db)
 
       run =
         call_line(
           ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"uniform"}}}),
-          @with_db
+          state
         )
 
       run_text = get_in(run, ["result", "content", Access.at(0), "text"])
@@ -1037,7 +1068,7 @@ defmodule AgenticKbMcpTest do
       true_record =
         call_line(
           ~s({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e1","verdict":true}]}}}),
-          @with_db
+          state
         )
 
       assert get_in(true_record, ["result", "content", Access.at(0), "text"]) =~
@@ -1046,7 +1077,7 @@ defmodule AgenticKbMcpTest do
       false_record =
         call_line(
           ~s({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e2","verdict":false,"note":"unsupported evidence"}]}}}),
-          @with_db
+          state
         )
 
       assert get_in(false_record, ["result", "content", Access.at(0), "text"]) =~
@@ -1055,7 +1086,7 @@ defmodule AgenticKbMcpTest do
       unknown =
         call_line(
           ~s({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[],"surprise":true}}}),
-          @with_db
+          state
         )
 
       assert %{"result" => %{"isError" => true, "content" => [%{"text" => unknown_text}]}} = unknown
@@ -1065,7 +1096,7 @@ defmodule AgenticKbMcpTest do
       note_less =
         call_line(
           ~s({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-e2","verdict":false}]}}}),
-          @with_db
+          state
         )
 
       assert %{"result" => %{"isError" => true, "content" => [%{"text" => refusal}]}} = note_less
@@ -1080,7 +1111,7 @@ defmodule AgenticKbMcpTest do
       permanent_guard =
         call_line(
           ~s({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[{"entry_id":"audit-perm","verdict":false,"note":"attempted expiry"}]}}}),
-          @with_db
+          state
         )
 
       assert %{"result" => %{"isError" => true, "content" => [%{"text" => perm_text}]}} =

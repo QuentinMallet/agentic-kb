@@ -86,7 +86,8 @@ defmodule AgenticKbMcp.AuthorizationTest do
   for {name, response} <- [
         {:missing, {:error, :missing}},
         {:runtime_error, {:error, :runtime}},
-        {:undefined, {:ok, nil}}
+        {:undefined, {:ok, nil}},
+        {:malformed, {:ok, "true"}}
       ] do
     test "OPA #{name} fails closed" do
       {_clock, monotonic_ms} = clock_agent()
@@ -96,6 +97,29 @@ defmodule AgenticKbMcp.AuthorizationTest do
 
       assert {:error, :policy_unavailable} =
                Authorization.authorize(authorizer, "kb.audit.record", %{})
+    end
+  end
+
+  test "OPA JSON parser allows only a single explicit true result" do
+    assert {:ok, true} =
+             AgenticKbMcp.OpaEvaluator.parse_decision(
+               ~s({"result":[{"expressions":[{"value":true}]}]})
+             )
+
+    assert {:ok, false} =
+             AgenticKbMcp.OpaEvaluator.parse_decision(
+               ~s({"result":[{"expressions":[{"value":false}]}]})
+             )
+
+    for stdout <- [
+          ~s({"result":[]}),
+          ~s({"result":[{"expressions":[]}]}),
+          ~s({"result":[{"expressions":[{"value":true},{"value":true}]}]}),
+          ~s({"result":[{"expressions":[{"value":true}]},{"expressions":[{"value":true}]}]}),
+          ~s({"result":[{"expressions":[{"value":"true"}]}]}),
+          "not json"
+        ] do
+      assert {:error, :runtime} = AgenticKbMcp.OpaEvaluator.parse_decision(stdout)
     end
   end
 

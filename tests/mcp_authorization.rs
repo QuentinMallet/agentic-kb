@@ -99,9 +99,16 @@ fn audit_runs_are_owned_by_the_launch_caller_and_store_that_attribution() {
 
     let conn = db::open_ro(&paths.db).unwrap();
     let stolen_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM audit_runs WHERE run_id=?1", [run_id], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(stolen_rows, 0, "cross-caller record must not leave a prefix row");
+    assert_eq!(
+        stolen_rows, 0,
+        "cross-caller record must not leave a prefix row"
+    );
 
     let accepted = audit_record(
         &paths,
@@ -109,7 +116,10 @@ fn audit_runs_are_owned_by_the_launch_caller_and_store_that_attribution() {
         run_id,
         vec![json!({"entry_id": entry_id, "verdict": true})],
     );
-    assert_eq!(accepted["type"], "ok", "owner record must succeed: {accepted}");
+    assert_eq!(
+        accepted["type"], "ok",
+        "owner record must succeed: {accepted}"
+    );
 
     let caller: String = conn
         .query_row(
@@ -162,7 +172,10 @@ fn direct_expire_events_also_use_the_launch_caller() {
 
     let entry_id = add_auditable(&paths, "authorization/direct-expire");
     let expired = direct_expire(&paths, "host-agent-a", &entry_id);
-    assert_eq!(expired["type"], "ok", "trusted direct expire must succeed: {expired}");
+    assert_eq!(
+        expired["type"], "ok",
+        "trusted direct expire must succeed: {expired}"
+    );
 
     let event = events::read_events(&paths.events)
         .unwrap()
@@ -195,13 +208,14 @@ fn failed_verdict_three_of_five_leaves_no_partial_audit_or_expire_state() {
         .collect();
     assert_eq!(sampled.len(), 5);
 
-    trigger_conn.execute_batch(&format!(
-        "CREATE TRIGGER fail_third_audit BEFORE INSERT ON audit_runs
+    trigger_conn
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_third_audit BEFORE INSERT ON audit_runs
          WHEN NEW.run_id = '{}' AND NEW.entry_id = '{}'
          BEGIN SELECT RAISE(ABORT, 'fault verdict 3'); END;",
-        run_id, sampled[2]
-    ))
-    .unwrap();
+            run_id, sampled[2]
+        ))
+        .unwrap();
     drop(trigger_conn);
 
     let before_events = events::read_events(&paths.events).unwrap().events.len();
@@ -225,9 +239,16 @@ fn failed_verdict_three_of_five_leaves_no_partial_audit_or_expire_state() {
 
     let conn = db::open_ro(&paths.db).unwrap();
     let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM audit_runs WHERE run_id=?1", [&run_id], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1",
+            [&run_id],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(rows, 0, "a verdict-3 failure must roll back the entire request");
+    assert_eq!(
+        rows, 0,
+        "a verdict-3 failure must roll back the entire request"
+    );
 
     let stale: i64 = conn
         .query_row(
@@ -242,5 +263,106 @@ fn failed_verdict_three_of_five_leaves_no_partial_audit_or_expire_state() {
         events::read_events(&paths.events).unwrap().events.len(),
         before_events,
         "a failed request must not append durable expire events"
+    );
+}
+
+#[test]
+fn exact_duplicate_audit_record_is_a_noop() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("fixture.txt"), "fixture\n").unwrap();
+    let (paths, _initial_conn) = db::test_db(repo.path());
+
+    let entry_id = add_auditable(&paths, "authorization/idempotent");
+    let run = audit_run(&paths, "host-agent-a", 1);
+    let run_id = run["run_id"].as_str().unwrap();
+    let verdict = vec![json!({"entry_id": entry_id, "verdict": true})];
+
+    let first = audit_record(&paths, "host-agent-a", run_id, verdict.clone());
+    assert_eq!(first["type"], "ok", "first record must succeed: {first}");
+    assert_eq!(first["recorded"], 1);
+
+    let before_events = events::read_events(&paths.events).unwrap().events.len();
+    let second = audit_record(&paths, "host-agent-a", run_id, verdict);
+    assert_eq!(second["type"], "ok", "exact replay must succeed: {second}");
+    assert_eq!(second["recorded"], 0);
+    assert_eq!(second["expired"], 0);
+    assert_eq!(
+        events::read_events(&paths.events).unwrap().events.len(),
+        before_events
+    );
+
+    let conn = db::open_ro(&paths.db).unwrap();
+    let audit_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_runs WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_rows, 1, "exact replay must not duplicate audit rows");
+
+    let successes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(successes),0) FROM source_weights",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(successes, 1, "exact replay must not double-count weights");
+}
+
+#[test]
+fn changed_duplicate_audit_record_rejects_before_effects() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("fixture.txt"), "fixture\n").unwrap();
+    let (paths, _initial_conn) = db::test_db(repo.path());
+
+    let entry_id = add_auditable(&paths, "authorization/conflict");
+    let run = audit_run(&paths, "host-agent-a", 1);
+    let run_id = run["run_id"].as_str().unwrap();
+
+    let first = audit_record(
+        &paths,
+        "host-agent-a",
+        run_id,
+        vec![json!({"entry_id": entry_id, "verdict": true})],
+    );
+    assert_eq!(first["type"], "ok", "first record must succeed: {first}");
+
+    let before_events = events::read_events(&paths.events).unwrap().events.len();
+    let conflict = audit_record(
+        &paths,
+        "host-agent-a",
+        run_id,
+        vec![json!({
+            "entry_id": entry_id,
+            "verdict": false,
+            "note": "changed replay"
+        })],
+    );
+    assert_eq!(conflict["type"], "error");
+    assert_eq!(conflict["code"], "audit_record_conflict");
+    assert_eq!(
+        events::read_events(&paths.events).unwrap().events.len(),
+        before_events,
+        "changed replay must not append an expire event"
+    );
+
+    let conn = db::open_ro(&paths.db).unwrap();
+    let (audit_rows, stale, failures): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM audit_runs WHERE run_id=?1),
+                (SELECT is_stale FROM entries WHERE id=?2),
+                (SELECT COALESCE(SUM(failures),0) FROM source_weights)",
+            rusqlite::params![run_id, entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(audit_rows, 1, "changed replay must not add an audit row");
+    assert_eq!(stale, 0, "changed replay must not expire the entry");
+    assert_eq!(
+        failures, 0,
+        "changed replay must not count a failure weight"
     );
 }
