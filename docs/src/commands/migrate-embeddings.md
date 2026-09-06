@@ -21,19 +21,23 @@ store can eventually drop the legacy cosine-scoring path.
 
 ## What it does: staged swap with a retained backup
 
-1. Creates and retains `agent-kb.db.pre-normalized-embeddings.bak`, a backup
-   of the live database, before making any change.
-2. Copies the live database into a staging file and migrates every legacy
+1. Discards any leftover stage from a prior run that was interrupted before
+   validation completed — the live database and its retained backup remain
+   the authority, so nothing unrecoverable is lost by discarding it.
+2. Checkpoints and verifies the live database's WAL, before anything else
+   is copied, so already-committed pages are captured and never discarded
+   later in the swap.
+3. Creates and retains `agent-kb.db.pre-normalized-embeddings.bak`, a backup
+   of the live database, if one does not already exist.
+4. Copies the live database into a staging file and migrates every legacy
    entry and cue blob there, leaving the live database untouched during
    this phase.
-3. Validates the staged copy: publication proceeds only once every legacy
+5. Validates the staged copy: publication proceeds only once every legacy
    blob in the stage is confirmed finite, non-zero, and exactly the
    configured embedding dimension. A corrupt blob aborts the migration
    without marking any row live — the live database is never touched by a
    failed migration.
-4. Checkpoints and verifies the live database's WAL before publication, so
-   already-committed pages are never discarded during the swap, then
-   atomically publishes the staged database over the live one.
+6. Atomically publishes the staged database over the live one.
 
 A durable staging-state file records progress, so an interruption before
 publication is resumable: re-running the command publishes only when the
