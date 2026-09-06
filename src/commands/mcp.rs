@@ -5895,6 +5895,153 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_attaches_evidence_to_latest_retained_candidate_upsert() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(
+            &paths,
+            &emb,
+            "p/compact-ordering-candidate",
+            Some("candidate-session"),
+        );
+
+        let seeded_events = events::read_events(&paths.events).unwrap().events;
+        let seed_upsert = seeded_events
+            .iter()
+            .find(|event| event["action"] == "upsert" && event["table"] == "entries")
+            .unwrap()
+            .clone();
+        let seed_evidence = seeded_events
+            .iter()
+            .find(|event| event["action"] == "evidence_add" && event["table"] == "evidence")
+            .unwrap()
+            .clone();
+
+        let run = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","sample_size": 1}),
+            ),
+            &paths,
+        );
+        assert_eq!(run["type"], "ok");
+        let run_id = run["run_id"].as_str().unwrap();
+        assert_eq!(run["samples"][0]["id"], eid);
+
+        let expired = handle_expire(
+            &tr::<ExpireRequest>(
+                "expire",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","entry_id": eid}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(expired["type"], "ok");
+
+        let mut revived_upsert = seed_upsert;
+        revived_upsert["path"] = json!("p/compact-ordering-candidate-revived");
+        revived_upsert["summary"] = json!("revived");
+        revived_upsert["content"] = json!("revived content");
+        revived_upsert["is_stale"] = json!(false);
+        revived_upsert["evidence_status"] = json!("present");
+        revived_upsert["ts"] = json!("2024-01-01T00:00:10Z");
+
+        let mut revived_evidence = seed_evidence;
+        revived_evidence["evidence"]["id"] = json!("compact-order-ev2");
+        revived_evidence["evidence"]["citation_path"] = json!("src/foo.rs:1-5");
+        revived_evidence["evidence"]["citation_hash"] = json!("sha256:compact-order-ev2");
+        revived_evidence["evidence"]["recorded_at"] = json!("2024-01-01T00:00:11Z");
+        revived_evidence["ts"] = json!("2024-01-01T00:00:11Z");
+
+        events::append_event(&paths.events, &revived_upsert).unwrap();
+        events::append_event(&paths.events, &revived_evidence).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        db::apply_event(&conn, &emb, &revived_upsert).unwrap();
+        db::apply_event(&conn, &emb, &revived_evidence).unwrap();
+        let appended_len = fs::metadata(&paths.events).unwrap().len();
+        cursor::write(
+            &conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&paths.events),
+                offset: appended_len,
+                tail_sha: cursor::tail_sha(&paths.events, appended_len).unwrap(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        crate::commands::compact::Compact
+            .execute_with_paths(&paths)
+            .unwrap();
+        let compacted = events::read_events(&paths.events).unwrap().events;
+
+        let (replay_dir, replay_paths, replay_emb) = setup();
+        fs::write(
+            &replay_paths.events,
+            compacted
+                .iter()
+                .map(|event| format!("{}\n", serde_json::to_string(event).unwrap()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let replay_conn = db::open_unchecked_for_test(&replay_paths.db).unwrap();
+        for event in &compacted {
+            db::apply_event(&replay_conn, &replay_emb, event).unwrap();
+        }
+        let event_len = fs::metadata(&replay_paths.events).unwrap().len();
+        cursor::write(
+            &replay_conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&replay_paths.events),
+                offset: event_len,
+                tail_sha: cursor::tail_sha(&replay_paths.events, event_len).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (stale, evidence_status, evidence_ids, candidates): (i64, String, String, i64) =
+            replay_conn
+                .query_row(
+                    "SELECT
+                        (SELECT is_stale FROM entries WHERE id=?1),
+                        (SELECT evidence_status FROM entries WHERE id=?1),
+                        (SELECT COALESCE(group_concat(id, ','), '') FROM evidence WHERE entry_id=?1),
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    params![eid, run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!(stale, 0, "revived candidate must remain live after rebuild");
+        assert_eq!(
+            evidence_status, "present",
+            "revived candidate must remain audit-eligible after rebuild"
+        );
+        assert_eq!(
+            evidence_ids, "compact-order-ev2",
+            "post-expire evidence must attach to the revived upsert, not the old retained upsert"
+        );
+        assert_eq!(
+            candidates, 1,
+            "candidate ownership must survive compaction/rebuild"
+        );
+
+        let accepted = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(accepted["type"], "ok");
+        assert_eq!(accepted["recorded"], 1);
+        assert_eq!(accepted["expired"], 0);
+        drop(replay_dir);
+    }
+
+    #[test]
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);

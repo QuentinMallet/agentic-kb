@@ -276,6 +276,7 @@ impl Compact {
         // implicitly dropped — they never appear in entry_pairs, so they are never
         // emitted. This is safe: absent == stale, so rebuild from the compacted log
         // produces identical search-visible state.
+        let mut retained_entry_upserts: Vec<(usize, String)> = Vec::new();
         let mut entry_pairs: Vec<(usize, &str)> =
             entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
@@ -292,11 +293,26 @@ impl Compact {
             {
                 live_entry_ids.insert(id.to_string());
             }
+            retained_entry_upserts.push((i, id.to_string()));
             retained_indices.push(i);
         }
 
         for i in audit_required_entry_upserts {
+            if let Some(id) = evts[i]["id"].as_str() {
+                retained_entry_upserts.push((i, id.to_string()));
+            }
             retained_indices.push(i);
+        }
+        retained_entry_upserts.sort_unstable();
+        retained_entry_upserts.dedup();
+        let mut evidence_target_upsert_by_entry: HashMap<String, usize> = HashMap::new();
+        for (upsert_i, entry_id) in &retained_entry_upserts {
+            if expire_last
+                .get(entry_id.as_str())
+                .is_none_or(|&expire_i| *upsert_i > expire_i)
+            {
+                evidence_target_upsert_by_entry.insert(entry_id.clone(), *upsert_i);
+            }
         }
         for i in audit_required_expire_indices {
             retained_indices.push(i);
@@ -335,7 +351,7 @@ impl Compact {
         // exactly LiveAtIdx in AgentKbEvidence.tla. This drops orphan events both
         // before the first upsert and between expire and revival. The old explicit
         // first-upsert bound is redundant because LiveAtIdx implies one precedes i.
-        let mut evidence_by_entry: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut evidence_by_upsert: HashMap<usize, Vec<usize>> = HashMap::new();
         for i in evidence_indices {
             let ev = &evts[i];
             let entry_id = ev["entry_id"].as_str().unwrap_or("");
@@ -351,11 +367,14 @@ impl Compact {
                     .get(entry_id)
                     .is_none_or(|&expire_i| i > expire_i)
             {
-                evidence_by_entry
-                    .entry(entry_id.to_string())
-                    .or_default()
-                    .push(i);
+                if let Some(upsert_i) = evidence_target_upsert_by_entry.get(entry_id) {
+                    evidence_by_upsert.entry(*upsert_i).or_default().push(i);
+                }
             }
+        }
+
+        for evidence_indices in evidence_by_upsert.values_mut() {
+            evidence_indices.sort_unstable();
         }
 
         retained_indices.sort_unstable();
@@ -364,16 +383,12 @@ impl Compact {
         for i in retained_indices {
             let ev = &evts[i];
             compacted.push(ev.clone());
-            if ev["action"] == "upsert" && ev["table"] == "entries" {
-                if let Some(entry_id) = ev["id"].as_str() {
-                    if let Some(indices) = evidence_by_entry.remove(entry_id) {
-                        compacted.extend(
-                            indices
-                                .into_iter()
-                                .map(|evidence_i| evts[evidence_i].clone()),
-                        );
-                    }
-                }
+            if let Some(indices) = evidence_by_upsert.remove(&i) {
+                compacted.extend(
+                    indices
+                        .into_iter()
+                        .map(|evidence_i| evts[evidence_i].clone()),
+                );
             }
         }
 
