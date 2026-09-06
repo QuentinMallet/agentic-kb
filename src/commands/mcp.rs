@@ -2631,12 +2631,17 @@ mod tests {
 
     #[test]
     fn test_handle_add_accepts_nested_worktree_citation() {
-        let (_dir, paths, emb) = setup();
+        let (dir, paths, emb) = setup();
+        let citation = dir
+            .path()
+            .join(".state/worktrees/feature/src/lib.rs");
+        fs::create_dir_all(citation.parent().unwrap()).unwrap();
+        fs::write(&citation, "fn warning_fixture() {}\n").unwrap();
         let id = json!("nested-worktree-citation");
         let req = json!({
             "method":"add", "id":"nested-worktree-citation", "path":"test/nested",
             "summary":"sum", "content":"body", "tags":[], "kind":"convention",
-            "evidence":[{"kind":"code", "citation_path":".state/worktrees/feature/src/lib.rs:1-2", "citation_hash":"sha256:abc"}]
+            "evidence":[{"kind":"code", "citation_path":".state/worktrees/feature/src/lib.rs:1-2"}]
         });
 
         let resp = handle_add(&id, &req, &paths, &emb);
