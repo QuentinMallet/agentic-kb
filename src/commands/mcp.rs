@@ -6565,12 +6565,12 @@ mod tests {
         let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'uniform','mcp-test')",
             [&uniform],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'traffic','mcp-test')",
             [&traffic],
         )
         .unwrap();
@@ -7530,7 +7530,10 @@ mod tests {
         let import = json!({"method":"import","id":"pin-import","path":"seeds.json","upsert":true});
         let stale = json!({"method":"stale_check","id":"pin-stale","files":["src/a.rs"],
                            "commits":["0000000000000000000000000000000000000000"],"blame":false});
-        let expire = json!({"method":"expire","id":"pin-expire","caller_id":"mcp-test","entry_id":"nope","reason":"r",
+        // `caller_id` is deliberately absent: the deployed pin supplies only
+        // public MCP tool arguments. The Elixir host bridge injects identity
+        // into the private Rust port request after public validation.
+        let expire = json!({"method":"expire","id":"pin-expire","entry_id":"nope","reason":"r",
                             "force":true});
         let run = json!({"method":"run","id":"pin-run","test_id":"t1","result":"pass",
                          "adapter":"browser","detail":"d"});
@@ -7600,19 +7603,30 @@ mod tests {
         // from the abscissa APP cell, which no unit test initialises.
         let (dir, paths, emb) = setup();
         fs::write(dir.path().join("pin.txt"), b"pin\n").unwrap();
-        for req in [
+        for public_req in [
             &search, &add, &cite, &import, &stale, &expire, &run, &test_add, &tests, &reembed,
             &rebuild, &kb_get,
         ] {
-            let resp = dispatch(&paths, &emb, req);
+            // The public deployed-pin payload reaches Elixir first. Its host
+            // bridge, not an MCP client, adds caller identity to requests for
+            // private Rust handlers that require it.
+            let mut private_req = public_req.clone();
+            if private_req["method"] == "expire" {
+                private_req
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("caller_id".to_owned(), json!("mcp-test"));
+            }
+
+            let resp = dispatch(&paths, &emb, &private_req);
             let code = resp["code"].as_str().unwrap_or("");
             assert_ne!(
                 code, "parse_error",
-                "deployed pin request must clear the boundary: {req} -> {resp}"
+                "deployed pin request must clear the boundary: {public_req} -> {resp}"
             );
             assert_ne!(
                 code, "unknown_method",
-                "deployed pin method must be routed: {req} -> {resp}"
+                "deployed pin method must be routed: {public_req} -> {resp}"
             );
         }
     }
