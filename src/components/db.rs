@@ -2906,7 +2906,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(marker_exists, 1, "the fast reopen must target the new live inode");
+        assert_eq!(
+            marker_exists, 1,
+            "the fast reopen must target the new live inode"
+        );
     }
 
     fn proptest_cases(default_full: u32) -> u32 {
