@@ -18,8 +18,21 @@ A `log_format` version line was considered and rejected: every binary already
 deployed predates it, so a version line protects nothing already in the
 field, and adding one is itself a format change — it buys nothing for this
 transition. The downgrade posture in this document carries the weight
-instead. This ruling (2026-09-04, C1 question Q5) is tracked as bd-21ef.1.15,
-which revisits adding a version line before the next format change.
+instead. This ruling (2026-09-04, C1 question Q5) was tracked as bd-21ef.1.15
+pending a decision on how to protect a *future* format change; it has since
+been resolved by a closed writer-schema registry rather than an in-band
+version line.
+
+`WRITER_LOG_FORMAT_VERSION: Option<u16>` in `src/components/events.rs` is the
+single switch: `None` today. Every production event writer is declared in a
+`writer_schema_registry!` table with a `WriterCompatibility` of either
+`LegacyCompatible` or `RequiresLogFormat`. A `const _` assertion generated
+for each table entry fails to compile if any writer is marked
+`RequiresLogFormat` while `WRITER_LOG_FORMAT_VERSION` is still `None`. This
+makes forgetting to introduce a version line when a genuinely incompatible
+writer is added a compile error, rather than a runtime hazard — closing the
+question this document's `:5` already answered for the current format
+(`write_span`, `scan_events`).
 
 ## Old-binary read behavior
 
@@ -51,6 +64,18 @@ remain (step 3 below).
 Do not delete markers in place: only the span-aware reader identifies which
 event lines committed, and compact also supplies the durable replacement and
 generation update. `scan_events`, `Compact::execute_with_paths`
+
+## Raw writer entry points are test-only
+
+`cursor::append_and_apply` and `cursor::append_and_apply_with` are gated
+behind the `event-log-test-raw` Cargo feature (declared in `Cargo.toml` and
+enabled for dev-dependencies), so they no longer compile into a production
+binary. Production writers call `cursor::append_and_apply_writer_events` (or
+its `_with` variant), which only accepts a `events::WriterEvent` built
+against the closed writer schema registry described above — a caller cannot
+bypass a schema's declared version or compatibility class through the
+production path. Any out-of-tree code that depended on the raw
+`append_and_apply` entry points stops compiling without that feature.
 
 ## Deployment note: fleet pins
 
