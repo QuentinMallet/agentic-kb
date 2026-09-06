@@ -514,6 +514,24 @@ pub fn open_ro_peer(db_path: &Path) -> Result<Connection> {
 /// Creates the schema when absent. That is legitimate DDL: the caller holds the
 /// exclusive lock.
 pub fn open_rw(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<Connection> {
+    require_live_write_lock(paths, lock)?;
+    let conn = open_conn_rw(&paths.db)?;
+    ensure_schema_and_stamp(&conn)?;
+    Ok(conn)
+}
+
+/// Open the current live database for mutation after a prior `open_rw` has
+/// established its schema. The governing lock is checked on every reopen;
+/// callers must revalidate any cached preflight when the live inode changes.
+pub fn open_rw_existing(
+    paths: &config::Paths,
+    lock: &crate::commands::add::Lock,
+) -> Result<Connection> {
+    require_live_write_lock(paths, lock)?;
+    open_conn_rw(&paths.db)
+}
+
+fn require_live_write_lock(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<()> {
     let expected = fs::canonicalize(&paths.lock).with_context(|| {
         format!(
             "canonicalize write lock {} (open_rw requires a live lock guard)",
@@ -527,9 +545,7 @@ pub fn open_rw(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Resu
             expected.display()
         );
     }
-    let conn = open_conn_rw(&paths.db)?;
-    ensure_schema_and_stamp(&conn)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// Open a scratch database — rebuild's private tmp file — with no governing
@@ -3717,6 +3733,39 @@ mod tests {
             rust.into_iter()
                 .map(|x| x.1.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn open_rw_existing_reopens_the_replaced_live_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        open_or_init(&paths).unwrap();
+
+        let replacement = paths.db.with_extension("replacement");
+        std::fs::copy(&paths.db, &replacement).unwrap();
+        let replacement_conn = open_unchecked_for_test(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value TEXT)")
+            .unwrap();
+        drop(replacement_conn);
+
+        let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+        let first = open_rw_existing(&paths, &lock).unwrap();
+        drop(first);
+        std::fs::rename(&replacement, &paths.db).unwrap();
+
+        let live = open_rw_existing(&paths, &lock).unwrap();
+        let marker_exists: i64 = live
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='replacement_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker_exists, 1,
+            "the fast reopen must target the new live inode"
         );
     }
 
