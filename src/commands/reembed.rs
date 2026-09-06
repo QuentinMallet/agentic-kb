@@ -55,15 +55,20 @@ use std::os::unix::fs::MetadataExt;
 /// Only the commit is durability. `db::suppress_close_checkpoint` keeps that
 /// checkpoint and its unlink out of the window, which leaves two, and moving
 /// the `embed_text_mode` stamp into the preflight removed a sixth fsync that
-/// the very first batch paid as its own implicit commit. Measured on a host
-/// under other load (`load1` 16 to 23, so an idle host is faster, not
-/// slower): per-phase medians over eight warm batches were 0.040 ms lock,
-/// 1.102 ms open, 0.041 ms vintage read, 0.003 ms BEGIN, 1.062 ms inserts,
-/// 19.361 ms commit, 0.250 ms connection drop, for a 21.917 ms window
-/// against 102.616 ms for the same table before the change. Fifteen budget
-/// samples across three runs ranged 10.667 ms to 47.960 ms, all within the
-/// gate; the top of that range is always a run's first batch, which extends
-/// a newly created WAL rather than reusing one.
+/// the very first batch paid as its own implicit commit. Deferring the
+/// close-time checkpoint also means deferring the automatic one, or it would
+/// fire from inside a commit once the WAL passed `wal_autocheckpoint`; see
+/// `REEMBED_DRAIN_EVERY_BATCHES` for what bounds the WAL instead.
+///
+/// Measured on a host under other load (`load1` 16, so an idle host is
+/// faster, not slower), over 24 batches so the run crosses a drain: per-phase
+/// medians were 0.029 ms flock, 0.787 ms open, 0.026 ms vintage read,
+/// 0.002 ms BEGIN, 0.563 ms inserts, 22.201 ms commit, 0.183 ms connection
+/// drop, 0.011 ms bookkeeping and unlock, for a 23.237 ms window against
+/// 102.616 ms for the same table before the change. All 24 samples were
+/// within the gate, from 19.385 ms to 48.441 ms; the top is the run's first
+/// batch, which extends a newly created WAL rather than reusing one, and the
+/// batch after a drain shows no spike.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
 /// How often `write_batches` drains the WAL between batches. Deferring both of
@@ -1184,7 +1189,7 @@ mod tests {
         let samples = measure_batch_phases("budget", BUDGET_SAMPLE_BATCHES);
         let windows = lock_windows(&samples);
         let table = phase_table(&samples);
-        eprintln!("reembed batch lock hold measurement (acquire -> connection drop)\n{table}");
+        eprintln!("reembed batch lock hold measurement (flock acquire -> flock release)\n{table}");
         let worst = windows.iter().copied().max().expect("at least one batch");
         assert!(
             worst <= std::time::Duration::from_millis(50),
