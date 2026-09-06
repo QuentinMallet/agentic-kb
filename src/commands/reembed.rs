@@ -12,8 +12,8 @@ use std::os::unix::fs::MetadataExt;
 
 /// Writes per lock acquisition, in one transaction per batch (a single
 /// commit, not one implicit commit per row — see `write_batches`). Budget:
-/// <= 50 ms lock-hold per batch on an idle host, timed from lock
-/// acquisition to the batch connection being dropped after commit.
+/// <= 50 ms lock-hold per batch on an idle host, timed from the flock
+/// being acquired to the flock being released.
 /// `test_reembed_batch_lock_hold_budget` (ignored by default — see its doc
 /// comment) times this exact window on a real batch and prints the
 /// observed duration; it is a measurement to be taken on a quiet host, not
@@ -134,6 +134,9 @@ pub(crate) enum BatchPhase {
     Committed,
     /// The connection has been dropped; the lock is released next.
     ConnDropped,
+    /// The universal write lock has been released. The end of the hold, and
+    /// therefore the end of the window the budget is stated against.
+    LockReleased,
 }
 
 // Only the measurement tests enumerate or name the phases; production just
@@ -143,7 +146,7 @@ pub(crate) enum BatchPhase {
 impl BatchPhase {
     /// The phases in the order `write_batches` emits them. The first is a
     /// start marker, so there are `ORDER.len() - 1` measurable spans.
-    pub(crate) const ORDER: [BatchPhase; 8] = [
+    pub(crate) const ORDER: [BatchPhase; 9] = [
         BatchPhase::BatchStart,
         BatchPhase::LockAcquired,
         BatchPhase::Opened,
@@ -152,6 +155,7 @@ impl BatchPhase {
         BatchPhase::Inserted,
         BatchPhase::Committed,
         BatchPhase::ConnDropped,
+        BatchPhase::LockReleased,
     ];
 
     /// Label for the span that ENDS at this phase.
@@ -165,6 +169,7 @@ impl BatchPhase {
             BatchPhase::Inserted => "inserts",
             BatchPhase::Committed => "COMMIT (durable)",
             BatchPhase::ConnDropped => "connection drop",
+            BatchPhase::LockReleased => "bookkeeping + unlock",
         }
     }
 }
@@ -567,6 +572,12 @@ fn write_batches<B, P>(
         for (id, cause) in stmt_failures {
             record_failure(report, id, cause);
         }
+        // Explicit, so the lock-hold window the budget is stated against ends
+        // where the hold actually ends. Letting the guard fall out of scope
+        // would leave the bookkeeping above inside the hold but outside the
+        // measurement.
+        drop(lock);
+        phase(batch_index, BatchPhase::LockReleased);
     }
     if !writes.is_empty() {
         drain_wal(paths);
@@ -729,8 +740,10 @@ mod tests {
             .collect()
     }
 
-    /// The measured budget window per batch: lock acquisition through the
-    /// connection drop, i.e. every span after `flock acquire`.
+    /// The measured budget window per batch: flock acquisition through flock
+    /// release, i.e. every span after `flock acquire`. It ends at the release
+    /// and not at the connection drop, so nothing done while the lock is still
+    /// held falls outside the number the budget is stated against.
     fn lock_windows(samples: &[Vec<std::time::Duration>]) -> Vec<std::time::Duration> {
         samples
             .iter()
