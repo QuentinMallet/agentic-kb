@@ -24,6 +24,26 @@ pub const MAX_CITATION_EXCERPT_CHARS: usize = 512;
 /// Matches the current entry-id/documentation bound used by KB write surfaces.
 pub const MAX_DERIVED_FROM_LEN: usize = 200;
 
+/// Return citation paths rooted in a disposable nested worktree.
+pub fn nested_worktree_citation_paths<'a>(evidence: &'a [Value]) -> Vec<&'a str> {
+    evidence
+        .iter()
+        .filter_map(|ev| ev.get("citation_path").and_then(Value::as_str))
+        .filter(|path| path.starts_with(".state/worktrees/"))
+        .collect()
+}
+
+/// Warn callers that a citation rooted in a nested worktree will stale after merge.
+pub fn warn_nested_worktree_citations(evidence: &[Value]) {
+    let paths = nested_worktree_citation_paths(evidence);
+    if !paths.is_empty() {
+        eprintln!(
+            "warn: citation_path under .state/worktrees/ will go stale after the worktree is removed: {}",
+            paths.join(", ")
+        );
+    }
+}
+
 /// Validate tags array shape and tag length (br-9lq).
 ///
 /// - `tags` must be a JSON array of strings.
@@ -594,6 +614,23 @@ mod tests {
         assert!(
             validate_tags(&tags).is_ok(),
             "tag with max length 50 should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_nested_worktree_citation_paths_are_reported() {
+        let evidence = vec![
+            json!({"citation_path": ".state/worktrees/feature/src/lib.rs:1-2"}),
+            json!({"citation_path": "src/lib.rs:3-4"}),
+            json!({"citation_path": ".state/worktrees/feature"}),
+        ];
+
+        assert_eq!(
+            nested_worktree_citation_paths(&evidence),
+            vec![
+                ".state/worktrees/feature/src/lib.rs:1-2",
+                ".state/worktrees/feature",
+            ]
         );
     }
 }

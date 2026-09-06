@@ -7,7 +7,8 @@
 
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::commands::add_validation::{
-    compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
+    compute_evidence_status_write, validate_kb_add_inputs, warn_nested_worktree_citations,
+    wrap_citation_excerpt,
 };
 use crate::commands::cite::{compute_citation_fields, with_citation_fields};
 use crate::components::verification::{verify_evidence, RelocationPolicy, UnverifiedReason};
@@ -1283,6 +1284,7 @@ fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embed
     if let Err(e) = validate_kb_add_inputs(&entry_id, &kind, &tags, &evidence_rows) {
         return json!({"id":id,"type":"error","code":"validation_error","message":e.to_string()});
     }
+    warn_nested_worktree_citations(&evidence_rows);
 
     // A caller-supplied hash is an assertion about the cited bytes. Validate
     // that assertion before kb_core::add can append its JSONL batch or apply
@@ -3610,6 +3612,26 @@ mod tests {
             proptest::prop_assert_eq!(evidence_count, 0);
             proptest::prop_assert_eq!(fs::read(&paths.events).unwrap_or_default(), before_events);
         }
+    }
+
+    #[test]
+    fn test_handle_add_accepts_nested_worktree_citation() {
+        let (dir, paths, emb) = setup();
+        let citation = dir
+            .path()
+            .join(".state/worktrees/feature/src/lib.rs");
+        fs::create_dir_all(citation.parent().unwrap()).unwrap();
+        fs::write(&citation, "fn warning_fixture() {}\n").unwrap();
+        let id = json!("nested-worktree-citation");
+        let req = json!({
+            "method":"add", "id":"nested-worktree-citation", "path":"test/nested",
+            "summary":"sum", "content":"body", "tags":[], "kind":"convention",
+            "evidence":[{"kind":"code", "citation_path":".state/worktrees/feature/src/lib.rs:1-2"}]
+        });
+
+        let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
+
+        assert_eq!(resp["type"], "ok");
     }
 
     #[test]

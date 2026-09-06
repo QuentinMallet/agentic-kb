@@ -9,7 +9,9 @@
 //! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
 //! The `expire_reason` is `"replaced by --replace-path"`.
 
-use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
+use crate::commands::add_validation::{
+    compute_evidence_status_write, validate_kb_add_inputs, warn_nested_worktree_citations,
+};
 use crate::components::embedder;
 use crate::components::kb_core;
 use crate::config;
@@ -113,6 +115,7 @@ impl Add {
 
         // Validate kind, tags, and evidence before acquiring the lock.
         validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
+        warn_nested_worktree_citations(&evidence_rows);
 
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
