@@ -14,7 +14,25 @@ When an agent calls `kb_add` with an evidence row containing only a `citation_pa
   write if it differs (`test_kb_core_add_rejects_wrong_explicit_citation_hash`).
   A missing hash is filled with that computed value. An explicitly supplied
   `citation_sha` remains unchanged; a missing one is filled when a Git HEAD is
-  available at the cited file's directory.
+  available at the cited file's directory — resolved at that file's own
+  parent directory, so a citation inside a nested worktree records that
+  worktree's HEAD rather than the caller's working-directory HEAD
+  (`compute_citation_fields` in `src/commands/cite.rs`).
+- **MCP layer rejects more broadly than the hash-mismatch check above:**
+  before `kb_core::add` is ever called, `handle_add`'s
+  `validate_explicit_citation_hashes` (`src/commands/mcp.rs`) re-verifies
+  every evidence row with both a `citation_path` and a non-empty
+  `citation_hash`, rejecting *any* non-verified outcome — malformed range,
+  missing file, out-of-bounds range, or path escape, not only a hash
+  mismatch — with `evidence[i] citation_hash failed verification for
+  citation_path "...": <reason>` and code `validation_error`, before any
+  event append or database write. See "MCP write-time rejection" in
+  [Citation Semantics](./citation-semantics.md).
+- **Worktree citation warning:** `kb_add` (both CLI and MCP) prints
+  `warn: citation_path under .state/worktrees/ will go stale after the
+  worktree is removed: <paths>` for any `citation_path` beginning
+  `.state/worktrees/` (`add_validation::warn_nested_worktree_citations`).
+  This is advisory only; the write still succeeds.
 - **Before event append:** Resolution failures are loud write-time errors that reject the entire `kb_add` call, naming the problematic path and reason. A malformed citation or missing file causes the write to fail, never resulting in an unverifiable row in the database.
 - **Replay invariant:** Resolved fields are persisted in the event as-is; the verifier on later rebuilds or replay never re-resolves them. This means the hash and SHA captured at write time are preserved exactly as computed, unaffected by later file changes or git history rewrites.
 
@@ -53,7 +71,7 @@ non-disclosure boundary is pinned by
 
 The A0 audit found 41 evidence rows and zero affected citations, so no stored
 row required migration. This audit result and the cross-platform rationale are
-recorded in [ADR-5: Citation symlink policy](../decisions/adr-5-symlink-policy.md).
+recorded in ADR-5: Citation symlink policy (`docs/decisions/adr-5-symlink-policy.md`).
 
 ## Cheap Compliance: The Rationale
 
