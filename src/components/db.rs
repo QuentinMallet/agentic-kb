@@ -279,15 +279,28 @@ pub fn note_uninitialized(db_path: &Path) {
     eprintln!("{}", uninitialized_note(db_path));
 }
 
-/// Open a read-write connection: WAL, foreign keys, parent dirs. No DDL, no
-/// stamp, no sweep, no lock. Shared by the openers that are allowed to mutate.
+/// Open a read-write connection: WAL, durable commits, foreign keys, parent
+/// dirs. No DDL, no stamp, no sweep, no lock. Shared by the openers that are
+/// allowed to mutate.
+///
+/// `synchronous=FULL` is set explicitly rather than inherited. It is the
+/// bundled amalgamation's compile-time default today, but a system SQLite or a
+/// build carrying `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` would drop every WAL
+/// commit's fsync and make writers silently non-durable across power loss.
+/// That premise carries more weight since `suppress_close_checkpoint`: a
+/// batched writer's close no longer performs a checkpoint whose own fsyncs
+/// used to make each batch durable regardless of this setting, so the commit's
+/// own fsync is now the only thing standing behind a committed row.
+/// `open_split.rs`'s `locked_writers_commit_durably` reads it back.
 fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
         fs::create_dir_all(p)?;
     }
     let conn =
         Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
     Ok(conn)
 }
 
