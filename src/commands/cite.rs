@@ -80,7 +80,7 @@ where
     let citation_hash = format!("sha256:{}", computed.sha256_hex);
     let fields = CitationFields {
         citation_path: citation_path.clone(),
-        citation_sha: config::git_head_sha(),
+        citation_sha: config::git_head_sha_at(repo_root),
         citation_hash,
         file_size,
     };
@@ -155,6 +155,7 @@ mod tests {
     use serde_json::Value;
     use std::env;
     use std::fs;
+    use std::process::Command as ProcessCommand;
 
     const FAST_PROPTEST_CASES: u32 = 16;
 
@@ -263,6 +264,32 @@ mod tests {
 
         assert_eq!(fields.citation_path, "sample.rs");
         assert_eq!(fields.file_size, 13);
+    }
+
+    #[test]
+    fn test_compute_citation_fields_uses_cited_repository_head() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("sample.rs"), b"fn main() {}\n").unwrap();
+
+        for args in [
+            ["init"].as_slice(),
+            ["config", "user.email", "cite-test@example.invalid"].as_slice(),
+            ["config", "user.name", "Citation Test"].as_slice(),
+            ["add", "sample.rs"].as_slice(),
+            ["commit", "-m", "add cited file"].as_slice(),
+        ] {
+            assert!(ProcessCommand::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let expected_sha = config::git_head_sha_at(dir.path());
+        let fields = compute_citation_fields(dir.path(), "sample.rs", None).unwrap();
+
+        assert_eq!(fields.citation_sha, expected_sha);
     }
 
     #[test]
