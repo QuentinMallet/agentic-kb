@@ -127,7 +127,8 @@ impl Search {
             );
 
             // Deduplicate: local results take priority.
-            let local_ids: HashSet<String> = local_results.iter().map(|r| r.id.clone()).collect();
+            let mut merged_ids: HashSet<String> =
+                local_results.iter().map(|r| r.id.clone()).collect();
             let mut merged = local_results;
 
             for peer_path in peer_paths {
@@ -160,7 +161,7 @@ impl Search {
                             r.origin_repo = Some(peer_path.clone());
                         }
                         for r in peer_results {
-                            if !local_ids.contains(&r.id) {
+                            if merged_ids.insert(r.id.clone()) {
                                 merged.push(r);
                             }
                         }
@@ -384,14 +385,34 @@ mod tests {
     fn federated_results_are_ranked_and_truncated_before_verification() {
         let mut merged = vec![
             crate::components::db::SearchEntry {
-                id: "low".into(), path: "low".into(), summary: String::new(), content: String::new(), tags: "[]".into(),
-                score: 0.1, source: "fts", score_kind: "fts", evidence: vec![], confidence: 0.5,
-                audit_n: 0, origin_repo: None, updated_at: String::new(),
+                id: "low".into(),
+                path: "low".into(),
+                summary: String::new(),
+                content: String::new(),
+                tags: "[]".into(),
+                score: 0.1,
+                source: "fts",
+                score_kind: "fts",
+                evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
+                origin_repo: None,
+                updated_at: String::new(),
             },
             crate::components::db::SearchEntry {
-                id: "high".into(), path: "high".into(), summary: String::new(), content: String::new(), tags: "[]".into(),
-                score: 0.9, source: "fts", score_kind: "fts", evidence: vec![], confidence: 0.5,
-                audit_n: 0, origin_repo: Some("peer".into()), updated_at: String::new(),
+                id: "high".into(),
+                path: "high".into(),
+                summary: String::new(),
+                content: String::new(),
+                tags: "[]".into(),
+                score: 0.9,
+                source: "fts",
+                score_kind: "fts",
+                evidence: vec![],
+                confidence: 0.5,
+                audit_n: 0,
+                origin_repo: Some("peer".into()),
+                updated_at: String::new(),
             },
         ];
 

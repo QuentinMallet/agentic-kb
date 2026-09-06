@@ -2219,28 +2219,7 @@ pub fn search_entries(
         let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
         let do_verify = idx < verify_count;
 
-        // br-und: compute total bytes for this entry's evidence rows (br-und security I3)
-        let mut total_bytes: usize = 0;
-        for ev in &ev_rows {
-            if let Some(ref citation_path) = ev.citation_path {
-                // Parse citation_path format "path:start-end" to extract byte range
-                if let Some(colon_idx) = citation_path.rfind(':') {
-                    let range_part = &citation_path[colon_idx + 1..];
-                    if let Some(dash_idx) = range_part.find('-') {
-                        if let (Ok(start), Ok(end)) = (
-                            range_part[..dash_idx].parse::<usize>(),
-                            range_part[dash_idx + 1..].parse::<usize>(),
-                        ) {
-                            if start <= end {
-                                total_bytes = total_bytes.saturating_add(end - start);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let budget_exceeded = total_bytes > MAX_PER_ENTRY_BYTES;
+        let (budget_exceeded, total_bytes) = evidence_byte_budget_exceeded(&ev_rows);
         if budget_exceeded {
             eprintln!(
                 "kb: entry {} evidence bytes capped at MAX_PER_ENTRY_BYTES={} (had {}); skipping verification",
@@ -2391,6 +2370,25 @@ pub fn search_entries(
     Ok(entries)
 }
 
+fn evidence_byte_budget_exceeded(ev_rows: &[Evidence]) -> (bool, usize) {
+    let total_bytes = ev_rows.iter().fold(0usize, |total, ev| {
+        let Some(citation_path) = ev.citation_path.as_deref() else {
+            return total;
+        };
+        let Some((_, range)) = citation_path.rsplit_once(':') else {
+            return total;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return total;
+        };
+        match (start.parse::<usize>(), end.parse::<usize>()) {
+            (Ok(start), Ok(end)) if start <= end => total.saturating_add(end - start),
+            _ => total,
+        }
+    });
+    (total_bytes > MAX_PER_ENTRY_BYTES, total_bytes)
+}
+
 /// Verify already-selected search results against the repository that produced
 /// each result. Federation calls this only after its global ranking and limit
 /// have been applied, so discarded peer rows never incur verification work.
@@ -2412,8 +2410,10 @@ pub fn verify_search_entries(
             continue;
         };
 
-        for ev in &mut entry.evidence {
-            let model_ev = Evidence {
+        let model_evidence: Vec<Evidence> = entry
+            .evidence
+            .iter()
+            .map(|ev| Evidence {
                 id: ev.id.clone(),
                 entry_id: entry.id.clone(),
                 kind: ev.kind.clone(),
@@ -2423,7 +2423,17 @@ pub fn verify_search_entries(
                 citation_excerpt: ev.citation_excerpt.clone(),
                 derived_from: None,
                 recorded_at: None,
-            };
+            })
+            .collect();
+        let (budget_exceeded, total_bytes) = evidence_byte_budget_exceeded(&model_evidence);
+        if budget_exceeded {
+            eprintln!(
+                "kb: entry {} evidence bytes capped at MAX_PER_ENTRY_BYTES={} (had {}); skipping verification",
+                entry.id, MAX_PER_ENTRY_BYTES, total_bytes
+            );
+            continue;
+        }
+        for (ev, model_ev) in entry.evidence.iter_mut().zip(model_evidence) {
             let outcome = crate::components::verification::verify_evidence(
                 &model_ev,
                 root,
@@ -2532,6 +2542,54 @@ mod tests {
             recency_lambda,
             mmr_lambda: 0.0,
         }
+    }
+
+    #[test]
+    fn deferred_verification_preserves_byte_cap_and_origin_root() {
+        let peer = tempfile::tempdir().unwrap();
+        let cited = peer.path().join("cited.rs");
+        let bytes = b"origin-root citation";
+        std::fs::write(&cited, bytes).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        let hash = format!("sha256:{:x}", digest.finalize());
+
+        let mut entries = vec![SearchEntry {
+            id: "survivor".into(),
+            path: "survivor.rs".into(),
+            summary: String::new(),
+            content: String::new(),
+            tags: "[]".into(),
+            score: 1.0,
+            source: "fts",
+            score_kind: "fts",
+            evidence: vec![SearchEvidence {
+                id: "ev-survivor".into(),
+                kind: "code".into(),
+                citation_path: Some("cited.rs:0-20".into()),
+                citation_sha: None,
+                citation_hash: hash,
+                citation_excerpt: Some("origin-root citation".into()),
+                verified: None,
+                verification_status: None,
+            }],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: Some(peer.path().to_string_lossy().into_owned()),
+            updated_at: String::new(),
+        }];
+
+        verify_search_entries(&mut entries, 1, None);
+        assert_eq!(entries[0].evidence[0].verified, Some(true));
+
+        entries[0].evidence[0].citation_path =
+            Some(format!("cited.rs:0-{}", MAX_PER_ENTRY_BYTES + 1));
+        entries[0].evidence[0].verified = None;
+        entries[0].evidence[0].verification_status = None;
+        verify_search_entries(&mut entries, 1, None);
+        assert_eq!(entries[0].evidence[0].verified, None);
+        assert_eq!(entries[0].evidence[0].verification_status, None);
     }
 
     #[test]
