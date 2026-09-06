@@ -45,7 +45,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         let similarity = dot / (norm_a * norm_b);
-        similarity.is_finite().then_some(similarity).unwrap_or(0.0)
+        if similarity.is_finite() {
+            similarity
+        } else {
+            0.0
+        }
     }
 }
 

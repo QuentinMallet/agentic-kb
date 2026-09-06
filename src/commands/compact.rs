@@ -291,7 +291,7 @@ impl Compact {
                 continue;
             }
             if !evts[i]["is_stale"].as_bool().unwrap_or(false)
-                && !expire_last.get(id).is_some_and(|&e| e > i)
+                && expire_last.get(id).is_none_or(|&e| e <= i)
             {
                 live_entry_ids.insert(id.to_string());
             }
