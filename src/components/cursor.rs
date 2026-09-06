@@ -103,12 +103,16 @@
 //!
 //! # Measured cost of the gate (reference for the T2b write lane)
 //!
-//! The gate is charged per WRITE, not per event, and it is dominated by bounded
-//! reads rather than by the size of the batch it guards. [`inspect`] reads one
-//! `committed_len` window plus the two [`TAIL_SHA_WINDOW`] windows of the
-//! current fingerprint, and the write then hashes two more windows for the
-//! cursor it stamps: about five 64 KiB reads, whatever the batch holds and
-//! however long the log is.
+//! The gate is charged per WRITE, not per event. [`inspect`] verifies the final
+//! framing span in O(span bytes), then reads the two [`TAIL_SHA_WINDOW`]
+//! fingerprint anchors; the write hashes two more bounded anchors for the
+//! cursor it stamps. The fingerprint windows are fixed by design because they
+//! are sampling anchors, not containers that must hold a complete span.
+//!
+//! Before bd-21ef.1.20 the framing check read one fixed 64 KiB suffix but
+//! counted event lines. A closing span larger than that suffix therefore
+//! missed its `batch_begin` and forced a whole-log scan on every write. The
+//! growing suffix now bounds that work by the bytes in the closing span.
 //!
 //! Measured on a loaded shared machine, 1000 events of ~450 bytes each:
 //!
@@ -126,9 +130,9 @@
 //! fixtures seed in batches, and it is the number the T2b write-lane benchmark
 //! should be re-measured against on a quiet machine.
 //!
-//! The lead to pull if that re-run finds the cost too high: `committed_len`'s
-//! intact-span shortcut reads a whole [`TAIL_SHA_WINDOW`] to confirm the log
-//! ends on a closed span, when the closing span is usually a few hundred bytes.
+//! The lead to pull if that re-run finds the cost too high: the initial framing
+//! probe still reads 64 KiB when the closing span is usually a few hundred
+//! bytes.
 
 use crate::commands::add::Lock;
 use crate::components::db;

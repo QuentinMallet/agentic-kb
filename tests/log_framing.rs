@@ -21,7 +21,8 @@ use kb::commands::add::acquire_lock;
 use kb::components::db::{apply_event, open_db_memory};
 use kb::components::embedder::NoopEmbedder;
 use kb::components::events::{
-    append_event, append_events_batch, read_events, read_events_from_offset,
+    append_event, append_events_batch, committed_len, measure_event_log_reads, read_events,
+    read_events_from_offset,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -89,6 +90,27 @@ fn upsert(id: &str) -> Value {
         "kind": "memory",
         "ts": "2024-01-01T00:00:00Z",
     })
+}
+
+fn padded_upsert(id: &str, bytes: usize) -> Value {
+    let mut event = upsert(id);
+    event["content"] = Value::String("x".repeat(bytes));
+    event
+}
+
+fn large_framed_log(path: &Path, tail_events: usize, payload_bytes: usize) -> (u64, u64) {
+    for batch in 0..8 {
+        let prefix: Vec<_> = (0..500)
+            .map(|i| padded_upsert(&format!("prefix-{batch}-{i}"), payload_bytes))
+            .collect();
+        append_events_batch(path, &prefix).unwrap();
+    }
+    let before_tail = fs::metadata(path).unwrap().len();
+    let tail: Vec<_> = (0..tail_events)
+        .map(|i| padded_upsert(&format!("tail-{i}"), payload_bytes))
+        .collect();
+    append_events_batch(path, &tail).unwrap();
+    (before_tail, fs::metadata(path).unwrap().len())
 }
 
 /// Sidecars written by the repair path, in directory order.
@@ -305,6 +327,130 @@ fn test_commit_with_a_mismatched_batch_id_is_a_hard_error() {
 // D1 — committed_len is a span boundary
 // ---------------------------------------------------------------------------
 
+// The 8 prefix batches fix ~2.7 MB of log ahead of the tail span in both tests
+// below. 200 tail events land the span at ~130 KB — comfortably past the old
+// 64 KiB window, so the old fixed-window code still falls back to a full
+// scan, but small enough next to the fixed prefix that the budget below
+// (span_len * 5) sits well under the log's total size. That gap is what
+// makes these tests fail on the pre-fix algorithm instead of passing either
+// way: the old code's full-scan cost is pinned to the ~2.9 MB log regardless
+// of span size, and 5 * ~130 KB does not reach that.
+#[test]
+fn test_committed_len_large_closing_span_has_span_bounded_read_cost() {
+    let (_dir, path) = log_dir();
+    let (before_tail, framed_len) = large_framed_log(&path, 200, 500);
+    let span_len = framed_len - before_tail;
+    assert!(
+        span_len * 5 < framed_len,
+        "test setup must keep the budget under a whole-log scan: {} * 5 >= {framed_len}",
+        span_len
+    );
+
+    let (actual, bytes_read) = measure_event_log_reads(|| committed_len(&path).unwrap());
+    assert_eq!(actual, framed_len);
+    assert!(
+        bytes_read <= span_len * 5,
+        "read {bytes_read} bytes to verify a {span_len}-byte closing span"
+    );
+}
+
+/// Repairing a torn (dangling, no `batch_commit`) span costs more than the
+/// torn span's own bytes: after `dangling_span_start` locates the candidate
+/// begin, the caller re-verifies the *preceding* span with its own
+/// `ends_on_intact_span` growth search, so the fixed cost of that
+/// re-verification (bounded by the preceding batch's size, not the torn
+/// span's) is added on top. `torn_budget` makes both terms explicit instead
+/// of folding them into a single multiplier that would either fail to
+/// discriminate at large spans or fail to cover the fixed cost at small
+/// ones — see the calibration this was fit from in the fix commit message.
+fn torn_budget(torn_span_len: u64) -> u64 {
+    torn_span_len.saturating_mul(5) + 1_100_000
+}
+
+#[test]
+fn test_append_repairs_large_torn_span_with_span_bounded_read_cost() {
+    let (dir, path) = log_dir();
+    let (before_tail, framed_len) = large_framed_log(&path, 200, 500);
+    let raw = fs::read(&path).unwrap();
+    let commit_start = raw[..raw.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap();
+    fs::write(&path, &raw[..commit_start]).unwrap();
+    let torn_span_len = commit_start as u64 - before_tail;
+    let budget = torn_budget(torn_span_len);
+    assert!(
+        budget < framed_len,
+        "test setup must keep the budget under a whole-log scan: {budget} >= {framed_len}"
+    );
+
+    let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
+    let (_, bytes_read) =
+        measure_event_log_reads(|| append_event(&path, &upsert("after")).unwrap());
+    let read = read_events(&path).unwrap();
+    assert_eq!(read.events.first(), Some(&padded_upsert("prefix-0-0", 500)));
+    assert_eq!(read.events.last(), Some(&upsert("after")));
+    assert!(!read.events.iter().any(|event| event["id"] == "tail-0"));
+    assert!(
+        bytes_read <= budget,
+        "read {bytes_read} bytes to repair a {torn_span_len}-byte torn span (original {framed_len}, budget {budget})"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    ))]
+
+    #[test]
+    fn test_committed_len_window_boundary_spans_remain_span_bounded(
+        target_bytes in 60usize * 1024..=200usize * 1024,
+    ) {
+        let (_dir, path) = log_dir();
+        let payload = 500;
+        let count = (target_bytes / 600).max(1);
+        let (before_tail, framed_len) = large_framed_log(&path, count, payload);
+        let span_len = framed_len - before_tail;
+
+        let (actual, bytes_read) = measure_event_log_reads(|| committed_len(&path).unwrap());
+        prop_assert_eq!(actual, framed_len);
+        prop_assert!(bytes_read <= span_len * 5,
+            "read {} bytes for {}-byte span", bytes_read, span_len);
+    }
+
+    /// The torn (dangling, uncommitted) counterpart of the test above: a span
+    /// missing its `batch_commit` marker, swept across the same window
+    /// boundary, repaired by `append_event` while holding the lock.
+    #[test]
+    fn test_append_repairs_torn_span_across_the_window_boundary_stays_span_bounded(
+        target_bytes in 60usize * 1024..=200usize * 1024,
+    ) {
+        let (dir, path) = log_dir();
+        let payload = 500;
+        let count = (target_bytes / 600).max(1);
+        let (before_tail, framed_len) = large_framed_log(&path, count, payload);
+        let raw = fs::read(&path).unwrap();
+        let commit_start = raw[..raw.len() - 1]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap();
+        fs::write(&path, &raw[..commit_start]).unwrap();
+        let torn_span_len = commit_start as u64 - before_tail;
+        let budget = torn_budget(torn_span_len);
+
+        let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
+        let (_, bytes_read) =
+            measure_event_log_reads(|| append_event(&path, &upsert("after")).unwrap());
+        let read = read_events(&path).unwrap();
+        prop_assert_eq!(read.events.last(), Some(&upsert("after")));
+        prop_assert!(!read.events.iter().any(|event| event["id"].as_str().is_some_and(|id| id.starts_with("tail-"))));
+        prop_assert!(bytes_read <= budget,
+            "read {} bytes to repair a {}-byte torn span (original {}, budget {})", bytes_read, torn_span_len, framed_len, budget);
+    }
+}
+
 #[test]
 fn test_committed_len_is_a_span_boundary_not_a_line_boundary() {
     let (_dir, path) = log_dir();
@@ -401,6 +547,62 @@ fn test_append_truncates_a_complete_dangling_span() {
     assert_eq!(read.events, vec![upsert("kept"), upsert("next")]);
     // The discarded span is preserved best-effort, but never re-read as events.
     assert_eq!(torn_sidecars(dir.path()).len(), 1);
+}
+
+/// A blank line inside a dangling span must not count toward its declared
+/// arity — `scan_events` never counts one toward an open span's `n` either,
+/// so `committed_len`'s fast path and the full scan must agree on where the
+/// dangling span starts, and `append_event` must be able to repair it rather
+/// than hard-erroring on a log the reader itself accepts.
+#[test]
+fn test_dangling_span_with_a_blank_line_matches_the_reader_and_repairs() {
+    let (dir, path) = log_dir();
+    let committed = format!("{}\n", upsert("kept"));
+    write_raw(&path, committed.as_bytes());
+    append_raw(
+        &path,
+        format!("{}\n{}\n\t\n", begin("dangling", 1), upsert("x")).as_bytes(),
+    );
+
+    let via_scan = read_events(&path).unwrap();
+    assert_eq!(via_scan.committed_len, committed.len() as u64);
+    assert_eq!(committed_len(&path).unwrap(), via_scan.committed_len);
+
+    let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
+    append_event(&path, &upsert("next")).unwrap();
+    let read = read_events(&path).unwrap();
+    assert_eq!(read.events, vec![upsert("kept"), upsert("next")]);
+}
+
+/// A dangling `batch_begin` with an empty `batch_id` is the same hard error
+/// `marker_batch_id` gives the full scan — the fast path must not silently
+/// accept and truncate it instead. The begin marker sits at file offset 0 so
+/// the caller's `Some(0) => Some(0)` trust in `repair_uncommitted_tail_before_append`
+/// cannot be short-circuited by re-verifying an (absent) preceding span —
+/// this is the exact shape that let the empty-`batch_id` bug truncate the
+/// whole log to nothing instead of hard-erroring.
+#[test]
+fn test_dangling_begin_with_an_empty_batch_id_is_a_hard_error_not_a_silent_truncation() {
+    let (dir, path) = log_dir();
+    write_raw(
+        &path,
+        format!("{}\n{}\n", begin("", 1), upsert("x")).as_bytes(),
+    );
+
+    let read_err = read_events(&path).unwrap_err().to_string();
+    assert!(
+        read_err.contains("batch_id"),
+        "expected a batch_id hard error, got: {read_err}"
+    );
+
+    let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
+    let append_err = append_event(&path, &upsert("next"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        append_err.contains("batch_id"),
+        "expected append to hard-error too, got: {append_err}"
+    );
 }
 
 #[test]

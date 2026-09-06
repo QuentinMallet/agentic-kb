@@ -7,6 +7,11 @@ description = "Agent knowledge base CLI — JSONL event log + SQLite materialize
 [features]
 default = []
 crash-sim = []
+# Test-only: exposes `events::measure_event_log_reads`, the read-byte-budget
+# seam used by the tail-window regression tests. Never enabled for a plain
+# `cargo build`/`cargo build --release` — only for test targets, via the
+# self dev-dependency below.
+event-log-read-metrics = []
 
 [[bin]]
 name = "kb"
@@ -59,6 +64,7 @@ name = "write_path"
 harness = false
 
 [dev-dependencies]
+kb = { path = ".", features = ["event-log-read-metrics"] }
 libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.11.0"
