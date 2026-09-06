@@ -151,8 +151,7 @@ fn split_sections(text: &str) -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-        let is_heading = hashes >= 1
-            && hashes <= 3
+        let is_heading = (1..=3).contains(&hashes)
             && trimmed.len() > hashes
             && trimmed.as_bytes().get(hashes) == Some(&b' ');
 

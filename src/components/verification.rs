@@ -747,12 +747,13 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
 
         #[cfg(target_os = "linux")]
         {
+            let _ = file_abs;
             let fd = file.as_raw_fd();
             let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
                 Ok(path) => path,
                 Err(_) => return false,
             };
-            return resolved.starts_with(&canonical_root);
+            resolved.starts_with(&canonical_root)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -762,7 +763,7 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
                 Ok(path) => path,
                 Err(_) => return false,
             };
-            return resolved.starts_with(&canonical_root);
+            resolved.starts_with(&canonical_root)
         }
     }
 
@@ -844,6 +845,7 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
         })
     }
 
+    #[cfg(test)]
     fn hash_check_at_citation(
         &self,
         file_rel: &str,
@@ -1025,6 +1027,7 @@ impl<'a, R: CapabilityReporter> Verifier<'a, R> {
         }
     }
 
+    #[cfg(test)]
     fn verify_evidence(&self, ev: &Evidence, policy: RelocationPolicy) -> VerificationOutcome {
         if ev.kind != "code" {
             return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
@@ -1627,10 +1630,7 @@ mod tests {
         let citation_path = format!("{}:{}-{}", file_name, start, end);
 
         let ev = make_evidence(Some(citation_path), expected_hash, "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            true
-        );
+        assert!(verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1651,10 +1651,7 @@ mod tests {
 
         // Wrong hash
         let ev = make_evidence(Some(citation_path), "sha256:deadbeef".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1665,10 +1662,7 @@ mod tests {
             "code",
         );
         // Must return false, not panic or Err
-        assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1688,10 +1682,7 @@ mod tests {
         let citation_path = format!("{}:1000-2000", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -2027,10 +2018,7 @@ mod tests {
         let prefixed_hash = format!("sha256:{bare_hash}");
 
         let ev = make_evidence(Some(citation_path), prefixed_hash, "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            true
-        );
+        assert!(verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -2319,10 +2307,7 @@ mod tests {
             "code",
         );
         // Must return Ok(false) — no panic, no Err, no read outside repo.
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
         // Confirm we did not create any artifact inside the tempdir from this call.
         assert_eq!(stdfs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -2339,10 +2324,7 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -2353,10 +2335,7 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -2478,10 +2457,7 @@ mod tests {
             "sha256:anything".to_string(),
             "test",
         );
-        assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -2505,17 +2481,14 @@ mod tests {
         let citation_path = format!("{}:0-5242880", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
     fn test_verify_evidence_rejects_out_of_bounds_end() {
         // Citation with end beyond file size must be rejected.
         let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&vec![0u8; 100]).unwrap(); // 100 bytes
+        tmp.write_all(&[0u8; 100]).unwrap(); // 100 bytes
         tmp.flush().unwrap();
 
         let file_name = tmp
@@ -2530,10 +2503,7 @@ mod tests {
         let citation_path = format!("{}:0-200", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     /// The relocation scan budget is a hard cap, not a hint: a single file
@@ -2821,9 +2791,8 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false,
+        assert!(
+            !verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             "files larger than MAX_FILE_BYTES must return Ok(false)"
         );
     }

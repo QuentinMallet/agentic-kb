@@ -73,7 +73,7 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
         blob.chunks_exact(EMB_ELEMENT_BYTES)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
-    } else if blob.len() % 4 == 0 {
+    } else if blob.len().is_multiple_of(4) {
         // Legacy f32 path
         blob.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -341,7 +341,7 @@ mod tests {
         ) {
             let len = a.len().min(b.len());
             let sim = cosine_similarity(&a[..len], &b[..len]);
-            prop_assert!(sim >= -1.0001 && sim <= 1.0001, "sim out of range: {sim}");
+            prop_assert!((-1.0001..=1.0001).contains(&sim), "sim out of range: {sim}");
         }
     }
 
@@ -422,7 +422,7 @@ mod tests {
     /// f32s round-trip through blob encoding
     #[test]
     fn test_f32s_blob_roundtrip() {
-        let original = vec![1.0f32, -2.5, 3.14, 0.0];
+        let original = vec![1.0f32, -2.5, 3.25, 0.0];
         let blob = f32s_to_blob(&original);
         let recovered = blob_to_f32s(&blob);
         assert_eq!(original, recovered);

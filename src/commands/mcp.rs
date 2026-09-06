@@ -10,9 +10,11 @@ use crate::commands::add_validation::{
     compute_evidence_status_write, validate_kb_add_inputs, wrap_citation_excerpt,
 };
 use crate::commands::cite::with_citation_fields;
+use crate::components::verification::RelocationPolicy;
 use crate::components::{cursor, db, embedder, events, kb_core, query_hits};
 use crate::config;
 use crate::crash_sim::{kill_point, KillPoint};
+use crate::models::Evidence;
 use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -183,7 +185,7 @@ impl NumField {
             return Ok(None);
         };
         match raw.as_u64() {
-            Some(n) if n >= min && n <= max => Ok(Some(n)),
+            Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
             Some(n) => Err(format!("{name} must be in {min}..={max} (got {n})")),
             None => Err(format!(
                 "{name} must be an integer in {min}..={max} (got {raw})"
@@ -1109,7 +1111,7 @@ fn search_meta(paths: &config::Paths, results: &[db::SearchEntry]) -> Value {
     })
 }
 
-fn full_evidence_to_json(evidence: Vec<crate::models::Evidence>) -> Vec<Value> {
+fn full_evidence_to_json(evidence: Vec<Evidence>) -> Vec<Value> {
     evidence
         .into_iter()
         .map(|ev| {
@@ -1283,7 +1285,7 @@ fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embed
     }
 
     let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
     let version_ref = config::git_head_sha();
 
     // Delegate all event-writing and DB-apply work to kb_core::add (AC2, AC3).
@@ -1333,7 +1335,7 @@ fn handle_import(
     let file_path = req.path.clone();
     let upsert = req.upsert.unwrap_or(false);
 
-    let content = match std::fs::read_to_string(&file_path) {
+    let content = match fs::read_to_string(&file_path) {
         Ok(c) => c,
         Err(e) => {
             return json!({"id":id,"type":"error","code":"import_error","message":e.to_string()})
@@ -1399,7 +1401,7 @@ fn handle_import(
         }
 
         let entry_id = uuid::Uuid::new_v4().to_string();
-        let ts = chrono::Utc::now().to_rfc3339();
+        let ts = Utc::now().to_rfc3339();
         let summary = seed
             .get("summary")
             .and_then(|v| v.as_str())
@@ -1508,7 +1510,7 @@ fn handle_run(req: &RunRequest, paths: &config::Paths, emb: &dyn embedder::Embed
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
     let run_id = uuid::Uuid::new_v4().to_string();
     let event = json!({
         "action": "insert", "table": "run_history",
@@ -1556,7 +1558,7 @@ fn handle_test_add(
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
     let event = json!({
         "action": "upsert", "table": "test_cases",
         "id": test_id, "app": app, "name": name,
@@ -1709,7 +1711,7 @@ fn handle_stale_check(req: &StaleCheckRequest, paths: &config::Paths) -> Value {
         &explicit_commits,
         blame,
         repo_root.as_deref(),
-        crate::components::verification::RelocationPolicy::Never,
+        RelocationPolicy::Never,
     ) {
         Ok(r) => r,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -1790,7 +1792,7 @@ fn handle_expire(
         });
     }
 
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
     let event = json!({
         "action": "expire",
         "table": "entries",
@@ -1808,6 +1810,8 @@ fn handle_expire(
     json!({"id": id, "type": "ok", "expired": entry_id})
 }
 
+type AuditEntry = (String, String, String, String, String);
+
 /// Fetch a random sample of live, auditable entries.
 ///
 /// Passes the Statement by value into `and_then` so the closure owns it,
@@ -1816,7 +1820,7 @@ fn handle_expire(
 fn audit_sample_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
-) -> rusqlite::Result<Vec<(String, String, String, String, String)>> {
+) -> rusqlite::Result<Vec<AuditEntry>> {
     conn.prepare(
         "SELECT id, path, summary, kind, evidence_status
          FROM entries
@@ -1837,8 +1841,6 @@ fn audit_sample_entries(
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
     })
 }
-
-type AuditEntry = (String, String, String, String, String);
 
 /// Weighted sampling without replacement. The uniform arm has already been
 /// fixed, so excluded IDs can never move into the traffic arm.
@@ -1956,7 +1958,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     };
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
 
     // Uniform-first: complete and freeze the unbiased arm before consulting
     // the separate telemetry file for the additive traffic arm. The traffic
@@ -2053,7 +2055,7 @@ fn handle_audit_record(
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
 
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = Utc::now().to_rfc3339();
     let mut recorded = 0u32;
     let mut expired = 0u32;
 
@@ -2461,7 +2463,7 @@ fn handle_kb_peers_add(req: &PeersAddRequest, paths: &config::Paths) -> Value {
     };
 
     let source_repo = paths.root.to_string_lossy().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = Utc::now().to_rfc3339();
 
     let expires_at: Option<String> = if let Some(days) = ttl_days {
         match conn.query_row(
@@ -4045,7 +4047,6 @@ mod tests {
     #[test]
     fn test_mutating_request_refused_while_the_log_is_unreadable() {
         let (_dir, paths, emb) = setup();
-        let id = json!("d1");
         let req = json!({"method":"add","id":"d1","path":"t/a","summary":"one","content":"c","tags":["a"],"kind":"convention"});
         assert_eq!(dispatch(&paths, &emb, &req)["type"], "ok");
 

@@ -32,18 +32,6 @@ struct Phase2TestHook {
 }
 
 #[cfg(test)]
-pub(crate) fn set_phase2_barrier(b: std::sync::Arc<std::sync::Barrier>) {
-    let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
-    *m.lock().unwrap() = Some(Phase2TestHook {
-        events_path: None,
-        barrier: b,
-        mutation_done: None,
-        phase3_timings: None,
-        attempts: None,
-    });
-}
-
-#[cfg(test)]
 fn set_rebuild_measurement(
     events_path: PathBuf,
     barrier: std::sync::Arc<std::sync::Barrier>,

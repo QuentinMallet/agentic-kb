@@ -1211,8 +1211,8 @@ mod tests {
         use proptest::prelude::*;
         use std::collections::HashSet;
 
-        /// Invariant: STALE, REVIEW, UNREACHABLE buckets are pairwise disjoint.
-        /// All entry IDs appear in exactly zero or one bucket.
+        // Invariant: STALE, REVIEW, UNREACHABLE buckets are pairwise disjoint.
+        // All entry IDs appear in exactly zero or one bucket.
         proptest! {
             #[test]
             fn prop_stale_check_buckets_are_disjoint(
@@ -1224,9 +1224,9 @@ mod tests {
                 let conn = open_db_memory().expect("memory db");
 
                 // Insert a small set of entries with various paths and refs.
-                let entry_ids = vec!["e1", "e2", "e3"];
-                let paths = vec!["a.rs", "b.rs", "c.rs"];
-                let shas = vec![
+                let entry_ids = ["e1", "e2", "e3"];
+                let paths = ["a.rs", "b.rs", "c.rs"];
+                let shas = [
                     "a1b2c3d4e5f6789012345678901234567890abcd",
                     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
                     "0000000000000000000000000000000000000000",

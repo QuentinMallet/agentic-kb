@@ -292,11 +292,10 @@ impl Decision {
     /// make a pre-v3 database unwritable under `KB_NO_EMBED`, where the upgrade
     /// rebuild deliberately defers to avoid dropping embeddings.
     pub fn blocks_writes(&self) -> bool {
-        match self {
-            Decision::NoOp => false,
-            Decision::FullRebuild(RebuildReason::SchemaObsolete) => false,
-            _ => true,
-        }
+        !matches!(
+            self,
+            Decision::NoOp | Decision::FullRebuild(RebuildReason::SchemaObsolete)
+        )
     }
 
     /// One clause naming why, for an error message or a staleness note.
