@@ -45,7 +45,10 @@ Compaction rewrites `events.jsonl` by filtering and re-ordering events. The proc
 
 ### Retention
 
-An evidence event (`evidence_add`, `citation_healed`, or `evidence_expire`) survives compaction if and only if:
+Compaction retains the last upsert per live entry and drops entries whose
+last expire follows their last upsert, **except** for entries named as an
+audit candidate (see "Audit batch retention" below), which are retained
+regardless of staleness. An evidence event (`evidence_add`, `citation_healed`, or `evidence_expire`) survives compaction if and only if:
 
 1. Its parent entry `E` is **live at the end of the log** (the entry's last upsert comes after its last expire).
 2. The event's original index `i` is **strictly greater than** `expire_last[E]` (the index of `E`'s most recent expire event). This bound prevents resurrecting evidence that was explicitly deleted.
@@ -63,13 +66,35 @@ Retained events are emitted in a specific order:
 
 **Result:** Evidence events are never reordered ahead of their parent entry's upsert. The relative order of evidence events for a single entry (e.g., `evidence_add` followed by `citation_healed`) is preserved.
 
+### Audit batch retention
+
+Compaction additionally retains three things beyond the ordinary
+entry/evidence rules above, so that audit history and confidence weights
+survive a rebuild:
+
+1. Every `audit_run_candidates_batch` and `audit_record_batch` event is
+   retained verbatim, regardless of the state of the entries it references.
+2. The entry upsert of any entry named as an audit candidate in a retained
+   `audit_run_candidates_batch` is retained even when that entry is stale
+   at the end of the log — overriding the ordinary "drop stale entries"
+   rule above.
+3. That entry's expire event (if any) is likewise retained, so a
+   subsequent rebuild reproduces the same live/stale state the audit
+   batch was recorded against.
+
+This is implemented by the `audit_required_entry_upserts` and
+`audit_required_expire_indices` index sets in `src/commands/compact.rs`,
+consulted both when collecting entry upserts and evidence, and by the
+`audit_run_candidate_indices` / `audit_record_batch_indices` collection
+alongside the ordinary evidence indices.
+
 ### Fixpoint Property
 
-Compacting an already-compacted log is a no-op: the compacted log's size does not change, and a second compaction produces identical output. This is verified by the assertion `compact.rs:670-674` on every run.
+Compacting an already-compacted log is a no-op: the compacted log's size does not change, and a second compaction produces identical output. This is verified by an assertion inside `test_cmd_compact_evidence_fixpoint` (`src/commands/compact.rs`) on every run.
 
 ## Torn-Tail Policy
 
-The event-log reader (`events.rs:119-149`) tolerates incomplete writes at the end of the log, but enforces strict correctness for the middle.
+The event-log reader (`scan_events` in `src/components/events.rs`) tolerates incomplete writes at the end of the log, but enforces strict correctness for the middle.
 
 ### Tolerated: Final Unterminated Line
 
@@ -77,7 +102,7 @@ If the final line in `events.jsonl` is truncated — either a partial JSON objec
 
 The implementation uses `BufRead::read_until(b'\n', ...)` rather than `lines()` to distinguish a torn final line (no trailing newline) from a complete-but-malformed line (terminated with `\n` but corrupt JSON).
 
-**Soundness assumption:** `append_event()` and `append_events_batch()` (`events.rs:88-116`) write content and then a newline to an unbuffered file. A process crash can only truncate the tail, never produce a terminated-but-truncated line.
+**Soundness assumption:** `append_event()` and `append_events_batch()` write content and then a newline to an unbuffered file. A process crash can only truncate the tail, never produce a terminated-but-truncated line.
 
 ### Hard error: Malformed Middle Lines
 
