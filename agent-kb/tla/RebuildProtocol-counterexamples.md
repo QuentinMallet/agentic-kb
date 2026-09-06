@@ -274,6 +274,41 @@ different depth. This is the same phenomenon already documented for this
 module (see finding 3 above: "CE6-current... now caught two states
 earlier") — not a new kind of divergence.
 
+### Analyst audit: PASS, two non-blocking notes
+
+1. `Phase1Snapshot` is unguarded on `batch_lock`, although rebuild's real
+   Phase 1 briefly takes the flock (`src/commands/rebuild.rs:406`); the model
+   can fire `Phase1Snapshot` while `batch_lock = TRUE`, which reality
+   forbids. A weaker guard only adds behaviours relative to the real system,
+   so it is conservative and cannot mask a violation the stricter guard would
+   have caught.
+2. Reusing `"B"` overloads a CE6 log line as a batch frame, so under CE6
+   `Checkpoint` folds a batch's `"B"` into `files["old"]` alongside the CE6
+   span's own `"B"`. Nothing reads the merged value as ambiguous —
+   `BatchAtomic` ranges over `tmp_db`, not `wal_frames`/`files`, and
+   `NameResolvesCommitted` tests only `"W"` — so this is harmless, but it is a
+   symbol collision to be aware of. A distinct third symbol would need
+   `TypeOK` and every `SUBSET {"A","B","W"}`-typed variable's range widened.
+
+**Non-vacuity probe:** the temporary property
+`NotBatchFrameAfterSwap == ~(phase \notin {"p1","p2"} /\ "B" \in wal_frames)`
+(unshipped, not a module invariant) violates on `CE4_Fixed` (`RetainedConn =
+FALSE`) at 13/11 states, depth 5:
+
+```text
+State 1  Init                 phase=p1
+State 2  Phase1Snapshot       phase=p2
+State 3  BatchOpen            phase=p2  batch_lock=TRUE   writer_open=TRUE
+State 4  BatchCommitAndClose  phase=p2  batch_lock=FALSE  writer_open=FALSE  wal_frames={"B","W"}
+State 5  Phase2Replay         phase=p3                                       <- violates here ("B" present, phase outside {p1,p2})
+```
+
+This proves `CE4_Fixed`'s own 56/48/13 run (§ above) actually reaches and
+evaluates `NoWriterConnAtSwap` on batch-then-swap paths where a `"B"` frame
+is present at the swap boundary, not only on paths where `BatchOpen` never
+fired — `CE4_Fixed` genuinely exercises the new actions, not just tolerates
+their absence.
+
 ## CE4 — unlink-before-rename loses the name's committed WAL state
 
 The initial live name maps to `old`; its main file is `{}`, while its committed
