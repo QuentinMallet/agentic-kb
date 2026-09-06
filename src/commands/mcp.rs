@@ -6565,12 +6565,12 @@ mod tests {
         let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'uniform','mcp-test')",
             [&uniform],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'traffic','mcp-test')",
             [&traffic],
         )
         .unwrap();
@@ -7530,7 +7530,10 @@ mod tests {
         let import = json!({"method":"import","id":"pin-import","path":"seeds.json","upsert":true});
         let stale = json!({"method":"stale_check","id":"pin-stale","files":["src/a.rs"],
                            "commits":["0000000000000000000000000000000000000000"],"blame":false});
-        let expire = json!({"method":"expire","id":"pin-expire","caller_id":"mcp-test","entry_id":"nope","reason":"r",
+        // `caller_id` is deliberately absent: the deployed pin supplies only
+        // public MCP tool arguments. The Elixir host bridge injects identity
+        // into the private Rust port request after public validation.
+        let expire = json!({"method":"expire","id":"pin-expire","entry_id":"nope","reason":"r",
                             "force":true});
         let run = json!({"method":"run","id":"pin-run","test_id":"t1","result":"pass",
                          "adapter":"browser","detail":"d"});
