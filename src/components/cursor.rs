@@ -727,6 +727,36 @@ pub fn append_and_apply(
     append_and_apply_with(lock, conn, paths, embedder, batch, |_| Ok(()))
 }
 
+/// Production-only entry point for the closed event writer registry.
+///
+/// Tests and legacy/corruption fixtures still exercise the raw replay path via
+/// [`append_and_apply`].  Shipped command handlers use this boundary so a new
+/// durable action cannot bypass its schema/version/format-compatibility
+/// declaration in `events.rs`.
+pub fn append_and_apply_writer_events(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn Embedder,
+    batch: &[events::WriterEvent],
+) -> Result<()> {
+    append_and_apply_writer_events_with(lock, conn, paths, embedder, batch, |_| Ok(()))
+}
+
+/// Typed-registry variant of [`append_and_apply_with`] for writers that need
+/// additional work in the same transaction.
+pub fn append_and_apply_writer_events_with<T>(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn Embedder,
+    batch: &[events::WriterEvent],
+    inside: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let raw: Vec<Value> = batch.iter().map(|event| event.as_value().clone()).collect();
+    append_and_apply_with(lock, conn, paths, embedder, &raw, inside)
+}
+
 /// [`append_and_apply`], plus caller work inside the same transaction.
 ///
 /// D3 owns the outer transaction; a caller that needs its own writes to commit

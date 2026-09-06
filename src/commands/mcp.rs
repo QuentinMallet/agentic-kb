@@ -1597,19 +1597,22 @@ fn handle_run(req: &RunRequest, paths: &config::Paths, emb: &dyn embedder::Embed
 
     let ts = Utc::now().to_rfc3339();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let event = json!({
+    let event = match events::run_history_insert(json!({
         "action": "insert", "table": "run_history",
         "test_id": test_id, "result": result,
         "adapter": adapter, "detail": detail,
         "ts": ts, "run_id": run_id, "session": "mcp",
-    });
+    })) {
+        Ok(event) => event,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
     // Writer 7 of 10.
-    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
+    if let Err(e) = cursor::append_and_apply_writer_events(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1644,19 +1647,22 @@ fn handle_test_add(
     };
 
     let ts = Utc::now().to_rfc3339();
-    let event = json!({
+    let event = match events::test_case_upsert(json!({
         "action": "upsert", "table": "test_cases",
         "id": test_id, "app": app, "name": name,
         "protocol": protocol, "config": config_str,
         "version_ref": null, "ts": ts, "session": "mcp",
-    });
+    })) {
+        Ok(event) => event,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
     let conn = match db::open_rw(paths, &lock) {
         Ok(c) => c,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
     // Writer 8 of 10.
-    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
+    if let Err(e) = cursor::append_and_apply_writer_events(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -1885,17 +1891,20 @@ fn handle_expire(
     }
 
     let ts = Utc::now().to_rfc3339();
-    let event = json!({
+    let event = match events::entry_expire(json!({
         "action": "expire",
         "table": "entries",
         "id": entry_id,
         "reason": reason,
         "ts": ts,
         "session": caller_id,
-    });
+    })) {
+        Ok(event) => event,
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
     // Writer 9 of 10.
-    if let Err(e) = cursor::append_and_apply(&lock, &conn, paths, emb, &[event]) {
+    if let Err(e) = cursor::append_and_apply_writer_events(&lock, &conn, paths, emb, &[event]) {
         return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
     }
 
@@ -2114,7 +2123,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
                 })
             })
             .collect();
-        let event = json!({
+        let event = match events::audit_run_candidates_batch(json!({
             "action": "audit_run_candidates_batch",
             "table": "audit_run_candidates",
             "run_id": run_id,
@@ -2122,11 +2131,20 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
             "created_at": ts,
             "ts": ts,
             "candidates": candidates,
-        });
+        })) {
+            Ok(event) => event,
+            Err(e) => {
+                return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()})
+            }
+        };
 
-        if let Err(e) =
-            cursor::append_and_apply(&lock, &conn, paths, &embedder::NoopEmbedder, &[event])
-        {
+        if let Err(e) = cursor::append_and_apply_writer_events(
+            &lock,
+            &conn,
+            paths,
+            &embedder::NoopEmbedder,
+            &[event],
+        ) {
             return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
         }
     }
@@ -2345,7 +2363,7 @@ fn handle_audit_record(
         .iter()
         .filter(|verdict_obj| !verdict_obj.verdict)
         .count() as u32;
-    let batch = vec![json!({
+    let batch = match events::audit_record_batch(json!({
         "action": "audit_record_batch",
         "table": "audit_runs",
         "run_id": run_id,
@@ -2353,9 +2371,12 @@ fn handle_audit_record(
         "audited_at": ts,
         "ts": ts,
         "verdicts": event_verdicts,
-    })];
+    })) {
+        Ok(event) => vec![event],
+        Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
+    };
 
-    let atomic: Result<(u32, u32)> = cursor::append_and_apply_with(
+    let atomic: Result<(u32, u32)> = cursor::append_and_apply_writer_events_with(
         &lock,
         &conn,
         paths,

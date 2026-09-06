@@ -22,7 +22,7 @@ use kb::components::db::{apply_event, open_db_memory};
 use kb::components::embedder::NoopEmbedder;
 use kb::components::events::{
     append_event, append_events_batch, committed_len, measure_event_log_reads, read_events,
-    read_events_from_offset,
+    read_events_from_offset, writer_schema_registry, writer_schema_samples,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -855,6 +855,59 @@ fn test_synthetic_corpus_of_every_kind_replays_identically_framed_and_unframed()
     assert_eq!(framed_read.events, corpus);
     assert_eq!(materialize(&legacy_read.events), materialize(&corpus));
     assert_eq!(materialize(&framed_read.events), materialize(&corpus));
+}
+
+/// The writer registry, rather than a source scan, is the closed contract for
+/// future event-log format changes.  Its samples must remain readable both by
+/// the legacy marker-less reader and by the framed writer/reader pair.
+#[test]
+fn test_writer_schema_registry_is_exhaustive_and_format_compatible() {
+    let registry = writer_schema_registry();
+    let corpus = writer_schema_samples();
+
+    assert_eq!(
+        registry.len(),
+        corpus.len(),
+        "every registered production writer schema must have a canonical sample"
+    );
+    assert!(
+        registry.iter().all(|schema| !schema.requires_log_format()),
+        "the writer is intentionally unversioned until a future format change"
+    );
+    for schema in registry {
+        assert!(
+            corpus.iter().any(|event| {
+                event["action"] == schema.action && event["table"] == schema.table
+            }),
+            "missing canonical sample for {}:{}",
+            schema.action,
+            schema.table
+        );
+    }
+
+    let (_legacy_dir, legacy_path) = log_dir();
+    let legacy = corpus
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    write_raw(&legacy_path, legacy.as_bytes());
+
+    let (_framed_dir, framed_path) = log_dir();
+    for event in &corpus {
+        append_event(&framed_path, event).unwrap();
+    }
+
+    let legacy_events = read_events(&legacy_path).unwrap().events;
+    let framed_events = read_events(&framed_path).unwrap().events;
+    assert_eq!(legacy_events, corpus);
+    assert_eq!(framed_events, corpus);
+    assert_eq!(materialize(&legacy_events), materialize(&framed_events));
+    assert!(corpus
+        .iter()
+        .any(|event| event["action"] == "audit_run_candidates_batch"));
+    assert!(corpus
+        .iter()
+        .any(|event| event["action"] == "audit_record_batch"));
 }
 
 #[test]

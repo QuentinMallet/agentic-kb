@@ -441,17 +441,17 @@ pub fn add_locked(
     }
 
     // Build expire events (one per existing entry being replaced).
-    let expire_events: Vec<Value> = existing_ids
+    let expire_events: Result<Vec<_>> = existing_ids
         .iter()
         .map(|old_id| {
-            serde_json::json!({
+            events::entry_expire(serde_json::json!({
                 "action": "expire",
                 "table": "entries",
                 "id": old_id,
                 "reason": args.expire_reason,
                 "ts": args.ts,
                 "session": args.session,
-            })
+            }))
         })
         .collect();
 
@@ -478,7 +478,7 @@ pub fn add_locked(
     }
 
     // Build evidence-add events (one per evidence row).
-    let evidence_events: Vec<Value> = args
+    let evidence_events: Result<Vec<_>> = args
         .evidence_rows
         .iter()
         .map(|ev| {
@@ -513,7 +513,11 @@ pub fn add_locked(
                     .map(|s| s.to_string()),
                 recorded_at: Some(args.ts.clone()),
             };
-            events::evidence_add_event(&args.id, &evidence, args.version_ref.as_deref())
+            events::evidence_add(events::evidence_add_event(
+                &args.id,
+                &evidence,
+                args.version_ref.as_deref(),
+            ))
         })
         .collect();
 
@@ -521,12 +525,12 @@ pub fn add_locked(
     // JSONL-first invariant: this append precedes all DB writes.
     // Order: expires, upsert, evidence-adds. The same Vec is then applied to the
     // DB in-order under the held flock, so no per-event clone is needed.
-    let mut batch: Vec<Value> = expire_events;
-    batch.push(add_event);
-    batch.extend(evidence_events);
+    let mut batch = expire_events?;
+    batch.push(events::entry_upsert(add_event)?);
+    batch.extend(evidence_events?);
     // Writer 1 of 10. Append + sync + apply + cursor as one unit (C1/D3): the
     // helper owns the kill points, the embedding prefetch, and the transaction.
-    cursor::append_and_apply(lock, conn, paths, embedder, &batch)?;
+    cursor::append_and_apply_writer_events(lock, conn, paths, embedder, &batch)?;
 
     if args.evidence_status == "missing"
         && matches!(args.kind.as_str(), "observation" | "belief" | "procedure")

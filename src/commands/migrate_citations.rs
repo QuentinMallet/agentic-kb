@@ -339,19 +339,25 @@ fn apply_heals(
                     });
                     continue;
                 }
-                let event = events::citation_healed_event(
+                let event = events::citation_healed(events::citation_healed_event(
                     &row.entry_id,
                     &row.evidence_id,
                     &verify_row.citation_path,
                     &new_path,
                     &verify_row.citation_hash,
                     version_ref.as_deref(),
-                );
+                ))?;
                 // Writer 6 of 10. If append succeeds but apply fails, a rerun
                 // may append a second citation_healed event. Applying the same
                 // target is a state-idempotent no-op; deterministic op IDs are
                 // deferred.
-                cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event])?;
+                cursor::append_and_apply_writer_events(
+                    &lock,
+                    conn,
+                    paths,
+                    &NoopEmbedder,
+                    &[event],
+                )?;
                 report.emitted_events += 1;
                 report.would_heal.push(MigrationRow {
                     new_path: Some(new_path),

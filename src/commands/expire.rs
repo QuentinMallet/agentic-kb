@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::{Embedder, NoopEmbedder};
-use crate::components::{cursor, db};
+use crate::components::{cursor, db, events};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -64,7 +64,7 @@ impl Expire {
         let ts = chrono::Utc::now().to_rfc3339();
         let (session, omc_session_id) = read_omc_session();
 
-        let event = serde_json::json!({
+        let event = events::entry_expire(serde_json::json!({
             "action": "expire",
             "table": "entries",
             "id": self.id,
@@ -72,10 +72,10 @@ impl Expire {
             "ts": ts,
             "session": session,
             "session_id": omc_session_id,
-        });
+        }))?;
 
         // Writer 2 of 10.
-        cursor::append_and_apply(&lock, &conn, paths, embedder, &[event])?;
+        cursor::append_and_apply_writer_events(&lock, &conn, paths, embedder, &[event])?;
 
         println!("expired {}", self.id);
         Ok(())

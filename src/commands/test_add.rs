@@ -1,7 +1,7 @@
 //! `test-add` subcommand
 
 use crate::commands::add::{acquire_lock, read_omc_session};
-use crate::components::{cursor, db};
+use crate::components::{cursor, db, events};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -58,7 +58,7 @@ impl TestAdd {
         let ts = chrono::Utc::now().to_rfc3339();
         let (session, omc_session_id) = read_omc_session();
 
-        let event = serde_json::json!({
+        let event = events::test_case_upsert(serde_json::json!({
             "action": "upsert",
             "table": "test_cases",
             "id": id,
@@ -70,12 +70,12 @@ impl TestAdd {
             "ts": ts,
             "session": session,
             "session_id": omc_session_id,
-        });
+        }))?;
 
         // Writer 4 of 10.
         let conn = db::open_rw(&paths, &lock)?;
         let embedder = crate::components::embedder::NoopEmbedder;
-        cursor::append_and_apply(&lock, &conn, &paths, &embedder, &[event])?;
+        cursor::append_and_apply_writer_events(&lock, &conn, &paths, &embedder, &[event])?;
 
         println!("added test case  {}/{} ({})", self.app, self.name, id);
         Ok(())
