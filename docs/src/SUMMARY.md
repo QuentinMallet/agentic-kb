@@ -23,6 +23,7 @@
 - [`kb context`](./commands/context.md)
 - [`kb compress`](./commands/compress.md)
 - [`kb hook`](./commands/hook.md)
+- [`kb migrate-embeddings`](./commands/migrate-embeddings.md)
 
 ## Security
 
