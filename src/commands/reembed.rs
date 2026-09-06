@@ -3,7 +3,7 @@
 use crate::commands::add::make_embedder;
 use crate::components::{db, embedder};
 use crate::config;
-use crate::models::f32s_to_f16_blob;
+use crate::models::normalized_f32s_to_f16_blob;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::params;
@@ -103,9 +103,10 @@ impl Reembed {
             let text = db::entry_embed_text(mode, path, summary, content, tags);
             match embedder.embed(&text) {
                 Ok(emb_vec) => {
-                    let blob = f32s_to_f16_blob(&emb_vec);
+                    let blob = normalized_f32s_to_f16_blob(&emb_vec)?;
                     conn.execute(
-                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding, normalized) \
+                         VALUES(?1, ?2, 1)",
                         params![rowid, blob],
                     )?;
                     done += 1;

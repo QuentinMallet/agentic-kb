@@ -15,6 +15,7 @@ pub mod import_cmd;
 pub mod ingest;
 pub mod mcp;
 pub mod migrate_citations;
+pub mod migrate_embeddings;
 pub mod older_than;
 pub mod peers;
 pub mod rebuild;
@@ -40,6 +41,8 @@ pub enum KbCmd {
     Mcp(mcp::Mcp),
     /// Heal legacy whole-file workaround citations (`path:0-N`) to bare paths
     MigrateCitations(migrate_citations::MigrateCitations),
+    /// Rewrite legacy embedding blobs as normalized f16 vectors
+    MigrateEmbeddings(migrate_embeddings::MigrateEmbeddings),
     /// Check if kb entries for given files are stale
     StaleCheck(stale_check::StaleCheck),
     /// Replay all events and rebuild agent-kb.db from scratch

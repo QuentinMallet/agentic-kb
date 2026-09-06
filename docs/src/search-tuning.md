@@ -162,3 +162,17 @@ What gets embedded per entry:
 Switching modes requires re-embedding the whole store (`kb reembed` after
 deleting `entries_emb` rows, or `kb rebuild`) — mixed-vintage embeddings make
 cosine scores incomparable. Measure with `kb eval` before and after.
+
+## Pre-normalized embedding migration
+
+New embeddings are stored as finite, non-zero, L2-normalized f16 vectors. Each
+entry and cue blob carries its own normalization marker: marked rows use a dot
+product while legacy rows retain cosine scoring, so a partially migrated store
+does not silently change ranking.
+
+Run `kb migrate-embeddings` to convert existing blobs. It creates and retains
+`agent-kb.db.pre-normalized-embeddings.bak`, validates a staged copy, and
+atomically publishes the staged database only after every legacy entry and cue
+blob is finite and non-zero. A corrupt blob aborts the migration without
+marking any live row; restore the retained backup if an operator needs to roll
+back after publication.

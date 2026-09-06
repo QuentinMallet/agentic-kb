@@ -1118,12 +1118,16 @@ fn handle_reembed(
         let text = crate::components::db::entry_embed_text(mode, path, summary, content, tags);
         match emb.embed(&text) {
             Ok(emb_vec) => {
-                // f16 is the canonical wire format (models.rs); the CLI reembed
-                // path writes f16 — this handler previously wrote legacy f32
-                // blobs, creating mixed-vintage rows.
-                let blob = crate::models::f32s_to_f16_blob(&emb_vec);
+                let blob = match crate::models::normalized_f32s_to_f16_blob(&emb_vec) {
+                    Ok(blob) => blob,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
                 let _ = conn.execute(
-                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1, ?2)",
+                    "INSERT OR REPLACE INTO entries_emb(rowid, embedding, normalized) \
+                     VALUES(?1, ?2, 1)",
                     params![rowid, blob],
                 );
                 done += 1;

@@ -1,5 +1,6 @@
 //! Data models and vector math utilities
 
+use anyhow::{bail, Result};
 use half::f16;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ pub const EMB_BLOB_BYTES: usize = EMB_DIMS * EMB_ELEMENT_BYTES; // 768
 /// Returns 0.0 if vectors have different lengths (dimension mismatch from
 /// model upgrade or corrupt embedding blob).
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
+    if a.len() != b.len() || !a.iter().chain(b.iter()).all(|value| value.is_finite()) {
         eprintln!(
             "kb: cosine_similarity dimension mismatch: {} vs {}",
             a.len(),
@@ -29,11 +30,40 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
+    if !norm_a.is_finite() || !norm_b.is_finite() || norm_a == 0.0 || norm_b == 0.0 {
         0.0
     } else {
-        dot / (norm_a * norm_b)
+        let similarity = dot / (norm_a * norm_b);
+        similarity.is_finite().then_some(similarity).unwrap_or(0.0)
     }
+}
+
+/// Validate and L2-normalize an embedding before it reaches persisted state.
+///
+/// This is a release-build guard.  A finite check alone is insufficient:
+/// normalizing the zero vector manufactures NaNs, which are byte-valid blobs
+/// but invalid similarity inputs.
+pub fn normalize_embedding(v: &[f32]) -> Result<Vec<f32>> {
+    if v.is_empty() {
+        bail!("embedding must not be empty");
+    }
+    if !v.iter().all(|value| value.is_finite()) {
+        bail!("embedding contains non-finite values");
+    }
+    let norm = v.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        bail!("embedding must have a finite, non-zero L2 norm");
+    }
+    let normalized: Vec<f32> = v.iter().map(|value| value / norm).collect();
+    if !normalized.iter().all(|value| value.is_finite()) {
+        bail!("embedding normalization produced non-finite values");
+    }
+    Ok(normalized)
+}
+
+/// Normalize an embedding and encode it in the canonical f16 wire format.
+pub fn normalized_f32s_to_f16_blob(v: &[f32]) -> Result<Vec<u8>> {
+    Ok(f32s_to_f16_blob(&normalize_embedding(v)?))
 }
 
 /// Encode f32 slice as little-endian f16 blob (new wire format for entries_emb).
@@ -55,7 +85,7 @@ pub fn f32s_to_f16_blob(v: &[f32]) -> Vec<u8> {
 /// - any other multiple of 4: f32 le path (legacy format — existing DBs)
 /// - anything else: returns empty vec (corrupt blob; caller gets sim=0.0)
 pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
-    if blob.len() == EMB_BLOB_BYTES {
+    let decoded: Vec<f32> = if blob.len() == EMB_BLOB_BYTES {
         // f16 path (current format)
         blob.chunks_exact(EMB_ELEMENT_BYTES)
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -70,6 +100,12 @@ pub fn decode_emb_blob(blob: &[u8]) -> Vec<f32> {
             "kb: decode_emb_blob: unexpected blob length {} — corrupt embedding?",
             blob.len()
         );
+        return Vec::new();
+    };
+    if decoded.iter().all(|value| value.is_finite()) {
+        decoded
+    } else {
+        eprintln!("kb: decode_emb_blob: non-finite embedding values — corrupt embedding?");
         Vec::new()
     }
 }
@@ -94,6 +130,10 @@ pub fn decode_f16_blob_into(blob: &[u8], scratch: &mut Vec<f32>) {
     scratch.reserve(EMB_DIMS);
     for c in blob.chunks_exact(EMB_ELEMENT_BYTES) {
         scratch.push(f16::from_le_bytes([c[0], c[1]]).to_f32());
+    }
+    if !scratch.iter().all(|value| value.is_finite()) {
+        scratch.clear();
+        eprintln!("kb: decode_f16_blob_into: non-finite embedding values — corrupt embedding?");
     }
 }
 
