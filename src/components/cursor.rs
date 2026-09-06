@@ -717,6 +717,7 @@ fn verify_lock(lock: &Lock, paths: &config::Paths) -> Result<()> {
 ///
 /// Every production writer goes through here. See [`append_and_apply_with`]
 /// for the variant that lets a caller join the cursor's transaction.
+#[cfg(feature = "event-log-test-raw")]
 pub fn append_and_apply(
     lock: &Lock,
     conn: &Connection,
@@ -754,7 +755,7 @@ pub fn append_and_apply_writer_events_with<T>(
     inside: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
     let raw: Vec<Value> = batch.iter().map(|event| event.as_value().clone()).collect();
-    append_and_apply_with(lock, conn, paths, embedder, &raw, inside)
+    append_and_apply_with_raw(lock, conn, paths, embedder, &raw, inside)
 }
 
 /// [`append_and_apply`], plus caller work inside the same transaction.
@@ -762,7 +763,23 @@ pub fn append_and_apply_writer_events_with<T>(
 /// D3 owns the outer transaction; a caller that needs its own writes to commit
 /// with the apply (C2's `A1` audit record) joins it here rather than opening a
 /// nested transaction, which SQLite rejects.
+#[cfg(feature = "event-log-test-raw")]
 pub fn append_and_apply_with<T>(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn Embedder,
+    batch: &[Value],
+    inside: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    append_and_apply_with_raw(lock, conn, paths, embedder, batch, inside)
+}
+
+/// Raw implementation shared only by typed production writers and tests with
+/// the explicit `event-log-test-raw` feature.  Keeping this private means a
+/// released downstream caller cannot append arbitrary `Value` records and
+/// bypass the writer-schema registry.
+fn append_and_apply_with_raw<T>(
     lock: &Lock,
     conn: &Connection,
     paths: &config::Paths,

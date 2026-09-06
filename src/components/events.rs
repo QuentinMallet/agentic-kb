@@ -364,6 +364,35 @@ pub fn writer_schema_samples() -> Vec<serde_json::Value> {
     ]
 }
 
+/// Build every canonical sample through its matching compile-time payload
+/// marker.  The match is deliberately exhaustive over the closed registry so
+/// a newly declared writer cannot obtain a sample by falling back to raw JSON.
+pub fn writer_schema_sample_events() -> Result<Vec<WriterEvent>> {
+    writer_schema_samples()
+        .into_iter()
+        .map(
+            |event| match (event["action"].as_str(), event["table"].as_str()) {
+                (Some("upsert"), Some("entries")) => entry_upsert(event),
+                (Some("expire"), Some("entries")) => entry_expire(event),
+                (Some("evidence_add"), Some("evidence")) => evidence_add(event),
+                (Some("citation_healed"), Some("evidence")) => citation_healed(event),
+                (Some("evidence_expire"), Some("evidence")) => evidence_expire(event),
+                (Some("upsert"), Some("test_cases")) => test_case_upsert(event),
+                (Some("insert"), Some("run_history")) => run_history_insert(event),
+                (Some("audit_run_candidates_batch"), Some("audit_run_candidates")) => {
+                    audit_run_candidates_batch(event)
+                }
+                (Some("audit_record_batch"), Some("audit_runs")) => audit_record_batch(event),
+                (action, table) => anyhow::bail!(
+                    "canonical sample has no typed writer payload: {}:{}",
+                    action.unwrap_or("<missing>"),
+                    table.unwrap_or("<missing>")
+                ),
+            },
+        )
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TornTail {
     pub line: usize,
@@ -545,6 +574,17 @@ fn append_events_batch_impl(events_path: &Path, events: &[serde_json::Value]) ->
         File::sync_data,
         crate::components::fsync::sync_dir,
     )
+}
+
+/// Append registered production events without accepting raw JSON from the
+/// caller.  This is the event-log half of the typed writer boundary; the
+/// cursor half additionally applies the same batch and advances its cursor.
+pub fn append_writer_events_batch(events_path: &Path, events: &[WriterEvent]) -> Result<u64> {
+    let raw: Vec<serde_json::Value> = events
+        .iter()
+        .map(|event| event.as_value().clone())
+        .collect();
+    append_events_batch_impl(events_path, &raw)
 }
 
 /// Implementation seam used to prove sync ordering and failure behavior.

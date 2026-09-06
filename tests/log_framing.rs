@@ -21,8 +21,9 @@ use kb::commands::add::acquire_lock;
 use kb::components::db::{apply_event, open_db_memory};
 use kb::components::embedder::NoopEmbedder;
 use kb::components::events::{
-    append_event, append_events_batch, committed_len, measure_event_log_reads, read_events,
-    read_events_from_offset, writer_schema_registry, writer_schema_samples,
+    append_event, append_events_batch, append_writer_events_batch, committed_len,
+    measure_event_log_reads, read_events, read_events_from_offset, writer_schema_registry,
+    writer_schema_sample_events,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -863,7 +864,11 @@ fn test_synthetic_corpus_of_every_kind_replays_identically_framed_and_unframed()
 #[test]
 fn test_writer_schema_registry_is_exhaustive_and_format_compatible() {
     let registry = writer_schema_registry();
-    let corpus = writer_schema_samples();
+    let writer_events = writer_schema_sample_events().unwrap();
+    let corpus: Vec<Value> = writer_events
+        .iter()
+        .map(|event| event.as_value().clone())
+        .collect();
 
     assert_eq!(
         registry.len(),
@@ -893,9 +898,7 @@ fn test_writer_schema_registry_is_exhaustive_and_format_compatible() {
     write_raw(&legacy_path, legacy.as_bytes());
 
     let (_framed_dir, framed_path) = log_dir();
-    for event in &corpus {
-        append_event(&framed_path, event).unwrap();
-    }
+    append_writer_events_batch(&framed_path, &writer_events).unwrap();
 
     let legacy_events = read_events(&legacy_path).unwrap().events;
     let framed_events = read_events(&framed_path).unwrap().events;
