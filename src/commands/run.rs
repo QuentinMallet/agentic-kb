@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::Embedder;
-use crate::components::{cursor, db};
+use crate::components::{cursor, db, events};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use anyhow::bail;
@@ -55,7 +55,7 @@ impl Run {
         let (session, omc_session_id) = read_omc_session();
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let event = serde_json::json!({
+        let event = events::run_history_insert(serde_json::json!({
             "action": "insert",
             "table": "run_history",
             "test_id": self.test_id,
@@ -66,11 +66,11 @@ impl Run {
             "run_id": run_id,
             "session": session,
             "session_id": omc_session_id,
-        });
+        }))?;
 
         // Writer 3 of 10.
         let conn = db::open_rw(paths, &lock)?;
-        cursor::append_and_apply(&lock, &conn, paths, embedder, &[event])?;
+        cursor::append_and_apply_writer_events(&lock, &conn, paths, embedder, &[event])?;
 
         println!(
             "recorded run {}  {} -> {}",

@@ -12,6 +12,9 @@ crash-sim = []
 # `cargo build`/`cargo build --release` — only for test targets, via the
 # self dev-dependency below.
 event-log-read-metrics = []
+# Test/benchmark-only escape hatch for corruption and legacy JSON fixtures.
+# Shipped command handlers go through `WriterEvent` instead.
+event-log-test-raw = []
 
 [[bin]]
 name = "kb"
@@ -64,7 +67,7 @@ name = "write_path"
 harness = false
 
 [dev-dependencies]
-kb = { path = ".", features = ["event-log-read-metrics"] }
+kb = { path = ".", features = ["event-log-read-metrics", "event-log-test-raw"] }
 libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.11.0"

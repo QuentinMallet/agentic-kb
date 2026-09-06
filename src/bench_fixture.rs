@@ -1,7 +1,7 @@
 //! Deterministic synthetic data shared by benchmarks and the CLI fixture builder.
 
 use crate::commands::add::Lock;
-use crate::components::{cursor, db, embedder::Embedder};
+use crate::components::{cursor, db, embedder::Embedder, events};
 use crate::config;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -156,14 +156,41 @@ pub fn seed_fixture(
     for i in 0..n {
         batch.extend(fixture_events(i, &mut rng));
         if batch.len() >= SEED_BATCH_EVENTS {
-            cursor::append_and_apply(lock, conn, paths, emb, &batch)?;
-            batch.clear();
+            let typed = writer_fixture_events(std::mem::take(&mut batch))?;
+            cursor::append_and_apply_writer_events(lock, conn, paths, emb, &typed)?;
         }
     }
     if !batch.is_empty() {
-        cursor::append_and_apply(lock, conn, paths, emb, &batch)?;
+        let typed = writer_fixture_events(batch)?;
+        cursor::append_and_apply_writer_events(lock, conn, paths, emb, &typed)?;
     }
     Ok(())
+}
+
+/// Convert fixture records through the same closed registry used by shipped
+/// writers.  Benchmark data is a production-style durable log fixture, not a
+/// corruption test, so it must not be an escape hatch around schema review.
+fn writer_fixture_events(
+    batch: Vec<serde_json::Value>,
+) -> anyhow::Result<Vec<events::WriterEvent>> {
+    batch
+        .into_iter()
+        .map(|event| {
+            let action = event["action"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("fixture event missing action"))?
+                .to_owned();
+            let table = event["table"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("fixture event missing table"))?
+                .to_owned();
+            match (action.as_str(), table.as_str()) {
+                ("upsert", "entries") => events::entry_upsert(event),
+                ("evidence_add", "evidence") => events::evidence_add(event),
+                _ => anyhow::bail!("fixture event has no typed writer payload: {action}:{table}"),
+            }
+        })
+        .collect()
 }
 
 /// Stable logical digest, independent of SQLite page/WAL layout.

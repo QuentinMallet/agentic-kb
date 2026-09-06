@@ -125,6 +125,274 @@ pub const BATCH_BEGIN: &str = "batch_begin";
 /// `action` value of the marker line that closes a commit span.
 pub const BATCH_COMMIT: &str = "batch_commit";
 
+/// The log is deliberately marker-framed but otherwise unversioned.  A future
+/// schema that cannot be read by deployed binaries must change this constant
+/// as part of the same patch; the registry's const assertions make forgetting
+/// that transition a compile error.
+const WRITER_LOG_FORMAT_VERSION: Option<u16> = None;
+
+/// Whether a writer schema is safe for marker-less legacy readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterCompatibility {
+    LegacyCompatible,
+    RequiresLogFormat,
+}
+
+impl WriterCompatibility {
+    const fn requires_log_format(self) -> bool {
+        matches!(self, Self::RequiresLogFormat)
+    }
+}
+
+/// Closed description of one production event writer.
+///
+/// `payload_type` names the Rust-facing payload category at the writer
+/// boundary.  It is intentionally data rather than a reader constraint: old
+/// logs remain raw JSON and must continue to replay unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterSchema {
+    pub action: &'static str,
+    pub table: &'static str,
+    pub payload_version: u16,
+    pub payload_type: &'static str,
+    compatibility: WriterCompatibility,
+}
+
+impl WriterSchema {
+    pub const fn requires_log_format(&self) -> bool {
+        self.compatibility.requires_log_format()
+    }
+}
+
+macro_rules! writer_schema_registry {
+    ($(($action:literal, $table:literal, $version:expr, $payload:literal, $compat:ident)),+ $(,)?) => {
+        const WRITER_SCHEMAS: &[WriterSchema] = &[
+            $(WriterSchema {
+                action: $action,
+                table: $table,
+                payload_version: $version,
+                payload_type: $payload,
+                compatibility: WriterCompatibility::$compat,
+            }),+
+        ];
+
+        $(const _: () = {
+            assert!(
+                !WriterCompatibility::$compat.requires_log_format()
+                    || WRITER_LOG_FORMAT_VERSION.is_some(),
+                "a RequiresLogFormat writer schema needs an in-band log_format version"
+            );
+        };)+
+    };
+}
+
+// This is the only inventory production writers may target.  Keep the audit
+// batch records here: they are durable events even though they do not map to
+// the older entry/evidence/test-case tables.
+writer_schema_registry!(
+    ("upsert", "entries", 1, "EntryUpsert", LegacyCompatible),
+    ("expire", "entries", 1, "EntryExpire", LegacyCompatible),
+    (
+        "evidence_add",
+        "evidence",
+        1,
+        "EvidenceAdd",
+        LegacyCompatible
+    ),
+    (
+        "citation_healed",
+        "evidence",
+        1,
+        "CitationHealed",
+        LegacyCompatible
+    ),
+    (
+        "evidence_expire",
+        "evidence",
+        1,
+        "EvidenceExpire",
+        LegacyCompatible
+    ),
+    (
+        "upsert",
+        "test_cases",
+        1,
+        "TestCaseUpsert",
+        LegacyCompatible
+    ),
+    (
+        "insert",
+        "run_history",
+        1,
+        "RunHistoryInsert",
+        LegacyCompatible
+    ),
+    (
+        "audit_run_candidates_batch",
+        "audit_run_candidates",
+        1,
+        "AuditRunCandidatesBatch",
+        LegacyCompatible
+    ),
+    (
+        "audit_record_batch",
+        "audit_runs",
+        1,
+        "AuditRecordBatch",
+        LegacyCompatible
+    ),
+);
+
+/// Return the complete production writer schema inventory.
+pub fn writer_schema_registry() -> &'static [WriterSchema] {
+    WRITER_SCHEMAS
+}
+
+/// A JSON event admitted by the closed production writer registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriterEvent(serde_json::Value);
+
+impl WriterEvent {
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+/// A compile-time writer payload identity.  The payload remains JSON on disk;
+/// these zero-sized types prevent a production call site from choosing an
+/// arbitrary action/table pair at runtime.
+pub trait WriterPayload {
+    const ACTION: &'static str;
+    const TABLE: &'static str;
+    const VERSION: u16;
+}
+
+macro_rules! writer_payload {
+    ($name:ident, $action:literal, $table:literal) => {
+        pub struct $name;
+        impl WriterPayload for $name {
+            const ACTION: &'static str = $action;
+            const TABLE: &'static str = $table;
+            const VERSION: u16 = 1;
+        }
+    };
+}
+
+writer_payload!(EntryUpsert, "upsert", "entries");
+writer_payload!(EntryExpire, "expire", "entries");
+writer_payload!(EvidenceAdd, "evidence_add", "evidence");
+writer_payload!(CitationHealed, "citation_healed", "evidence");
+writer_payload!(EvidenceExpire, "evidence_expire", "evidence");
+writer_payload!(TestCaseUpsert, "upsert", "test_cases");
+writer_payload!(RunHistoryInsert, "insert", "run_history");
+writer_payload!(
+    AuditRunCandidatesBatch,
+    "audit_run_candidates_batch",
+    "audit_run_candidates"
+);
+writer_payload!(AuditRecordBatch, "audit_record_batch", "audit_runs");
+
+/// Admit a production event under a compile-time payload identity.  Readers
+/// deliberately remain raw-JSON compatible, while every shipped writer gets
+/// one explicit schema/version/compatibility entry.
+pub fn writer_event<P: WriterPayload>(value: serde_json::Value) -> Result<WriterEvent> {
+    let Some(schema) = WRITER_SCHEMAS
+        .iter()
+        .find(|schema| schema.action == P::ACTION && schema.table == P::TABLE)
+    else {
+        anyhow::bail!(
+            "unregistered production event schema: {}:{}",
+            P::ACTION,
+            P::TABLE
+        );
+    };
+    if schema.payload_version != P::VERSION {
+        anyhow::bail!(
+            "writer payload version disagrees with registry for {}:{}",
+            P::ACTION,
+            P::TABLE
+        );
+    }
+    if value["action"].as_str() != Some(schema.action)
+        || value["table"].as_str() != Some(schema.table)
+    {
+        anyhow::bail!(
+            "writer event does not match registered schema {}:{}",
+            schema.action,
+            schema.table
+        );
+    }
+    Ok(WriterEvent(value))
+}
+
+macro_rules! writer_constructor {
+    ($name:ident, $payload:ty) => {
+        pub fn $name(value: serde_json::Value) -> Result<WriterEvent> {
+            writer_event::<$payload>(value)
+        }
+    };
+}
+
+writer_constructor!(entry_upsert, EntryUpsert);
+writer_constructor!(entry_expire, EntryExpire);
+writer_constructor!(evidence_add, EvidenceAdd);
+writer_constructor!(citation_healed, CitationHealed);
+writer_constructor!(evidence_expire, EvidenceExpire);
+writer_constructor!(test_case_upsert, TestCaseUpsert);
+writer_constructor!(run_history_insert, RunHistoryInsert);
+writer_constructor!(audit_run_candidates_batch, AuditRunCandidatesBatch);
+writer_constructor!(audit_record_batch, AuditRecordBatch);
+
+/// Canonical samples provide an executable, exhaustive corpus for the writer
+/// registry.  They are intentionally ordinary v1 JSON so this release does
+/// not add a `log_format` line or alter existing event bytes.
+pub fn writer_schema_samples() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"action":"upsert","table":"entries","id":"schema-entry","path":"schema.rs","summary":"schema","content":"registry sample","tags":[],"kind":"observation","evidence_status":"present","ts":"2024-01-01T00:00:00Z"}),
+        serde_json::json!({"action":"evidence_add","table":"evidence","entry_id":"schema-entry","evidence":{"id":"schema-evidence","entry_id":"schema-entry","kind":"code","citation_hash":"sha256:sample"},"version_ref":null,"ts":"2024-01-01T00:00:02Z"}),
+        serde_json::json!({"action":"citation_healed","table":"evidence","entry_id":"schema-entry","evidence_id":"schema-evidence","old_path":"old.rs","new_path":"new.rs","citation_hash":"sha256:sample","version_ref":null,"ts":"2024-01-01T00:00:03Z"}),
+        serde_json::json!({"action":"evidence_expire","table":"evidence","entry_id":"schema-entry","evidence_id":"schema-evidence","reason":"sample","ts":"2024-01-01T00:00:04Z"}),
+        serde_json::json!({"action":"upsert","table":"test_cases","id":"schema-test","app":"kb","name":"schema","protocol":"rust_tool","config":"{}","ts":"2024-01-01T00:00:05Z"}),
+        serde_json::json!({"action":"insert","table":"run_history","test_id":"schema-test","run_id":"schema-run","result":"pass","detail":"sample","adapter":"rust_tool","ts":"2024-01-01T00:00:06Z"}),
+        serde_json::json!({"action":"audit_run_candidates_batch","table":"audit_run_candidates","run_id":"schema-audit","caller_id":"schema-caller","created_at":"2024-01-01T00:00:07Z","ts":"2024-01-01T00:00:07Z","candidates":[{"entry_id":"schema-entry","arm":"uniform"}]}),
+        serde_json::json!({"action":"audit_record_batch","table":"audit_runs","run_id":"schema-audit","caller_id":"schema-caller","audited_at":"2024-01-01T00:00:08Z","ts":"2024-01-01T00:00:08Z","verdicts":[{"entry_id":"schema-entry","verdict":true,"note":"sample"}]}),
+        serde_json::json!({"action":"expire","table":"entries","id":"schema-entry","reason":"sample","ts":"2024-01-01T00:00:09Z"}),
+    ]
+}
+
+/// Build every canonical sample through its matching compile-time payload
+/// marker.  The match is deliberately exhaustive over the closed registry so
+/// a newly declared writer cannot obtain a sample by falling back to raw JSON.
+pub fn writer_schema_sample_events() -> Result<Vec<WriterEvent>> {
+    writer_schema_samples()
+        .into_iter()
+        .map(
+            |event| match (event["action"].as_str(), event["table"].as_str()) {
+                (Some("upsert"), Some("entries")) => entry_upsert(event),
+                (Some("expire"), Some("entries")) => entry_expire(event),
+                (Some("evidence_add"), Some("evidence")) => evidence_add(event),
+                (Some("citation_healed"), Some("evidence")) => citation_healed(event),
+                (Some("evidence_expire"), Some("evidence")) => evidence_expire(event),
+                (Some("upsert"), Some("test_cases")) => test_case_upsert(event),
+                (Some("insert"), Some("run_history")) => run_history_insert(event),
+                (Some("audit_run_candidates_batch"), Some("audit_run_candidates")) => {
+                    audit_run_candidates_batch(event)
+                }
+                (Some("audit_record_batch"), Some("audit_runs")) => audit_record_batch(event),
+                (action, table) => anyhow::bail!(
+                    "canonical sample has no typed writer payload: {}:{}",
+                    action.unwrap_or("<missing>"),
+                    table.unwrap_or("<missing>")
+                ),
+            },
+        )
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TornTail {
     pub line: usize,
@@ -285,13 +553,38 @@ fn write_span(f: &mut File, events: &[serde_json::Value]) -> Result<()> {
 /// file length. The applied cursor (C1/D3) records exactly this value, and
 /// taking it from the writer keeps the cost of a write O(bytes appended)
 /// rather than O(log size).
+#[cfg(feature = "event-log-test-raw")]
 pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
+    append_events_batch_impl(events_path, events)
+}
+
+/// Internal raw append used by the typed writer boundary.  This remains crate
+/// visible in release builds so the format layer can serialize `WriterEvent`,
+/// but external callers only receive the raw `Value` API in test/benchmark
+/// builds where legacy and corruption fixtures need it.
+#[cfg(not(feature = "event-log-test-raw"))]
+pub(crate) fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
+    append_events_batch_impl(events_path, events)
+}
+
+fn append_events_batch_impl(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
     append_events_batch_with_sync(
         events_path,
         events,
         File::sync_data,
         crate::components::fsync::sync_dir,
     )
+}
+
+/// Append registered production events without accepting raw JSON from the
+/// caller.  This is the event-log half of the typed writer boundary; the
+/// cursor half additionally applies the same batch and advances its cursor.
+pub fn append_writer_events_batch(events_path: &Path, events: &[WriterEvent]) -> Result<u64> {
+    let raw: Vec<serde_json::Value> = events
+        .iter()
+        .map(|event| event.as_value().clone())
+        .collect();
+    append_events_batch_impl(events_path, &raw)
 }
 
 /// Implementation seam used to prove sync ordering and failure behavior.
@@ -350,7 +643,13 @@ where
 /// newline write fail, and without a span the next append would classify that
 /// complete-JSON tail as reader-accepted and promote an event the caller
 /// reported as failed.
+#[cfg(feature = "event-log-test-raw")]
 pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<u64> {
+    append_event_impl(events_path, event)
+}
+
+#[cfg(feature = "event-log-test-raw")]
+fn append_event_impl(events_path: &Path, event: &serde_json::Value) -> Result<u64> {
     append_events_batch(events_path, std::slice::from_ref(event))
 }
 

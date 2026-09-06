@@ -312,16 +312,16 @@ fn heal_relocations(
         {
             continue;
         }
-        let event = events::citation_healed_event(
+        let event = events::citation_healed(events::citation_healed_event(
             &r.entry_id,
             &r.evidence_id,
             &r.old_path,
             &new_path,
             &evidence.citation_hash,
             version_ref.as_deref(),
-        );
+        ))?;
         // Writer 5 of 10.
-        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event])?;
+        cursor::append_and_apply_writer_events(&lock, conn, paths, &NoopEmbedder, &[event])?;
         r.healed = true;
     }
     Ok(())
