@@ -155,9 +155,10 @@ pub fn decode_legacy_f32_embedding(blob: &[u8]) -> Vec<f32> {
 /// existing scratch buffer.
 ///
 /// Clears `scratch`, then appends exactly `EMB_DIMS` decoded floats.
-/// Returns without writing if `blob.len() != EMB_BLOB_BYTES` (the caller then
-/// gets an empty slice → cosine_similarity returns 0.0, matching mismatch
-/// behaviour for corrupt blobs).
+/// Rejects a malformed length by clearing `scratch`, incrementing the corrupt
+/// embedding counter, and returning an empty slice. Callers use this only for
+/// rows marked as canonical f16, so a non-canonical length is corrupt rather
+/// than a legacy fallback.
 ///
 /// Intended for the semantic-scan hot loop — allocate the scratch buffer
 /// ONCE outside the loop and pass a mutable reference here to avoid
@@ -165,7 +166,11 @@ pub fn decode_legacy_f32_embedding(blob: &[u8]) -> Vec<f32> {
 pub fn decode_f16_blob_into(blob: &[u8], scratch: &mut Vec<f32>) {
     scratch.clear();
     if blob.len() != EMB_BLOB_BYTES {
-        // legacy f32 blob — caller detects via scratch.is_empty() and falls back to decode_emb_blob
+        CORRUPT_EMBEDDINGS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "kb: decode_f16_blob_into: expected {EMB_BLOB_BYTES} bytes, got {} — corrupt embedding?",
+            blob.len()
+        );
         return;
     }
     scratch.reserve(EMB_DIMS);
@@ -606,5 +611,17 @@ mod tests {
         scratch.clear();
         decode_f16_blob_into(&blob, &mut scratch);
         assert_eq!(scratch.len(), EMB_DIMS);
+    }
+
+    #[test]
+    fn malformed_canonical_f16_length_clears_scratch_and_is_counted() {
+        let before = corrupt_embedding_count();
+        let mut scratch = vec![1.0; EMB_DIMS];
+        let malformed = vec![0_u8; EMB_BLOB_BYTES - 1];
+
+        decode_f16_blob_into(&malformed, &mut scratch);
+
+        assert!(scratch.is_empty());
+        assert!(corrupt_embedding_count() >= before + 1);
     }
 }

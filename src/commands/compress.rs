@@ -258,8 +258,19 @@ mod tests {
 
     impl Embedder for TestEmbedder {
         fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-            Ok(vec![text.len() as f32, 1.0])
+            let mut embedding = vec![0.0; crate::models::EMB_DIMS];
+            embedding[0] = text.len().max(1) as f32;
+            Ok(embedding)
         }
+    }
+
+    #[test]
+    fn test_embedder_returns_a_finite_nonzero_model_sized_vector() {
+        let embedding = TestEmbedder.embed("").unwrap();
+
+        assert_eq!(embedding.len(), crate::models::EMB_DIMS);
+        assert!(embedding.iter().all(|value| value.is_finite()));
+        assert!(embedding.iter().any(|value| *value != 0.0));
     }
 
     fn make_paths(root: &std::path::Path) -> Paths {
