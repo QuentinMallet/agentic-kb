@@ -5776,6 +5776,125 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_preserves_stale_sampled_candidate_for_later_audit_record() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(
+            &paths,
+            &emb,
+            "p/compact-stale-candidate",
+            Some("candidate-session"),
+        );
+
+        let run = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","sample_size": 1}),
+            ),
+            &paths,
+        );
+        assert_eq!(run["type"], "ok");
+        let run_id = run["run_id"].as_str().unwrap();
+        assert_eq!(run["samples"][0]["id"], eid);
+
+        let expired = handle_expire(
+            &tr::<ExpireRequest>(
+                "expire",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","entry_id": eid}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(expired["type"], "ok");
+
+        crate::commands::compact::Compact
+            .execute_with_paths(&paths)
+            .unwrap();
+        let compacted = events::read_events(&paths.events).unwrap().events;
+
+        let (replay_dir, replay_paths, replay_emb) = setup();
+        fs::write(
+            &replay_paths.events,
+            compacted
+                .iter()
+                .map(|event| format!("{}\n", serde_json::to_string(event).unwrap()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let replay_conn = db::open_unchecked_for_test(&replay_paths.db).unwrap();
+        for event in &compacted {
+            db::apply_event(&replay_conn, &replay_emb, event).unwrap();
+        }
+        let event_len = fs::metadata(&replay_paths.events).unwrap().len();
+        cursor::write(
+            &replay_conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&replay_paths.events),
+                offset: event_len,
+                tail_sha: cursor::tail_sha(&replay_paths.events, event_len).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (stale, candidates): (i64, i64) = replay_conn
+            .query_row(
+                "SELECT
+                    (SELECT is_stale FROM entries WHERE id=?1),
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                params![eid, run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 1,
+            "compacted rebuild must preserve the stale sampled entry row"
+        );
+        assert_eq!(
+            candidates, 1,
+            "compacted rebuild must preserve candidate ownership"
+        );
+
+        let accepted = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(accepted["type"], "ok");
+        assert_eq!(accepted["recorded"], 1);
+        assert_eq!(accepted["expired"], 0);
+
+        let duplicate = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(duplicate["type"], "ok");
+        assert_eq!(duplicate["recorded"], 0);
+
+        let conflict = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "changed"}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(conflict["type"], "error");
+        assert_eq!(conflict["code"], "audit_record_conflict");
+        drop(replay_dir);
+    }
+
+    #[test]
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);

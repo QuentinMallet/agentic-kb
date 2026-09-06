@@ -149,7 +149,9 @@ impl Compact {
         let mut run_indices: Vec<usize> = Vec::new();
         let mut audit_run_candidate_indices: Vec<usize> = Vec::new();
         let mut audit_record_batch_indices: Vec<usize> = Vec::new();
+        let mut audit_candidate_entry_ids: HashSet<String> = HashSet::new();
         let mut audit_required_entry_upserts: HashSet<usize> = HashSet::new();
+        let mut audit_required_expire_indices: HashSet<usize> = HashSet::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
         let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
         let mut effective_evidence_add_indices: HashSet<usize> = HashSet::new();
@@ -168,6 +170,9 @@ impl Compact {
             match (action, table) {
                 ("upsert", "entries") => {
                     entry_last.insert(id.clone(), i);
+                    if audit_candidate_entry_ids.contains(&id) {
+                        audit_required_entry_upserts.insert(i);
+                    }
                     if ev["is_stale"].as_bool().unwrap_or(false) {
                         live_at_cursor.remove(&id);
                         evidence_owner_by_id.retain(|_, owner| owner != &id);
@@ -177,6 +182,9 @@ impl Compact {
                 }
                 ("expire", "entries") => {
                     expire_last.insert(id.clone(), i);
+                    if audit_candidate_entry_ids.contains(&id) {
+                        audit_required_expire_indices.insert(i);
+                    }
                     live_at_cursor.remove(&id);
                     evidence_owner_by_id.retain(|_, owner| owner != &id);
                 }
@@ -188,6 +196,17 @@ impl Compact {
                 }
                 ("audit_run_candidates_batch", "audit_run_candidates") => {
                     audit_run_candidate_indices.push(i);
+                    if let Some(candidates) = ev["candidates"].as_array() {
+                        for candidate in candidates {
+                            let Some(entry_id) = candidate["entry_id"].as_str() else {
+                                continue;
+                            };
+                            audit_candidate_entry_ids.insert(entry_id.to_string());
+                            if let Some(&upsert_i) = entry_last.get(entry_id) {
+                                audit_required_entry_upserts.insert(upsert_i);
+                            }
+                        }
+                    }
                 }
                 ("audit_record_batch", "audit_runs") => {
                     audit_record_batch_indices.push(i);
@@ -277,6 +296,9 @@ impl Compact {
         }
 
         for i in audit_required_entry_upserts {
+            retained_indices.push(i);
+        }
+        for i in audit_required_expire_indices {
             retained_indices.push(i);
         }
 
