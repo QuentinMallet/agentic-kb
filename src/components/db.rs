@@ -867,6 +867,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE audit_run_candidates ADD COLUMN arm TEXT NOT NULL DEFAULT 'uniform';",
     );
+    // MCP audit authorization (bd-1orr): every sampled run and recorded
+    // verdict carries the host-bound caller from the private port boundary.
+    // Existing rows are retained as legacy data but can never satisfy a new
+    // caller-owned record request.
+    let _ = conn
+        .execute_batch("ALTER TABLE audit_runs ADD COLUMN caller_id TEXT NOT NULL DEFAULT ''; ");
+    let _ = conn.execute_batch(
+        "ALTER TABLE audit_run_candidates ADD COLUMN caller_id TEXT NOT NULL DEFAULT '';",
+    );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
@@ -893,7 +902,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id     TEXT NOT NULL,
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
-            evidence_ref TEXT
+            evidence_ref TEXT,
+            caller_id    TEXT NOT NULL DEFAULT ''
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry
             ON audit_runs(run_id, entry_id);
@@ -910,6 +920,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id   TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             arm        TEXT NOT NULL DEFAULT 'uniform',
+            caller_id  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, entry_id)
         );
         "#,
@@ -1467,6 +1478,171 @@ fn synthetic_run_key(
     Ok(format!("{prefix}{ordinal}"))
 }
 
+fn expire_entry_materialized(conn: &Connection, id: &str, ts: Option<&str>) -> Result<()> {
+    match ts {
+        Some(ts) => conn.execute(
+            "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=?2 WHERE id=?1",
+            params![id, ts],
+        ),
+        None => conn.execute(
+            "UPDATE entries SET is_stale=1, evidence_status='n/a' WHERE id=?1",
+            params![id],
+        ),
+    }?;
+    // ADR-2 intentionally does not cascade through derived_from:
+    // provenance edges on other entries may still name this stale
+    // entry, whose row remains available to provenance traversal.
+    conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
+    // Remove from FTS so expired entries don't appear in search.
+    // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+    let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+    // GC: remove embedding row so entries_emb stays in sync with live entries.
+    conn.execute(
+        "DELETE FROM entries_emb WHERE rowid = \
+         (SELECT rowid FROM entries WHERE id=?1)",
+        params![id],
+    )?;
+    // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
+    conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+    Ok(())
+}
+
+fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Result<()> {
+    let run_id = event["run_id"]
+        .as_str()
+        .context("audit_record_batch: missing run_id")?;
+    let caller_id = event["caller_id"]
+        .as_str()
+        .context("audit_record_batch: missing caller_id")?;
+    let audited_at = event["audited_at"]
+        .as_str()
+        .or_else(|| event["ts"].as_str())
+        .unwrap_or("");
+    let ts = event_ts(event);
+    let verdicts = event["verdicts"]
+        .as_array()
+        .context("audit_record_batch: missing verdicts")?;
+
+    with_apply_event_savepoint(conn, || -> Result<()> {
+        for verdict in verdicts {
+            let entry_id = verdict["entry_id"]
+                .as_str()
+                .context("audit_record_batch: missing verdict entry_id")?;
+            let verdict_bool = verdict["verdict"]
+                .as_bool()
+                .context("audit_record_batch: missing boolean verdict")?;
+            let note = verdict["note"].as_str();
+            let verdict_text = if verdict_bool { "true" } else { "false" };
+
+            let existing: Option<(String, Option<String>, String)> = conn
+                .query_row(
+                    "SELECT verdict, evidence_ref, caller_id FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, entry_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((existing_verdict, existing_note, existing_caller))
+                    if existing_verdict == verdict_text
+                        && existing_note.as_deref() == note
+                        && existing_caller == caller_id =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    anyhow::bail!(
+                        "audit_record_batch: conflicting replay for run_id '{run_id}' entry '{entry_id}'"
+                    );
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![run_id, entry_id, verdict_text, note, audited_at, caller_id],
+            )?;
+            crate::crash_sim::kill_point(crate::crash_sim::KillPoint::AuditAfterRunInsert);
+
+            let (entry_kind, entry_session_id): (String, String) = conn.query_row(
+                "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
+                params![entry_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+
+            let weight_sql = if verdict_bool {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
+            } else {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
+            };
+            conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
+
+            if !verdict_bool {
+                expire_entry_materialized(conn, entry_id, ts)?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
+fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value) -> Result<()> {
+    let run_id = event["run_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing run_id")?;
+    let caller_id = event["caller_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing caller_id")?;
+    let created_at = event["created_at"]
+        .as_str()
+        .or_else(|| event["ts"].as_str())
+        .unwrap_or("");
+    let candidates = event["candidates"]
+        .as_array()
+        .context("audit_run_candidates_batch: missing candidates")?;
+
+    with_apply_event_savepoint(conn, || -> Result<()> {
+        for candidate in candidates {
+            let entry_id = candidate["entry_id"]
+                .as_str()
+                .context("audit_run_candidates_batch: missing candidate entry_id")?;
+            let arm = candidate["arm"].as_str().unwrap_or("uniform");
+
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT caller_id, arm FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, entry_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((existing_caller, existing_arm))
+                    if existing_caller == caller_id && existing_arm == arm =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    anyhow::bail!(
+                        "audit_run_candidates_batch: conflicting replay for run_id '{run_id}' entry '{entry_id}'"
+                    );
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "INSERT INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![run_id, entry_id, created_at, arm, caller_id],
+            )?;
+        }
+        Ok(())
+    })
+}
+
 /// Apply a single event atomically.
 ///
 /// The operation uses a savepoint and therefore composes inside a caller-owned
@@ -1680,33 +1856,19 @@ pub fn apply_event_at(
             // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
             with_apply_event_savepoint(conn, || -> Result<()> {
-                match ts {
-                    Some(ts) => conn.execute(
-                        "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=?2 WHERE id=?1",
-                        params![id, ts],
-                    ),
-                    None => conn.execute(
-                        "UPDATE entries SET is_stale=1, evidence_status='n/a' WHERE id=?1",
-                        params![id],
-                    ),
-                }?;
-                // ADR-2 intentionally does not cascade through derived_from:
-                // provenance edges on other entries may still name this stale
-                // entry, whose row remains available to provenance traversal.
-                conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
-                // Remove from FTS so expired entries don't appear in search.
-                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
-                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
-                // GC: remove embedding row so entries_emb stays in sync with live entries.
-                conn.execute(
-                    "DELETE FROM entries_emb WHERE rowid = \
-                     (SELECT rowid FROM entries WHERE id=?1)",
-                    params![id],
-                )?;
-                // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
-                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                expire_entry_materialized(conn, id, ts)?;
                 Ok(())
             })?;
+            increment_post_cutover_writes(conn);
+        }
+
+        ("audit_record_batch", "audit_runs") => {
+            apply_audit_record_batch(conn, event)?;
+            increment_post_cutover_writes(conn);
+        }
+
+        ("audit_run_candidates_batch", "audit_run_candidates") => {
+            apply_audit_run_candidates_batch(conn, event)?;
             increment_post_cutover_writes(conn);
         }
 

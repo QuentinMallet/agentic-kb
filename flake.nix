@@ -40,7 +40,7 @@
               pname = "agentic-kb-mcp";
               version = "0.1.0";
               src = ./mcp;
-              nativeBuildInputs = [ pkgs.elixir_1_18 ];
+              nativeBuildInputs = [ pkgs.elixir_1_18 pkgs.makeWrapper ];
               MIX_ENV = "prod";
               HEX_OFFLINE = "1";
               buildPhase = ''
@@ -51,6 +51,8 @@
               '';
               installPhase = ''
                 install -Dm755 agentic_kb_mcp $out/bin/agentic-kb-mcp
+                wrapProgram $out/bin/agentic-kb-mcp \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.open-policy-agent ]}
               '';
             };
           in
@@ -171,6 +173,7 @@
               # a hard floor. Pin the versioned, OTP-scoped attribute (not bare
               # `elixir`, which tracks the default BEAM set and can drift under it).
               beam27Packages.elixir
+              open-policy-agent
 
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao

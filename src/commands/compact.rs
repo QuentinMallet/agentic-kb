@@ -147,6 +147,12 @@ impl Compact {
         let mut expire_last: HashMap<String, usize> = HashMap::new();
         let mut live_entry_ids: HashSet<String> = HashSet::new();
         let mut run_indices: Vec<usize> = Vec::new();
+        let mut audit_run_candidate_indices: Vec<usize> = Vec::new();
+        let mut audit_record_batch_indices: Vec<usize> = Vec::new();
+        let mut audit_candidate_entry_ids: HashSet<String> = HashSet::new();
+        let mut audit_required_entry_upserts: HashSet<usize> = HashSet::new();
+        let mut audit_required_expire_indices: HashSet<usize> = HashSet::new();
+        let mut entry_upsert_indices: Vec<(usize, String)> = Vec::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
         let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
         let mut effective_evidence_add_indices: HashSet<usize> = HashSet::new();
@@ -164,7 +170,11 @@ impl Compact {
             }
             match (action, table) {
                 ("upsert", "entries") => {
+                    entry_upsert_indices.push((i, id.clone()));
                     entry_last.insert(id.clone(), i);
+                    if audit_candidate_entry_ids.contains(&id) {
+                        audit_required_entry_upserts.insert(i);
+                    }
                     if ev["is_stale"].as_bool().unwrap_or(false) {
                         live_at_cursor.remove(&id);
                         evidence_owner_by_id.retain(|_, owner| owner != &id);
@@ -174,6 +184,9 @@ impl Compact {
                 }
                 ("expire", "entries") => {
                     expire_last.insert(id.clone(), i);
+                    if audit_candidate_entry_ids.contains(&id) {
+                        audit_required_expire_indices.insert(i);
+                    }
                     live_at_cursor.remove(&id);
                     evidence_owner_by_id.retain(|_, owner| owner != &id);
                 }
@@ -182,6 +195,38 @@ impl Compact {
                 }
                 ("insert", "run_history") => {
                     run_indices.push(i);
+                }
+                ("audit_run_candidates_batch", "audit_run_candidates") => {
+                    audit_run_candidate_indices.push(i);
+                    if let Some(candidates) = ev["candidates"].as_array() {
+                        for candidate in candidates {
+                            let Some(entry_id) = candidate["entry_id"].as_str() else {
+                                continue;
+                            };
+                            audit_candidate_entry_ids.insert(entry_id.to_string());
+                            if let Some(&upsert_i) = entry_last.get(entry_id) {
+                                audit_required_entry_upserts.insert(upsert_i);
+                            }
+                        }
+                    }
+                }
+                ("audit_record_batch", "audit_runs") => {
+                    audit_record_batch_indices.push(i);
+                    if let Some(verdicts) = ev["verdicts"].as_array() {
+                        for verdict in verdicts {
+                            let Some(entry_id) = verdict["entry_id"].as_str() else {
+                                continue;
+                            };
+                            if let Some(&upsert_i) = entry_last.get(entry_id) {
+                                audit_required_entry_upserts.insert(upsert_i);
+                            }
+                            if verdict["verdict"].as_bool() == Some(false) {
+                                expire_last.insert(entry_id.to_string(), i);
+                                live_at_cursor.remove(entry_id);
+                                evidence_owner_by_id.retain(|_, owner| owner != entry_id);
+                            }
+                        }
+                    }
                 }
                 ("evidence_add", "evidence")
                 | ("citation_healed", "evidence")
@@ -233,16 +278,36 @@ impl Compact {
         // implicitly dropped — they never appear in entry_pairs, so they are never
         // emitted. This is safe: absent == stale, so rebuild from the compacted log
         // produces identical search-visible state.
+        let mut retained_entry_upserts: Vec<(usize, String)> = Vec::new();
         let mut entry_pairs: Vec<(usize, &str)> =
             entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
-            if evts[i]["is_stale"].as_bool().unwrap_or(false)
-                || expire_last.get(id).is_some_and(|&e| e > i)
+            let required_for_audit = audit_required_entry_upserts.contains(&i);
+            if !required_for_audit
+                && (evts[i]["is_stale"].as_bool().unwrap_or(false)
+                    || expire_last.get(id).is_some_and(|&e| e > i))
             {
                 continue;
             }
-            live_entry_ids.insert(id.to_string());
+            if !evts[i]["is_stale"].as_bool().unwrap_or(false)
+                && !expire_last.get(id).is_some_and(|&e| e > i)
+            {
+                live_entry_ids.insert(id.to_string());
+            }
+            retained_entry_upserts.push((i, id.to_string()));
+            retained_indices.push(i);
+        }
+
+        for i in audit_required_entry_upserts {
+            if let Some(id) = evts[i]["id"].as_str() {
+                retained_entry_upserts.push((i, id.to_string()));
+            }
+            retained_indices.push(i);
+        }
+        retained_entry_upserts.sort_unstable();
+        retained_entry_upserts.dedup();
+        for i in audit_required_expire_indices {
             retained_indices.push(i);
         }
 
@@ -265,6 +330,12 @@ impl Compact {
         for i in run_indices {
             retained_indices.push(i);
         }
+        for i in audit_run_candidate_indices {
+            retained_indices.push(i);
+        }
+        for i in audit_record_batch_indices {
+            retained_indices.push(i);
+        }
 
         // Evidence events are retained verbatim for live parent entries, but an
         // entry expire is an evidence-GC boundary: evidence from before the last
@@ -273,7 +344,9 @@ impl Compact {
         // exactly LiveAtIdx in AgentKbEvidence.tla. This drops orphan events both
         // before the first upsert and between expire and revival. The old explicit
         // first-upsert bound is redundant because LiveAtIdx implies one precedes i.
-        let mut evidence_by_entry: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut retained_entry_upsert_indices: HashSet<usize> =
+            retained_entry_upserts.iter().map(|(i, _)| *i).collect();
+        let mut evidence_by_upsert: HashMap<usize, Vec<usize>> = HashMap::new();
         for i in evidence_indices {
             let ev = &evts[i];
             let entry_id = ev["entry_id"].as_str().unwrap_or("");
@@ -289,28 +362,43 @@ impl Compact {
                     .get(entry_id)
                     .is_none_or(|&expire_i| i > expire_i)
             {
-                evidence_by_entry
-                    .entry(entry_id.to_string())
-                    .or_default()
-                    .push(i);
+                let last_expire_i = expire_last.get(entry_id).copied();
+                if let Some((upsert_i, upsert_entry_id)) =
+                    entry_upsert_indices
+                        .iter()
+                        .rev()
+                        .find(|(upsert_i, upsert_entry_id)| {
+                            upsert_entry_id == entry_id
+                                && *upsert_i <= i
+                                && !evts[*upsert_i]["is_stale"].as_bool().unwrap_or(false)
+                                && last_expire_i.is_none_or(|expire_i| *upsert_i > expire_i)
+                        })
+                {
+                    if retained_entry_upsert_indices.insert(*upsert_i) {
+                        retained_entry_upserts.push((*upsert_i, upsert_entry_id.clone()));
+                        retained_indices.push(*upsert_i);
+                    }
+                    evidence_by_upsert.entry(*upsert_i).or_default().push(i);
+                }
             }
         }
 
+        for evidence_indices in evidence_by_upsert.values_mut() {
+            evidence_indices.sort_unstable();
+        }
+
         retained_indices.sort_unstable();
+        retained_indices.dedup();
         let mut compacted: Vec<serde_json::Value> = Vec::new();
         for i in retained_indices {
             let ev = &evts[i];
             compacted.push(ev.clone());
-            if ev["action"] == "upsert" && ev["table"] == "entries" {
-                if let Some(entry_id) = ev["id"].as_str() {
-                    if let Some(indices) = evidence_by_entry.remove(entry_id) {
-                        compacted.extend(
-                            indices
-                                .into_iter()
-                                .map(|evidence_i| evts[evidence_i].clone()),
-                        );
-                    }
-                }
+            if let Some(indices) = evidence_by_upsert.remove(&i) {
+                compacted.extend(
+                    indices
+                        .into_iter()
+                        .map(|evidence_i| evts[evidence_i].clone()),
+                );
             }
         }
 
