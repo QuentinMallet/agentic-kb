@@ -422,7 +422,7 @@ mod tests {
     /// f32s round-trip through blob encoding
     #[test]
     fn test_f32s_blob_roundtrip() {
-        let original = vec![1.0f32, -2.5, 3.14, 0.0];
+        let original = vec![1.0f32, -2.5, 3.25, 0.0];
         let blob = f32s_to_blob(&original);
         let recovered = blob_to_f32s(&blob);
         assert_eq!(original, recovered);

@@ -4,7 +4,6 @@ use crate::commands::add::acquire_lock;
 use crate::components::{events, fsync::sync_parent_dir};
 use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
-use anyhow::Context;
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
