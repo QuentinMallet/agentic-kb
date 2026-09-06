@@ -89,6 +89,11 @@ Model cache requirement:
 - The intended cache is the repo-local `.fastembed-cache`; the harness also checks the sibling repository root when invoked from a worktree.
 - `src/config.rs:275` honors `FASTEMBED_CACHE_PATH` first, so the benchmark lane uses that cache instead of falling back to `$HOME/.cache/fastembed`.
 
+Write lane specifics:
+
+- Since bd-21ef.1.19, `kb-bench-fixture` seeds every fixture in framed batches through the event-log writer, so the database and its event log converge on disk. Only the write lane depends on this: `kb add` refuses to write against a database whose event log is missing or behind.
+- Each write-lane Hyperfine sample runs against a fresh copy of the seeded fixture; `--prepare` copies the whole fixture directory so the database and its event-log/cursor sidecars travel together as one unit.
+
 ### Criterion attribution lane
 
 Interactive component attribution:

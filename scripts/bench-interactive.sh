@@ -74,6 +74,8 @@ if [[ "$run_write" -eq 1 ]]; then
   printf -v write_base_q '%q' "$write_base"
   printf -v write_run_q '%q' "$write_run"
   write_start="$(date +%s)"
+  # Copy the whole fixture repository: the database and its event log/cursor
+  # sidecars are one converged unit and must never be reset independently.
   hyperfine --runs "$write_runs" "${warm[@]}" \
     --prepare "rm -rf $write_run_q && mkdir -p $write_run_q && cp -R $write_base_q/. $write_run_q" \
     --export-json "$write_raw/${write_fixture_size}-add-write.json" \
