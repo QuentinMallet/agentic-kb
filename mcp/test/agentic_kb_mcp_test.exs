@@ -1073,6 +1073,17 @@ defmodule AgenticKbMcpTest do
       name
     end
 
+    defp start_authorizer(opa) do
+      name = :"mcp_authz_#{System.unique_integer([:positive, :monotonic])}"
+
+      start_supervised!(
+        {AgenticKbMcp.Authorization, name: name, caller_id: "host-agent-a", opa: opa},
+        id: name
+      )
+
+      name
+    end
+
     defp with_authorizer(state), do: Map.put(state, :authorization, start_allowing_authorizer())
 
     test "mutating tools fail closed when authorization is missing" do
@@ -1124,6 +1135,47 @@ defmodule AgenticKbMcpTest do
         )
 
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
+    end
+
+    test "traffic audit requires both base audit and traffic authorization" do
+      start_fake_port()
+      test_pid = self()
+
+      traffic_only =
+        start_authorizer(fn input, _opts ->
+          send(test_pid, {:traffic_only_action, input["action"]})
+          {:ok, input["action"] == "kb.audit.traffic"}
+        end)
+
+      denied =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"traffic"}}}),
+          Map.put(@with_db, :authorization, traffic_only)
+        )
+
+      assert %{"result" => %{"isError" => true, "content" => [%{"text" => denied_text}]}} =
+               denied
+
+      assert denied_text =~ "authorization denied"
+      assert_receive {:traffic_only_action, "kb.audit.run"}
+
+      allowed =
+        start_authorizer(fn input, _opts ->
+          send(test_pid, {:dual_scope_action, input["action"]})
+          {:ok, input["action"] in ["kb.audit.run", "kb.audit.traffic"]}
+        end)
+
+      accepted =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"traffic"}}}),
+          Map.put(@with_db, :authorization, allowed)
+        )
+
+      assert get_in(accepted, ["result", "content", Access.at(0), "text"]) =~
+               "Audit run audit-1"
+
+      assert_receive {:dual_scope_action, "kb.audit.run"}
+      assert_receive {:dual_scope_action, "kb.audit.traffic"}
     end
 
     test "kb_audit_record dispatches through the real tools/call and port paths" do

@@ -147,6 +147,9 @@ impl Compact {
         let mut expire_last: HashMap<String, usize> = HashMap::new();
         let mut live_entry_ids: HashSet<String> = HashSet::new();
         let mut run_indices: Vec<usize> = Vec::new();
+        let mut audit_run_candidate_indices: Vec<usize> = Vec::new();
+        let mut audit_record_batch_indices: Vec<usize> = Vec::new();
+        let mut audit_required_entry_upserts: HashSet<usize> = HashSet::new();
         let mut evidence_indices: Vec<usize> = Vec::new();
         let mut evidence_live_at_index: HashSet<usize> = HashSet::new();
         let mut effective_evidence_add_indices: HashSet<usize> = HashSet::new();
@@ -182,6 +185,27 @@ impl Compact {
                 }
                 ("insert", "run_history") => {
                     run_indices.push(i);
+                }
+                ("audit_run_candidates_batch", "audit_run_candidates") => {
+                    audit_run_candidate_indices.push(i);
+                }
+                ("audit_record_batch", "audit_runs") => {
+                    audit_record_batch_indices.push(i);
+                    if let Some(verdicts) = ev["verdicts"].as_array() {
+                        for verdict in verdicts {
+                            let Some(entry_id) = verdict["entry_id"].as_str() else {
+                                continue;
+                            };
+                            if let Some(&upsert_i) = entry_last.get(entry_id) {
+                                audit_required_entry_upserts.insert(upsert_i);
+                            }
+                            if verdict["verdict"].as_bool() == Some(false) {
+                                expire_last.insert(entry_id.to_string(), i);
+                                live_at_cursor.remove(entry_id);
+                                evidence_owner_by_id.retain(|_, owner| owner != entry_id);
+                            }
+                        }
+                    }
                 }
                 ("evidence_add", "evidence")
                 | ("citation_healed", "evidence")
@@ -237,12 +261,22 @@ impl Compact {
             entry_last.iter().map(|(id, &i)| (i, id.as_str())).collect();
         entry_pairs.sort_by_key(|&(i, _)| i);
         for (i, id) in entry_pairs {
-            if evts[i]["is_stale"].as_bool().unwrap_or(false)
-                || expire_last.get(id).is_some_and(|&e| e > i)
+            let required_for_audit = audit_required_entry_upserts.contains(&i);
+            if !required_for_audit
+                && (evts[i]["is_stale"].as_bool().unwrap_or(false)
+                    || expire_last.get(id).is_some_and(|&e| e > i))
             {
                 continue;
             }
-            live_entry_ids.insert(id.to_string());
+            if !evts[i]["is_stale"].as_bool().unwrap_or(false)
+                && !expire_last.get(id).is_some_and(|&e| e > i)
+            {
+                live_entry_ids.insert(id.to_string());
+            }
+            retained_indices.push(i);
+        }
+
+        for i in audit_required_entry_upserts {
             retained_indices.push(i);
         }
 
@@ -263,6 +297,12 @@ impl Compact {
         // no longer bounds `run_history` growth; T3's keyed insertion (D5.1)
         // bounds duplication instead.
         for i in run_indices {
+            retained_indices.push(i);
+        }
+        for i in audit_run_candidate_indices {
+            retained_indices.push(i);
+        }
+        for i in audit_record_batch_indices {
             retained_indices.push(i);
         }
 
@@ -297,6 +337,7 @@ impl Compact {
         }
 
         retained_indices.sort_unstable();
+        retained_indices.dedup();
         let mut compacted: Vec<serde_json::Value> = Vec::new();
         for i in retained_indices {
             let ev = &evts[i];

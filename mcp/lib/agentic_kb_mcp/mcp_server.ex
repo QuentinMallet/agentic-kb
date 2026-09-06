@@ -531,7 +531,8 @@ defmodule AgenticKbMcp.McpServer do
     {:error, "verdicts must contain at most 50 items"}
   end
 
-  defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts}) when is_list(verdicts) do
+  defp validate_tool_values("kb_audit_record", %{"verdicts" => verdicts})
+       when is_list(verdicts) do
     Enum.find_value(verdicts, :ok, &validate_audit_verdict_item/1)
   end
 
@@ -885,9 +886,12 @@ defmodule AgenticKbMcp.McpServer do
     AgenticKbMcp.PortManager.call_port(req) |> render_result()
   end
 
-  defp authorize_tool(%{authorization: authorization}, tool, args) when not is_nil(authorization) do
+  defp authorize_tool(%{authorization: authorization}, tool, args)
+       when not is_nil(authorization) do
     case authz_actions(tool, args) do
-      [] -> :ok
+      [] ->
+        :ok
+
       actions ->
         Enum.reduce_while(actions, :ok, fn action, :ok ->
           case AgenticKbMcp.Authorization.authorize(authorization, action, args) do
@@ -905,20 +909,27 @@ defmodule AgenticKbMcp.McpServer do
     end
   end
 
-  defp authz_actions("kb_audit_run", %{"mode" => "traffic"}), do: ["kb.audit.traffic"]
+  defp authz_actions("kb_audit_run", %{"mode" => "traffic"}),
+    do: ["kb.audit.run", "kb.audit.traffic"]
+
   defp authz_actions("kb_audit_run", _args), do: ["kb.audit.run"]
+
   defp authz_actions("kb_audit_record", %{"verdicts" => verdicts}) when is_list(verdicts) do
     if Enum.any?(verdicts, &(&1["verdict"] == false)),
       do: ["kb.audit.record", "kb.audit.expire"],
       else: ["kb.audit.record"]
   end
+
   defp authz_actions("kb_audit_record", _args), do: ["kb.audit.record"]
   defp authz_actions("kb_expire", %{"force" => true}), do: ["kb.entry.expire.force"]
   defp authz_actions("kb_expire", _args), do: ["kb.entry.expire"]
   defp authz_actions(_tool, _args), do: []
 
   defp trusted_caller(%{authorization: nil}), do: nil
-  defp trusted_caller(%{authorization: authorization}), do: AgenticKbMcp.Authorization.caller_id(authorization)
+
+  defp trusted_caller(%{authorization: authorization}),
+    do: AgenticKbMcp.Authorization.caller_id(authorization)
+
   defp trusted_caller(_state), do: nil
 
   @doc """
@@ -936,8 +947,13 @@ defmodule AgenticKbMcp.McpServer do
       %{"type" => "result", "entry" => entry} ->
         %{"content" => [%{"type" => "text", "text" => format_full_entry(entry)}]}
 
-      %{"type" => "result", "citation_path" => path, "citation_sha" => sha,
-        "citation_hash" => hash, "file_size" => size} ->
+      %{
+        "type" => "result",
+        "citation_path" => path,
+        "citation_sha" => sha,
+        "citation_hash" => hash,
+        "file_size" => size
+      } ->
         text =
           "citation_path=#{path}\ncitation_sha=#{render_scalar(sha)}\n" <>
             "citation_hash=#{hash}\nfile_size=#{size}"
@@ -1017,7 +1033,10 @@ defmodule AgenticKbMcp.McpServer do
       %{"type" => "ok", "recorded" => recorded, "expired" => expired} ->
         %{
           "content" => [
-            %{"type" => "text", "text" => "Recorded #{recorded} audit verdict(s); expired #{expired} entry/entries."}
+            %{
+              "type" => "text",
+              "text" => "Recorded #{recorded} audit verdict(s); expired #{expired} entry/entries."
+            }
           ]
         }
 

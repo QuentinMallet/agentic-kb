@@ -1522,6 +1522,60 @@ fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Res
     })
 }
 
+fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value) -> Result<()> {
+    let run_id = event["run_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing run_id")?;
+    let caller_id = event["caller_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing caller_id")?;
+    let created_at = event["created_at"]
+        .as_str()
+        .or_else(|| event["ts"].as_str())
+        .unwrap_or("");
+    let candidates = event["candidates"]
+        .as_array()
+        .context("audit_run_candidates_batch: missing candidates")?;
+
+    with_apply_event_savepoint(conn, || -> Result<()> {
+        for candidate in candidates {
+            let entry_id = candidate["entry_id"]
+                .as_str()
+                .context("audit_run_candidates_batch: missing candidate entry_id")?;
+            let arm = candidate["arm"].as_str().unwrap_or("uniform");
+
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT caller_id, arm FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, entry_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((existing_caller, existing_arm))
+                    if existing_caller == caller_id && existing_arm == arm =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    anyhow::bail!(
+                        "audit_run_candidates_batch: conflicting replay for run_id '{run_id}' entry '{entry_id}'"
+                    );
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "INSERT INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![run_id, entry_id, created_at, arm, caller_id],
+            )?;
+        }
+        Ok(())
+    })
+}
+
 /// Apply a single event atomically.
 ///
 /// The operation uses a savepoint and therefore composes inside a caller-owned
@@ -1741,6 +1795,11 @@ pub fn apply_event_at(
 
         ("audit_record_batch", "audit_runs") => {
             apply_audit_record_batch(conn, event)?;
+            increment_post_cutover_writes(conn);
+        }
+
+        ("audit_run_candidates_batch", "audit_run_candidates") => {
+            apply_audit_run_candidates_batch(conn, event)?;
             increment_post_cutover_writes(conn);
         }
 

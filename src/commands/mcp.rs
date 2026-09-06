@@ -2033,10 +2033,6 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let samples: Vec<Value> = entry_rows
         .iter()
         .map(|((eid, path, summary, kind, evidence_status), arm)| {
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id) VALUES(?1,?2,?3,?4,?5)",
-                params![run_id, eid, ts, arm, caller_id],
-            );
             let evidence = audit_evidence_rows(&conn, eid);
             json!({
                 "id": eid,
@@ -2049,6 +2045,33 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
             })
         })
         .collect();
+
+    if !entry_rows.is_empty() {
+        let candidates: Vec<Value> = entry_rows
+            .iter()
+            .map(|((eid, _, _, _, _), arm)| {
+                json!({
+                    "entry_id": eid,
+                    "arm": arm,
+                })
+            })
+            .collect();
+        let event = json!({
+            "action": "audit_run_candidates_batch",
+            "table": "audit_run_candidates",
+            "run_id": run_id,
+            "caller_id": caller_id,
+            "created_at": ts,
+            "ts": ts,
+            "candidates": candidates,
+        });
+
+        if let Err(e) =
+            cursor::append_and_apply(&lock, &conn, paths, &embedder::NoopEmbedder, &[event])
+        {
+            return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()});
+        }
+    }
 
     json!({"id": id, "type": "ok", "run_id": run_id, "samples": samples})
 }
@@ -4688,6 +4711,124 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_audit_run_candidate_registration_is_atomic() {
+        let (_dir, paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/audit-run-atomic-a", None);
+        add_live_entry(&paths, &emb, "p/audit-run-atomic-b", None);
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_second_audit_candidate
+             BEFORE INSERT ON audit_run_candidates
+             WHEN (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id = NEW.run_id) = 1
+             BEGIN
+               SELECT RAISE(ABORT, 'candidate registration failed after first insert');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let response = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","sample_size": 2}),
+            ),
+            &paths,
+        );
+
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["code"], "db_error");
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let candidates: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_run_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            candidates, 0,
+            "candidate registration must fail closed without a proper prefix"
+        );
+    }
+
+    fn run_audit_run_crash_child() {
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = config::Paths::from_root(std::path::Path::new(&root));
+        let req = json!({"caller_id":"mcp-test","sample_size": 2});
+        handle_audit_run(
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &req),
+            &paths,
+        );
+        panic!("child handle_audit_run returned without hitting the configured kill point");
+    }
+
+    #[test]
+    fn test_handle_audit_run_candidate_batch_replays_after_crash_before_apply() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref()
+            == Some("audit-run-candidates-before-apply")
+        {
+            run_audit_run_crash_child();
+        }
+
+        let (dir, paths, emb) = setup();
+        add_live_entry(&paths, &emb, "p/audit-run-replay-a", None);
+        add_live_entry(&paths, &emb, "p/audit-run-replay-b", None);
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_handle_audit_run_candidate_batch_replays_after_crash_before_apply")
+            .arg("--nocapture")
+            .current_dir(dir.path())
+            .env("KB_CRASH_TEST_CASE", "audit-run-candidates-before-apply")
+            .env("KB_CRASH_TEST_ROOT", dir.path())
+            .env("KB_CRASH_AFTER", KillPoint::BeforeApply.to_string())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "crash simulation should terminate after candidate batch append and before apply"
+        );
+
+        let events = events::read_events(&paths.events).unwrap().events;
+        let candidate_event = events
+            .iter()
+            .find(|event| event["action"] == "audit_run_candidates_batch")
+            .expect("audit_run must durably append the candidate batch before apply");
+        let run_id = candidate_event["run_id"].as_str().unwrap();
+        let event_candidates = candidate_event["candidates"].as_array().unwrap().len() as i64;
+        assert_eq!(event_candidates, 2);
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "crash before apply must not insert candidates");
+
+        let lock = acquire_lock(&paths.lock).unwrap();
+        let replayed = cursor::replay_tail_locked(&lock, &conn, &paths, &emb).unwrap();
+        drop(lock);
+        assert_eq!(replayed, 1, "recovery must replay the candidate batch");
+
+        let (after, owner_count): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1),
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND caller_id='mcp-test')",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, event_candidates);
+        assert_eq!(owner_count, event_candidates);
+    }
+
+    #[test]
     fn test_audit_run_absent_mode_remains_uniform() {
         let (_dir, paths, emb) = setup();
         let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
@@ -5515,6 +5656,123 @@ mod tests {
         );
         assert_eq!(changed_retry["type"], "error");
         assert_eq!(changed_retry["code"], "audit_record_conflict");
+    }
+
+    #[test]
+    fn test_compact_replays_audit_batches_without_resurrecting_false_verdict_entry() {
+        let (_dir, paths, emb) = setup();
+        let eid = add_live_entry(
+            &paths,
+            &emb,
+            "p/compact-audit-batch",
+            Some("compact-session"),
+        );
+
+        let run = handle_audit_run(
+            &tr::<AuditRunRequest>(
+                "audit_run",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","sample_size": 1}),
+            ),
+            &paths,
+        );
+        assert_eq!(run["type"], "ok");
+        let run_id = run["run_id"].as_str().unwrap();
+        assert_eq!(run["samples"][0]["id"], eid);
+
+        let record = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "unsupported"}]}),
+            ),
+            &paths,
+            &emb,
+        );
+        assert_eq!(record["type"], "ok");
+        assert_eq!(record["expired"], 1);
+
+        crate::commands::compact::Compact
+            .execute_with_paths(&paths)
+            .unwrap();
+        let compacted = events::read_events(&paths.events).unwrap().events;
+        assert!(
+            compacted
+                .iter()
+                .any(|event| event["action"] == "audit_run_candidates_batch"),
+            "compact must retain candidate ownership batches"
+        );
+        assert!(
+            compacted
+                .iter()
+                .any(|event| event["action"] == "audit_record_batch"),
+            "compact must retain verdict batches"
+        );
+
+        let (replay_dir, replay_paths, replay_emb) = setup();
+        fs::write(
+            &replay_paths.events,
+            compacted
+                .iter()
+                .map(|event| format!("{}\n", serde_json::to_string(event).unwrap()))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let replay_conn = db::open_unchecked_for_test(&replay_paths.db).unwrap();
+        for event in &compacted {
+            db::apply_event(&replay_conn, &replay_emb, event).unwrap();
+        }
+        let event_len = fs::metadata(&replay_paths.events).unwrap().len();
+        cursor::write(
+            &replay_conn,
+            &cursor::Cursor {
+                generation: cursor::read_generation(&replay_paths.events),
+                offset: event_len,
+                tail_sha: cursor::tail_sha(&replay_paths.events, event_len).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let (stale, audit_rows, weight_failures, candidates): (i64, i64, i64, i64) = replay_conn
+            .query_row(
+                "SELECT
+                    (SELECT is_stale FROM entries WHERE id=?1),
+                    (SELECT COUNT(*) FROM audit_runs WHERE run_id=?2 AND entry_id=?1),
+                    (SELECT COALESCE(SUM(failures),0) FROM source_weights WHERE kind='observation' AND session_id='compact-session'),
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                params![eid, run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 1,
+            "false-verdict entry must stay absent after rebuild"
+        );
+        assert_eq!(
+            audit_rows, 1,
+            "audit row must reconstruct from compacted log"
+        );
+        assert_eq!(
+            weight_failures, 1,
+            "source weight must reconstruct from compacted log"
+        );
+        assert_eq!(
+            candidates, 1,
+            "candidate ownership must reconstruct from compacted log"
+        );
+
+        let changed_retry = handle_audit_record(
+            &tr::<AuditRecordRequest>(
+                "audit_record",
+                &json!(null),
+                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+            ),
+            &replay_paths,
+            &replay_emb,
+        );
+        assert_eq!(changed_retry["type"], "error");
+        assert_eq!(changed_retry["code"], "audit_record_conflict");
+        drop(replay_dir);
     }
 
     #[test]
