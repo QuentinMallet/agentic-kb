@@ -2,9 +2,11 @@ package authz
 
 default allow := false
 
-# Operators deploy the launch principal in this policy/data boundary.  The
-# default policy intentionally authorizes no host, so a missing deployment
-# remains fail-closed rather than accidentally granting every local client.
+# This bundled policy trusts a single principal out of the box:
+# "agentic-kb-host". `default allow := false` makes any other caller
+# fail-closed, but operators deploying under a different launch identity
+# (a different `--caller-id` value) must replace trusted_callers below with
+# their own, or every mutating audit/expiry call will be denied.
 trusted_callers := {"agentic-kb-host"}
 
 mutating_scopes := {
