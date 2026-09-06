@@ -21,7 +21,8 @@ use kb::commands::add::acquire_lock;
 use kb::components::db::{apply_event, open_db_memory};
 use kb::components::embedder::NoopEmbedder;
 use kb::components::events::{
-    append_event, append_events_batch, read_events, read_events_from_offset,
+    append_event, append_events_batch, committed_len, measure_event_log_reads, read_events,
+    read_events_from_offset,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -89,6 +90,27 @@ fn upsert(id: &str) -> Value {
         "kind": "memory",
         "ts": "2024-01-01T00:00:00Z",
     })
+}
+
+fn padded_upsert(id: &str, bytes: usize) -> Value {
+    let mut event = upsert(id);
+    event["content"] = Value::String("x".repeat(bytes));
+    event
+}
+
+fn large_framed_log(path: &Path, tail_events: usize, payload_bytes: usize) -> (u64, u64) {
+    for batch in 0..8 {
+        let prefix: Vec<_> = (0..500)
+            .map(|i| padded_upsert(&format!("prefix-{batch}-{i}"), payload_bytes))
+            .collect();
+        append_events_batch(path, &prefix).unwrap();
+    }
+    let before_tail = fs::metadata(path).unwrap().len();
+    let tail: Vec<_> = (0..tail_events)
+        .map(|i| padded_upsert(&format!("tail-{i}"), payload_bytes))
+        .collect();
+    append_events_batch(path, &tail).unwrap();
+    (before_tail, fs::metadata(path).unwrap().len())
 }
 
 /// Sidecars written by the repair path, in directory order.
@@ -304,6 +326,66 @@ fn test_commit_with_a_mismatched_batch_id_is_a_hard_error() {
 // ---------------------------------------------------------------------------
 // D1 — committed_len is a span boundary
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_committed_len_large_closing_span_has_span_bounded_read_cost() {
+    let (_dir, path) = log_dir();
+    let (before_tail, framed_len) = large_framed_log(&path, 2_000, 500);
+    let span_len = framed_len - before_tail;
+
+    let (actual, bytes_read) = measure_event_log_reads(|| committed_len(&path).unwrap());
+    assert_eq!(actual, framed_len);
+    assert!(
+        bytes_read <= span_len * 5,
+        "read {bytes_read} bytes to verify a {span_len}-byte closing span"
+    );
+}
+
+#[test]
+fn test_append_repairs_large_torn_span_with_span_bounded_read_cost() {
+    let (dir, path) = log_dir();
+    let (before_tail, framed_len) = large_framed_log(&path, 2_000, 500);
+    let raw = fs::read(&path).unwrap();
+    let commit_start = raw[..raw.len() - 1]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap();
+    fs::write(&path, &raw[..commit_start]).unwrap();
+    let torn_span_len = commit_start as u64 - before_tail;
+
+    let _lock = acquire_lock(&dir.path().join(".lock")).unwrap();
+    let (_, bytes_read) =
+        measure_event_log_reads(|| append_event(&path, &upsert("after")).unwrap());
+    let read = read_events(&path).unwrap();
+    assert_eq!(read.events.first(), Some(&padded_upsert("prefix-0-0", 500)));
+    assert_eq!(read.events.last(), Some(&upsert("after")));
+    assert!(!read.events.iter().any(|event| event["id"] == "tail-0"));
+    assert!(
+        bytes_read <= torn_span_len * 6,
+        "read {bytes_read} bytes to repair a {torn_span_len}-byte torn span (original {framed_len})"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn test_committed_len_window_boundary_spans_remain_span_bounded(
+        target_bytes in 60usize * 1024..=200usize * 1024,
+    ) {
+        let (_dir, path) = log_dir();
+        let payload = 500;
+        let count = (target_bytes / 600).max(1);
+        let (before_tail, framed_len) = large_framed_log(&path, count, payload);
+        let span_len = framed_len - before_tail;
+
+        let (actual, bytes_read) = measure_event_log_reads(|| committed_len(&path).unwrap());
+        prop_assert_eq!(actual, framed_len);
+        prop_assert!(bytes_read <= span_len * 5,
+            "read {} bytes for {}-byte span", bytes_read, span_len);
+    }
+}
 
 #[test]
 fn test_committed_len_is_a_span_boundary_not_a_line_boundary() {

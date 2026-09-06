@@ -35,10 +35,46 @@
 use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use anyhow::{Context, Result};
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+thread_local! {
+    static MEASURED_READ_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+struct MeasuredRead<R>(R);
+
+impl<R: Read> Read for MeasuredRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.0.read(buf)?;
+        MEASURED_READ_BYTES.with(|total| {
+            if let Some(before) = total.get() {
+                total.set(Some(before + read as u64));
+            }
+        });
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for MeasuredRead<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+/// Test/benchmark seam returning the bytes read from event logs by `operation`.
+#[doc(hidden)]
+pub fn measure_event_log_reads<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+    MEASURED_READ_BYTES.with(|total| {
+        let previous = total.replace(Some(0));
+        let result = operation();
+        let measured = total.replace(previous).unwrap_or(0);
+        (result, measured)
+    })
+}
 
 /// `action` value of the marker line that opens a commit span.
 pub const BATCH_BEGIN: &str = "batch_begin";
@@ -309,52 +345,142 @@ const TAIL_WINDOW: u64 = 64 * 1024;
 ///
 /// Every span this binary writes is appended to a log it has already scanned in
 /// full, so an intact closing span at end of file means `committed_len == len`
-/// without re-scanning. Anything else — a legacy tail, a torn tail, a dangling
-/// span, or a line appended by a binary that predates the envelope — returns
-/// false and falls through to the full span-aware scan, which is where the D7
-/// hard errors live. That keeps the append path's cost bounded by the last span
-/// rather than by the size of the log.
-fn ends_on_intact_span(file: &mut File, len: u64) -> Result<bool> {
-    let start = len.saturating_sub(TAIL_WINDOW);
-    file.seek(SeekFrom::Start(start))?;
-    let mut window = vec![0_u8; (len - start) as usize];
-    file.read_exact(&mut window)?;
-    if !window.ends_with(b"\n") {
-        return Ok(false);
+/// without re-scanning. The suffix doubles until it contains the declared
+/// number of event lines and their begin marker. Non-framed tails return false;
+/// the caller separately recognizes a dangling final span before falling back
+/// to the full scan where the D7 hard errors live.
+fn ends_on_intact_span<R: Read + Seek>(file: &mut R, len: u64) -> Result<bool> {
+    let mut window_len = len.min(TAIL_WINDOW);
+    loop {
+        let start = len - window_len;
+        file.seek(SeekFrom::Start(start))?;
+        let mut window = vec![0_u8; window_len as usize];
+        file.read_exact(&mut window)?;
+        if !window.ends_with(b"\n") {
+            return Ok(false);
+        }
+        let mut lines: Vec<&[u8]> = window[..window.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .collect();
+        if start > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let Some(Ok(Some(commit))) = lines.last().map(|line| parse_event_line(line)) else {
+            return Ok(false);
+        };
+        if commit["action"] != BATCH_COMMIT {
+            return Ok(false);
+        }
+        let (Some(batch_id), Some(n)) = (commit["batch_id"].as_str(), commit["n"].as_u64()) else {
+            return Ok(false);
+        };
+        let Ok(n) = usize::try_from(n) else {
+            return Ok(false);
+        };
+        if lines.len() >= n.saturating_add(2) {
+            let begin_index = lines.len() - n - 2;
+            let body = &lines[begin_index + 1..lines.len() - 1];
+            if body.iter().any(|line| {
+                matches!(parse_event_line(line), Ok(Some(value))
+                    if value["action"] == BATCH_BEGIN || value["action"] == BATCH_COMMIT)
+            }) {
+                return Ok(false);
+            }
+            let Ok(Some(begin)) = parse_event_line(lines[begin_index]) else {
+                return Ok(false);
+            };
+            return Ok(begin["action"] == BATCH_BEGIN
+                && begin["batch_id"].as_str() == Some(batch_id)
+                && begin["n"].as_u64() == Some(n as u64));
+        }
+        if start == 0 {
+            return Ok(false);
+        }
+        window_len = len.min(window_len.saturating_mul(2));
     }
-    let mut lines: Vec<&[u8]> = window[..window.len() - 1]
-        .split(|byte| *byte == b'\n')
-        .collect();
-    if start > 0 && !lines.is_empty() {
-        // The window may open mid-line; that partial line is not usable.
-        lines.remove(0);
+}
+
+/// Locate a structurally valid final span whose commit marker is missing.
+fn dangling_span_start<R: Read + Seek>(file: &mut R, len: u64) -> Result<Option<u64>> {
+    let mut window_len = len.min(TAIL_WINDOW);
+    loop {
+        let start = len - window_len;
+        file.seek(SeekFrom::Start(start))?;
+        let mut window = vec![0_u8; window_len as usize];
+        file.read_exact(&mut window)?;
+        let skip = if start == 0 {
+            0
+        } else {
+            window
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(window.len(), |i| i + 1)
+        };
+        let complete_start = start + skip as u64;
+        let mut offset = complete_start;
+        let mut parsed = Vec::new();
+        for line in window[skip..].split_inclusive(|byte| *byte == b'\n') {
+            let content = line.strip_suffix(b"\n").unwrap_or(line);
+            parsed.push((offset, content));
+            offset += line.len() as u64;
+        }
+        if parsed.last().is_some_and(|(_, line)| line.is_empty()) {
+            parsed.pop();
+        }
+        for (index, (begin_offset, line)) in parsed.iter().enumerate().rev() {
+            let Ok(Some(begin)) = parse_event_line(line) else {
+                continue;
+            };
+            if begin["action"] != BATCH_BEGIN {
+                continue;
+            }
+            if begin["batch_id"].as_str().is_none() {
+                return Ok(None);
+            }
+            let Some(n) = begin["n"].as_u64().and_then(|n| usize::try_from(n).ok()) else {
+                return Ok(None);
+            };
+            let preceding_marker = parsed[..index].iter().rev().find_map(|(_, line)| {
+                let Ok(Some(value)) = parse_event_line(line) else {
+                    return None;
+                };
+                match value["action"].as_str() {
+                    Some(BATCH_BEGIN) => Some(BATCH_BEGIN.to_owned()),
+                    Some(BATCH_COMMIT) => Some(BATCH_COMMIT.to_owned()),
+                    _ => None,
+                }
+            });
+            if preceding_marker.as_deref() == Some(BATCH_BEGIN) {
+                return Ok(None);
+            }
+            let body = &parsed[index + 1..];
+            if body.iter().any(|(_, line)| {
+                matches!(parse_event_line(line), Ok(Some(value))
+                    if value["action"] == BATCH_BEGIN || value["action"] == BATCH_COMMIT)
+            }) {
+                return Ok(None);
+            }
+            // A non-newline-terminated, unparsable final chunk may be the
+            // partially written commit marker. Like `scan_events`, do not
+            // count that torn chunk as an event line.
+            let body_len = body.len()
+                - usize::from(
+                    !window.ends_with(b"\n")
+                        && body
+                            .last()
+                            .is_some_and(|(_, line)| parse_event_line(line).is_err()),
+                );
+            anyhow::ensure!(
+                body_len <= n,
+                "events: batch declared {n} event(s) but observed more before EOF"
+            );
+            return Ok(Some(*begin_offset));
+        }
+        if start == 0 {
+            return Ok(None);
+        }
+        window_len = len.min(window_len.saturating_mul(2));
     }
-    let Some(Ok(Some(commit))) = lines.last().map(|line| parse_event_line(line)) else {
-        return Ok(false);
-    };
-    if commit["action"] != BATCH_COMMIT {
-        return Ok(false);
-    }
-    let (Some(batch_id), Some(n)) = (commit["batch_id"].as_str(), commit["n"].as_u64()) else {
-        return Ok(false);
-    };
-    let n = n as usize;
-    if lines.len() < n + 2 {
-        return Ok(false);
-    }
-    let body = &lines[lines.len() - n - 1..lines.len() - 1];
-    if body.iter().any(|line| {
-        matches!(parse_event_line(line), Ok(Some(value))
-            if value["action"] == BATCH_BEGIN || value["action"] == BATCH_COMMIT)
-    }) {
-        return Ok(false);
-    }
-    let Ok(Some(begin)) = parse_event_line(lines[lines.len() - n - 2]) else {
-        return Ok(false);
-    };
-    Ok(begin["action"] == BATCH_BEGIN
-        && begin["batch_id"].as_str() == Some(batch_id)
-        && begin["n"].as_u64() == Some(n as u64))
 }
 
 /// Drop everything past `committed_len` while the caller holds the event-log flock.
@@ -384,7 +510,28 @@ fn repair_uncommitted_tail_before_append(events_path: &Path) -> Result<()> {
     if len == 0 {
         return Ok(());
     }
-    if ends_on_intact_span(&mut file, len)? {
+    if ends_on_intact_span(&mut MeasuredRead(&mut file), len)? {
+        return Ok(());
+    }
+
+    let dangling_start = dangling_span_start(&mut MeasuredRead(&mut file), len)?;
+    let trusted_dangling_start = match dangling_start {
+        Some(0) => Some(0),
+        Some(start) if ends_on_intact_span(&mut MeasuredRead(&mut file), start)? => Some(start),
+        _ => None,
+    };
+    if let Some(committed_len) = trusted_dangling_start {
+        file.seek(SeekFrom::Start(committed_len))?;
+        let mut tail = Vec::with_capacity((len - committed_len) as usize);
+        MeasuredRead(&mut file).read_to_end(&mut tail)?;
+        if !log_lock_held() {
+            anyhow::bail!("events: refusing to truncate the uncommitted span in {} without the event-log flock — every log-writing call site must hold it", events_path.display());
+        }
+        match preserve_torn_tail(events_path, &tail) {
+            Ok(sidecar) => eprintln!("events: WARNING truncated an uncommitted span ({} bytes) from {}, preserved in {}", tail.len(), events_path.display(), sidecar.display()),
+            Err(error) => eprintln!("events: WARNING truncated an uncommitted span ({} bytes) from {}; sidecar not written: {error}", tail.len(), events_path.display()),
+        }
+        file.set_len(committed_len)?;
         return Ok(());
     }
 
@@ -392,7 +539,7 @@ fn repair_uncommitted_tail_before_append(events_path: &Path) -> Result<()> {
     if committed_len < len {
         file.seek(SeekFrom::Start(committed_len))?;
         let mut tail = Vec::with_capacity((len - committed_len) as usize);
-        file.read_to_end(&mut tail)?;
+        MeasuredRead(&mut file).read_to_end(&mut tail)?;
         if tail_opens_span(&tail) {
             if !log_lock_held() {
                 anyhow::bail!(
@@ -627,9 +774,10 @@ fn empty_read() -> ReadEvents {
 ///
 /// Takes the same intact-span shortcut the append path does: a log this binary
 /// has already appended to ends on a closed span, so `committed_len` is the
-/// file length and no scan is needed. Anything else — a legacy tail, a torn
-/// tail, a dangling span — falls through to the full span-aware scan, which is
-/// also where the D7 hard errors live.
+/// file length and no scan is needed. A structurally valid dangling final span
+/// similarly yields its begin offset. Legacy or otherwise ambiguous tails fall
+/// through to the full span-aware scan, which is also where the D7 hard errors
+/// live.
 ///
 /// The applied-cursor write guard calls this on every write, so the shortcut is
 /// what keeps a write O(bytes appended) instead of O(log size).
@@ -642,8 +790,13 @@ pub fn committed_len(events_path: &Path) -> Result<u64> {
     if len == 0 {
         return Ok(0);
     }
-    if ends_on_intact_span(&mut file, len)? {
+    if ends_on_intact_span(&mut MeasuredRead(&mut file), len)? {
         return Ok(len);
+    }
+    if let Some(start) = dangling_span_start(&mut MeasuredRead(&mut file), len)? {
+        if start == 0 || ends_on_intact_span(&mut MeasuredRead(&mut file), start)? {
+            return Ok(start);
+        }
     }
     Ok(read_events(events_path)?.committed_len)
 }
@@ -662,7 +815,7 @@ pub fn read_events_up_to(events_path: &Path, max: usize) -> Result<ReadEvents> {
         return Ok(empty_read());
     }
     let file = File::open(events_path)?;
-    let scan = scan_events(BufReader::new(file), max)?;
+    let scan = scan_events(BufReader::new(MeasuredRead(file)), max)?;
     Ok(ReadEvents {
         events: scan.events,
         torn_tail: scan.torn_tail,
@@ -680,7 +833,7 @@ pub fn read_events_prefix(events_path: &Path, len: u64) -> Result<ReadEvents> {
         return Ok(empty_read());
     }
     let file = File::open(events_path)?;
-    let scan = scan_events(BufReader::new(file.take(len)), usize::MAX)?;
+    let scan = scan_events(BufReader::new(MeasuredRead(file).take(len)), usize::MAX)?;
     Ok(ReadEvents {
         events: scan.events,
         torn_tail: scan.torn_tail,
