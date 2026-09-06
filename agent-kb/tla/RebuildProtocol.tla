@@ -26,22 +26,31 @@ after a modelled restart (Reopen, findings 4 and 6).
 Delta (bd-21ef.2.22): reembed's per-batch writer, which suppresses SQLite's
 close-time checkpoint.  BatchOpen/BatchCommitAndClose let wal_frames rise
 during Phase 1/2 (previously wal_frames was monotonically non-increasing, so
-a dirty WAL could only ever be an Init-time condition) and writer_open tracks
-whether a batch connection is open on the live inode.  RetainedConn is a
-single non-vacuity toggle, mirroring how Fixed already gates this module's
+a dirty WAL could only ever be an Init-time condition).  The flock and the
+connection are two separate variables: batch_lock (a batch holds the
+universal flock -- this is what blocks rebuild's Phase2Replay, the action
+that first takes rebuild into its locked phases) and writer_open (a
+connection is open on the live inode -- this is what NoWriterConnAtSwap
+checks, and it is deliberately NOT what gates Phase2Replay, since a released
+lock with a still-open connection is exactly the retained-connection bug the
+invariant exists to catch).  Batch frames use the "B" symbol (already in the
+module's frame alphabet) rather than "W", so the bound "B" \notin wal_frames
+is not vacuously true under the CE4 scenario the way it would be with "W"
+(CE4's Init already sets wal_frames = {"W"}).  RetainedConn is a single
+non-vacuity toggle, mirroring how Fixed already gates this module's
 correct-vs-buggy branches: RetainedConn = TRUE selects the rejected
-alternative (a connection held open across batches) so NoWriterConnAtSwap can
-be shown to actually distinguish the two.
+alternative (a connection held open past the lock release) so
+NoWriterConnAtSwap can be shown to actually distinguish the two.
 ***************************************************************************)
 CONSTANTS Fixed, Scenario, MaxLogLen, MaxConcurrentAppends, RetainedConn
 
 VARIABLES log, committed_len, tmp_db, live_db, files, wal_frames, phase,
           cursor, snapshot_boundary, concurrent_appends, tmp_mode, killed,
-          replayed, writer_open
+          replayed, batch_lock, writer_open
 
 vars == <<log, committed_len, tmp_db, live_db, files, wal_frames, phase,
           cursor, snapshot_boundary, concurrent_appends, tmp_mode, killed,
-          replayed, writer_open>>
+          replayed, batch_lock, writer_open>>
 
 Lines == {"begin", "A", "B", "commit", "W"}
 FileIds == {"old", "tmp"}
@@ -79,7 +88,7 @@ TypeOK ==
   /\ snapshot_boundary \in 0..MaxLogLen
   /\ concurrent_appends \in 0..MaxConcurrentAppends
   /\ tmp_mode \in Modes /\ killed \in BOOLEAN /\ replayed \in BOOLEAN
-  /\ writer_open \in BOOLEAN
+  /\ batch_lock \in BOOLEAN /\ writer_open \in BOOLEAN
 
 Init ==
   /\ IF Scenario = "CE4"
@@ -91,7 +100,7 @@ Init ==
   /\ cursor = [generation |-> 0, offset |-> 0, tail_sha |-> "none"]
   /\ snapshot_boundary = 0 /\ concurrent_appends = 0
   /\ tmp_mode = "DELETE" /\ killed = FALSE /\ replayed = FALSE
-  /\ writer_open = FALSE
+  /\ batch_lock = FALSE /\ writer_open = FALSE
 
 Phase1Snapshot ==
   /\ phase = "p1" /\ ~killed
@@ -99,7 +108,7 @@ Phase1Snapshot ==
   /\ phase' = "p2"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, concurrent_appends, tmp_mode, killed, replayed,
-                  writer_open>>
+                  batch_lock, writer_open>>
 
 (* Phase 2 is unlocked: the writer finishes the span one physical line at a time. *)
 WriterAppend ==
@@ -112,7 +121,7 @@ WriterAppend ==
   /\ concurrent_appends' = concurrent_appends + 1
   /\ UNCHANGED <<tmp_db, live_db, files, wal_frames, phase, cursor,
                   snapshot_boundary, tmp_mode, killed, replayed,
-                  writer_open>>
+                  batch_lock, writer_open>>
 
 (* Finding 3: the CE6 replay-order pin (Len(log) = MaxLogLen) is removed so
    the Fixed model explores every interleaving of replay against the
@@ -124,13 +133,20 @@ WriterAppend ==
    replay-before-append schedules the pin had excluded.  No separate pinned
    locator config was needed: TLC still finds the Current violation (see the
    counterexamples doc), so none is shipped. *)
+(* bd-21ef.2.22: gated on ~batch_lock, not ~writer_open.  This is rebuild's
+   flock acquisition -- it must wait for a concurrent batch to release the
+   lock, but a lingering connection on the live inode does not block a lock
+   acquisition, and must not appear to here.  Guarding on ~writer_open
+   instead would make NoWriterConnAtSwap true by construction (Phase2Replay
+   could never fire with a connection open, correct or not), which is
+   exactly the vacuity this guard placement avoids. *)
 Phase2Replay ==
-  /\ phase = "p2" /\ ~killed
+  /\ phase = "p2" /\ ~killed /\ ~batch_lock
   /\ tmp_db' = CommittedEvents(Prefix(log, snapshot_boundary))
   /\ phase' = "p3"
   /\ UNCHANGED <<log, committed_len, live_db, files, wal_frames, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 Phase3CatchUp ==
   /\ phase = "p3" /\ ~killed
@@ -142,7 +158,7 @@ Phase3CatchUp ==
   /\ phase' = "KP_PRE_CHECKPOINT"
   /\ UNCHANGED <<log, committed_len, live_db, files, wal_frames,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 Checkpoint ==
   /\ phase = "KP_PRE_CHECKPOINT" /\ ~killed
@@ -153,7 +169,7 @@ Checkpoint ==
   /\ phase' = "KP_POST_CHECKPOINT"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 VerifyAndClose ==
   /\ phase = "KP_POST_CHECKPOINT" /\ ~killed
@@ -162,7 +178,7 @@ VerifyAndClose ==
   /\ phase' = "KP_POST_TMP_SYNC"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, wal_frames, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 (* Finding 5: the fixed design must explicitly transition the tmp DB into WAL
    mode before it is ever named live.  DELETE mode -- today's forced pragma,
@@ -175,7 +191,7 @@ SetTmpWalMode ==
   /\ tmp_mode' = "WAL"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   phase, cursor, snapshot_boundary, concurrent_appends,
-                  killed, replayed, writer_open>>
+                  killed, replayed, batch_lock, writer_open>>
 
 FirstNameOperation ==
   /\ phase = "KP_POST_TMP_SYNC" /\ ~killed
@@ -187,7 +203,7 @@ FirstNameOperation ==
           /\ phase' = "KP_POST_UNLINK"
   /\ UNCHANGED <<log, committed_len, tmp_db, files, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 SecondNameOperation ==
   /\ ~killed
@@ -199,27 +215,27 @@ SecondNameOperation ==
           /\ phase' = "KP_POST_RENAME"
   /\ UNCHANGED <<log, committed_len, tmp_db, files, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed, writer_open>>
+                  replayed, batch_lock, writer_open>>
 
 DirSync ==
   /\ phase = (IF Fixed THEN "KP_POST_UNLINK" ELSE "KP_POST_RENAME")
   /\ ~killed /\ phase' = "KP_POST_DIR_SYNC"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, snapshot_boundary, concurrent_appends, tmp_mode,
-                  killed, replayed, writer_open>>
+                  killed, replayed, batch_lock, writer_open>>
 
 Finish ==
   /\ phase = "KP_POST_DIR_SYNC" /\ ~killed /\ phase' = "done"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, snapshot_boundary, concurrent_appends, tmp_mode,
-                  killed, replayed, writer_open>>
+                  killed, replayed, batch_lock, writer_open>>
 
 Kill ==
   /\ phase \in KillPoints \union {"current_pre_rename"} /\ ~killed
   /\ killed' = TRUE
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   phase, cursor, snapshot_boundary, concurrent_appends,
-                  tmp_mode, replayed, writer_open>>
+                  tmp_mode, replayed, batch_lock, writer_open>>
 
 (* Findings 4 and 6: the Phase-3 cursor write (cursor', in Phase3CatchUp) was
    never read by any action.  Reopen models the next process start -- either
@@ -240,41 +256,48 @@ Reopen ==
   /\ replayed' = ~(cursor.offset = committed_len /\ cursor.generation = 0)
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, snapshot_boundary, concurrent_appends, tmp_mode,
-                  writer_open>>
+                  batch_lock, writer_open>>
 
 (* Delta (bd-21ef.2.22): reembed's per-batch writer, which suppresses
    SQLite's close-time checkpoint.  Two obligations the module could not
    previously express: a batch RAISES wal_frames in the window where rebuild
    holds no lock (previously wal_frames was monotonically non-increasing, so
    a dirty WAL could only ever be an Init-time condition), and it closes
-   every connection on the live inode before releasing the flock.
+   every connection on the live inode before releasing the flock -- modelled
+   as two separate variables, not one (see the module header): batch_lock is
+   the flock rebuild's Phase2Replay must wait for; writer_open is the
+   connection NoWriterConnAtSwap checks.
 
    BatchOpen fires only in the phases where rebuild holds no lock
-   ("p1"/"p2"), and is bounded by "W" \notin wal_frames so the state space
+   ("p1"/"p2"), and is bounded by "B" \notin wal_frames so the state space
    stays finite without a new CONSTANT -- wal_frames is a set, so a second
-   batch's frame is indistinguishable from the first once "W" is already
-   present (this is why the bound is a no-op under the CE4 scenario, whose
-   Init already has wal_frames = {"W"}: the coverage for a pre-existing
-   dirty WAL at rest is via Init there, not via this transition). *)
+   batch's frame is indistinguishable from the first once "B" is already
+   present.  Unlike "W", "B" is not already in CE4's Init, so this bound is
+   not vacuous there. *)
 BatchOpen ==
-  /\ phase \in {"p1", "p2"} /\ ~killed /\ ~writer_open
-  /\ "W" \notin wal_frames
+  /\ phase \in {"p1", "p2"} /\ ~killed /\ ~batch_lock /\ ~writer_open
+  /\ "B" \notin wal_frames
+  /\ batch_lock' = TRUE
   /\ writer_open' = TRUE
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   phase, cursor, snapshot_boundary, concurrent_appends,
                   tmp_mode, killed, replayed>>
 
 (* Commit and close.  The frames STAY in the WAL -- this is the change: no
-   close-time checkpoint.  RetainedConn is a non-vacuity toggle mirroring how
-   Fixed already gates this module's correct-vs-buggy branches:
-   RetainedConn = FALSE is the shipped behaviour (both connections drop
-   before the flock is released, so writer_open goes back to FALSE);
-   RetainedConn = TRUE selects the rejected alternative from the commit
-   message ("retained connection across batches | opens the old inode to a
-   rebuild swap"), leaving writer_open' = TRUE. *)
+   close-time checkpoint.  batch_lock always drops (the flock is released);
+   RetainedConn decides whether writer_open drops with it.  RetainedConn is a
+   non-vacuity toggle mirroring how Fixed already gates this module's
+   correct-vs-buggy branches: RetainedConn = FALSE is the shipped behaviour
+   (both connections drop before the flock is released, so writer_open goes
+   back to FALSE in the same step as batch_lock); RetainedConn = TRUE selects
+   the rejected alternative from the commit message ("retained connection
+   across batches | opens the old inode to a rebuild swap"), releasing the
+   lock while writer_open' stays TRUE -- exactly the state Phase2Replay's
+   ~batch_lock guard (and not a ~writer_open guard) lets through. *)
 BatchCommitAndClose ==
-  /\ writer_open /\ ~killed
-  /\ wal_frames' = wal_frames \union {"W"}
+  /\ batch_lock /\ writer_open /\ ~killed
+  /\ wal_frames' = wal_frames \union {"B"}
+  /\ batch_lock' = FALSE
   /\ writer_open' = RetainedConn
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, phase, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
@@ -294,9 +317,10 @@ NameResolvesCommitted ==
     => "W" \in NamedDbContents
 
 (* The load-bearing new obligation, quoting the commit: "no connection is
-   open on the live inode when the lock is released".  Rebuild holds the
-   flock from KP_PRE_CHECKPOINT onward (BatchOpen is disabled from that phase
-   on), so no batch connection may survive into any swap phase. *)
+   open on the live inode when the lock is released".  Phase2Replay's guard
+   is ~batch_lock, not ~writer_open (see BatchCommitAndClose/Phase2Replay
+   comments), so this invariant is the only thing that catches a batch
+   releasing the flock while its connection is still open. *)
 NoWriterConnAtSwap == phase \notin {"p1", "p2"} => ~writer_open
 
 (* Finding 1: BatchAtomic previously required `killed`, but Kill is never
