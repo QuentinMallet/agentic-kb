@@ -128,6 +128,10 @@ pub(crate) enum BatchPhase {
     ConnDropped,
 }
 
+// Only the measurement tests enumerate or name the phases; production just
+// passes the variants to a closure that ignores them, so this metadata is
+// test-only rather than dead.
+#[cfg(test)]
 impl BatchPhase {
     /// The phases in the order `write_batches` emits them. The first is a
     /// start marker, so there are `ORDER.len() - 1` measurable spans.

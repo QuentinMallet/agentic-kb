@@ -2807,7 +2807,11 @@ fn dot_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     let dot: f32 = a.iter().zip(b).map(|(left, right)| left * right).sum();
-    dot.is_finite().then_some(dot).unwrap_or(0.0)
+    if dot.is_finite() {
+        dot
+    } else {
+        0.0
+    }
 }
 
 /// Use the dot kernel only when each participating persisted blob was marked
