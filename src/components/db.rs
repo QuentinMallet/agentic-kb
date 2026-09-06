@@ -607,13 +607,18 @@ pub struct DeferredCheckpoints {
 /// read-only handle cannot. Drop the returned guard immediately after
 /// `writer`, never before.
 ///
-/// Returns `None` when the read-only handle cannot be opened or cannot take
-/// its shared lock. `wal_autocheckpoint=0` is still applied in that case,
-/// which is harmless: without close-checkpoint suppression the WAL is reset at
-/// every close and never reaches any threshold. Losing the optimization costs
-/// latency, never correctness, so neither half is an error.
+/// Returns `None` when either half fails: the pragma, or opening the read-only
+/// handle and taking its shared lock. Both halves are refused together on
+/// purpose — suppressing the close-time checkpoint while the automatic one is
+/// still armed is worse than deferring nothing, because the WAL then grows
+/// into a checkpoint fired from inside a COMMIT. Falling back to SQLite's own
+/// behaviour costs latency, never correctness, so this is not an error.
 pub fn defer_checkpoints(writer: &Connection, db_path: &Path) -> Option<DeferredCheckpoints> {
-    let _ = writer.pragma_update(None, "wal_autocheckpoint", 0);
+    // Not discarded: a failure here would silently restore the 1000-page
+    // threshold, and the close-time suppression below would then let the WAL
+    // grow into an automatic checkpoint fired from inside a COMMIT — the exact
+    // in-window checkpoint this exists to prevent. Better to defer nothing.
+    writer.pragma_update(None, "wal_autocheckpoint", 0).ok()?;
     let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

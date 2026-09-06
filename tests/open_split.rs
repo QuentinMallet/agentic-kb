@@ -703,7 +703,7 @@ fn test_db_fixture_returns_paths_and_a_writable_connection() {
 /// system SQLite or a `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` build would make WAL
 /// commits skip their fsync, and nothing else in the suite would notice.
 ///
-/// This matters more since `db::suppress_close_checkpoint`: a batched writer's
+/// This matters more since `db::defer_checkpoints`: a batched writer's
 /// close used to run a checkpoint whose fsyncs made each batch durable whatever
 /// this setting was, and that belt is gone. 2 is `SQLITE_CHECKPOINT_FULL`'s
 /// numeric encoding of FULL.
