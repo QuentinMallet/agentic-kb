@@ -100,20 +100,39 @@ impl KbCmd {
     ///
     /// Drives the C1/D3 recovery point at CLI dispatch. `rebuild` is excluded
     /// because it *is* the repair, and `mcp` because it derives its paths from
-    /// `--db` and initializes itself at startup.
+    /// `--db` and initializes itself at startup. Five subcommands classify
+    /// per invocation rather than per subcommand -- this is the complete set;
+    /// every other variant classifies statically regardless of its flags:
+    /// `stale-check` only escalates when `--relocate` requests it (erring
+    /// toward `true` when the flag is set, even though `heal_relocations`
+    /// itself may still find nothing to heal); `compress`, `reembed`,
+    /// `ingest`, and `import` all invert on their own `--dry-run` flag, since
+    /// each of those bodies returns before any write once `dry_run` is set.
     fn mutates(&self) -> bool {
-        !matches!(
-            self,
-            KbCmd::Search(_)
-                | KbCmd::CitedBy(_)
-                | KbCmd::Cite(_)
-                | KbCmd::Context(_)
-                | KbCmd::Eval(_)
-                | KbCmd::Tests(_)
-                | KbCmd::OlderThan(_)
-                | KbCmd::Rebuild(_)
-                | KbCmd::Mcp(_)
-        )
+        match self {
+            KbCmd::Add(_) => true,
+            KbCmd::Search(_) => false,
+            KbCmd::Mcp(_) => false,
+            KbCmd::MigrateCitations(_) => true,
+            KbCmd::StaleCheck(c) => c.relocate != stale_check::RelocateArg::Never,
+            KbCmd::Rebuild(_) => false,
+            KbCmd::Compact(_) => true,
+            KbCmd::Compress(c) => !c.dry_run,
+            KbCmd::CitedBy(_) => false,
+            KbCmd::Cite(_) => false,
+            KbCmd::Context(_) => false,
+            KbCmd::Eval(_) => false,
+            KbCmd::Expire(_) => true,
+            KbCmd::Reembed(c) => !c.dry_run,
+            KbCmd::Tests(_) => false,
+            KbCmd::TestAdd(_) => true,
+            KbCmd::Run(_) => true,
+            KbCmd::Ingest(c) => !c.dry_run,
+            KbCmd::Import(c) => !c.dry_run,
+            KbCmd::OlderThan(_) => false,
+            KbCmd::Peers(cmd) => cmd.mutates(),
+            KbCmd::Hook(_) => true,
+        }
     }
 }
 
@@ -152,5 +171,190 @@ impl Configurable<KbConfig> for EntryPoint {
 
     fn process_config(&self, config: KbConfig) -> Result<KbConfig, FrameworkError> {
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod mutation_classification_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Independent, wildcard-free duplicate of `KbCmd::mutates()`'s
+    /// classification, including the nested `Peers`/`PeersEdge` leaves.
+    /// Adding a `KbCmd` variant -- or a `Peers`/`PeersEdge` leaf -- breaks
+    /// this match's exhaustiveness -- a compile error in this test file, not
+    /// only in production code -- so a new variant cannot silently stay
+    /// untested. The compiler owns exhaustiveness; this duplicate plus the
+    /// argv table below together own agreement on each variant's specific
+    /// verdict.
+    fn expected_mutates(cmd: &KbCmd) -> bool {
+        match cmd {
+            KbCmd::Add(_) => true,
+            KbCmd::Search(_) => false,
+            KbCmd::Mcp(_) => false,
+            KbCmd::MigrateCitations(_) => true,
+            KbCmd::StaleCheck(c) => c.relocate != stale_check::RelocateArg::Never,
+            KbCmd::Rebuild(_) => false,
+            KbCmd::Compact(_) => true,
+            KbCmd::Compress(c) => !c.dry_run,
+            KbCmd::CitedBy(_) => false,
+            KbCmd::Cite(_) => false,
+            KbCmd::Context(_) => false,
+            KbCmd::Eval(_) => false,
+            KbCmd::Expire(_) => true,
+            KbCmd::Reembed(c) => !c.dry_run,
+            KbCmd::Tests(_) => false,
+            KbCmd::TestAdd(_) => true,
+            KbCmd::Run(_) => true,
+            KbCmd::Ingest(c) => !c.dry_run,
+            KbCmd::Import(c) => !c.dry_run,
+            KbCmd::OlderThan(_) => false,
+            KbCmd::Peers(p) => match p {
+                peers::Peers::Add(_) => true,
+                peers::Peers::List(_) => false,
+                peers::Peers::Remove(_) => true,
+                peers::Peers::Show(_) => false,
+                peers::Peers::Import(_) => true,
+                peers::Peers::Edge(e) => match e {
+                    peers::PeersEdge::Add(_) => true,
+                    peers::PeersEdge::List(_) => false,
+                    peers::PeersEdge::Remove(_) => true,
+                    peers::PeersEdge::CleanupEpic(_) => true,
+                },
+            },
+            KbCmd::Hook(_) => true,
+        }
+    }
+
+    fn assert_classification(args: &[&str], expected: bool) {
+        let entry = EntryPoint::try_parse_from(args)
+            .unwrap_or_else(|e| panic!("invalid classification-test argv {args:?}: {e}"));
+        assert_eq!(entry.cmd.mutates(), expected, "argv: {args:?}");
+        assert_eq!(
+            expected_mutates(&entry.cmd),
+            expected,
+            "argv: {args:?} -- table's expected value disagrees with the \
+             independent classification match; a new or changed KbCmd \
+             variant needs a case here too"
+        );
+    }
+
+    #[test]
+    fn every_cli_and_peers_variant_has_an_explicit_mutation_classification() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &[
+                    "kb",
+                    "add",
+                    "--path",
+                    "p",
+                    "--summary",
+                    "s",
+                    "--content",
+                    "c",
+                    "--tags",
+                    "t",
+                ],
+                true,
+            ),
+            (&["kb", "search", "q"], false),
+            (&["kb", "mcp", "--db", "agent-kb.db"], false),
+            (&["kb", "migrate-citations"], true),
+            (&["kb", "stale-check", "p"], false),
+            (&["kb", "stale-check", "p", "--relocate", "file"], true),
+            (&["kb", "rebuild"], false),
+            (&["kb", "compact"], true),
+            (&["kb", "compress", "p"], true),
+            (&["kb", "compress", "p", "--dry-run"], false),
+            (&["kb", "cited-by", "p"], false),
+            (&["kb", "cite", "p"], false),
+            (&["kb", "context", "--budget", "100"], false),
+            (&["kb", "eval", "golden.jsonl"], false),
+            (&["kb", "expire", "id"], true),
+            (&["kb", "reembed"], true),
+            (&["kb", "reembed", "--dry-run"], false),
+            (&["kb", "tests"], false),
+            (
+                &[
+                    "kb",
+                    "test-add",
+                    "--app",
+                    "a",
+                    "--name",
+                    "n",
+                    "--protocol",
+                    "rust_tool",
+                    "--config",
+                    "{}",
+                ],
+                true,
+            ),
+            (&["kb", "run", "id", "--result", "pass"], true),
+            (
+                &[
+                    "kb",
+                    "ingest",
+                    "--path",
+                    "p",
+                    "--summary",
+                    "s",
+                    "--tags",
+                    "t",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "kb",
+                    "ingest",
+                    "--path",
+                    "p",
+                    "--summary",
+                    "s",
+                    "--tags",
+                    "t",
+                    "--dry-run",
+                ],
+                false,
+            ),
+            (&["kb", "import", "p"], true),
+            (&["kb", "import", "p", "--dry-run"], false),
+            (&["kb", "older-than", "1"], false),
+            (
+                &[
+                    "kb",
+                    "hook",
+                    "session-end",
+                    "--transcript",
+                    "p",
+                    "--session-id",
+                    "s",
+                ],
+                true,
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_classification(args, *expected);
+        }
+
+        let peer_cases: &[(&[&str], bool)] = &[
+            (&["kb", "peers", "add", "target", "--type", "dep"], true),
+            (&["kb", "peers", "list"], false),
+            (&["kb", "peers", "remove", "id"], true),
+            (&["kb", "peers", "show", "repo"], false),
+            (&["kb", "peers", "import", "seeds.json"], true),
+            (
+                &[
+                    "kb", "peers", "edge", "add", "source", "target", "--type", "dep",
+                ],
+                true,
+            ),
+            (&["kb", "peers", "edge", "list"], false),
+            (&["kb", "peers", "edge", "remove", "id"], true),
+            (&["kb", "peers", "edge", "cleanup-epic", "slug"], true),
+        ];
+        for (args, expected) in peer_cases {
+            assert_classification(args, *expected);
+        }
     }
 }

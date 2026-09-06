@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use rusqlite::params;
 use serde_json::json;
+use std::io::{self, Write};
 
 // ---------------------------------------------------------------------------
 // Top-level enum
@@ -29,6 +30,19 @@ pub enum Peers {
     /// Manage directed peer edges (add/list/remove/cleanup-epic)
     #[command(subcommand)]
     Edge(PeersEdge),
+}
+
+impl Peers {
+    pub(crate) fn mutates(&self) -> bool {
+        match self {
+            Peers::Add(_) => true,
+            Peers::List(_) => false,
+            Peers::Remove(_) => true,
+            Peers::Show(_) => false,
+            Peers::Import(_) => true,
+            Peers::Edge(cmd) => cmd.mutates(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,11 +203,30 @@ impl Runnable for PeersList {
 impl PeersList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_ro(&paths.db)?;
-        let source_repo = detect_source_repo(&paths);
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
+
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let source_repo = detect_source_repo(paths);
 
         let rows = query_peers_for_repo(&conn, &source_repo, self.graph_type.as_deref())?;
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
@@ -260,7 +293,26 @@ impl Runnable for PeersShow {
 impl PeersShow {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_ro(&paths.db)?;
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
+
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         // Try as-is and canonicalized path.
         let canonical = std::fs::canonicalize(&self.repo_path)
@@ -284,7 +336,7 @@ impl PeersShow {
             rows.extend(canon_rows);
         }
 
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
@@ -548,6 +600,17 @@ pub enum PeersEdge {
     CleanupEpic(PeersEdgeCleanupEpic),
 }
 
+impl PeersEdge {
+    fn mutates(&self) -> bool {
+        match self {
+            PeersEdge::Add(_) => true,
+            PeersEdge::List(_) => false,
+            PeersEdge::Remove(_) => true,
+            PeersEdge::CleanupEpic(_) => true,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PeersEdgeAdd
 // ---------------------------------------------------------------------------
@@ -683,10 +746,29 @@ impl Runnable for PeersEdgeList {
 impl PeersEdgeList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_ro(&paths.db)?;
-        let out = query_peer_edges(&conn, self.epic_slug.as_deref())?;
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
 
-        println!("{}", serde_json::to_string_pretty(&out)?);
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let rows = query_peer_edges(&conn, self.epic_slug.as_deref())?;
+
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
