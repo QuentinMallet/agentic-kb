@@ -25,7 +25,7 @@ pub const MAX_CITATION_EXCERPT_CHARS: usize = 512;
 pub const MAX_DERIVED_FROM_LEN: usize = 200;
 
 /// Return citation paths rooted in a disposable nested worktree.
-pub fn nested_worktree_citation_paths<'a>(evidence: &'a [Value]) -> Vec<&'a str> {
+pub fn nested_worktree_citation_paths(evidence: &[Value]) -> Vec<&str> {
     evidence
         .iter()
         .filter_map(|ev| ev.get("citation_path").and_then(Value::as_str))
