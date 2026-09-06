@@ -42,11 +42,11 @@ fn strip_line_comment(line: &str) -> &str {
 /// For each line of `source`, whether it falls inside (at any nesting depth)
 /// a `#[cfg(test)] mod <name> { ... }` block — the crate's unit-test modules
 /// are not all named `tests` (`components/cursor.rs` also has a
-/// `crash_tests`, `commands/mcp.rs` a `tests_api`), so this matches the
-/// `#[cfg(test)]` attribute on the immediately preceding line rather than a
-/// fixed module name. Brace-counting on the comment-stripped line, not a
-/// parser: the same line-based limitation `strip_line_comment` above
-/// already accepts.
+/// `crash_tests`, `commands/stale_check.rs` a `heal_writer_tests`), so this
+/// matches the `#[cfg(test)]` attribute on the immediately preceding line
+/// rather than a fixed module name. Brace-counting on the comment-stripped
+/// line, not a parser: the same line-based limitation `strip_line_comment`
+/// above already accepts.
 fn lines_inside_cfg_test_module(source: &str) -> Vec<bool> {
     let mut inside = Vec::with_capacity(source.lines().count());
     let mut depth: i32 = 0;
@@ -138,6 +138,47 @@ fn open_unchecked_for_test_is_confined_to_test_modules() {
     assert!(
         offenders.is_empty(),
         "open_unchecked_for_test called outside a test module: {}",
+        offenders.join(", ")
+    );
+}
+
+/// `commands::mcp::tests_api::dispatch_for_test` / `dispatch_value_for_test`
+/// serialize a request and call the real `handle_request` dispatcher, but
+/// hardcode the retrieval tuning a production port session reads from live
+/// config (`inline_verify_k`, `recency_lambda`, `mmr_lambda` —
+/// `src/commands/mcp.rs:72`) instead. They are `#[doc(hidden)] pub`, like
+/// `open_unchecked_for_test` above, only so integration-test crates can
+/// reach them: a production call site would compile silently and run every
+/// search with `recency_lambda = 0.0` and `mmr_lambda = 0.0`. Forbidden
+/// everywhere in `src/` except inside a `mod tests { ... }` block or
+/// `commands/mcp.rs` itself (the seam's own definition).
+#[test]
+fn dispatch_for_test_is_confined_to_test_modules() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mcp_component = src_root.join("commands/mcp.rs");
+    let mut offenders = Vec::new();
+    const SEAM_CALLS: &[&str] = &["dispatch_for_test(", "dispatch_value_for_test("];
+
+    for path in src_rs_files(&src_root) {
+        if path == mcp_component {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
+        let test_flags = lines_inside_cfg_test_module(&source);
+        for (index, line) in source.lines().enumerate() {
+            if test_flags[index] {
+                continue;
+            }
+            let code = strip_line_comment(line);
+            if SEAM_CALLS.iter().any(|call| code.contains(call)) {
+                offenders.push(format!("{}:{}", path.display(), index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "dispatch_for_test/dispatch_value_for_test called outside a test module: {}",
         offenders.join(", ")
     );
 }

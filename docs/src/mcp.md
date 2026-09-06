@@ -148,6 +148,14 @@ non-empty trimmed note; before writing any batch, `handle_audit_record` calls
 route through `handle_kb_peers_add` and `handle_kb_peers_remove`, which acquire
 the repository lock and use `db::open_rw`.
 
+## `kb_audit_record`
+
+A batch containing any invalid verdict — an unknown entry id, an entry not
+sampled by the run, a `false` verdict missing its required note, or a
+`false` verdict against a permanent entry — is rejected in full before any
+write, so the other, valid verdicts in that same batch are not applied
+either.
+
 ## `kb_provenance`
 
 The Rust result contains `roots`, `dangling`, `graph`, and `truncated`.

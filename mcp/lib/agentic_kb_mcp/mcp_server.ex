@@ -392,7 +392,8 @@ defmodule AgenticKbMcp.McpServer do
     },
     %{
       "name" => "kb_audit_record",
-      "description" => "Record verdicts for entries returned by kb_audit_run.",
+      "description" =>
+        "Record verdicts for entries returned by kb_audit_run. Any one invalid verdict rejects the whole batch before any write.",
       "inputSchema" => %{
         "type" => "object",
         "additionalProperties" => false,
