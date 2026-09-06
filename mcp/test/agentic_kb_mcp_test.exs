@@ -141,6 +141,12 @@ defmodule AgenticKbMcpTest do
   alias AgenticKbMcp.McpServer
   alias AgenticKbMcp.RenderFixture
 
+  test "shared Rust/Elixir schema contract fixture is present" do
+    fixture = Path.join(__DIR__, "schema_contract.json") |> File.read!() |> :json.decode()
+    assert is_map(fixture["pin_fields"])
+    assert is_map(fixture["bounds"])
+  end
+
   describe "DbDiscovery layout precedence" do
     test "selects canonical, legacy, then canonical when both exist" do
       Enum.each(
@@ -536,39 +542,8 @@ defmodule AgenticKbMcpTest do
   # docs/decisions/b1-request-contract.md. The pin is agentic-kb rev
   # 058f82bdb650a1de44de167adea0672c54f1f2c1 (machines_conf flake.lock) whose
   # `dispatch_tool/3` clauses are byte-identical to this branch's.
-  @deployed_pin_args %{
-    "kb_search" => [
-      "query",
-      "limit",
-      "mode",
-      "path_prefix",
-      "tag",
-      "inline_verify_k",
-      "expand_ids"
-    ],
-    "kb_add" => [
-      "path",
-      "summary",
-      "content",
-      "tags",
-      "permanent",
-      "replace_path",
-      "kind",
-      "evidence",
-      "cues"
-    ],
-    "kb_cite" => ["path", "start", "end"],
-    "kb_import" => ["path", "upsert"],
-    "kb_stale_check" => ["files", "commits", "blame"],
-    "kb_expire" => ["entry_id", "reason", "force"],
-    "kb_run" => ["test_id", "result", "adapter", "detail"],
-    "kb_test_add" => ["app", "name", "protocol", "config", "test_id"],
-    "kb_tests" => ["app"],
-    "kb_reembed" => ["dry_run", "max_chars"],
-    "kb_compact" => [],
-    "kb_rebuild" => [],
-    "kb_get" => ["entry_id"]
-  }
+  @schema_contract Path.join(__DIR__, "schema_contract.json") |> File.read!() |> :json.decode()
+  @deployed_pin_args @schema_contract["pin_fields"]
 
   @s1_tool_args %{
     "kb_audit_run" => ["sample_size", "mode"],
@@ -753,13 +728,10 @@ defmodule AgenticKbMcpTest do
     # so a client validates before calling instead of learning the cap from an
     # error. inline_verify_k shipped with a minimum and no maximum.
     test "every bounded numeric argument advertises both of its bounds" do
-      expected = %{
-        {"kb_search", "limit"} => {1, 100},
-        {"kb_search", "inline_verify_k"} => {0, 100},
-        {"kb_reembed", "max_chars"} => {1, 100_000}
-      }
-
-      for {{tool_name, field}, {min, max}} <- expected do
+      for {key, bounds} <- @schema_contract["bounds"] do
+        [tool_name, field] = String.split(key, ".")
+        min = bounds["minimum"]
+        max = bounds["maximum"]
         schema =
           McpServer.tools()
           |> Enum.find(&(&1["name"] == tool_name))
@@ -777,6 +749,16 @@ defmodule AgenticKbMcpTest do
       registered = McpServer.tools() |> Enum.map(& &1["name"]) |> Enum.sort()
       expected = Map.keys(@deployed_pin_args) ++ Map.keys(@s1_tool_args)
       assert registered == Enum.sort(expected)
+    end
+
+    test "deployed-pin field table exactly matches each Elixir tool schema" do
+      for {tool_name, expected_fields} <- @deployed_pin_args do
+        tool = Enum.find(McpServer.tools(), &(&1["name"] == tool_name))
+        actual_fields = tool["inputSchema"]["properties"] |> Map.keys()
+
+        assert MapSet.new(actual_fields) == MapSet.new(expected_fields),
+               "#{tool_name} schema fields drifted from the shared deployed-pin table"
+      end
     end
   end
 
