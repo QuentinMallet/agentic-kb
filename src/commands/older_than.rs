@@ -360,7 +360,11 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert_eq!(out.len(), 50_000, "half of 100k entries should be stale");
-        assert!(elapsed.as_millis() < 2000);
         eprintln!("SQL aggregate on 100k entries: {}ms", elapsed.as_millis());
+        assert!(
+            elapsed.as_millis() < 2000,
+            "SQL aggregate on 100k entries took {}ms — expected < 2000ms",
+            elapsed.as_millis()
+        );
     }
 }
