@@ -54,19 +54,32 @@ fn require_unblocked_dispatch(label: &str, root: &std::path::Path, args: &[&str]
     output.stdout
 }
 
-/// The portion of `source` before its own `#[cfg(test)] mod ... { ... }`
-/// unit-test module (every file below has exactly one, the file's own unit
-/// tests), so a grep against it cannot be satisfied by a mention inside the
-/// file's own tests rather than its production code.
+/// The portion of `source` before its `#[cfg(test)] mod tests { ... }`
+/// unit-test module, so a grep against it cannot be satisfied by a mention
+/// inside the file's own tests rather than its production code.
 ///
-/// Looks specifically for the trailing `#[cfg(test)]\nmod tests` marker
-/// rather than the first `#[cfg(test)]` occurrence anywhere in the file: a
-/// production item can carry its own leading `#[cfg(test)]` attribute (a
-/// test-only `use`, a `#[cfg(test)] fn`, ...) ahead of the file's actual
-/// unit-test module, and truncating at that first occurrence would discard
-/// the rest of the real production code along with it. Falls back to the
-/// last `#[cfg(test)]` occurrence when no `mod tests` marker is present, on
-/// the assumption that the final one is the unit-test module boundary.
+/// Rule: cut at the first `#[cfg(test)]\nmod tests` marker; if none is
+/// found, cut at the last `#[cfg(test)]` occurrence instead; if there is no
+/// `#[cfg(test)]` at all, return the whole file unchanged. The first branch
+/// exists because a production item can carry its own leading
+/// `#[cfg(test)]` attribute (a test-only `use`, a `#[cfg(test)] fn`, ...)
+/// ahead of the file's actual unit-test module, and cutting at that first
+/// occurrence would discard the rest of the real production code along
+/// with it -- `src/commands/tests.rs` has no `#[cfg(test)]` at all (third
+/// branch) and `src/commands/stale_check.rs` has a second, later
+/// `#[cfg(test)] mod heal_writer_tests` after its `mod tests` (still caught
+/// by the first branch, since it matches on the first occurrence of that
+/// exact marker).
+///
+/// The returned slice is a textual cut, not a purified production view: a
+/// standalone `#[cfg(test)]`-gated item declared *before* the `mod tests`
+/// marker (mcp.rs's `use crate::crash_sim::KillPoint` and its `fn tr` test
+/// fixture helper, for instance) is still inside it. The `open_ro`/`open_db`
+/// pins below are therefore a textual grep over "everything before the unit
+/// tests", not "only genuine production code" -- a future test-only item
+/// declared in that region that happened to contain the literal text
+/// `open_db(` would trip the negative pin even though it is not a real
+/// production call site.
 fn production_source(source: &str) -> &str {
     if let Some(idx) = source.find("\n#[cfg(test)]\nmod tests") {
         return &source[..idx];
