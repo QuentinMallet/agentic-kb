@@ -50,8 +50,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// --release` never activates this feature, so `MeasuredRead` compiles to
 /// the transparent, zero-cost pass-through below instead.
 mod read_metrics {
-    use std::io::{Read, Seek, SeekFrom};
-
     pub(super) struct MeasuredRead<R>(pub R);
 
     #[cfg(any(test, feature = "event-log-read-metrics"))]
