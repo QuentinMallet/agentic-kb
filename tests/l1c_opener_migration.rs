@@ -54,12 +54,37 @@ fn require_unblocked_dispatch(label: &str, root: &std::path::Path, args: &[&str]
     output.stdout
 }
 
-/// The portion of `source` before its own `#[cfg(test)] mod ... { ... }`
-/// unit-test module (every file below has exactly one, the file's own unit
-/// tests), so a grep against it cannot be satisfied by a mention inside the
-/// file's own tests rather than its production code.
+/// The portion of `source` before its `#[cfg(test)] mod tests { ... }`
+/// unit-test module, so a grep against it cannot be satisfied by a mention
+/// inside the file's own tests rather than its production code.
+///
+/// Rule: cut at the first `#[cfg(test)]\nmod tests` marker; if none is
+/// found, cut at the last `#[cfg(test)]` occurrence instead; if there is no
+/// `#[cfg(test)]` at all, return the whole file unchanged. The first branch
+/// exists because a production item can carry its own leading
+/// `#[cfg(test)]` attribute (a test-only `use`, a `#[cfg(test)] fn`, ...)
+/// ahead of the file's actual unit-test module, and cutting at that first
+/// occurrence would discard the rest of the real production code along
+/// with it -- `src/commands/tests.rs` has no `#[cfg(test)]` at all (third
+/// branch) and `src/commands/stale_check.rs` has a second, later
+/// `#[cfg(test)] mod heal_writer_tests` after its `mod tests` (still caught
+/// by the first branch, since it matches on the first occurrence of that
+/// exact marker).
+///
+/// The returned slice is a textual cut, not a purified production view: a
+/// standalone `#[cfg(test)]`-gated item declared *before* the `mod tests`
+/// marker (mcp.rs's `use crate::crash_sim::KillPoint` and its `fn tr` test
+/// fixture helper, for instance) is still inside it. The `open_ro`/`open_db`
+/// pins below are therefore a textual grep over "everything before the unit
+/// tests", not "only genuine production code" -- a future test-only item
+/// declared in that region that happened to contain the literal text
+/// `open_db(` would trip the negative pin even though it is not a real
+/// production call site.
 fn production_source(source: &str) -> &str {
-    match source.find("\n#[cfg(test)]") {
+    if let Some(idx) = source.find("\n#[cfg(test)]\nmod tests") {
+        return &source[..idx];
+    }
+    match source.rfind("\n#[cfg(test)]") {
         Some(idx) => &source[..idx],
         None => source,
     }
@@ -102,6 +127,21 @@ fn migrated_read_surfaces_are_pinned_to_open_ro() {
             "{name} revived the legacy opener"
         );
     }
+
+    // mcp.rs carries its own leading `#[cfg(test)]` item (a test-only
+    // `use`) ahead of `handle_audit_report`, so a truncation regression in
+    // `production_source` that stopped at the *first* `#[cfg(test)]`
+    // instead of the unit-test module boundary would silently discard
+    // `handle_audit_report` itself -- the `open_ro(` assertion above would
+    // then fail with the misleading "lost its read-only opener" message
+    // even though the opener call is untouched. Assert the function
+    // actually survived into the production slice so a future regression
+    // of this kind fails with the real reason instead.
+    let mcp_production = production_source(include_str!("../src/commands/mcp.rs"));
+    assert!(
+        mcp_production.contains("fn handle_audit_report"),
+        "mcp.rs production slice lost fn handle_audit_report -- production_source truncated too early"
+    );
 
     // peers.rs is a mixed file holding three readers (list, show, edge list)
     // alongside six writers, so a bare "contains open_ro(" pin above would
@@ -374,4 +414,87 @@ fn migrated_writer_entry_waits_for_the_write_lock() {
         .expect("writer did not resume after paths.lock was released")
         .expect("writer failed after paths.lock was released");
     writer.join().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::production_source;
+
+    /// Regression test for the bug this file's own truncation idiom once
+    /// had: a source file that carries a leading `#[cfg(test)]` item (a
+    /// test-only `use`, matching mcp.rs's `use crate::crash_sim::KillPoint;`)
+    /// ahead of real production code, followed by the file's actual
+    /// `#[cfg(test)] mod tests { ... }` unit-test module. The old
+    /// implementation truncated at the *first* `#[cfg(test)]` occurrence,
+    /// which discarded all of the production code after the early item --
+    /// including, in mcp.rs's case, `handle_audit_report` itself.
+    #[test]
+    fn production_source_keeps_code_after_an_early_cfg_test_item() {
+        let source = concat!(
+            "use std::fs;\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "use some::test_only::Helper;\n",
+            "\n",
+            "fn production_fn() -> bool {\n",
+            "    true\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    use super::*;\n",
+            "\n",
+            "    #[test]\n",
+            "    fn it_works() {\n",
+            "        assert!(production_fn());\n",
+            "    }\n",
+            "}\n",
+        );
+
+        let production = production_source(source);
+
+        assert!(
+            production.contains("fn production_fn"),
+            "production code after an early #[cfg(test)] item must survive: {production:?}"
+        );
+        assert!(
+            !production.contains("mod tests"),
+            "the trailing unit-test module must still be stripped: {production:?}"
+        );
+        assert!(
+            !production.contains("it_works"),
+            "unit-test-only code must not leak into the production slice: {production:?}"
+        );
+    }
+
+    /// When there is no trailing `#[cfg(test)] mod tests` marker, falling
+    /// back to the *last* `#[cfg(test)]` occurrence still strips the
+    /// rightmost test-shaped block rather than the first one.
+    #[test]
+    fn production_source_falls_back_to_the_last_cfg_test_when_no_mod_tests_marker() {
+        let source = concat!(
+            "#[cfg(test)]\n",
+            "use some::test_only::Helper;\n",
+            "\n",
+            "fn production_fn() -> bool {\n",
+            "    true\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "fn test_only_helper() -> bool {\n",
+            "    false\n",
+            "}\n",
+        );
+
+        let production = production_source(source);
+
+        assert!(
+            production.contains("fn production_fn"),
+            "production code before the trailing #[cfg(test)] item must survive: {production:?}"
+        );
+        assert!(
+            !production.contains("test_only_helper"),
+            "the trailing #[cfg(test)] item must still be stripped: {production:?}"
+        );
+    }
 }
