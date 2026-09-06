@@ -17,7 +17,9 @@ When an agent calls `kb_add` with an evidence row containing only a `citation_pa
   available at the cited file's directory — resolved at that file's own
   parent directory, so a citation inside a nested worktree records that
   worktree's HEAD rather than the caller's working-directory HEAD
-  (`compute_citation_fields` in `src/commands/cite.rs`).
+  (`kb_core::add` calls `config::git_head_sha_at(absolute_path.parent())` in
+  `src/components/kb_core.rs`; the `kb cite` tool resolves the same way via
+  `compute_citation_fields` in `src/commands/cite.rs`).
 - **MCP layer rejects more broadly than the hash-mismatch check above:**
   before `kb_core::add` is ever called, `handle_add`'s
   `validate_explicit_citation_hashes` (`src/commands/mcp.rs`) re-verifies
