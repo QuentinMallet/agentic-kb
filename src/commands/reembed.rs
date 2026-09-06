@@ -44,6 +44,26 @@ use std::os::unix::fs::MetadataExt;
 /// regressions pass, but all samples still miss the <= 50 ms gate; retain the
 /// universal lock and durable transaction semantics while investigating a
 /// structurally different reduction in per-batch SQLite work.
+///
+/// Resolved 2026-09-06. Attributing the window phase by phase
+/// (`test_reembed_batch_lock_hold_phase_breakdown`) showed the batch's own
+/// work — lock, open, vintage read, BEGIN, 32 inserts — costs about 2 ms in
+/// total, and everything else was fsync. A syscall trace found five per
+/// batch: the fresh WAL's header, the containing directory (because SQLite's
+/// close had unlinked `-wal`/`-shm`, so this batch recreated them), the
+/// durable commit, and the close-time checkpoint's WAL and database syncs.
+/// Only the commit is durability. `db::suppress_close_checkpoint` keeps that
+/// checkpoint and its unlink out of the window, which leaves two, and moving
+/// the `embed_text_mode` stamp into the preflight removed a sixth fsync that
+/// the very first batch paid as its own implicit commit. Measured on a host
+/// under other load (`load1` 16 to 23, so an idle host is faster, not
+/// slower): per-phase medians over eight warm batches were 0.040 ms lock,
+/// 1.102 ms open, 0.041 ms vintage read, 0.003 ms BEGIN, 1.062 ms inserts,
+/// 19.361 ms commit, 0.250 ms connection drop, for a 21.917 ms window
+/// against 102.616 ms for the same table before the change. Fifteen budget
+/// samples across three runs ranged 10.667 ms to 47.960 ms, all within the
+/// gate; the top of that range is always a run's first batch, which extends
+/// a newly created WAL rather than reusing one.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,7 +348,7 @@ where
     // critical section. Every batch below still opens the current live
     // pathname under the universal lock, but can safely skip this repeated
     // DDL/stamp work.
-    preflight_reembed_schema(paths)?;
+    preflight_reembed_schema(paths, mode)?;
 
     let mut embedded_ids = HashSet::new();
     let initial_db_identity = db_identity(&paths.db);
@@ -455,6 +475,13 @@ fn write_batches<B, P>(
                 continue;
             }
         };
+        // Held for exactly as long as `conn`, and dropped with it below: this
+        // is what keeps SQLite's close-time checkpoint (two fsyncs) and its
+        // sidecar unlink (which costs the next batch a directory fsync) out of
+        // the lock window. See `db::suppress_close_checkpoint` for why that is
+        // safe against a `rebuild` swap, and `drain_wal` below for where the
+        // deferred backfill happens instead.
+        let no_close_checkpoint = db::suppress_close_checkpoint(&paths.db);
         phase(batch_index, BatchPhase::Opened);
         db::check_embed_mode_vintage(&conn, mode);
         phase(batch_index, BatchPhase::VintageChecked);
@@ -508,6 +535,7 @@ fn write_batches<B, P>(
         // and everything that follows is process-local. Keeping it here also
         // makes ConnDropped a clean measurement of the close itself.
         drop(conn);
+        drop(no_close_checkpoint);
         phase(batch_index, BatchPhase::ConnDropped);
         for id in successes {
             if embedded_ids.insert(id) {
@@ -519,11 +547,40 @@ fn write_batches<B, P>(
             record_failure(report, id, cause);
         }
     }
+    if !writes.is_empty() {
+        drain_wal(paths);
+    }
 }
 
-fn preflight_reembed_schema(paths: &config::Paths) -> anyhow::Result<()> {
+/// Backfill the WAL that the per-batch writers deliberately left unbackfilled
+/// (see `db::suppress_close_checkpoint`) so the database is self-contained
+/// again at rest, and take its own hold of the write lock to do it — after
+/// every batch's window has closed, so it cannot widen one.
+///
+/// Best-effort by design: leaving the WAL longer than necessary costs later
+/// readers a little and costs `rebuild` one drained checkpoint, both of which
+/// already happen on their own. It never costs a committed write, which is
+/// durable in the WAL whether or not this runs.
+fn drain_wal(paths: &config::Paths) {
+    let Ok(lock) = acquire_lock(&paths.lock) else {
+        return;
+    };
+    let Ok(conn) = db::open_rw_existing(paths, &lock) else {
+        return;
+    };
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+}
+
+fn preflight_reembed_schema(paths: &config::Paths, mode: db::EmbedTextMode) -> anyhow::Result<()> {
     let lock = acquire_lock(&paths.lock)?;
     let conn = db::open_rw(paths, &lock)?;
+    // Also here, not only per batch: on a database that has never recorded an
+    // `embed_text_mode`, this check INSERTs it, and outside a transaction that
+    // is its own durable commit — a second fsync inside the first batch's lock
+    // window, on top of the batch's own. Stamping it once up front leaves the
+    // per-batch call a pure read, which is all it needs to be to warn about a
+    // vintage mismatch on a database swapped in mid-run.
+    db::check_embed_mode_vintage(&conn, mode);
     drop(conn);
     Ok(())
 }
@@ -666,6 +723,19 @@ mod tests {
         out
     }
 
+    /// Swap `replacement` in over the live database the way `rebuild` does:
+    /// the atomic rename (D4 step 4) followed by the unlink of the replaced
+    /// inode's `-wal`/`-shm` (D4 step 5). A bare rename is not a faithful
+    /// model of a rebuild swap — it would leave the old inode's sidecars
+    /// bound to the new file's name, which is the state rebuild's steps 1, 2
+    /// and 5 exist to rule out.
+    fn swap_live_db(paths: &config::Paths, replacement: &std::path::Path) {
+        std::fs::rename(replacement, &paths.db).unwrap();
+        let db = paths.db.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(format!("{db}-wal"));
+        let _ = std::fs::remove_file(format!("{db}-shm"));
+    }
+
     fn seed(paths: &config::Paths, id: &str, summary: &str) {
         Add {
             path: format!("docs/{id}"),
@@ -797,7 +867,7 @@ mod tests {
             1800,
             |batch, _| {
                 if batch == 1 {
-                    std::fs::rename(&replacement, &paths.db).unwrap();
+                    swap_live_db(&paths, &replacement);
                 }
             },
             |_, _| {},
@@ -847,7 +917,7 @@ mod tests {
         }
         let report = run_reembed_with_hook(&paths, &FixedEmbedder(0.5), false, 1800, |batch, _| {
             if batch == 1 {
-                std::fs::rename(&replacement, &paths.db).unwrap();
+                swap_live_db(&paths, &replacement);
             }
         })
         .unwrap();
@@ -926,7 +996,7 @@ mod tests {
                     // batch has fully committed against the original db, so
                     // the reconcile pass starts from a live db with none
                     // of pass one's writes already present in it.
-                    std::fs::rename(&replacement, &paths.db).unwrap();
+                    swap_live_db(&paths, &replacement);
                 }
             },
         )
@@ -1065,6 +1135,75 @@ mod tests {
             samples.len(),
             REEMBED_WRITE_BATCH_SIZE,
             phase_table(&samples)
+        );
+    }
+
+    fn wal_len(paths: &config::Paths) -> Option<u64> {
+        std::fs::metadata(format!("{}-wal", paths.db.to_string_lossy()))
+            .ok()
+            .map(|meta| meta.len())
+    }
+
+    /// The lock-hold budget now depends on a code-level property, not just on
+    /// how fast the host's storage is: no checkpoint may run inside a batch's
+    /// lock window. A checkpoint there would backfill the WAL into the
+    /// database and unlink `-wal`, so an intact WAL still carrying batch 0's
+    /// frames when batch 1 starts is direct evidence that none ran. Guarded
+    /// here without wall-clock timing so a regression fails in the default
+    /// suite rather than only in the ignored measurement.
+    #[test]
+    fn test_no_checkpoint_runs_inside_a_batch_lock_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = 2 * REEMBED_WRITE_BATCH_SIZE;
+        for index in 0..total {
+            seed(&paths, &format!("nockpt-{index}"), "seed");
+        }
+        let observed = std::cell::Cell::new(None::<u64>);
+        let report = run_reembed_with_hook(
+            &paths,
+            &FixedEmbedder(0.5),
+            false,
+            1800,
+            |batch_index, _| {
+                if batch_index == 1 {
+                    observed.set(Some(wal_len(&paths).unwrap_or(0)));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report.embedded, total);
+        // 32 bytes is a bare WAL header; batch 0's frames make it longer.
+        let observed = observed.get().expect("batch 1 must have run");
+        assert!(
+            observed > 32,
+            "batch 0's frames must still be in the WAL when batch 1 starts \
+             (found a {observed}-byte WAL): a checkpoint ran inside the lock window, \
+             which costs the batch two fsyncs and the next batch a directory fsync"
+        );
+    }
+
+    /// The flip side of the property above: deferring the backfill must not
+    /// leave it undone. `run_reembed` drains the WAL in its own hold of the
+    /// lock, after the last batch's window has closed, so the database at rest
+    /// is self-contained.
+    #[test]
+    fn test_reembed_drains_the_wal_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        db::open_or_init(&paths).unwrap();
+        let total = 2 * REEMBED_WRITE_BATCH_SIZE;
+        for index in 0..total {
+            seed(&paths, &format!("drain-{index}"), "seed");
+        }
+        let report = run_reembed(&paths, &FixedEmbedder(0.5), false, 1800).unwrap();
+        assert_eq!(report.embedded, total);
+        assert_eq!(
+            wal_len(&paths).unwrap_or(0),
+            0,
+            "reembed must leave the live database self-contained: any WAL left \
+             behind must be drained and truncated"
         );
     }
 

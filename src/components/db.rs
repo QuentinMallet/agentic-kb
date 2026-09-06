@@ -531,6 +531,72 @@ pub fn open_rw_existing(
     open_conn_rw(&paths.db)
 }
 
+/// A second, read-only handle on the live database, held for exactly as long
+/// as a locked writer's connection so that SQLite does not checkpoint when
+/// that writer closes.
+///
+/// Why this exists. `sqlite3WalClose` opportunistically checkpoints whenever
+/// it can take an EXCLUSIVE lock on the database file, which is whenever the
+/// closing connection is the last one open, and then unlinks `-wal`/`-shm`.
+/// For a writer that opens and closes once per batch — which the reembed lock
+/// contract requires, so that a `rebuild` swap is always picked up by
+/// pathname — that turns one durable commit into five fsyncs: the fresh WAL's
+/// header, the directory (because `-wal` and `-shm` were just created), the
+/// commit itself, the checkpoint's WAL sync, and the checkpoint's database
+/// sync. Only the third is durability. A syscall trace of the reembed batch
+/// path showed exactly that sequence, and the four non-commit fsyncs are the
+/// bulk of the measured lock-hold time.
+///
+/// The handle is opened `SQLITE_OPEN_READ_ONLY` on purpose, and that flag is
+/// load-bearing twice over: while it is alive the writer cannot take the
+/// EXCLUSIVE lock, so the writer skips both the checkpoint and the unlink;
+/// and when this handle is dropped it cannot take that lock either, because
+/// a POSIX write lock on a descriptor opened `O_RDONLY` fails, so it does not
+/// simply perform the checkpoint in the writer's place. This is the one place
+/// in the crate that wants a genuinely read-only file handle; [`open_ro`] is
+/// deliberately not one (it must be able to recover a hot WAL).
+///
+/// Durability is untouched. The writer's own commit still fsyncs the WAL
+/// under `synchronous=FULL`, and a crash replays those frames. What is
+/// deferred is only the backfill of committed frames into the database file.
+///
+/// Swap safety. This handle is opened and dropped inside a single hold of the
+/// write lock, so no connection is open on the live inode when the lock is
+/// released and `rebuild` may replace the file — the invariant that rules out
+/// a connection retained across batches still holds. What it does leave at
+/// rest is a `-wal` carrying unbackfilled frames. `rebuild`'s D4 sequence is
+/// built for exactly that: step 1 drains the live WAL with
+/// `wal_checkpoint(TRUNCATE)` under this same lock, step 2 gates the swap on
+/// the resulting zero-length `-wal`, and step 5 unlinks the replaced inode's
+/// sidecars. Callers should still drain once per run outside their timed
+/// windows so the database at rest is self-contained.
+pub struct CloseCheckpointSuppressor {
+    #[allow(dead_code)]
+    conn: Connection,
+}
+
+/// Open a [`CloseCheckpointSuppressor`] on `db_path`. Call it only while
+/// holding the write lock and only after the writer connection is open: the
+/// writer is what creates `-shm`, which a read-only handle cannot.
+///
+/// Returns `None` when the read-only handle cannot be opened or cannot take
+/// its shared lock. That costs the optimization — the writer's close
+/// checkpoints as before — and never correctness, so it is not an error.
+pub fn suppress_close_checkpoint(db_path: &Path) -> Option<CloseCheckpointSuppressor> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // A statement, not merely the open: in WAL mode SQLite takes the shared
+    // lock on the database file when the WAL is first opened, which happens on
+    // first access. `schema_version` reads the header rather than the parsed
+    // schema, so this is the cheapest read that still takes the lock.
+    conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
+        .ok()?;
+    Some(CloseCheckpointSuppressor { conn })
+}
+
 fn require_live_write_lock(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<()> {
     let expected = fs::canonicalize(&paths.lock).with_context(|| {
         format!(
