@@ -6457,15 +6457,15 @@ mod tests {
         let contract: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
             .expect("shared MCP schema contract fixture must be valid JSON");
         let bounds = &contract["bounds"];
-        assert_eq!(bounds["kb_search.limit"]["maximum"].as_u64(), Some(db::MAX_LIMIT as u64));
-        assert_eq!(
-            bounds["kb_search.inline_verify_k"]["maximum"].as_u64(),
-            Some(db::MAX_INLINE_VERIFY_K as u64)
-        );
-        assert_eq!(
-            bounds["kb_reembed.max_chars"]["maximum"].as_u64(),
-            Some(MAX_REEMBED_MAX_CHARS)
-        );
+        let expected = [
+            ("kb_search.limit", 1, db::MAX_LIMIT as u64),
+            ("kb_search.inline_verify_k", 0, db::MAX_INLINE_VERIFY_K as u64),
+            ("kb_reembed.max_chars", 1, MAX_REEMBED_MAX_CHARS),
+        ];
+        for (field, minimum, maximum) in expected {
+            assert_eq!(bounds[field]["minimum"].as_u64(), Some(minimum));
+            assert_eq!(bounds[field]["maximum"].as_u64(), Some(maximum));
+        }
     }
 
     #[test]
