@@ -27,8 +27,16 @@ use std::os::unix::fs::MetadataExt;
 /// exercised write_batches at all, and predates the per-batch transaction
 /// above — both were review findings). Still well above the 50 ms
 /// idle-host budget, but the transaction cut it roughly 4-6x versus the
-/// pre-transaction code path measured the same way (319-634 ms). A
-/// quiet-machine re-measurement is owed at post-impl.
+/// pre-transaction code path measured the same way (319-634 ms).
+///
+/// Re-measured 2026-09-06 in the release profile on an otherwise idle
+/// 12-core host (load1 2.50 at start; no concurrent build/test jobs), using
+/// `CARGO_TARGET_DIR=/tmp/agentic-kb-target-bd-21ef.2.18 cargo test --release
+/// -p kb test_reembed_batch_lock_hold_budget -- --ignored --nocapture`.
+/// Three warm samples were 96.898973 ms, 109.389693 ms, and 64.847207 ms.
+/// The release-profile idle-host result still exceeds the 50 ms budget, so
+/// this obligation remains open pending a smaller batch or moving embedding
+/// work fully outside the lock.
 pub(crate) const REEMBED_WRITE_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
