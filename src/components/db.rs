@@ -3921,9 +3921,9 @@ mod tests {
                 ]
             } else {
                 vec![
-                    ("rank-a".into(), 0.0f32.to_bits(), "semantic", "semantic"),
-                    ("rank-b".into(), 0.0f32.to_bits(), "semantic", "semantic"),
-                    ("rank-c".into(), 0.0f32.to_bits(), "semantic", "semantic"),
+                    ("rank-a".into(), 1065351018, "semantic", "semantic"),
+                    ("rank-b".into(), 1065041172, "semantic", "semantic"),
+                    ("rank-c".into(), 1064372691, "semantic", "semantic"),
                 ]
             };
             assert_eq!(actual_bytes, expected_bytes);
@@ -4104,7 +4104,7 @@ mod tests {
     }
 
     #[test]
-    fn nan_blob_is_zero_scored_and_reported_in_search_stats() {
+    fn malformed_normalized_f16_blob_is_zero_scored_and_reported_in_search_stats() {
         let conn = open_db_memory().unwrap();
         for (id, summary) in [
             ("rank-a", "sealedwaiver sealedwaiver rank-a"),
@@ -4123,7 +4123,7 @@ mod tests {
             });
             apply_event(&conn, &FullDimEmbedder, &event).unwrap();
         }
-        let blob = f32s_to_blob(&[f32::NAN, 1.0]);
+        let blob = vec![0_u8; EMB_BLOB_BYTES - 1];
         conn.execute("UPDATE entries_emb SET embedding=?1 WHERE rowid=(SELECT rowid FROM entries WHERE id='rank-a')", [blob]).unwrap();
         let (rows, stats) = search_entries_with_stats(
             &conn,
@@ -4132,7 +4132,7 @@ mod tests {
             &single_fetch_opts(false, true, 0.0),
         )
         .unwrap();
-        assert!(stats.corrupt_embeddings > 0);
+        assert_eq!(stats.corrupt_embeddings, 1);
         assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
         assert_eq!(rows.last().map(|r| r.score), Some(0.0));
     }
