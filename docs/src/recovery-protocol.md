@@ -68,12 +68,16 @@ database. `Compact::run`,
 ## Materialization invariant
 
 Replaying the committed log reproduces `entries`, `test_cases`, `evidence`,
-`cues`, `entries_fts`, `entries_emb`, and `run_history`. `materialized`,
-`test_every_apply_event_arm_is_idempotent_under_replay`
+`cues`, `entries_fts`, `entries_emb`, `run_history`, `audit_runs`,
+`audit_run_candidates`, and `source_weights`. `materialized`,
+`test_every_apply_event_arm_is_idempotent_under_replay`. The audit tables are
+populated by `apply_event` arms for the `audit_record_batch` and
+`audit_run_candidates_batch` actions (`apply_audit_record_batch`,
+`apply_audit_run_candidates_batch` in `src/components/db.rs`), the same
+mechanism as every other table in this list.
 
-Database-native tables outside this invariant are `kb_meta`, `audit_runs`,
-`source_weights`, `audit_run_candidates`, `graphs`, `peers`, and
-`fts5_deprecation_gate`. `ensure_schema`
+Database-native tables outside this invariant are `kb_meta`, `graphs`,
+`peers`, and `fts5_deprecation_gate`. `ensure_schema`
 
 `entries_fts_v2` is maintained from `entries` by SQLite triggers rather than a
 separate event arm. `ensure_schema`
