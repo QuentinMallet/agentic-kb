@@ -18,6 +18,9 @@ exec 2>/dev/null
 
 set -uo pipefail
 
+audit_state=$(mktemp "${TMPDIR:-/tmp}/agentic-kb-audit.XXXXXX")
+trap 'rm -f "$audit_state"' EXIT
+
 field() { # field <name> <json-line> -> the string value of "<name>":"..."
   echo "$2" | grep -o "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
 }
@@ -61,13 +64,65 @@ while IFS= read -r line; do
       while IFS= read -r _unused; do :; done
       ;;
     audit_run)
-      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[]}\n' "$id"
+      printf '{"id":"%s","type":"ok","run_id":"audit-1","samples":[{"id":"audit-e1","path":"audit/e1","summary":"first","kind":"belief","evidence_status":"present","arm":"uniform","evidence":[]},{"id":"audit-e2","path":"audit/e2","summary":"second","kind":"belief","evidence_status":"present","arm":"uniform","evidence":[]}]}\n' "$id"
       ;;
     audit_record)
-      printf '{"id":"%s","type":"ok","recorded":1,"expired":0}\n' "$id"
+      # `audit-perm` is a fixture-only id for the permanent-guard case: a
+      # false verdict against it always refuses, before any counting below,
+      # mirroring handle_audit_record's permanent check that runs before its
+      # apply loop (src/commands/mcp.rs) — nothing is appended to
+      # $audit_state, so it can never contribute to a later audit_report.
+      #
+      # Scanned per verdict item, not over the whole line: each item is a
+      # leaf JSON object with no nested braces, so `grep -oE '\{[^{}]*\}'`
+      # extracts them one at a time and entry_id/verdict are matched
+      # together within the SAME object — a batch also carrying another
+      # entry's unrelated false verdict must not be misread as this case.
+      permanent_guard_hit=false
+      while IFS= read -r verdict_obj; do
+        if echo "$verdict_obj" | grep -Eq '"entry_id"[[:space:]]*:[[:space:]]*"audit-perm"' \
+            && echo "$verdict_obj" | grep -Eq '"verdict"[[:space:]]*:[[:space:]]*false'; then
+          permanent_guard_hit=true
+        fi
+      done < <(echo "$line" | grep -oE '\{[^{}]*\}')
+
+      if [ "$permanent_guard_hit" = true ]; then
+        printf '{"id":"%s","type":"error","code":"permanent_guard","message":"entry '\''audit-perm'\'' cannot be expired: permanent"}\n' "$id"
+      else
+        # Count every verdict in the line, not just the first: a mixed batch
+        # of true and false verdicts records and expires each one, matching
+        # the real handler's per-verdict apply loop. An empty batch counts
+        # zero of each, which also gives the correct recorded:0,expired:0
+        # for that case without a separate branch.
+        true_count=$(echo "$line" | grep -oE '"verdict"[[:space:]]*:[[:space:]]*true' | wc -l | tr -d ' ')
+        false_count=$(echo "$line" | grep -oE '"verdict"[[:space:]]*:[[:space:]]*false' | wc -l | tr -d ' ')
+        i=0
+        while [ "$i" -lt "$true_count" ]; do
+          printf 'true\n' >> "$audit_state"
+          i=$((i + 1))
+        done
+        i=0
+        while [ "$i" -lt "$false_count" ]; do
+          printf 'false\n' >> "$audit_state"
+          i=$((i + 1))
+        done
+        recorded=$((true_count + false_count))
+        printf '{"id":"%s","type":"ok","recorded":%s,"expired":%s}\n' "$id" "$recorded" "$false_count"
+      fi
       ;;
     audit_report)
-      printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      total=$(wc -l < "$audit_state" | tr -d ' ')
+      supported=$(grep -c '^true$' "$audit_state" || true)
+      if [ "$total" -eq 0 ]; then
+        printf '{"id":"%s","type":"result","per_kind_session_precision":[],"last_run_at":null,"total_runs":0,"per_arm_precision":[]}\n' "$id"
+      else
+        # %.10g, not %.1f: the real handler emits an unrounded f64 ratio, and
+        # a fixed one-decimal-place round trips only for a 1/2 split (0.5) —
+        # a future three-verdict case (2/3) would otherwise render 0.7, a
+        # value the real handler never produces.
+        precision=$(awk -v yes="$supported" -v all="$total" 'BEGIN { printf "%.10g", yes / all }')
+        printf '{"id":"%s","type":"result","per_kind_session_precision":[{"kind":"belief","session_id":"__GLOBAL__","precision":%s,"n":%s}],"last_run_at":"2026-09-05T00:00:00Z","total_runs":%s,"per_arm_precision":[{"arm":"uniform","n":%s,"precision":%s}]}\n' "$id" "$precision" "$total" "$total" "$total" "$precision"
+      fi
       ;;
     provenance)
       printf '{"id":"%s","type":"result","roots":["root-1"],"graph":[],"truncated":false}\n' "$id"

@@ -32,6 +32,8 @@ tools (`kb_audit_run`, `kb_audit_record`, `kb_audit_report`, and
 `handle_audit_run` and `handle_audit_record` bound audit samples and verdict
 batches to `MAX_AUDIT_VERDICTS` (50). Typed `AuditVerdict` rows require a
 boolean verdict, `handle_audit_record` requires a non-empty note when it is
-false, and `db::expire_guard` preserves permanent entries. Caller identity,
+false, and `db::expire_guard` preserves permanent entries. Any one invalid
+verdict rejects the whole `kb_audit_record` batch before any write — the
+other, valid verdicts in that call are not applied either. Caller identity,
 rate limits, and OPA policy enforcement remain deferred follow-ups in beads
 `bd-1orr`.
