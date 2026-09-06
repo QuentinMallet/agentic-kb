@@ -22,16 +22,26 @@ model deliberately covers process kill points, not torn sectors/interior
 zero-fill.  Directory fsync is therefore represented as the final durability
 step.  NameResolvesCommitted must hold at every named kill point and again
 after a modelled restart (Reopen, findings 4 and 6).
+
+Delta (bd-21ef.2.22): reembed's per-batch writer, which suppresses SQLite's
+close-time checkpoint.  BatchOpen/BatchCommitAndClose let wal_frames rise
+during Phase 1/2 (previously wal_frames was monotonically non-increasing, so
+a dirty WAL could only ever be an Init-time condition) and writer_open tracks
+whether a batch connection is open on the live inode.  RetainedConn is a
+single non-vacuity toggle, mirroring how Fixed already gates this module's
+correct-vs-buggy branches: RetainedConn = TRUE selects the rejected
+alternative (a connection held open across batches) so NoWriterConnAtSwap can
+be shown to actually distinguish the two.
 ***************************************************************************)
-CONSTANTS Fixed, Scenario, MaxLogLen, MaxConcurrentAppends
+CONSTANTS Fixed, Scenario, MaxLogLen, MaxConcurrentAppends, RetainedConn
 
 VARIABLES log, committed_len, tmp_db, live_db, files, wal_frames, phase,
           cursor, snapshot_boundary, concurrent_appends, tmp_mode, killed,
-          replayed
+          replayed, writer_open
 
 vars == <<log, committed_len, tmp_db, live_db, files, wal_frames, phase,
           cursor, snapshot_boundary, concurrent_appends, tmp_mode, killed,
-          replayed>>
+          replayed, writer_open>>
 
 Lines == {"begin", "A", "B", "commit", "W"}
 FileIds == {"old", "tmp"}
@@ -69,6 +79,7 @@ TypeOK ==
   /\ snapshot_boundary \in 0..MaxLogLen
   /\ concurrent_appends \in 0..MaxConcurrentAppends
   /\ tmp_mode \in Modes /\ killed \in BOOLEAN /\ replayed \in BOOLEAN
+  /\ writer_open \in BOOLEAN
 
 Init ==
   /\ IF Scenario = "CE4"
@@ -80,13 +91,15 @@ Init ==
   /\ cursor = [generation |-> 0, offset |-> 0, tail_sha |-> "none"]
   /\ snapshot_boundary = 0 /\ concurrent_appends = 0
   /\ tmp_mode = "DELETE" /\ killed = FALSE /\ replayed = FALSE
+  /\ writer_open = FALSE
 
 Phase1Snapshot ==
   /\ phase = "p1" /\ ~killed
   /\ snapshot_boundary' = (IF Fixed THEN committed_len ELSE Len(log))
   /\ phase' = "p2"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
-                  cursor, concurrent_appends, tmp_mode, killed, replayed>>
+                  cursor, concurrent_appends, tmp_mode, killed, replayed,
+                  writer_open>>
 
 (* Phase 2 is unlocked: the writer finishes the span one physical line at a time. *)
 WriterAppend ==
@@ -98,7 +111,8 @@ WriterAppend ==
           /\ committed_len' = 4
   /\ concurrent_appends' = concurrent_appends + 1
   /\ UNCHANGED <<tmp_db, live_db, files, wal_frames, phase, cursor,
-                  snapshot_boundary, tmp_mode, killed, replayed>>
+                  snapshot_boundary, tmp_mode, killed, replayed,
+                  writer_open>>
 
 (* Finding 3: the CE6 replay-order pin (Len(log) = MaxLogLen) is removed so
    the Fixed model explores every interleaving of replay against the
@@ -116,7 +130,7 @@ Phase2Replay ==
   /\ phase' = "p3"
   /\ UNCHANGED <<log, committed_len, live_db, files, wal_frames, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 Phase3CatchUp ==
   /\ phase = "p3" /\ ~killed
@@ -128,7 +142,7 @@ Phase3CatchUp ==
   /\ phase' = "KP_PRE_CHECKPOINT"
   /\ UNCHANGED <<log, committed_len, live_db, files, wal_frames,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 Checkpoint ==
   /\ phase = "KP_PRE_CHECKPOINT" /\ ~killed
@@ -139,7 +153,7 @@ Checkpoint ==
   /\ phase' = "KP_POST_CHECKPOINT"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 VerifyAndClose ==
   /\ phase = "KP_POST_CHECKPOINT" /\ ~killed
@@ -148,7 +162,7 @@ VerifyAndClose ==
   /\ phase' = "KP_POST_TMP_SYNC"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, wal_frames, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 (* Finding 5: the fixed design must explicitly transition the tmp DB into WAL
    mode before it is ever named live.  DELETE mode -- today's forced pragma,
@@ -161,7 +175,7 @@ SetTmpWalMode ==
   /\ tmp_mode' = "WAL"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   phase, cursor, snapshot_boundary, concurrent_appends,
-                  killed, replayed>>
+                  killed, replayed, writer_open>>
 
 FirstNameOperation ==
   /\ phase = "KP_POST_TMP_SYNC" /\ ~killed
@@ -173,7 +187,7 @@ FirstNameOperation ==
           /\ phase' = "KP_POST_UNLINK"
   /\ UNCHANGED <<log, committed_len, tmp_db, files, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 SecondNameOperation ==
   /\ ~killed
@@ -185,27 +199,27 @@ SecondNameOperation ==
           /\ phase' = "KP_POST_RENAME"
   /\ UNCHANGED <<log, committed_len, tmp_db, files, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
-                  replayed>>
+                  replayed, writer_open>>
 
 DirSync ==
   /\ phase = (IF Fixed THEN "KP_POST_UNLINK" ELSE "KP_POST_RENAME")
   /\ ~killed /\ phase' = "KP_POST_DIR_SYNC"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, snapshot_boundary, concurrent_appends, tmp_mode,
-                  killed, replayed>>
+                  killed, replayed, writer_open>>
 
 Finish ==
   /\ phase = "KP_POST_DIR_SYNC" /\ ~killed /\ phase' = "done"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   cursor, snapshot_boundary, concurrent_appends, tmp_mode,
-                  killed, replayed>>
+                  killed, replayed, writer_open>>
 
 Kill ==
   /\ phase \in KillPoints \union {"current_pre_rename"} /\ ~killed
   /\ killed' = TRUE
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, wal_frames,
                   phase, cursor, snapshot_boundary, concurrent_appends,
-                  tmp_mode, replayed>>
+                  tmp_mode, replayed, writer_open>>
 
 (* Findings 4 and 6: the Phase-3 cursor write (cursor', in Phase3CatchUp) was
    never read by any action.  Reopen models the next process start -- either
