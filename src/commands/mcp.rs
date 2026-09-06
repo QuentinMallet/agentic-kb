@@ -6392,6 +6392,24 @@ mod tests {
         let rebuild = json!({"method":"rebuild","id":"pin-rebuild"});
         let kb_get = json!({"method":"kb_get","id":"pin-kb-get","entry_id":"nope"});
 
+        let contract: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
+            .expect("shared MCP schema contract fixture must be valid JSON");
+        let requests = [
+            ("kb_search", &search), ("kb_add", &add), ("kb_cite", &cite),
+            ("kb_import", &import), ("kb_stale_check", &stale), ("kb_expire", &expire),
+            ("kb_run", &run), ("kb_test_add", &test_add), ("kb_tests", &tests),
+            ("kb_reembed", &reembed), ("kb_compact", &compact), ("kb_rebuild", &rebuild),
+            ("kb_get", &kb_get),
+        ];
+        for (tool, request) in requests {
+            let actual: std::collections::BTreeSet<_> = request.as_object().unwrap().keys()
+                .filter(|key| key.as_str() != "method" && key.as_str() != "id")
+                .cloned().collect();
+            let expected: std::collections::BTreeSet<_> = contract["pin_fields"][tool]
+                .as_array().unwrap().iter().map(|field| field.as_str().unwrap().to_owned()).collect();
+            assert_eq!(actual, expected, "{tool} request drifted from shared deployed-pin field table");
+        }
+
         pin_accepted::<SearchRequest>(&search);
         pin_accepted::<AddRequest>(&add);
         pin_accepted::<CiteRequest>(&cite);
@@ -6426,6 +6444,28 @@ mod tests {
                 "deployed pin method must be routed: {req} -> {resp}"
             );
         }
+    }
+
+    #[test]
+    fn test_schema_contract_fixture_is_present() {
+        let _: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
+            .expect("shared MCP schema contract fixture must be valid JSON");
+    }
+
+    #[test]
+    fn test_schema_bounds_match_shared_contract_fixture() {
+        let contract: Value = serde_json::from_str(include_str!("../../mcp/test/schema_contract.json"))
+            .expect("shared MCP schema contract fixture must be valid JSON");
+        let bounds = &contract["bounds"];
+        assert_eq!(bounds["kb_search.limit"]["maximum"].as_u64(), Some(db::MAX_LIMIT as u64));
+        assert_eq!(
+            bounds["kb_search.inline_verify_k"]["maximum"].as_u64(),
+            Some(db::MAX_INLINE_VERIFY_K as u64)
+        );
+        assert_eq!(
+            bounds["kb_reembed.max_chars"]["maximum"].as_u64(),
+            Some(MAX_REEMBED_MAX_CHARS)
+        );
     }
 
     #[test]

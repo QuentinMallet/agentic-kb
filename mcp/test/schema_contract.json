@@ -1,0 +1,22 @@
+{
+  "bounds": {
+    "kb_search.limit": {"minimum": 1, "maximum": 100},
+    "kb_search.inline_verify_k": {"minimum": 0, "maximum": 20},
+    "kb_reembed.max_chars": {"minimum": 1, "maximum": 100000}
+  },
+  "pin_fields": {
+    "kb_search": ["query", "limit", "mode", "path_prefix", "tag", "inline_verify_k", "expand_ids"],
+    "kb_add": ["path", "summary", "content", "tags", "permanent", "replace_path", "kind", "evidence", "cues"],
+    "kb_cite": ["path", "start", "end"],
+    "kb_import": ["path", "upsert"],
+    "kb_stale_check": ["files", "commits", "blame"],
+    "kb_expire": ["entry_id", "reason", "force"],
+    "kb_run": ["test_id", "result", "adapter", "detail"],
+    "kb_test_add": ["app", "name", "protocol", "config", "test_id"],
+    "kb_tests": ["app"],
+    "kb_reembed": ["dry_run", "max_chars"],
+    "kb_compact": [],
+    "kb_rebuild": [],
+    "kb_get": ["entry_id"]
+  }
+}
