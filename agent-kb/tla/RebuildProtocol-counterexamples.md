@@ -184,6 +184,102 @@ non-vacuity — that `"done"` and `"reopened"` are actually reached, on both the
 clean-finish and the killed-then-reopened paths — was established with
 temporary, unshipped probe invariants during this pass, not asserted.
 
+## bd-21ef.2.22 — reembed batch writer (`writer_open`, `BatchOpen`/`BatchCommitAndClose`, `NoWriterConnAtSwap`)
+
+Refines the module per the `reembed-tla-audit.md` §4 sketch (bd-21ef.2.19,
+"keep close-time checkpoint out of the lock window"): a new `writer_open`
+variable, two new actions (`BatchOpen`, `BatchCommitAndClose`), a new
+`RetainedConn` CONSTANT (non-vacuity toggle mirroring `Fixed`), and a new
+invariant `NoWriterConnAtSwap == phase \notin {"p1","p2"} => ~writer_open`.
+Transcribed close to the audit's sketch verbatim — no extra guard was added
+beyond what the sketch specified (see finding below). `RetainedConn = FALSE`
+was added to the `CONSTANTS` line of every existing `.cfg` in this directory
+(TLC requires every declared CONSTANT bound).
+
+### Run matrix
+
+| Config | Result | States (gen/distinct) | Depth | vs. recorded |
+|---|---|---|---|---|
+| `CE4_Fixed` + `NoWriterConnAtSwap` | No error | 26 / 23 | 11 | identical to pre-change baseline |
+| `NV_RetainedConn` (new; CE6, Fixed=TRUE, RetainedConn=TRUE) | `NoWriterConnAtSwap` violated | 14 / 12 | 4 | n/a (new config) — **but see finding: not the intended witness** |
+| `CE4_Current` | `NameResolvesCommitted` violated (unchanged invariant) | 14 / 13 | 8 | was 22/19/10 — found sooner, see note below |
+| `WAL_Fixed` | No error | 26 / 23 | 11 | identical to pre-change baseline |
+| `CE6_Fixed` | No error | 325 / 235 | 15 | **was 76/62/13 — grew substantially, see finding** |
+| `NV_TypeOK` | `TypeOK` violated at Init | (single state) | 0 | identical to pre-change baseline |
+| `NV_WAL_Current` | `SwappedInWalMode` violated | 13 / 12 | 8 | was 14/13/8 — one state fewer, same depth |
+
+### Finding: `NoWriterConnAtSwap` is violated by a trace that never exercises `RetainedConn`
+
+Per the task brief, expected outcome for `CE4_Fixed` was "no error" (confirmed:
+`BatchOpen`'s bound `"W" \notin wal_frames` is never satisfied under
+`Scenario = "CE4"`, whose `Init` already sets `wal_frames = {"W"}` and no
+action clears it before `phase` leaves `{"p1","p2"}` — so `BatchOpen` is
+structurally dead for every CE4 config, `writer_open` stays `FALSE`
+throughout, and the invariant holds vacuously there).
+
+The non-vacuity config (`NV_RetainedConn`, `Scenario = "CE6"` since CE6's
+`Init` has `wal_frames = {}`, so `BatchOpen` can actually fire) does report a
+violation, but **the witnessing trace never reaches `BatchCommitAndClose`**:
+
+```text
+State 1  Init            phase=p1  writer_open=FALSE
+State 2  Phase1Snapshot  phase=p2  writer_open=FALSE
+State 3  BatchOpen       phase=p2  writer_open=TRUE
+State 4  Phase2Replay    phase=p3  writer_open=TRUE   <- violates NoWriterConnAtSwap here
+```
+
+`Phase2Replay` (the action that produces `phase' = "p3"`, the first phase
+excluded from `BatchOpen`'s `{"p1","p2"}` window) has no guard on
+`writer_open`, so nothing stops rebuild from advancing past Phase 2 while a
+batch is still open — regardless of `RetainedConn`. Re-running the identical
+`Scenario = "CE6", Fixed = TRUE` config with `RetainedConn = FALSE` (the
+shipped, correct behaviour) reproduces the byte-identical 4-state trace above
+and the same violation. **The invariant is violated equally by the correct
+design and the rejected alternative** — `NV_RetainedConn` does not
+demonstrate what item 2 of the task asked it to demonstrate (that only the
+rejected alternative violates `NoWriterConnAtSwap`), because the trace that
+falsifies it never involves `BatchCommitAndClose` at all.
+
+Root cause: the audit's sketch bounds `BatchOpen` to `phase \in {"p1","p2"}`
+but does not add a corresponding guard to whichever action first transitions
+`phase` out of that set (`Phase2Replay`) requiring `~writer_open`. Without
+that guard, the model has no mutual-exclusion between rebuild's phase
+progression and an open batch — which is precisely the flock-mediated
+property the invariant is meant to certify. A `~writer_open` guard added to
+`Phase2Replay` (modelling that rebuild's flock acquisition blocks until a
+concurrent batch releases it) is the natural fix, but per instructions this
+was **not** applied — it would change the spec to make the check pass rather
+than reporting the gap the sketch left.
+
+### Finding: `CE6_Fixed`'s state count grew (76/62/13 -> 325/235/15)
+
+`BatchOpen`/`BatchCommitAndClose` are unconditional in `Next` (no `Scenario`
+guard, unlike `WriterAppend`'s `Scenario = "CE6"` restriction). Under
+`Scenario = "CE4"` this is inert (see above), so `CE4_Fixed`, `CE4_Current`,
+and `WAL_Fixed` reproduce their pre-change reachable-state counts exactly.
+Under `Scenario = "CE6"`, `wal_frames = {}` at `Init`, so `BatchOpen` *is*
+reachable, and the two new actions add genuinely new interleavings to every
+CE6 config's state graph, not just the new `NV_RetainedConn` config — hence
+`CE6_Fixed`'s 3x growth. `CE6_Fixed`'s own invariants (`BatchAtomic`, `TypeOK`,
+`CursorMatchesAtDone`, `NoReplayOnMatchedCursor`) all still pass with no
+error at the larger count, so this is a coverage-scope change, not a
+regression, but it is not what "confirm they still produce their recorded
+results" asked for.
+
+### Note: violation-run counts for `CE4_Current` and `NV_WAL_Current` shifted slightly
+
+Both still violate the same invariant as before (`NameResolvesCommitted`,
+`SwappedInWalMode` respectively), but at a shallower depth / lower generated
+count than the pre-change baseline (`CE4_Current`: 14/13/8 vs. 22/19/10;
+`NV_WAL_Current`: 13/12/8 vs. 14/13/8). TLC's breadth-first search stops at
+the first counterexample found; adding two new disjuncts to `Next` shifts
+successor-enumeration order even where the new actions never fire (here,
+under `Scenario = "CE4"`), so the same violation can be found sooner. This is
+the same phenomenon already documented for this module (see finding 3 above:
+"CE6-current... now caught two states earlier"), not a new kind of
+divergence — flagged for completeness, not as a discrepancy needing a
+decision.
+
 ## CE4 — unlink-before-rename loses the name's committed WAL state
 
 The initial live name maps to `old`; its main file is `{}`, while its committed
