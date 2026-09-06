@@ -27,3 +27,4 @@
 ## Security
 
 - [Credential Redaction](./security/credential-redaction.md)
+- [MCP Authorization](./security/mcp-authorization.md)
