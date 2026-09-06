@@ -3,7 +3,7 @@
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::{db, embedder};
 use crate::config;
-use crate::models::f32s_to_f16_blob;
+use crate::models::normalized_f32s_to_f16_blob;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use rusqlite::params;
@@ -243,16 +243,14 @@ where
             &candidate.tags,
         );
         match emb.embed(&text) {
-            Ok(vector) if vector.iter().all(|x| x.is_finite()) => writes.push(PendingWrite {
-                id: candidate.id,
-                updated_at: candidate.updated_at,
-                blob: f32s_to_f16_blob(&vector),
-            }),
-            Ok(_) => record_failure(
-                &mut report,
-                candidate.id,
-                "embedder returned a non-finite component".to_string(),
-            ),
+            Ok(vector) => match normalized_f32s_to_f16_blob(&vector) {
+                Ok(blob) => writes.push(PendingWrite {
+                    id: candidate.id,
+                    updated_at: candidate.updated_at,
+                    blob,
+                }),
+                Err(error) => record_failure(&mut report, candidate.id, error.to_string()),
+            },
             Err(error) => record_failure(&mut report, candidate.id, error.to_string()),
         }
     }
@@ -408,8 +406,8 @@ fn write_batches<B, A>(
             // batch's vector — computed from the pre-edit content — land
             // on top of the new content.
             match txn.execute(
-                "INSERT OR IGNORE INTO entries_emb(rowid, embedding)
-                 SELECT e.rowid, ?3 FROM entries e WHERE e.id = ?1 AND e.is_stale = 0
+                "INSERT OR IGNORE INTO entries_emb(rowid, embedding, normalized)
+                 SELECT e.rowid, ?3, 1 FROM entries e WHERE e.id = ?1 AND e.is_stale = 0
                  AND e.updated_at = ?2
                  AND e.rowid NOT IN (SELECT rowid FROM entries_emb)",
                 params![write.id, write.updated_at, write.blob],
@@ -537,7 +535,10 @@ mod tests {
         let blob: Vec<u8> = conn.query_row(
             "SELECT emb.embedding FROM entries e JOIN entries_emb emb ON emb.rowid=e.rowid WHERE e.id='race'",
             [], |r| r.get(0)).unwrap();
-        assert_eq!(blob, f32s_to_f16_blob(&vec![0.75; 384]));
+        assert_eq!(
+            blob,
+            normalized_f32s_to_f16_blob(&vec![0.75; 384]).unwrap()
+        );
     }
 
     #[test]

@@ -4,8 +4,9 @@ use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
 use crate::config;
 use crate::models::{
-    cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_f16_blob, Evidence,
-    VerificationStatus, EMB_DIMS,
+    cosine_similarity, decode_emb_blob, decode_f16_blob_into, decode_legacy_f32_embedding,
+    normalize_embedding, normalized_f32s_to_f16_blob, Evidence, VerificationStatus, EMB_BLOB_BYTES,
+    EMB_DIMS,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
@@ -52,14 +53,6 @@ pub fn compare_rank(score_a: f32, id_a: &str, score_b: f32, id_b: &str) -> std::
     let score_a = if score_a == 0.0 { 0.0 } else { score_a };
     let score_b = if score_b == 0.0 { 0.0 } else { score_b };
     score_b.total_cmp(&score_a).then_with(|| id_a.cmp(id_b))
-}
-
-fn validate_embedding(embedding: Vec<f32>) -> Result<Vec<f32>> {
-    anyhow::ensure!(
-        embedding.iter().all(|x| x.is_finite()),
-        "embedder returned a non-finite component"
-    );
-    Ok(embedding)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,7 +767,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS entries_emb (
             rowid    INTEGER PRIMARY KEY,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1))
         );
 
         -- Cue anchors (Memora pickup .4): agent-supplied semantic entry points,
@@ -784,7 +778,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             entry_id  TEXT NOT NULL,
             cue       TEXT NOT NULL,
-            embedding BLOB
+            embedding BLOB,
+            normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1))
         );
         CREATE INDEX IF NOT EXISTS idx_cues_entry ON cues(entry_id);
 
@@ -857,6 +852,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
     // Migration: add session_id column for Phase 5 audit confidence per-session weighting.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
+    // The read kernel is selected per blob.  A database-level flag would let a
+    // mixed store use dot product for an unmigrated legacy row.
+    let _ = conn.execute_batch(
+        "ALTER TABLE entries_emb ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1));",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE cues ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1));",
+    );
     // Migration: add run_id to audit_runs for Phase 5 idempotency (INSERT OR IGNORE on unique index).
     let _ = conn.execute_batch("ALTER TABLE audit_runs ADD COLUMN run_id TEXT;");
     // Traffic-weighted audit sampling: arm metadata lives on the sampled
@@ -966,6 +969,70 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
     maybe_drop_contentless_fts(conn)?;
     Ok(())
+}
+
+/// Rewrite every unmarked persisted embedding as a normalized f16 blob.
+///
+/// The transaction is deliberately all-or-nothing: validate and stage both
+/// entry and cue rows before updating either table.  A corrupt, non-finite, or
+/// zero-norm legacy blob aborts the transaction, leaving its marker clear so
+/// callers retain the cosine fallback instead of silently using dot product.
+/// The file-level command owns the backup and atomic database-file swap; this
+/// connection-level operation is also used by property tests against `:memory:`.
+pub fn migrate_embeddings(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut staged_entries = Vec::new();
+    let mut staged_cues = Vec::new();
+
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, embedding FROM entries_emb WHERE normalized=0 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, blob) = row?;
+            let vector = decode_legacy_f32_embedding(&blob);
+            if vector.is_empty() {
+                anyhow::bail!("cannot migrate corrupt entry embedding row {rowid}");
+            }
+            staged_entries.push((rowid, normalized_f32s_to_f16_blob(&vector)?));
+        }
+    }
+
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, embedding FROM cues WHERE embedding IS NOT NULL AND normalized=0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (id, blob) = row?;
+            let vector = decode_legacy_f32_embedding(&blob);
+            if vector.is_empty() {
+                anyhow::bail!("cannot migrate corrupt cue embedding row {id}");
+            }
+            staged_cues.push((id, normalized_f32s_to_f16_blob(&vector)?));
+        }
+    }
+
+    let migrated = staged_entries.len() + staged_cues.len();
+    for (rowid, blob) in staged_entries {
+        tx.execute(
+            "UPDATE entries_emb SET embedding=?1, normalized=1 WHERE rowid=?2",
+            params![blob, rowid],
+        )?;
+    }
+    for (id, blob) in staged_cues {
+        tx.execute(
+            "UPDATE cues SET embedding=?1, normalized=1 WHERE id=?2",
+            params![blob, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(migrated)
 }
 
 #[derive(Debug, Clone)]
@@ -1566,15 +1633,17 @@ pub fn apply_event_at(
                     params![id, path, summary, content, tags],
                 );
 
-                // Sync embedding store (f16 wire format — 768 bytes per entry)
+                // A marked blob is normalized before it is written.  The marker
+                // and bytes share this transaction, preserving the per-blob gate.
                 if !embedder.is_noop() {
                     let mode = EmbedTextMode::from_env();
                     check_embed_mode_vintage(conn, mode);
                     let text = entry_embed_text(mode, path, summary, content, &tags);
-                    let emb = validate_embedding(embedder.embed(&text)?)?;
-                    let blob = f32s_to_f16_blob(&emb);
+                    let emb = embedder.embed(&text)?;
+                    let blob = normalized_f32s_to_f16_blob(&emb)?;
                     conn.execute(
-                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
+                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding, normalized) \
+                         VALUES(?1,?2,1)",
                         params![rowid, blob],
                     )?;
                 }
@@ -1588,11 +1657,11 @@ pub fn apply_event_at(
                         let blob: Option<Vec<u8>> = if embedder.is_noop() {
                             None
                         } else {
-                            Some(f32s_to_f16_blob(&validate_embedding(embedder.embed(cue)?)?))
+                            Some(normalized_f32s_to_f16_blob(&embedder.embed(cue)?)?)
                         };
                         conn.execute(
-                            "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
-                            params![id, cue, blob],
+                            "INSERT INTO cues(entry_id, cue, embedding, normalized) VALUES(?1,?2,?3,?4)",
+                            params![id, cue, blob, i64::from(!embedder.is_noop())],
                         )?;
                     }
                 }
@@ -2489,6 +2558,24 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
     Ok(scored)
 }
 
+fn dot_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || !a.iter().chain(b.iter()).all(|value| value.is_finite()) {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(left, right)| left * right).sum();
+    dot.is_finite().then_some(dot).unwrap_or(0.0)
+}
+
+/// Use the dot kernel only when each participating persisted blob was marked
+/// normalized in the same transaction that wrote its bytes.
+fn persisted_similarity(a: &[f32], a_normalized: bool, b: &[f32], b_normalized: bool) -> f32 {
+    if a_normalized && b_normalized && a.len() == EMB_DIMS && b.len() == EMB_DIMS {
+        dot_similarity(a, b)
+    } else {
+        cosine_similarity(a, b)
+    }
+}
+
 /// Greedy MMR re-rank of `entries` in place (Memora pickup .6).
 ///
 /// Selection: seed with the top-scored entry (top-1 is never displaced), then
@@ -2506,19 +2593,32 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT e.id, emb.embedding FROM entries e
+        "SELECT e.id, emb.embedding, emb.normalized FROM entries e
          JOIN entries_emb emb ON emb.rowid = e.rowid
          WHERE e.id IN ({})",
         placeholders
     );
-    let emb_map: std::collections::HashMap<String, Vec<f32>> = match conn.prepare(&sql) {
+    let emb_map: std::collections::HashMap<String, (Vec<f32>, bool)> = match conn.prepare(&sql) {
         Ok(mut stmt) => stmt
             .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)? == 1,
+                ))
             })
             .map(|rows| {
                 rows.filter_map(|r| r.ok())
-                    .map(|(id, blob)| (id, decode_emb_blob(&blob)))
+                    .map(|(id, blob, normalized)| {
+                        let vector = if normalized && blob.len() == EMB_BLOB_BYTES {
+                            decode_emb_blob(&blob)
+                        } else if normalized {
+                            Vec::new()
+                        } else {
+                            decode_legacy_f32_embedding(&blob)
+                        };
+                        (id, (vector, normalized))
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -2542,11 +2642,14 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
                 let rel = cand.score / max_score;
                 let max_sim = emb_map
                     .get(&cand.id)
-                    .map(|cv| {
+                    .map(|(cv, cand_normalized)| {
                         selected
                             .iter()
                             .filter_map(|s| emb_map.get(&s.id))
-                            .map(|sv| cosine_similarity(cv, sv).max(0.0))
+                            .map(|(sv, selected_normalized)| {
+                                persisted_similarity(cv, *cand_normalized, sv, *selected_normalized)
+                                    .max(0.0)
+                            })
                             .fold(0.0f32, f32::max)
                     })
                     .unwrap_or(0.0);
@@ -2733,13 +2836,13 @@ pub fn search_entries(
     }
 
     if effective_opts.do_semantic && !embedder.is_noop() {
-        let q_emb = validate_embedding(embedder.embed(query)?)?;
+        let q_emb = normalize_embedding(&embedder.embed(query)?)?;
         let path_prefix = effective_opts
             .path_prefix
             .as_deref()
             .map(like_prefix_pattern);
         let mut stmt = conn.prepare(
-            "SELECT e.id, emb.embedding
+            "SELECT e.id, emb.embedding, emb.normalized
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
@@ -2749,23 +2852,26 @@ pub fn search_entries(
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
         //
         // Scratch buffer allocated ONCE outside the loop — no per-row Vec allocation.
-        // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
-        // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
-        // decode_emb_blob fallback via length dispatch.
+        // Marked rows decode through the canonical f16 path; unmarked rows
+        // decode only through the exact legacy f32 wire contract. This keeps a
+        // 768-byte half-dimension f32 blob from being misread as canonical f16.
         let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
         let mut candidates: Vec<(f32, String)> = Vec::new();
         let rows = stmt.query_map(params![path_prefix.clone(), tag_filter], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)? == 1,
+            ))
         })?;
         for row in rows {
-            let (id, blob) = row?;
-            decode_f16_blob_into(&blob, &mut scratch);
-            let sim = if scratch.is_empty() {
-                // blob was not canonical f16 — fall back to graceful decode
-                let fallback = decode_emb_blob(&blob);
-                cosine_similarity(&q_emb, &fallback)
+            let (id, blob, normalized) = row?;
+            let sim = if normalized {
+                decode_f16_blob_into(&blob, &mut scratch);
+                persisted_similarity(&q_emb, true, &scratch, true)
             } else {
-                cosine_similarity(&q_emb, &scratch)
+                let fallback = decode_legacy_f32_embedding(&blob);
+                persisted_similarity(&q_emb, true, &fallback, false)
             };
             candidates.push((sim, id));
         }
@@ -2779,7 +2885,7 @@ pub fn search_entries(
         let mut cue_ranked: Vec<(f32, String)> = Vec::new();
         if effective_opts.do_fts {
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT c.entry_id, c.cue, c.embedding
+                "SELECT c.entry_id, c.cue, c.embedding, c.normalized
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
@@ -2795,16 +2901,17 @@ pub fn search_entries(
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, i64>(3)? == 1,
                     ))
                 })?;
                 for row in cue_rows {
-                    let (entry_id, cue, blob) = row?;
-                    decode_f16_blob_into(&blob, &mut scratch);
-                    let sim = if scratch.is_empty() {
-                        let fallback = decode_emb_blob(&blob);
-                        cosine_similarity(&q_emb, &fallback)
+                    let (entry_id, cue, blob, normalized) = row?;
+                    let sim = if normalized {
+                        decode_f16_blob_into(&blob, &mut scratch);
+                        persisted_similarity(&q_emb, true, &scratch, true)
                     } else {
-                        cosine_similarity(&q_emb, &scratch)
+                        let fallback = decode_legacy_f32_embedding(&blob);
+                        persisted_similarity(&q_emb, true, &fallback, false)
                     };
                     match best.get(&entry_id) {
                         Some((prev, prev_cue, ..))
@@ -3475,7 +3582,10 @@ mod tests {
             } else {
                 0.9
             };
-            Ok(vec![first, (1.0_f32 - first * first).sqrt()])
+            let mut v = vec![0.0f32; EMB_DIMS];
+            v[0] = first;
+            v[1] = (1.0_f32 - first * first).sqrt();
+            Ok(v)
         }
 
         fn is_noop(&self) -> bool {
@@ -3678,7 +3788,10 @@ mod tests {
                 .into_iter()
                 .map(|row| (row.id, row.score.to_bits()))
                 .collect();
-        let worse = f32s_to_blob(&[-0.9, (1.0_f32 - 0.9 * 0.9).sqrt()]);
+        let mut worse_vec = vec![0.0f32; EMB_DIMS];
+        worse_vec[0] = -0.9;
+        worse_vec[1] = (1.0_f32 - 0.9 * 0.9).sqrt();
+        let worse = f32s_to_blob(&worse_vec);
         conn.execute(
             "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','worse',?1)",
             [&worse],
@@ -6233,13 +6346,17 @@ mod tests {
             })
             .unwrap();
 
-        // Query vector: [1.0, 0.0] (unit vector along dim-0)
-        let q_vec: Vec<f32> = vec![1.0, 0.0];
+        // Query vector: unit vector along dim-0.
+        let mut q_vec: Vec<f32> = vec![0.0; EMB_DIMS];
+        q_vec[0] = 1.0;
 
-        // Entry A embedding: moderate similarity = [0.8, 0.6] → sim ≈ 0.8
-        let emb_a: Vec<f32> = vec![0.8, 0.6];
-        // Entry B embedding: very high similarity = [1.0, 0.0] → sim = 1.0
-        let emb_b: Vec<f32> = vec![1.0, 0.0];
+        // Entry A embedding: moderate similarity ≈ 0.8.
+        let mut emb_a: Vec<f32> = vec![0.0; EMB_DIMS];
+        emb_a[0] = 0.8;
+        emb_a[1] = 0.6;
+        // Entry B embedding: very high similarity = 1.0.
+        let mut emb_b: Vec<f32> = vec![0.0; EMB_DIMS];
+        emb_b[0] = 1.0;
 
         // Insert embeddings
         conn.execute(
@@ -6253,7 +6370,7 @@ mod tests {
         )
         .unwrap();
 
-        // Use a FakeEmbedder that returns q_vec = [1.0, 0.0]
+        // Use a FakeEmbedder that returns q_vec.
         struct FixedEmbedder(Vec<f32>);
         impl crate::components::embedder::Embedder for FixedEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
@@ -6331,7 +6448,11 @@ mod tests {
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![0.1_f32, 0.2_f32, 0.3_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 0.1;
+                v[1] = 0.2;
+                v[2] = 0.3;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false
@@ -6399,7 +6520,10 @@ mod tests {
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![0.4_f32, 0.5_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 0.4;
+                v[1] = 0.5;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false
@@ -6705,7 +6829,9 @@ mod tests {
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![1.0_f32, 0.0_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 1.0;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false

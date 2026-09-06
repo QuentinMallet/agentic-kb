@@ -247,19 +247,25 @@ Switching modes requires re-embedding the whole store (`kb reembed` after
 deleting `entries_emb` rows, or `kb rebuild`) — mixed-vintage embeddings make
 cosine scores incomparable. Measure with `kb eval` before and after.
 
-## Deferred Follow-Ups
+## Pre-normalized embedding migration
 
-Two known gaps in the current search/federation contract are tracked as open
-beads rather than fixed here:
+New embeddings are stored as finite, non-zero, L2-normalized f16 vectors. Each
+entry and cue blob carries its own normalization marker: marked rows use a dot
+product while legacy rows retain cosine scoring, so a partially migrated store
+does not silently change ranking.
 
-- `bd-federated-verify-after-truncate-ayb8` — inline verification currently
-  runs per repository (local and each peer) before `merge_federated_results`
-  performs the global merge and truncation. A row that inline verification
-  spent work on can still be discarded by the federated truncate, so
-  verification effort is not scoped to the final global `--limit`.
-- `bd-prenorm-embeddings-followup-te13` — a change to persist pre-normalized
-  embeddings in a new on-disk format, rather than normalizing at read time on
-  every `cosine_similarity` call. The `docs/benchmarks/p2-prenormalization.md`
-  measurement cleared the pre-registered 10% marginal-cost threshold at every
-  site (63-74% savings at 10,000 entries), so this is no longer deferred: it
-  is approved to land.
+Run `kb migrate-embeddings` to convert existing blobs. It creates and retains
+`agent-kb.db.pre-normalized-embeddings.bak`, validates a staged copy, and
+atomically publishes the staged database only after every legacy entry and cue
+blob is finite, non-zero, and exactly the configured embedding dimension. The
+live WAL is checkpointed and verified before publication, so its committed
+pages are never discarded during the swap. A durable staging-state file makes
+an interruption before publication resumable; it publishes only when the live
+source digest is unchanged, otherwise it discards the stale stage and retries
+from the live database. A corrupt blob aborts the migration without marking any
+live row; restore the retained backup if an operator needs to roll back after
+publication.
+
+Legacy migration accepts only the exact 384-element f32 wire format (1536
+bytes). In particular, an unmarked 768-byte blob is rejected rather than
+guessed to be f16: it can also represent a malformed 192-element f32 vector.
