@@ -45,6 +45,13 @@ discipline, C3 read-path integrity) plus follow-up hardening and docs.
   Cargo feature and no longer compile into a production binary; out-of-tree
   callers must go through `cursor::append_and_apply_writer_events`
   (bd-21ef.1.6).
+- The general-purpose `open_db` opener is removed. Database access now goes
+  through nine named openers (`open_ro`/`open_rw`/`open_rw_existing`/
+  `open_scratch`/`open_or_init`/`open_live_for_checkpoint`/
+  `defer_checkpoints`/`open_unchecked_for_test`/`test_db`) instead; every
+  mutation, including peer writes and the import duplicate check, now runs
+  under `paths.lock` (`docs/src/lock-contract.md`) (bd-21ef.2.3, bd-21ef.2.6,
+  bd-21ef.2.13).
 
 ### Added
 
@@ -88,13 +95,6 @@ discipline, C3 read-path integrity) plus follow-up hardening and docs.
 - `reembed` batches now run under a re-opened, lock-scoped writer with
   re-checked row selection, count raced-away entries instead of dropping
   them silently, and no longer double-count failures (bd-21ef.2.7).
-- Database access now goes through nine named openers
-  (`open_ro`/`open_rw`/`open_rw_existing`/`open_scratch`/`open_or_init`/
-  `open_live_for_checkpoint`/`defer_checkpoints`/`open_unchecked_for_test`/
-  `test_db`) instead of one general-purpose `open_db`; every mutation,
-  including peer writes and the import duplicate check, now runs under
-  `paths.lock` (`docs/src/lock-contract.md`) (bd-21ef.2.3, bd-21ef.2.6,
-  bd-21ef.2.13).
 - Repository-root derivation is unified behind `config::Paths` for both the
   Rust CLI/MCP and the Elixir MCP server, with the canonical `.state` marker
   taking precedence over the legacy layout before its first write
@@ -106,6 +106,11 @@ discipline, C3 read-path integrity) plus follow-up hardening and docs.
   before matching, so a literal prefix containing them can no longer match
   more than intended (bd-21ef.3.8).
 - Evidence rows with `kind: derived` now require `derived_from` (bd-21ef.2.9).
+- `PRAGMA synchronous=FULL` is now set explicitly on every writer connection
+  (`src/components/db.rs`'s `open_conn_rw`) instead of being inherited from
+  the bundled SQLite default; a read-back test pins it (bd-21ef.2.19).
+- `cargo clippy --all-targets --all-features -- -D warnings` is clean and
+  enforced in CI; 112 lints fixed with no allows (bd-yvyt).
 
 ### Fixed
 
@@ -133,13 +138,16 @@ discipline, C3 read-path integrity) plus follow-up hardening and docs.
   taking the write lock and running recovery on every read (bd-21ef.2.17).
 - CI's `l1c_opener_migration` production-source pin no longer truncates
   early on an aggregator branch (bd-21ef.2.21).
+- Fixed mix format drift in the MCP test suite that was failing CI
+  (bd-yvyt).
 
 ### Performance
 
 - `reembed`'s per-batch lock hold is reduced to well under the 50 ms budget
   by deferring SQLite's own close-time and automatic checkpoints out of the
-  lock window and draining the WAL periodically between batches instead
-  (measured ~20 ms at `load1` 4.9) (bd-21ef.2.19).
+  lock window and draining the WAL periodically between batches instead:
+  ~13.7 ms median (from ~103 ms), measured at `load1` 4.9. The periodic WAL
+  drain itself, a separate lock hold, measured 20.2/20.7 ms (bd-21ef.2.19).
 - `kb add`'s write-path benchmark is re-baselined like-for-like against a
   fixture that includes an event log: p50 87.5 ms / p95 155 ms, a median
   +7.5 ms / mean +10.5 ms overhead over the pre-D2 write path (1.10x p50 /
@@ -184,4 +192,5 @@ discipline, C3 read-path integrity) plus follow-up hardening and docs.
   component pointing outside the repository (ADR-5, bd-21ef.3.1,
   bd-21ef.3.6).
 
+[Unreleased]: https://github.com/QuentinMallet/agentic-kb/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/QuentinMallet/agentic-kb/compare/2e2051d...v0.2.0
