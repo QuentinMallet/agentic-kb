@@ -77,7 +77,13 @@ defmodule AgenticKbMcp.Authorization do
 
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-        state.opa.(input, Keyword.merge(state.opa_opts, timeout_ms: state.opa_timeout_ms, deadline_ms: deadline_ms))
+        state.opa.(
+          input,
+          Keyword.merge(state.opa_opts,
+            timeout_ms: state.opa_timeout_ms,
+            deadline_ms: deadline_ms
+          )
+        )
       end)
 
     case Task.yield(task, state.opa_timeout_ms) || Task.shutdown(task, :brutal_kill) do

@@ -791,6 +791,7 @@ defmodule AgenticKbMcpTest do
         [tool_name, field] = String.split(key, ".")
         min = bounds["minimum"]
         max = bounds["maximum"]
+
         schema =
           McpServer.tools()
           |> Enum.find(&(&1["name"] == tool_name))
