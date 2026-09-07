@@ -20,6 +20,8 @@ use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs;
@@ -1918,38 +1920,69 @@ type AuditEntry = (String, String, String, String, String);
 /// Passes the Statement by value into `and_then` so the closure owns it,
 /// avoiding the borrow-checker constraint where `MappedRows<'_, F>` borrows
 /// the statement until its destructor runs at end-of-scope.
+/// Uniform-without-replacement sample over the present-evidence rows,
+/// via reservoir sampling (Algorithm R) so a KB with tens or hundreds of
+/// thousands of entries doesn't require materializing and shuffling the
+/// whole table — memory stays O(sample_size), and the query cursor streams
+/// one row at a time through the reservoir instead of being collected
+/// up front. Uses the injected RNG (rather than SQL `ORDER BY RANDOM()`)
+/// so a test-seeded RNG makes the uniform arm's pick deterministic too —
+/// the traffic arm's excluded set (and thus its own distribution) depends
+/// on which entries land here.
 fn audit_sample_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
+    rng: &mut impl Rng,
 ) -> rusqlite::Result<Vec<AuditEntry>> {
-    conn.prepare(
+    if sample_size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
         "SELECT id, path, summary, kind, evidence_status
          FROM entries
-         WHERE is_stale=0 AND evidence_status='present'
-         ORDER BY RANDOM()
-         LIMIT ?1",
-    )
-    .and_then(|mut stmt| {
-        stmt.query_map(params![sample_size as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    })
+         WHERE is_stale=0 AND evidence_status='present'",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut reservoir: Vec<AuditEntry> = Vec::with_capacity(sample_size);
+    for (idx, row) in rows.filter_map(Result::ok).enumerate() {
+        // `idx` is 0-based; `idx + 1` is the count of rows seen so far
+        // (including this one), which is what Algorithm R's ticket draw
+        // is over.
+        if reservoir.len() < sample_size {
+            reservoir.push(row);
+        } else {
+            let j = rng.gen_range(0..idx + 1);
+            if j < sample_size {
+                reservoir[j] = row;
+            }
+        }
+    }
+    Ok(reservoir)
 }
 
 /// Weighted sampling without replacement. The uniform arm has already been
 /// fixed, so excluded IDs can never move into the traffic arm.
+///
+/// Unlike `audit_sample_entries`, this can't stream through a reservoir:
+/// each draw's ticket is weighted by hit count across the *whole* remaining
+/// candidate pool (`total` below), so the full set has to be in hand before
+/// the first draw. `sample_size` is small (it's the leftover half of an
+/// already-clamped `MAX_AUDIT_VERDICTS`-bounded request), so this stays
+/// bounded even though it materializes every present-evidence row.
 fn audit_traffic_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
     excluded: &[String],
     hit_counts: &[(String, u64)],
+    rng: &mut impl Rng,
 ) -> rusqlite::Result<Vec<AuditEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id,path,summary,kind,evidence_status FROM entries
@@ -1964,10 +1997,6 @@ fn audit_traffic_entries(
         .collect();
     let weights: std::collections::HashMap<&str, u64> =
         hit_counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
     let mut chosen = Vec::new();
     while !rows.is_empty() && chosen.len() < sample_size {
         let total: u64 = rows
@@ -1977,10 +2006,7 @@ fn audit_traffic_entries(
         if total == 0 {
             break;
         }
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let mut ticket = seed % total;
+        let mut ticket = rng.gen_range(0..total);
         let index = rows
             .iter()
             .position(|r| {
@@ -2020,6 +2046,17 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
 }
 
 fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
+    handle_audit_run_with_rng(req, paths, &mut StdRng::from_entropy())
+}
+
+/// Same as `handle_audit_run`, but with the sampling RNG injected so tests
+/// can seed it and get deterministic uniform/traffic draws instead of
+/// relying on a statistical margin over many iterations.
+fn handle_audit_run_with_rng(
+    req: &AuditRunRequest,
+    paths: &config::Paths,
+    rng: &mut impl Rng,
+) -> Value {
     let id = &req.id;
     let Some(caller_id) = req
         .caller_id
@@ -2060,7 +2097,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
         sample_size
     };
 
-    let uniform_rows = match audit_sample_entries(&conn, uniform_budget) {
+    let uniform_rows = match audit_sample_entries(&conn, uniform_budget, rng) {
         Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2078,7 +2115,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let traffic_rows = if mode == "traffic" && traffic_budget > 0 {
         query_hits::counts(&paths.query_hits)
             .and_then(|counts| {
-                audit_traffic_entries(&conn, traffic_budget, &uniform_ids, &counts).ok()
+                audit_traffic_entries(&conn, traffic_budget, &uniform_ids, &counts, rng).ok()
             })
             .unwrap_or_default()
     } else {
@@ -5154,6 +5191,14 @@ mod tests {
         query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 500], "test");
         query_hits::record_hits(&paths.query_hits, &[cold_a.clone(), cold_b.clone()], "test");
 
+        // Seeded RNG shared across all iterations (not re-seeded per call):
+        // the sampler used to draw from `SystemTime::now()`, so a run of 60
+        // iterations with sample_size:2 (uniform budget 1, traffic budget 1)
+        // was a ~0.6% false-failure draw — the uniform arm's SQL-random pick
+        // decides which entry the traffic arm excludes, and when it excludes
+        // `hot` the traffic draw can only land on a cold entry. Seeding
+        // removes that variance instead of just shrinking it.
+        let mut rng = StdRng::seed_from_u64(0x00a0_d17e_f224);
         let mut hot_traffic = 0;
         let mut cold_traffic = 0;
         for _ in 0..60 {
@@ -5161,13 +5206,14 @@ mod tests {
             // splits the budget between the two arms (1 each here), so a
             // budget of 1 would leave the traffic arm nothing to draw and
             // this test would never see a traffic-tagged sample.
-            let resp = handle_audit_run(
+            let resp = handle_audit_run_with_rng(
                 &tr::<AuditRunRequest>(
                     "audit_run",
                     &json!(null),
                     &json!({"caller_id":"mcp-test","sample_size":2,"mode":"traffic"}),
                 ),
                 &paths,
+                &mut rng,
             );
             assert_eq!(resp["type"], "ok");
             let samples = resp["samples"].as_array().unwrap();
@@ -5196,6 +5242,51 @@ mod tests {
         assert!(
             hot_traffic > cold_traffic,
             "high-traffic entry should be sampled more often"
+        );
+    }
+
+    /// `audit_sample_entries`'s reservoir sampler (Algorithm R) over 1000
+    /// synthetic present-evidence rows: sample_size=50 must return exactly
+    /// 50 distinct ids (uniform sampling without replacement), and the same
+    /// seed against the same table must reproduce the same reservoir.
+    /// Inserts rows directly into `entries` rather than through `handle_add`
+    /// — the sampler only reads that table, and 1000 real adds (embedding +
+    /// citation verification each) would make this test unnecessarily slow.
+    #[test]
+    fn test_audit_sample_entries_reservoir_is_distinct_and_seed_stable() {
+        let (_dir, paths, _emb) = setup();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        let conn = db::open_rw(&paths, &lock).unwrap();
+        conn.execute_batch("BEGIN;").unwrap();
+        for i in 0..1000 {
+            conn.execute(
+                "INSERT INTO entries (id, path, summary, content, tags, kind, evidence_status, is_stale)
+                 VALUES (?1, ?2, 's', 'c', '[]', 'observation', 'present', 0)",
+                params![format!("id-{i}"), format!("p/{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let mut rng_a = StdRng::seed_from_u64(0x5eed_5eed_5eed);
+        let sample_a = audit_sample_entries(&conn, 50, &mut rng_a).unwrap();
+        assert_eq!(sample_a.len(), 50);
+        let ids_a: std::collections::HashSet<&str> =
+            sample_a.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            ids_a.len(),
+            50,
+            "reservoir sample must return 50 distinct ids, got {}",
+            ids_a.len()
+        );
+
+        let mut rng_b = StdRng::seed_from_u64(0x5eed_5eed_5eed);
+        let sample_b = audit_sample_entries(&conn, 50, &mut rng_b).unwrap();
+        let ids_b: std::collections::HashSet<&str> =
+            sample_b.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "same seed against the same table must reproduce the same reservoir sample"
         );
     }
 
