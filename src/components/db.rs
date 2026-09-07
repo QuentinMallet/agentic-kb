@@ -2340,6 +2340,11 @@ struct SearchRuntimeStats {
     effective_verify_pool_size: usize,
     scheduled_verification_tasks: usize,
     spawned_verify_workers: usize,
+    /// High-water mark of concurrently-live verify-pool worker threads for
+    /// this search, measured in-pool via atomics (see bd-69bf) rather than
+    /// by sampling `/proc/self/task`, which counts the whole process's
+    /// threads and is polluted by concurrently running tests.
+    spawned_verify_workers_peak: usize,
     semantic_materialized_rows: usize,
     semantic_materialized_bytes: usize,
     cue_materialized_rows: usize,
@@ -2370,6 +2375,18 @@ fn take_search_runtime_stats() -> SearchRuntimeStats {
     SEARCH_RUNTIME_STATS_CELL
         .with(|cell| cell.borrow_mut().take())
         .expect("search runtime stats must be recorded")
+}
+
+/// Backfills `spawned_verify_workers_peak` onto the stats already recorded
+/// for this thread's in-progress search. Called after the verify-pool
+/// `thread::scope` joins, once the empirical peak is known.
+#[cfg(test)]
+fn set_search_runtime_stats_peak_workers(peak: usize) {
+    SEARCH_RUNTIME_STATS_CELL.with(|cell| {
+        if let Some(stats) = cell.borrow_mut().as_mut() {
+            stats.spawned_verify_workers_peak = peak;
+        }
+    });
 }
 
 pub struct FetchEntryByIdResult {
@@ -3554,11 +3571,21 @@ pub fn search_entries(
         effective_verify_pool_size: pool_size,
         scheduled_verification_tasks: total_tasks,
         spawned_verify_workers: if total_tasks > 0 { pool_size } else { 0 },
+        spawned_verify_workers_peak: 0,
         semantic_materialized_rows: semantic_materialized.0,
         semantic_materialized_bytes: semantic_materialized.1,
         cue_materialized_rows: cue_materialized.0,
         cue_materialized_bytes: cue_materialized.1,
     });
+
+    // bd-69bf: track this search's own verify-pool worker high-water mark
+    // in-pool via atomics, rather than sampling `/proc/self/task` (the
+    // whole process's thread count, polluted by concurrently running tests
+    // under `cargo test --test-threads>1`).
+    #[cfg(test)]
+    let worker_live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(test)]
+    let worker_peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let mut outcomes_flat: Vec<VerificationOutcome> = vec![
         VerificationOutcome {
@@ -3594,7 +3621,19 @@ pub fn search_entries(
                 let rx = rx_work.clone();
                 let tx = tx_result.clone();
                 let root_ref = repo_root.as_ref();
+                #[cfg(test)]
+                let worker_live_for_thread = std::sync::Arc::clone(&worker_live);
+                #[cfg(test)]
+                let worker_peak_for_thread = std::sync::Arc::clone(&worker_peak);
                 scope.spawn(move || {
+                    #[cfg(test)]
+                    {
+                        let live_now = worker_live_for_thread
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        worker_peak_for_thread
+                            .fetch_max(live_now, std::sync::atomic::Ordering::SeqCst);
+                    }
                     for (task_idx, ev) in rx {
                         let outcome = if let Some(root) = root_ref {
                             crate::components::verification::verify_evidence(
@@ -3611,6 +3650,8 @@ pub fn search_entries(
                         };
                         let _ = tx.send((task_idx, outcome));
                     }
+                    #[cfg(test)]
+                    worker_live_for_thread.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 });
             }
             // Drop the unused sender clone so rx_result closes after all
@@ -3635,6 +3676,10 @@ pub fn search_entries(
                 outcomes_flat[task_idx] = outcome;
             }
         });
+        #[cfg(test)]
+        set_search_runtime_stats_peak_workers(
+            worker_peak.load(std::sync::atomic::Ordering::SeqCst),
+        );
     }
 
     // --- Phase 4: assign results back to entries in original order ---
@@ -7209,18 +7254,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // br-improvement-catalog-23b.13: bounded verify pool — thread fan-out must
-    // not exceed pool size.
+    // br-improvement-catalog-23b.13: bounded verify pool — worker fan-out
+    // must not exceed pool size.
     //
     // Scenario: 10 entries × 50 evidence rows each. The old unbounded
     // thread::scope spawned 50 OS threads per scope call; with the bounded
-    // pool concurrent thread count is limited to `verify_pool_size` (2 here).
+    // pool concurrent worker count is limited to `verify_pool_size` (2 here).
     //
-    // Samples /proc/self/task at 50µs intervals; asserts peak threads ≤
-    // baseline + pool_size + 2 (slack: sampler thread + spare).
+    // bd-69bf: previously sampled `/proc/self/task` (the whole process's
+    // thread count) from a polling thread, which is polluted by every other
+    // test's threads under `cargo test --test-threads>1` (one process) and
+    // flaked accordingly. Instead this asserts on the in-pool peak worker
+    // count that `search_entries` tracks itself (via
+    // spawned_verify_workers_peak, atomics scoped to this one search) — no
+    // process-wide sampling, so concurrently running tests cannot affect it.
     // -----------------------------------------------------------------------
     #[test]
-    fn test_verify_pool_thread_fan_out_is_bounded() {
+    fn test_verify_pool_worker_count_stays_within_pool_size() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let conn = open_db_memory().unwrap();
@@ -7258,31 +7308,6 @@ mod tests {
 
         let pool_size: usize = 2;
 
-        #[cfg(target_os = "linux")]
-        let baseline = fs::read_dir("/proc/self/task")
-            .map(|d| d.count())
-            .unwrap_or(1);
-        #[cfg(not(target_os = "linux"))]
-        let baseline = 1usize;
-
-        let peak_threads = std::sync::Arc::new(AtomicUsize::new(baseline));
-        let stop_sampler = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let peak_clone = std::sync::Arc::clone(&peak_threads);
-        let stop_clone = std::sync::Arc::clone(&stop_sampler);
-        let sampler = std::thread::spawn(move || {
-            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                #[cfg(target_os = "linux")]
-                if let Ok(d) = fs::read_dir("/proc/self/task") {
-                    let count = d.count();
-                    let prev = peak_clone.load(std::sync::atomic::Ordering::Relaxed);
-                    if count > prev {
-                        peak_clone.store(count, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-        });
-
         let opts = SearchOptions {
             limit: 10,
             do_fts: true,
@@ -7297,17 +7322,21 @@ mod tests {
         };
         let _results = search_entries(&conn, &embedder, "bounded pool fan-out test entry", &opts)
             .expect("search must succeed");
+        let stats = take_search_runtime_stats();
 
-        stop_sampler.store(true, std::sync::atomic::Ordering::Relaxed);
-        sampler.join().unwrap();
-
-        let peak = peak_threads.load(std::sync::atomic::Ordering::Relaxed);
-        let allowed = baseline + pool_size + 2;
         assert!(
-            peak <= allowed,
-            "thread fan-out bounded: peak={peak}, baseline={baseline}, \
-             pool_size={pool_size}, allowed={allowed}. \
-             Old unbounded code peaks at 50+ threads (one per evidence row)."
+            stats.scheduled_verification_tasks > 0,
+            "test setup must schedule verification work"
+        );
+        assert!(
+            stats.spawned_verify_workers_peak >= 1,
+            "at least one worker must run when work is scheduled"
+        );
+        assert!(
+            stats.spawned_verify_workers_peak <= pool_size,
+            "peak in-pool worker count {} must not exceed the clamped pool size {pool_size}. \
+             Old unbounded code peaks at 50+ threads (one per evidence row).",
+            stats.spawned_verify_workers_peak
         );
     }
 
