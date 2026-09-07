@@ -3849,7 +3849,7 @@ mod tests {
         open_or_init(&paths).unwrap();
 
         let replacement = paths.db.with_extension("replacement");
-        std::fs::copy(&paths.db, &replacement).unwrap();
+        fs::copy(&paths.db, &replacement).unwrap();
         let replacement_conn = open_unchecked_for_test(&replacement).unwrap();
         replacement_conn
             .execute_batch("CREATE TABLE replacement_marker (value TEXT)")
@@ -3859,7 +3859,7 @@ mod tests {
         let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
         let first = open_rw_existing(&paths, &lock).unwrap();
         drop(first);
-        std::fs::rename(&replacement, &paths.db).unwrap();
+        fs::rename(&replacement, &paths.db).unwrap();
 
         let live = open_rw_existing(&paths, &lock).unwrap();
         let marker_exists: i64 = live
@@ -3890,8 +3890,8 @@ mod tests {
 
     struct SearchTestEmbedder;
 
-    impl crate::components::embedder::Embedder for SearchTestEmbedder {
-        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+    impl Embedder for SearchTestEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
             let first = if text.contains("rank-c") {
                 0.7
             } else if text.contains("rank-b") {
@@ -4189,8 +4189,8 @@ mod tests {
     /// a genuine, differentiated cosine score.
     struct FullDimEmbedder;
 
-    impl crate::components::embedder::Embedder for FullDimEmbedder {
-        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+    impl Embedder for FullDimEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
             let first = if text.contains("rank-c") {
                 0.7
             } else if text.contains("rank-b") {
@@ -4248,7 +4248,7 @@ mod tests {
         let peer = tempfile::tempdir().unwrap();
         let cited = peer.path().join("cited.rs");
         let bytes = b"origin-root citation";
-        std::fs::write(&cited, bytes).unwrap();
+        fs::write(&cited, bytes).unwrap();
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         digest.update(bytes);
@@ -4536,7 +4536,7 @@ mod tests {
     #[test]
     fn test_apply_event_run_history_keyed_insertion_is_n_replay_invariant() {
         let conn = open_db_memory().unwrap();
-        let embedder = crate::components::embedder::NoopEmbedder;
+        let embedder = NoopEmbedder;
         apply_event(&conn, &embedder, &run_history_test_case_event()).unwrap();
 
         let run_event = serde_json::json!({
@@ -4592,7 +4592,7 @@ mod tests {
 
         let replay = || {
             let conn = open_db_memory().unwrap();
-            let embedder = crate::components::embedder::NoopEmbedder;
+            let embedder = NoopEmbedder;
             for ev in &log {
                 apply_event(&conn, &embedder, ev).unwrap();
             }
@@ -4744,7 +4744,7 @@ mod tests {
         // default), so the prior `let _ =`-swallowed migration silently
         // never added the column here — an upgraded DB's schema diverged
         // from a fresh DB's while the swallow hid the failure.
-        let legacy = rusqlite::Connection::open_in_memory().unwrap();
+        let legacy = Connection::open_in_memory().unwrap();
         legacy
             .execute_batch(
                 "CREATE TABLE source_weights (
@@ -4802,7 +4802,7 @@ mod tests {
         // D6 R2 acceptance: an unexpected migration error propagates rather
         // than being swallowed. Force the backfill UPDATE to fail via a
         // trigger and confirm the caller observes an Err, not a silent Ok.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE source_weights (
                 kind        TEXT NOT NULL,
@@ -4831,7 +4831,7 @@ mod tests {
     fn test_init_adds_session_id_column_on_legacy_db() {
         // Simulate a pre-Phase-5 DB: create entries table without session_id,
         // then run ensure_schema and confirm the column was added.
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE entries (
                 id TEXT PRIMARY KEY,
@@ -6235,8 +6235,8 @@ mod tests {
         // ...which does not exist, and verified would be Some(false).
         let rel = "src/__br_bhg_regression_explicit_root__.rs";
         let cited_content = b"// br-bhg regression: explicit repo_root\n";
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join(rel), cited_content).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(rel), cited_content).unwrap();
 
         let mut h = Sha256::new();
         h.update(cited_content);
@@ -6325,7 +6325,7 @@ mod tests {
         evidence: Vec<(String, String, String)>,
     }
 
-    fn snapshot_db_state(conn: &Connection) -> anyhow::Result<DbSnapshot> {
+    fn snapshot_db_state(conn: &Connection) -> Result<DbSnapshot> {
         let mut entries: Vec<(String, String, String, i64)> = conn
             .prepare(
                 "SELECT id, COALESCE(kind,'belief'), COALESCE(evidence_status,'n/a'), is_stale \
@@ -6353,17 +6353,17 @@ mod tests {
     const KINDS: &[&str] = &["observation", "belief", "procedure", "convention"];
     const EV_KINDS: &[&str] = &["code", "test", "command", "user"];
 
-    fn arb_entry_id() -> impl proptest::strategy::Strategy<Value = String> {
+    fn arb_entry_id() -> impl Strategy<Value = String> {
         use proptest::prelude::*;
         (0..ENTRY_IDS.len()).prop_map(|i| ENTRY_IDS[i].to_string())
     }
 
-    fn arb_evidence_id() -> impl proptest::strategy::Strategy<Value = String> {
+    fn arb_evidence_id() -> impl Strategy<Value = String> {
         use proptest::prelude::*;
         (0..EVIDENCE_IDS.len()).prop_map(|i| EVIDENCE_IDS[i].to_string())
     }
 
-    fn arb_event() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+    fn arb_event() -> impl Strategy<Value = serde_json::Value> {
         use proptest::prelude::*;
         prop_oneof![
             // upsert entry
@@ -6450,8 +6450,8 @@ mod tests {
 
         // Create a file to cite
         let cited_content = b"test file for byte capping";
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/big.rs"), cited_content).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/big.rs"), cited_content).unwrap();
 
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -6689,8 +6689,8 @@ mod tests {
 
         // Use a FakeEmbedder that returns q_vec.
         struct FixedEmbedder(Vec<f32>);
-        impl crate::components::embedder::Embedder for FixedEmbedder {
-            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+        impl Embedder for FixedEmbedder {
+            fn embed(&self, _: &str) -> Result<Vec<f32>> {
                 Ok(self.0.clone())
             }
             fn is_noop(&self) -> bool {
@@ -6763,8 +6763,8 @@ mod tests {
     #[test]
     fn test_expire_deletes_entries_emb_row() {
         struct FakeEmbedder;
-        impl crate::components::embedder::Embedder for FakeEmbedder {
-            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+        impl Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> Result<Vec<f32>> {
                 let mut v = vec![0.0f32; EMB_DIMS];
                 v[0] = 0.1;
                 v[1] = 0.2;
@@ -6835,8 +6835,8 @@ mod tests {
     #[test]
     fn test_stale_upsert_deletes_entries_emb_row() {
         struct FakeEmbedder;
-        impl crate::components::embedder::Embedder for FakeEmbedder {
-            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+        impl Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> Result<Vec<f32>> {
                 let mut v = vec![0.0f32; EMB_DIMS];
                 v[0] = 0.4;
                 v[1] = 0.5;
@@ -7144,8 +7144,8 @@ mod tests {
     #[test]
     fn test_entries_emb_count_equals_live_entries_invariant() {
         struct FakeEmbedder;
-        impl crate::components::embedder::Embedder for FakeEmbedder {
-            fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
+        impl Embedder for FakeEmbedder {
+            fn embed(&self, _: &str) -> Result<Vec<f32>> {
                 let mut v = vec![0.0f32; EMB_DIMS];
                 v[0] = 1.0;
                 Ok(v)
@@ -7254,20 +7254,20 @@ mod tests {
         let pool_size: usize = 2;
 
         #[cfg(target_os = "linux")]
-        let baseline = std::fs::read_dir("/proc/self/task")
+        let baseline = fs::read_dir("/proc/self/task")
             .map(|d| d.count())
             .unwrap_or(1);
         #[cfg(not(target_os = "linux"))]
         let baseline = 1usize;
 
-        let peak_threads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(baseline));
+        let peak_threads = std::sync::Arc::new(AtomicUsize::new(baseline));
         let stop_sampler = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let peak_clone = std::sync::Arc::clone(&peak_threads);
         let stop_clone = std::sync::Arc::clone(&stop_sampler);
         let sampler = std::thread::spawn(move || {
             while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 #[cfg(target_os = "linux")]
-                if let Ok(d) = std::fs::read_dir("/proc/self/task") {
+                if let Ok(d) = fs::read_dir("/proc/self/task") {
                     let count = d.count();
                     let prev = peak_clone.load(std::sync::atomic::Ordering::Relaxed);
                     if count > prev {
@@ -7474,9 +7474,9 @@ mod tests {
     }
 
     proptest::proptest! {
-        #![proptest_config(proptest::prelude::ProptestConfig {
+        #![proptest_config(ProptestConfig {
             cases: proptest_cases(256),
-            .. proptest::prelude::ProptestConfig::default()
+            .. ProptestConfig::default()
         })]
         /// Replaying an arbitrary sequence of Add/EvidenceAdd/EvidenceExpire/Expire
         /// events into an in-memory DB produces the same materialized state as

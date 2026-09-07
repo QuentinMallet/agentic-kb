@@ -172,37 +172,6 @@ impl Embedder for CandleEmbedder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_noop_embedder_returns_empty() {
-        let embedder = NoopEmbedder;
-        let result = embedder.embed("anything").unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_noop_embedder_is_noop() {
-        let embedder = NoopEmbedder;
-        assert!(embedder.is_noop());
-    }
-
-    #[test]
-    fn test_candle_embedder_is_not_noop() {
-        let embedder = CandleEmbedder::new(Path::new("/tmp/test-cache"));
-        assert!(!embedder.is_noop());
-    }
-
-    #[test]
-    fn test_candle_embedder_new_does_not_load_model() {
-        // Construction should succeed without downloading anything
-        let embedder = CandleEmbedder::new(Path::new("/tmp/nonexistent-cache"));
-        assert!(!embedder.is_loaded());
-    }
-}
-
 /// An embedder whose vectors were all resolved before a write transaction
 /// opened (C1/D3).
 ///
@@ -296,5 +265,36 @@ impl Embedder for PrefetchedEmbedder<'_> {
 
     fn is_noop(&self) -> bool {
         self.inner.is_noop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_noop_embedder_returns_empty() {
+        let embedder = NoopEmbedder;
+        let result = embedder.embed("anything").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_noop_embedder_is_noop() {
+        let embedder = NoopEmbedder;
+        assert!(embedder.is_noop());
+    }
+
+    #[test]
+    fn test_candle_embedder_is_not_noop() {
+        let embedder = CandleEmbedder::new(Path::new("/tmp/test-cache"));
+        assert!(!embedder.is_noop());
+    }
+
+    #[test]
+    fn test_candle_embedder_new_does_not_load_model() {
+        // Construction should succeed without downloading anything
+        let embedder = CandleEmbedder::new(Path::new("/tmp/nonexistent-cache"));
+        assert!(!embedder.is_loaded());
     }
 }

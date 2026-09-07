@@ -39,7 +39,11 @@ defmodule AgenticKbMcp.OpaPolicyContractTest do
 
     assert {:ok, false} =
              AgenticKbMcp.OpaEvaluator.evaluate(
-               %{"caller" => "attacker", "caller_id" => "agentic-kb-host", "action" => "kb.audit.record"},
+               %{
+                 "caller" => "attacker",
+                 "caller_id" => "agentic-kb-host",
+                 "action" => "kb.audit.record"
+               },
                opts
              )
   end

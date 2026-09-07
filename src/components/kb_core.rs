@@ -892,7 +892,7 @@ mod tests {
         // cases below must fail with the exact same shape of error.
         let (dir, paths) = setup();
         let outside = tempdir().unwrap();
-        std::fs::write(outside.path().join("real.txt"), b"outside content").unwrap();
+        fs::write(outside.path().join("real.txt"), b"outside content").unwrap();
 
         symlink(
             outside.path().join("real.txt"),

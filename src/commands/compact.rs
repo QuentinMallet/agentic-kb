@@ -524,8 +524,8 @@ mod tests {
         use crate::components::cursor;
         use std::process::Command;
 
-        if std::env::var("KB_COMPACT_CRASH_ROOT").is_ok() {
-            let root = std::env::var("KB_COMPACT_CRASH_ROOT").unwrap();
+        if env::var("KB_COMPACT_CRASH_ROOT").is_ok() {
+            let root = env::var("KB_COMPACT_CRASH_ROOT").unwrap();
             let paths = Paths::from_root(std::path::Path::new(&root));
             let _ = Compact.execute_with_paths(&paths);
             return;
@@ -546,7 +546,7 @@ mod tests {
         let before_bytes = fs::read(&paths.events).unwrap();
         let before_generation = cursor::read_generation(&paths.events);
 
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = Command::new(env::current_exe().unwrap())
             .arg("test_crash_between_generation_bump_and_rename_over_reports")
             .arg("--nocapture")
             .env("KB_COMPACT_CRASH_ROOT", root)
@@ -1308,13 +1308,13 @@ mod tests {
         append_event(&paths.events, &evidence_add).unwrap();
         append_event(
             &paths.events,
-            &crate::components::events::evidence_expire_event("d", "ev-d-1", "replace"),
+            &events::evidence_expire_event("d", "ev-d-1", "replace"),
         )
         .unwrap();
         append_event(&paths.events, &evidence_add).unwrap();
         append_event(
             &paths.events,
-            &crate::components::events::citation_healed_event(
+            &events::citation_healed_event(
                 "a",
                 "ev-shared-0",
                 "src/a.rs:0-1",
@@ -1552,12 +1552,12 @@ mod tests {
                         }
                     }
                     CompactOp::EvidenceExpire { id, evidence_slot } => {
-                        append_event(&paths.events, &crate::components::events::evidence_expire_event(
+                        append_event(&paths.events, &events::evidence_expire_event(
                             id, &format!("ev-{id}-{evidence_slot}"), "property test"
                         )).unwrap();
                     }
                     CompactOp::CitationHealed { id, evidence_slot } => {
-                        append_event(&paths.events, &crate::components::events::citation_healed_event(
+                        append_event(&paths.events, &events::citation_healed_event(
                             id, &format!("ev-{id}-{evidence_slot}"), &format!("src/{id}.rs:0-1"),
                             &format!("src/{id}.rs:2-3"), "sha256:abc", None
                         )).unwrap();
@@ -1611,12 +1611,12 @@ mod tests {
         Compact,
     }
 
-    fn arb_compact_ops() -> impl proptest::strategy::Strategy<Value = Vec<CompactOp>> {
+    fn arb_compact_ops() -> impl Strategy<Value = Vec<CompactOp>> {
         proptest::collection::vec(arb_raw_op(), 0..32).prop_map(repair_writer_producible_ops)
     }
 
     /// Raw op generator — unrestricted alphabet across 4 ids.
-    fn arb_raw_op() -> impl proptest::strategy::Strategy<Value = CompactOp> {
+    fn arb_raw_op() -> impl Strategy<Value = CompactOp> {
         use proptest::prelude::*;
         let arb_id = proptest::sample::select(vec!["a", "b", "c", "d"]).prop_map(|s| s.to_string());
         let arb_evidence = (arb_id.clone(), 0_u8..2);
@@ -1798,7 +1798,7 @@ mod tests {
         // Through the applied-cursor writer: compaction now takes the same
         // convergence gate as any other write, so a fixture that seeded the log
         // and the database separately would be refused.
-        let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
 
         // Insert N entries with padded content each so that expiring them all
         // leaves at least 1024 SQLite free pages (see vacuum_fixture_size).
@@ -1883,11 +1883,11 @@ mod tests {
     fn seed_through_cursor(paths: &Paths, event: &serde_json::Value) {
         use crate::components::cursor::{self, Decision, RebuildReason};
         use crate::components::{db, embedder::NoopEmbedder};
-        let lock = crate::commands::add::acquire_lock(paths.lock.as_path()).unwrap();
+        let lock = acquire_lock(paths.lock.as_path()).unwrap();
         let conn = db::open_rw(paths, &lock).unwrap();
         if cursor::inspect(&conn, paths) == Decision::FullRebuild(RebuildReason::GenerationMismatch)
         {
-            let committed_len = crate::components::events::committed_len(&paths.events).unwrap();
+            let committed_len = events::committed_len(&paths.events).unwrap();
             cursor::write(
                 &conn,
                 &cursor::Cursor {

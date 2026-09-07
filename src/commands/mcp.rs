@@ -3296,7 +3296,7 @@ mod tests {
             // Create one entry per unique (kind, session_id) combination in the generated
             // verdicts, then record all verdicts.
             let mut entry_map: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
-            let mut verdict_objs: Vec<serde_json::Value> = Vec::new();
+            let mut verdict_objs: Vec<Value> = Vec::new();
 
             for (ki, si, verdict) in &verdicts {
                 let kind = AUDIT_KINDS[*ki];
@@ -3379,7 +3379,7 @@ mod tests {
             }).collect();
 
             // Record verdicts for all entries.
-            let mut verdict_objs: Vec<serde_json::Value> = Vec::new();
+            let mut verdict_objs: Vec<Value> = Vec::new();
             for (eid, v) in null_eids.iter().zip(verdict_null.iter().cycle()) {
                 verdict_objs.push(verdict_json(eid, *v));
             }
@@ -3486,14 +3486,14 @@ mod tests {
             }
 
             // DB-A: apply in forward order.
-            let fwd_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
+            let fwd_verdicts: Vec<Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
                 verdict_json(eid, *v)
             }).collect();
             let resp_a = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": fwd_verdicts})), &paths_a, &emb_a);
             proptest::prop_assert_eq!(&resp_a["type"], "ok", "forward apply must succeed");
 
             // DB-B: apply in reversed order.
-            let rev_verdicts: Vec<serde_json::Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
+            let rev_verdicts: Vec<Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
                 verdict_json(eid, *v)
             }).collect::<Vec<_>>().into_iter().rev().collect();
             let resp_b = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": rev_verdicts})), &paths_b, &emb_b);
@@ -4367,7 +4367,7 @@ mod tests {
     fn test_mutating_request_recovers_an_externally_diverged_database() {
         struct FixedEmbedder;
         impl embedder::Embedder for FixedEmbedder {
-            fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            fn embed(&self, _text: &str) -> Result<Vec<f32>> {
                 Ok(vec![0.1; 384])
             }
         }
@@ -4595,9 +4595,7 @@ mod tests {
             uuid::Uuid::parse_str(run_id).is_ok(),
             "run_id must be a uuid, got {run_id}"
         );
-        let logged = crate::components::events::read_events(&paths.events)
-            .unwrap()
-            .events;
+        let logged = events::read_events(&paths.events).unwrap().events;
         let run_event = logged
             .iter()
             .find(|e| e["action"] == "insert" && e["table"] == "run_history")
@@ -4862,7 +4860,7 @@ mod tests {
             // unknown_method. (Both fall under type=error so this is a refinement.)
             if ty == "error" {
                 let code = resp.get("code").and_then(|v| v.as_str()).unwrap_or("");
-                match serde_json::from_str::<serde_json::Value>(&line) {
+                match serde_json::from_str::<Value>(&line) {
                     Err(_) => proptest::prop_assert_eq!(
                         code, "parse_error",
                         "invalid JSON must produce code=parse_error"
@@ -5084,8 +5082,8 @@ mod tests {
     }
 
     fn run_audit_run_crash_child() {
-        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
-        let paths = config::Paths::from_root(std::path::Path::new(&root));
+        let root = env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = config::Paths::from_root(Path::new(&root));
         let req = json!({"caller_id":"mcp-test","sample_size": 2});
         handle_audit_run(
             &tr::<AuditRunRequest>("audit_run", &json!(null), &req),
@@ -5096,7 +5094,7 @@ mod tests {
 
     #[test]
     fn test_handle_audit_run_candidate_batch_replays_after_crash_before_apply() {
-        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref()
+        if env::var("KB_CRASH_TEST_CASE").ok().as_deref()
             == Some("audit-run-candidates-before-apply")
         {
             run_audit_run_crash_child();
@@ -5106,7 +5104,7 @@ mod tests {
         add_live_entry(&paths, &emb, "p/audit-run-replay-a", None);
         add_live_entry(&paths, &emb, "p/audit-run-replay-b", None);
 
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = std::process::Command::new(env::current_exe().unwrap())
             .arg("test_handle_audit_run_candidate_batch_replays_after_crash_before_apply")
             .arg("--nocapture")
             .current_dir(dir.path())
@@ -5833,11 +5831,11 @@ mod tests {
     }
 
     fn run_audit_crash_child() {
-        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
-        let run_id = std::env::var("KB_CRASH_TEST_RUN_ID").unwrap();
-        let entry_id = std::env::var("KB_CRASH_TEST_ENTRY_ID").unwrap();
-        let verdict = std::env::var("KB_CRASH_TEST_VERDICT").ok().as_deref() == Some("false");
-        let paths = config::Paths::from_root(std::path::Path::new(&root));
+        let root = env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let run_id = env::var("KB_CRASH_TEST_RUN_ID").unwrap();
+        let entry_id = env::var("KB_CRASH_TEST_ENTRY_ID").unwrap();
+        let verdict = env::var("KB_CRASH_TEST_VERDICT").ok().as_deref() == Some("false");
+        let paths = config::Paths::from_root(Path::new(&root));
         let emb = NoopEmbedder;
         let id = json!(null);
         let verdict_item = if verdict {
@@ -5856,7 +5854,7 @@ mod tests {
 
     #[test]
     fn test_handle_audit_record_crash_after_run_insert_leaves_no_split_row() {
-        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("audit-after-run-insert") {
+        if env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("audit-after-run-insert") {
             run_audit_crash_child();
         }
 
@@ -5865,7 +5863,7 @@ mod tests {
         let run_id = "run-crash-audit";
         seed_audit_candidate(&paths, run_id, &eid);
 
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = std::process::Command::new(env::current_exe().unwrap())
             .arg("test_handle_audit_record_crash_after_run_insert_leaves_no_split_row")
             .arg("--nocapture")
             .current_dir(dir.path())
@@ -5951,8 +5949,7 @@ mod tests {
 
     #[test]
     fn test_audit_record_replay_recovers_false_verdict_with_rows_weights_and_conflict_guard() {
-        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref()
-            == Some("audit-before-apply-false-batch")
+        if env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("audit-before-apply-false-batch")
         {
             run_audit_crash_child();
         }
@@ -5962,7 +5959,7 @@ mod tests {
         let run_id = "run-crash-audit-false";
         seed_audit_candidate(&paths, run_id, &eid);
 
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = std::process::Command::new(env::current_exe().unwrap())
             .arg("test_audit_record_replay_recovers_false_verdict_with_rows_weights_and_conflict_guard")
             .arg("--nocapture")
             .current_dir(dir.path())
@@ -8227,7 +8224,7 @@ mod tests {
     fn test_cli_and_mcp_reembed_report_same_counts_and_failure_causes() {
         struct ParityEmbedder;
         impl embedder::Embedder for ParityEmbedder {
-            fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            fn embed(&self, text: &str) -> Result<Vec<f32>> {
                 if text.contains("fail") {
                     anyhow::bail!("parity failure")
                 }

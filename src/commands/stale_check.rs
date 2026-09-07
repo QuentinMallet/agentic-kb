@@ -1397,7 +1397,7 @@ mod tests {
             "tags": [], "version_ref": "deadbeef", "kind": "belief",
             "ts": "2024-01-01T00:00:00Z",
         });
-        let live = crate::models::Evidence {
+        let live = Evidence {
             id: "ev-live".to_string(),
             entry_id: "e1".to_string(),
             kind: "code".to_string(),
@@ -1410,7 +1410,7 @@ mod tests {
         };
         {
             let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
-            crate::components::cursor::append_and_apply(
+            cursor::append_and_apply(
                 &lock,
                 &conn,
                 &paths,
@@ -1510,7 +1510,7 @@ mod tests {
         };
         {
             let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
-            crate::components::cursor::append_and_apply(
+            cursor::append_and_apply(
                 &lock,
                 &conn,
                 &paths,
@@ -1604,7 +1604,7 @@ mod tests {
         {
             let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
             let conn = db::open_rw(&paths, &lock).unwrap();
-            crate::components::cursor::append_and_apply(
+            cursor::append_and_apply(
                 &lock,
                 &conn,
                 &paths,

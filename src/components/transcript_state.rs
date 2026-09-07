@@ -202,7 +202,7 @@ mod tests {
                 m
             },
         };
-        std::fs::write(&tmp_path, serde_json::to_vec(&fake_map).unwrap()).unwrap();
+        fs::write(&tmp_path, serde_json::to_vec(&fake_map).unwrap()).unwrap();
 
         // State file should still reflect the pre-crash value (50).
         let ts2 = ts_in(dir.path());
