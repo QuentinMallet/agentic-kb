@@ -20,6 +20,9 @@ use abscissa_core::{Application, Command, Runnable};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs;
@@ -1921,16 +1924,15 @@ type AuditEntry = (String, String, String, String, String);
 fn audit_sample_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
+    rng: &mut impl Rng,
 ) -> rusqlite::Result<Vec<AuditEntry>> {
-    conn.prepare(
+    let mut stmt = conn.prepare(
         "SELECT id, path, summary, kind, evidence_status
          FROM entries
-         WHERE is_stale=0 AND evidence_status='present'
-         ORDER BY RANDOM()
-         LIMIT ?1",
-    )
-    .and_then(|mut stmt| {
-        stmt.query_map(params![sample_size as i64], |r| {
+         WHERE is_stale=0 AND evidence_status='present'",
+    )?;
+    let mut rows: Vec<AuditEntry> = stmt
+        .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1938,9 +1940,16 @@ fn audit_sample_entries(
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
             ))
-        })
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    // Shuffle with the injected RNG rather than `ORDER BY RANDOM()` so a
+    // test-seeded RNG makes the uniform arm's pick deterministic too — the
+    // traffic arm's excluded set (and thus its own distribution) depends on
+    // which entries land here.
+    rows.shuffle(rng);
+    rows.truncate(sample_size);
+    Ok(rows)
 }
 
 /// Weighted sampling without replacement. The uniform arm has already been
@@ -1950,6 +1959,7 @@ fn audit_traffic_entries(
     sample_size: usize,
     excluded: &[String],
     hit_counts: &[(String, u64)],
+    rng: &mut impl Rng,
 ) -> rusqlite::Result<Vec<AuditEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id,path,summary,kind,evidence_status FROM entries
@@ -1964,10 +1974,6 @@ fn audit_traffic_entries(
         .collect();
     let weights: std::collections::HashMap<&str, u64> =
         hit_counts.iter().map(|(id, n)| (id.as_str(), *n)).collect();
-    let mut seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
     let mut chosen = Vec::new();
     while !rows.is_empty() && chosen.len() < sample_size {
         let total: u64 = rows
@@ -1977,10 +1983,7 @@ fn audit_traffic_entries(
         if total == 0 {
             break;
         }
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let mut ticket = seed % total;
+        let mut ticket = rng.gen_range(0..total);
         let index = rows
             .iter()
             .position(|r| {
@@ -2020,6 +2023,17 @@ fn audit_evidence_rows(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Value
 }
 
 fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
+    handle_audit_run_with_rng(req, paths, &mut StdRng::from_entropy())
+}
+
+/// Same as `handle_audit_run`, but with the sampling RNG injected so tests
+/// can seed it and get deterministic uniform/traffic draws instead of
+/// relying on a statistical margin over many iterations.
+fn handle_audit_run_with_rng(
+    req: &AuditRunRequest,
+    paths: &config::Paths,
+    rng: &mut impl Rng,
+) -> Value {
     let id = &req.id;
     let Some(caller_id) = req
         .caller_id
@@ -2060,7 +2074,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
         sample_size
     };
 
-    let uniform_rows = match audit_sample_entries(&conn, uniform_budget) {
+    let uniform_rows = match audit_sample_entries(&conn, uniform_budget, rng) {
         Ok(rows) => rows,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
     };
@@ -2078,7 +2092,7 @@ fn handle_audit_run(req: &AuditRunRequest, paths: &config::Paths) -> Value {
     let traffic_rows = if mode == "traffic" && traffic_budget > 0 {
         query_hits::counts(&paths.query_hits)
             .and_then(|counts| {
-                audit_traffic_entries(&conn, traffic_budget, &uniform_ids, &counts).ok()
+                audit_traffic_entries(&conn, traffic_budget, &uniform_ids, &counts, rng).ok()
             })
             .unwrap_or_default()
     } else {
@@ -5154,6 +5168,14 @@ mod tests {
         query_hits::record_hits(&paths.query_hits, &vec![hot.clone(); 500], "test");
         query_hits::record_hits(&paths.query_hits, &[cold_a.clone(), cold_b.clone()], "test");
 
+        // Seeded RNG shared across all iterations (not re-seeded per call):
+        // the sampler used to draw from `SystemTime::now()`, so a run of 60
+        // iterations with sample_size:2 (uniform budget 1, traffic budget 1)
+        // was a ~0.6% false-failure draw — the uniform arm's SQL-random pick
+        // decides which entry the traffic arm excludes, and when it excludes
+        // `hot` the traffic draw can only land on a cold entry. Seeding
+        // removes that variance instead of just shrinking it.
+        let mut rng = StdRng::seed_from_u64(0x00a0_d17e_f224);
         let mut hot_traffic = 0;
         let mut cold_traffic = 0;
         for _ in 0..60 {
@@ -5161,13 +5183,14 @@ mod tests {
             // splits the budget between the two arms (1 each here), so a
             // budget of 1 would leave the traffic arm nothing to draw and
             // this test would never see a traffic-tagged sample.
-            let resp = handle_audit_run(
+            let resp = handle_audit_run_with_rng(
                 &tr::<AuditRunRequest>(
                     "audit_run",
                     &json!(null),
                     &json!({"caller_id":"mcp-test","sample_size":2,"mode":"traffic"}),
                 ),
                 &paths,
+                &mut rng,
             );
             assert_eq!(resp["type"], "ok");
             let samples = resp["samples"].as_array().unwrap();
