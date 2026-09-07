@@ -2,10 +2,10 @@
 
 `agentic-kb` keeps two benchmark lanes for interactive performance.
 
-The write-lane (`kb add`) baseline and its acceptance gate live separately:
-see [Write-Path Baseline](../benchmarks/write-path-baseline.md), re-baselined
-2026-09-07 after the D2 fdatasync-ordering fix retired the earlier absolute
-90.5 ms / 95.5 ms figures in favor of a like-for-like ratio gate.
+The write-lane (`kb add`) baseline and its acceptance gate live separately in
+`docs/benchmarks/write-path-baseline.md`, re-baselined 2026-09-07 after the D2
+fdatasync-ordering fix retired the earlier absolute 90.5 ms / 95.5 ms figures
+in favor of a like-for-like ratio gate.
 
 ## Why Two Lanes
 

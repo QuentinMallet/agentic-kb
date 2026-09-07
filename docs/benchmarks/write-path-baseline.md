@@ -99,8 +99,8 @@ KB_NO_EMBED=1 cargo bench --bench write_path
 ```
 
 - Commit/date/machine: TODO
-- `kb add` p50: TODO (baseline 57.0 ms)
-- `kb add` p95: TODO (baseline 90.5 ms)
+- `kb add` p50: TODO (retired baseline, no-log fixture; see Re-baseline after D2 — 57.0 ms)
+- `kb add` p95: TODO (retired baseline, no-log fixture; see Re-baseline after D2 — 90.5 ms)
 - `append_events_batch_only`: TODO (baseline 4.7891–5.2578 ms)
 - Full Criterion output/artifact: TODO
 
@@ -135,7 +135,7 @@ runs):**
 | Lane | p50 | p95 |
 |---|---:|---:|
 | New write path (fixture with event log) | 87.5 ms | 155 ms |
-| Master write path (fixture with event log) | 79.5 ms | 125 ms |
+| Master write path (master's own fixture, with event log) | 79.5 ms | 125 ms |
 | Master write path (same DB, log removed) | 78 ms | 128 ms |
 
 Paired overhead of the new write path over master on the same fixture: median
