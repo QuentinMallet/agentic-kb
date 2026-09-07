@@ -41,8 +41,21 @@ non-vacuity toggle, mirroring how Fixed already gates this module's
 correct-vs-buggy branches: RetainedConn = TRUE selects the rejected
 alternative (a connection held open past the lock release) so
 NoWriterConnAtSwap can be shown to actually distinguish the two.
+
+Delta (bd-21ef.2.23): checkpoint_live_db (rebuild.rs ~752-796) retries
+wal_checkpoint(TRUNCATE) and bails out busy rather than looping forever;
+nothing has been renamed or unlinked at that point, the live DB is
+untouched, and TmpDbGuard removes the tmp DB.  Checkpoint was previously
+total (always drains); CheckpointBusy is the sibling action, enabled from
+the same KP_PRE_CHECKPOINT phase whenever there is something to be busy
+about (wal_frames # {}), transitioning to a new terminal phase "aborted"
+instead of KP_POST_CHECKPOINT.  BuggyAbort is a non-vacuity toggle, again
+mirroring Fixed: BuggyAbort = TRUE selects the rejected alternative where an
+abort also unlinks the sidecars, so AbortLeavesLiveIntact can be shown to
+actually distinguish the two.
 ***************************************************************************)
-CONSTANTS Fixed, Scenario, MaxLogLen, MaxConcurrentAppends, RetainedConn
+CONSTANTS Fixed, Scenario, MaxLogLen, MaxConcurrentAppends, RetainedConn,
+          BuggyAbort
 
 VARIABLES log, committed_len, tmp_db, live_db, files, wal_frames, phase,
           cursor, snapshot_boundary, concurrent_appends, tmp_mode, killed,
@@ -83,7 +96,7 @@ TypeOK ==
   /\ wal_frames \subseteq {"A", "B", "W"}
   /\ phase \in {"p1", "p2", "p3", "KP_PRE_CHECKPOINT",
        "KP_POST_CHECKPOINT", "KP_POST_TMP_SYNC", "KP_POST_RENAME",
-       "KP_POST_UNLINK", "KP_POST_DIR_SYNC", "done", "reopened"}
+       "KP_POST_UNLINK", "KP_POST_DIR_SYNC", "done", "reopened", "aborted"}
   /\ cursor \in [generation: {0}, offset: 0..MaxLogLen, tail_sha: TailShas]
   /\ snapshot_boundary \in 0..MaxLogLen
   /\ concurrent_appends \in 0..MaxConcurrentAppends
@@ -168,6 +181,39 @@ Checkpoint ==
      ELSE /\ UNCHANGED <<files, wal_frames>>
   /\ phase' = "KP_POST_CHECKPOINT"
   /\ UNCHANGED <<log, committed_len, tmp_db, live_db, cursor,
+                  snapshot_boundary, concurrent_appends, tmp_mode, killed,
+                  replayed, batch_lock, writer_open>>
+
+(* bd-21ef.2.23: Checkpoint's sibling for a busy wal_checkpoint(TRUNCATE).
+   Real checkpoint_live_db retries five times at 50ms then bails; nothing
+   has been renamed or unlinked, the live DB is untouched, and TmpDbGuard
+   removes the tmp DB.  "aborted" is terminal here -- no action leaves it.
+   This is not a crash: it is checkpoint_live_db returning an error from a
+   still-running process, so it does not join KillPoints and Kill does not
+   apply to it; a subsequent rebuild attempt is simply a fresh run of this
+   whole state machine (a new Init), not a restart of this one, so no
+   Reopen-style recovery action was added either.
+
+   Guard `wal_frames # {}` mirrors the team's framing: a drain with nothing
+   to do cannot be busy (matches Checkpoint's own Fixed branch, which is a
+   no-op when wal_frames is already empty).  BuggyAbort selects whether the
+   sidecars are unlinked on the way out (the rejected alternative) or left
+   alone (the shipped behaviour, matching real TmpDbGuard which only ever
+   removes the *tmp* database, never touches the live one's sidecars).
+
+   tmp_db is left UNCHANGED: the module has no existing "discard" action for
+   it (no action anywhere ever resets tmp_db to {}), and files["tmp"] --
+   the on-disk representation TmpDbGuard actually deletes -- is still {} at
+   this point regardless, since VerifyAndClose (the only action that ever
+   writes files["tmp"]) has not run yet on this path.  So there is nothing
+   for this action to discard in files either; only wal_frames carries the
+   BuggyAbort distinction. *)
+CheckpointBusy ==
+  /\ Fixed /\ phase = "KP_PRE_CHECKPOINT" /\ ~killed
+  /\ wal_frames # {}
+  /\ wal_frames' = (IF BuggyAbort THEN {} ELSE wal_frames)
+  /\ phase' = "aborted"
+  /\ UNCHANGED <<log, committed_len, tmp_db, live_db, files, cursor,
                   snapshot_boundary, concurrent_appends, tmp_mode, killed,
                   replayed, batch_lock, writer_open>>
 
@@ -304,9 +350,9 @@ BatchCommitAndClose ==
                   replayed>>
 
 Next == Phase1Snapshot \/ WriterAppend \/ Phase2Replay \/ Phase3CatchUp \/
-        Checkpoint \/ VerifyAndClose \/ SetTmpWalMode \/ FirstNameOperation \/
-        SecondNameOperation \/ DirSync \/ Finish \/ Kill \/ Reopen \/
-        BatchOpen \/ BatchCommitAndClose
+        Checkpoint \/ CheckpointBusy \/ VerifyAndClose \/ SetTmpWalMode \/
+        FirstNameOperation \/ SecondNameOperation \/ DirSync \/ Finish \/
+        Kill \/ Reopen \/ BatchOpen \/ BatchCommitAndClose
 Spec == Init /\ [][Next]_vars
 
 NamedDbContents == files[live_db.db] \union
@@ -352,4 +398,19 @@ CursorMatchesAtDone ==
   phase = "done" => cursor.offset = committed_len /\ cursor.generation = 0
 
 NoReplayOnMatchedCursor == phase = "reopened" => ~replayed
+
+(* bd-21ef.2.23: the busy-checkpoint abort must leave the live DB exactly as
+   it was.  live_db.db = "old" holds structurally here -- no action before
+   FirstNameOperation ever touches live_db, and CheckpointBusy only fires
+   from KP_PRE_CHECKPOINT, well before FirstNameOperation's KP_POST_TMP_SYNC
+   -- so the first conjunct is a sanity check on that structural fact, not a
+   live constraint.  The second conjunct is the one CheckpointBusy can
+   actually violate: under CE4, files["old"] is still {} on this path (only
+   a successful Checkpoint ever writes files["old"]), so "W" \in
+   NamedDbContents depends entirely on wal_frames still carrying "W" --
+   exactly what BuggyAbort's unlink would erase. *)
+AbortLeavesLiveIntact ==
+  phase = "aborted" =>
+    /\ live_db.db = "old"
+    /\ (Scenario = "CE4" => "W" \in NamedDbContents)
 =============================================================================
