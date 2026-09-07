@@ -21,7 +21,6 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use clap::Parser;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -1921,39 +1920,63 @@ type AuditEntry = (String, String, String, String, String);
 /// Passes the Statement by value into `and_then` so the closure owns it,
 /// avoiding the borrow-checker constraint where `MappedRows<'_, F>` borrows
 /// the statement until its destructor runs at end-of-scope.
+/// Uniform-without-replacement sample over the present-evidence rows,
+/// via reservoir sampling (Algorithm R) so a KB with tens or hundreds of
+/// thousands of entries doesn't require materializing and shuffling the
+/// whole table — memory stays O(sample_size), and the query cursor streams
+/// one row at a time through the reservoir instead of being collected
+/// up front. Uses the injected RNG (rather than SQL `ORDER BY RANDOM()`)
+/// so a test-seeded RNG makes the uniform arm's pick deterministic too —
+/// the traffic arm's excluded set (and thus its own distribution) depends
+/// on which entries land here.
 fn audit_sample_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
     rng: &mut impl Rng,
 ) -> rusqlite::Result<Vec<AuditEntry>> {
+    if sample_size == 0 {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT id, path, summary, kind, evidence_status
          FROM entries
          WHERE is_stale=0 AND evidence_status='present'",
     )?;
-    let mut rows: Vec<AuditEntry> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?
-        .filter_map(Result::ok)
-        .collect();
-    // Shuffle with the injected RNG rather than `ORDER BY RANDOM()` so a
-    // test-seeded RNG makes the uniform arm's pick deterministic too — the
-    // traffic arm's excluded set (and thus its own distribution) depends on
-    // which entries land here.
-    rows.shuffle(rng);
-    rows.truncate(sample_size);
-    Ok(rows)
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut reservoir: Vec<AuditEntry> = Vec::with_capacity(sample_size);
+    for (idx, row) in rows.filter_map(Result::ok).enumerate() {
+        // `idx` is 0-based; `idx + 1` is the count of rows seen so far
+        // (including this one), which is what Algorithm R's ticket draw
+        // is over.
+        if reservoir.len() < sample_size {
+            reservoir.push(row);
+        } else {
+            let j = rng.gen_range(0..idx + 1);
+            if j < sample_size {
+                reservoir[j] = row;
+            }
+        }
+    }
+    Ok(reservoir)
 }
 
 /// Weighted sampling without replacement. The uniform arm has already been
 /// fixed, so excluded IDs can never move into the traffic arm.
+///
+/// Unlike `audit_sample_entries`, this can't stream through a reservoir:
+/// each draw's ticket is weighted by hit count across the *whole* remaining
+/// candidate pool (`total` below), so the full set has to be in hand before
+/// the first draw. `sample_size` is small (it's the leftover half of an
+/// already-clamped `MAX_AUDIT_VERDICTS`-bounded request), so this stays
+/// bounded even though it materializes every present-evidence row.
 fn audit_traffic_entries(
     conn: &rusqlite::Connection,
     sample_size: usize,
@@ -5219,6 +5242,51 @@ mod tests {
         assert!(
             hot_traffic > cold_traffic,
             "high-traffic entry should be sampled more often"
+        );
+    }
+
+    /// `audit_sample_entries`'s reservoir sampler (Algorithm R) over 1000
+    /// synthetic present-evidence rows: sample_size=50 must return exactly
+    /// 50 distinct ids (uniform sampling without replacement), and the same
+    /// seed against the same table must reproduce the same reservoir.
+    /// Inserts rows directly into `entries` rather than through `handle_add`
+    /// — the sampler only reads that table, and 1000 real adds (embedding +
+    /// citation verification each) would make this test unnecessarily slow.
+    #[test]
+    fn test_audit_sample_entries_reservoir_is_distinct_and_seed_stable() {
+        let (_dir, paths, _emb) = setup();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        let conn = db::open_rw(&paths, &lock).unwrap();
+        conn.execute_batch("BEGIN;").unwrap();
+        for i in 0..1000 {
+            conn.execute(
+                "INSERT INTO entries (id, path, summary, content, tags, kind, evidence_status, is_stale)
+                 VALUES (?1, ?2, 's', 'c', '[]', 'observation', 'present', 0)",
+                params![format!("id-{i}"), format!("p/{i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+
+        let mut rng_a = StdRng::seed_from_u64(0x5eed_5eed_5eed);
+        let sample_a = audit_sample_entries(&conn, 50, &mut rng_a).unwrap();
+        assert_eq!(sample_a.len(), 50);
+        let ids_a: std::collections::HashSet<&str> =
+            sample_a.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            ids_a.len(),
+            50,
+            "reservoir sample must return 50 distinct ids, got {}",
+            ids_a.len()
+        );
+
+        let mut rng_b = StdRng::seed_from_u64(0x5eed_5eed_5eed);
+        let sample_b = audit_sample_entries(&conn, 50, &mut rng_b).unwrap();
+        let ids_b: std::collections::HashSet<&str> =
+            sample_b.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "same seed against the same table must reproduce the same reservoir sample"
         );
     }
 
