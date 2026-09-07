@@ -4,14 +4,17 @@
 //! new bare whole-file form `path`, but only when the current file still hashes
 //! to the stored `citation_hash` and still has size `N`.
 
-use crate::commands::add::{acquire_lock, make_embedder};
+use crate::commands::add::acquire_lock;
+use crate::components::cursor;
 use crate::components::db;
 use crate::components::embedder::NoopEmbedder;
 use crate::components::events;
-use crate::components::verification::{compute_citation_hash_and_size, parse_citation_path};
+use crate::components::verification::{
+    compute_citation_hash_and_size, parse_citation_path, FileIdentity,
+};
 use crate::config;
 use abscissa_core::{Command, Runnable};
-use anyhow::{anyhow, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Component, Path, PathBuf};
@@ -72,32 +75,21 @@ enum PlannedAction {
 impl MigrateCitations {
     pub fn execute(&self) -> Result<()> {
         let paths = config::Paths::discover()?;
-        let embedder = make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        db::open_or_init(&paths)?;
         self.execute_with_paths(&paths)?;
         Ok(())
     }
 
     pub fn execute_with_paths(&self, paths: &config::Paths) -> Result<MigrationReport> {
-        let conn = db::open_db(&paths.db)?;
-        let repo_root = repo_root_from_paths(paths)?;
+        let conn = db::open_ro(&paths.db)?;
+        let repo_root = &paths.root;
         let mut report = plan_migration(&conn, repo_root.as_path(), &paths.events)?;
         if !self.dry_run {
-            apply_heals(paths, &conn, repo_root.as_path(), &mut report)?;
+            apply_heals(paths, repo_root.as_path(), &mut report)?;
         }
         render_cli(&report, self.dry_run);
         Ok(report)
     }
-}
-
-fn repo_root_from_paths(paths: &config::Paths) -> Result<std::path::PathBuf> {
-    paths
-        .db
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("could not derive repo root from {}", paths.db.display()))
 }
 
 fn plan_migration(
@@ -172,7 +164,9 @@ fn classify_row(row: &EvidenceCitationRow, repo_root: &Path, events_path: &Path)
             reason: SKIP_NON_LEGACY_REASON,
         };
     }
-    if citation_targets_events_log(file_rel, repo_root, events_path) {
+    if citation_targets_events_log(file_rel, repo_root, events_path)
+        || citation_aliases_events_log(file_rel, repo_root, events_path).unwrap_or(false)
+    {
         return PlannedAction::Fail {
             reason: SELF_REFERENTIAL_LOG_REASON.to_string(),
         };
@@ -237,14 +231,36 @@ fn citation_targets_events_log(file_rel: &str, repo_root: &Path, events_path: &P
     normalize_repo_relative(configured_rel).as_ref() == Some(&citation_rel)
 }
 
+fn citation_aliases_events_log(
+    file_rel: &str,
+    repo_root: &Path,
+    events_path: &Path,
+) -> Result<bool> {
+    let cited = repo_root.join(file_rel);
+    match (FileIdentity::of(&cited), FileIdentity::of(events_path)) {
+        (Ok(cited), Ok(events)) => Ok(cited == events),
+        (Err(error), _) => {
+            Err(error).with_context(|| format!("stat cited file {}", cited.display()))
+        }
+        (_, Err(error)) => {
+            Err(error).with_context(|| format!("stat event log {}", events_path.display()))
+        }
+    }
+}
+
+/// Apply the planned heals under the write lock.
+///
+/// Opens its own mutating connection rather than reusing the planning read
+/// connection: a mutation must be performed on a handle obtained with the lock
+/// in hand (ADR-1, principle 2).
 fn apply_heals(
     paths: &config::Paths,
-    conn: &Connection,
     repo_root: &Path,
     report: &mut MigrationReport,
 ) -> Result<()> {
     let version_ref = config::git_head_sha_at(repo_root);
-    let _lock = acquire_lock(&paths.lock)?;
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = &db::open_rw(paths, &lock)?;
 
     let planned = std::mem::take(&mut report.would_heal);
     for row in planned {
@@ -289,21 +305,59 @@ fn apply_heals(
             reason: None,
         };
 
+        let (file_rel, _) = parse_citation_path(&verify_row.citation_path)?;
+        let cited_path = repo_root.join(file_rel);
+        let identity_before_hash = FileIdentity::of(&cited_path)
+            .with_context(|| format!("stat cited file {}", cited_path.display()))?;
+        let events_identity = FileIdentity::of(&paths.events)
+            .with_context(|| format!("stat event log {}", paths.events.display()))?;
+        if identity_before_hash == events_identity {
+            report.failed.push(MigrationRow {
+                reason: Some(SELF_REFERENTIAL_LOG_REASON.to_string()),
+                ..current_view
+            });
+            continue;
+        }
         match classify_row(&verify_row, repo_root, &paths.events) {
             PlannedAction::WouldHeal { new_path } => {
-                let event = events::citation_healed_event(
+                // Recheck identity immediately before append as the path may
+                // have been replaced by a non-kb writer after classification.
+                let identity_before_append = FileIdentity::of(&cited_path)
+                    .with_context(|| format!("stat cited file {}", cited_path.display()))?;
+                let events_identity_before_append = FileIdentity::of(&paths.events)
+                    .with_context(|| format!("stat event log {}", paths.events.display()))?;
+                if identity_before_append != identity_before_hash
+                    || identity_before_append == events_identity_before_append
+                {
+                    report.failed.push(MigrationRow {
+                        reason: Some(if identity_before_append == events_identity_before_append {
+                            SELF_REFERENTIAL_LOG_REASON.to_string()
+                        } else {
+                            "citation file changed before append".to_string()
+                        }),
+                        ..current_view
+                    });
+                    continue;
+                }
+                let event = events::citation_healed(events::citation_healed_event(
                     &row.entry_id,
                     &row.evidence_id,
                     &verify_row.citation_path,
                     &new_path,
                     &verify_row.citation_hash,
                     version_ref.as_deref(),
-                );
-                events::append_event(&paths.events, &event)?;
-                // If append succeeds but apply fails, a rerun may append a
-                // second citation_healed event. Applying the same target is a
-                // state-idempotent no-op; deterministic op IDs are deferred.
-                db::apply_event(conn, &NoopEmbedder, &event)?;
+                ))?;
+                // Writer 6 of 10. If append succeeds but apply fails, a rerun
+                // may append a second citation_healed event. Applying the same
+                // target is a state-idempotent no-op; deterministic op IDs are
+                // deferred.
+                cursor::append_and_apply_writer_events(
+                    &lock,
+                    conn,
+                    paths,
+                    &NoopEmbedder,
+                    &[event],
+                )?;
                 report.emitted_events += 1;
                 report.would_heal.push(MigrationRow {
                     new_path: Some(new_path),
@@ -400,8 +454,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let paths = Paths::from_root(root);
-        let conn = db::open_db(&paths.db).unwrap();
+        let (paths, conn) = db::test_db(root);
         (dir, paths, conn)
     }
 
@@ -419,8 +472,8 @@ mod tests {
             "is_stale": false,
             "ts": "2024-01-01T00:00:00Z"
         });
-        events::append_event(&paths.events, &upsert).unwrap();
-        apply_event(conn, &NoopEmbedder, &upsert).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[upsert]).unwrap();
     }
 
     fn seed_evidence(
@@ -443,14 +496,14 @@ mod tests {
             recorded_at: Some("2026-09-02T00:00:00Z".to_string()),
         };
         let event = evidence_add_event(entry_id, &evidence, Some("deadbeef"));
-        events::append_event(&paths.events, &event).unwrap();
-        apply_event(conn, &NoopEmbedder, &event).unwrap();
+        let lock = acquire_lock(&paths.lock).unwrap();
+        cursor::append_and_apply(&lock, conn, paths, &NoopEmbedder, &[event]).unwrap();
     }
 
     #[test]
     fn test_migrate_citations_heals_matching_legacy_whole_file_range() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let bytes = fs::read(root.join("src/lib.rs")).unwrap();
@@ -501,12 +554,21 @@ mod tests {
         assert_eq!(events[2]["old_path"], format!("src/lib.rs:0-{end}"));
         assert_eq!(events[2]["new_path"], "src/lib.rs");
         assert_eq!(events[2]["citation_hash"], hash);
+
+        // C1/T4: the heal writer must leave the applied cursor caught up, or
+        // every later open replays its events.
+        let ro = db::open_ro(&paths.db).unwrap();
+        assert_eq!(
+            cursor::inspect(&ro, &paths),
+            cursor::Decision::NoOp,
+            "the citation_healed writer left the applied cursor behind the log"
+        );
     }
 
     #[test]
     fn test_migrate_citations_skips_bare_rows_on_rerun() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -550,7 +612,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_reports_changed_file_rows() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "abc\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -588,7 +650,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_reports_size_mismatch_rows() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "abc").unwrap();
         let old_end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -629,7 +691,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_dry_run_emits_no_events() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::read(root.join("src/lib.rs")).unwrap().len();
@@ -695,10 +757,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_migrate_citations_rejects_hard_link_alias_of_events_log() {
+        let (_dir, paths, conn) = setup_repo();
+        let root = paths.root.clone();
+        fs::create_dir_all(root.join("fixtures")).unwrap();
+        // events.jsonl is only created lazily on first append, so seed an
+        // entry first — hard_link needs the target file to already exist.
+        seed_live_entry(&paths, &conn, "entry-1");
+        let alias = root.join("fixtures/events-alias.jsonl");
+        fs::hard_link(&paths.events, &alias).unwrap();
+        let end = fs::metadata(&alias).unwrap().len() as usize;
+        seed_evidence(
+            &paths,
+            &conn,
+            "entry-1",
+            "ev-1",
+            &format!("fixtures/events-alias.jsonl:0-{end}"),
+            "sha256:deadbeef",
+        );
+
+        let report = MigrateCitations { dry_run: false }
+            .execute_with_paths(&paths)
+            .unwrap();
+
+        assert_eq!(report.emitted_events, 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].reason.as_deref(),
+            Some(SELF_REFERENTIAL_LOG_REASON)
+        );
+    }
+
     #[test]
     fn test_migrate_citations_heals_subdir_file_named_like_events_log() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("fixtures")).unwrap();
         fs::write(root.join("fixtures/agent-kb-events.jsonl"), "fixture\n").unwrap();
         let end = fs::metadata(root.join("fixtures/agent-kb-events.jsonl"))
@@ -734,7 +829,7 @@ mod tests {
     #[test]
     fn test_migrate_citations_skips_when_parent_goes_stale_between_plan_and_apply() {
         let (_dir, paths, conn) = setup_repo();
-        let root = repo_root_from_paths(&paths).unwrap();
+        let root = paths.root.clone();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "fn main() {}\n").unwrap();
         let end = fs::metadata(root.join("src/lib.rs")).unwrap().len() as usize;
@@ -763,7 +858,7 @@ mod tests {
         apply_event(&conn, &NoopEmbedder, &expire).unwrap();
         let before = read_events(&paths.events).unwrap().events.len();
 
-        apply_heals(&paths, &conn, &root, &mut report).unwrap();
+        apply_heals(&paths, &root, &mut report).unwrap();
 
         assert_eq!(report.emitted_events, 0);
         assert!(report.would_heal.is_empty());

@@ -4,7 +4,7 @@ use crate::components::db;
 use crate::components::embedder;
 use crate::components::retrieval_eval::{
     compare_reports, evaluate_split, parse_golden_jsonl, validate_sealed_manifest, EvalReport,
-    Split, SplitManifest,
+    Split, SplitManifest, Verdict,
 };
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -69,7 +69,6 @@ impl Eval {
         }
         let paths = config::Paths::discover()?;
         let emb = crate::commands::add::make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
         self.execute_with(&paths, emb.as_ref())
     }
 
@@ -120,7 +119,24 @@ impl Eval {
             mmr_lambda: kb_config.mmr_lambda,
         };
 
-        let conn = db::open_db(&paths.db)?;
+        // A read: an uninitialized repository behaves exactly like an
+        // initialized-but-empty one (zero entries either way), so evaluate
+        // against a throwaway empty in-memory schema instead of erroring —
+        // never create the repository's own database from a read. The
+        // cursor/log staleness check below only makes sense against the
+        // repository's own database, so it is skipped for the substitute.
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => {
+                // A read: detect and warn, never recover (C2/ADR-7).
+                crate::components::cursor::warn_if_behind(&conn, paths);
+                conn
+            }
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                db::open_db_memory()?
+            }
+            Err(e) => return Err(e),
+        };
         let report = evaluate_split(&conn, embedder, &cases, &opts, requested)?;
         let recall = report.recall_at_k();
         let mrr = report.mrr();
@@ -131,7 +147,7 @@ impl Eval {
                 recall_at_k: f64,
                 mrr: f64,
                 #[serde(flatten)]
-                report: &'a crate::components::retrieval_eval::EvalReport,
+                report: &'a EvalReport,
             }
             println!(
                 "{}",
@@ -181,7 +197,7 @@ impl Eval {
         let before: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[0])?)?;
         let after: EvalReport = serde_json::from_str(&std::fs::read_to_string(&files[1])?)?;
         let comparison = compare_reports(&before, &after)?;
-        if comparison.verdict == crate::components::retrieval_eval::Verdict::Inconclusive {
+        if comparison.verdict == Verdict::Inconclusive {
             println!("INCONCLUSIVE: no information — NOT evidence of no regression (discordant_pairs={})", comparison.discordant_pairs);
         } else {
             println!(
@@ -197,12 +213,11 @@ impl Eval {
     }
 }
 
-fn compare_exit_code(verdict: crate::components::retrieval_eval::Verdict) -> Option<i32> {
+fn compare_exit_code(verdict: Verdict) -> Option<i32> {
     match verdict {
         // `kb eval --compare` is a CI gate only for a demonstrated regression.
-        crate::components::retrieval_eval::Verdict::Regression => Some(EXIT_COMPARE_REGRESSION),
-        crate::components::retrieval_eval::Verdict::Significant
-        | crate::components::retrieval_eval::Verdict::Inconclusive => None,
+        Verdict::Regression => Some(EXIT_COMPARE_REGRESSION),
+        Verdict::Significant | Verdict::Inconclusive => None,
     }
 }
 

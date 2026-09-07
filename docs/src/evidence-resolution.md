@@ -7,8 +7,34 @@ The agent KB implements server-side resolution of evidence citations at write ti
 When an agent calls `kb_add` with an evidence row containing only a `citation_path`, the server resolves that path to a complete evidence record before appending the event to the log. The contract is:
 
 - **Caller provides:** `citation_path` (file path or file path + byte range) and optionally `evidence.kind` and `evidence.derived_from`.
+- If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id.
 - **Server resolves:** `citation_hash` (SHA-256 of the byte range) and `citation_sha` (git HEAD commit SHA), computed at write time from the working repository.
-- **Explicit values preserved:** If the caller supplies `citation_hash` or `citation_sha` explicitly, those values are never overwritten — the caller assertion is authoritative.
+- **Explicit hash checked:** If the caller supplies `citation_hash`, `kb_core::add`
+  recomputes the hash from the resolved file descriptor and rejects the whole
+  write if it differs (`test_kb_core_add_rejects_wrong_explicit_citation_hash`).
+  A missing hash is filled with that computed value. An explicitly supplied
+  `citation_sha` remains unchanged; a missing one is filled when a Git HEAD is
+  available at the cited file's directory — resolved at that file's own
+  parent directory, so a citation inside a nested worktree records that
+  worktree's HEAD rather than the caller's working-directory HEAD
+  (`kb_core::add` calls `config::git_head_sha_at(absolute_path.parent())` in
+  `src/components/kb_core.rs`; the `kb cite` tool resolves the same way via
+  `compute_citation_fields` in `src/commands/cite.rs`).
+- **MCP layer rejects more broadly than the hash-mismatch check above:**
+  before `kb_core::add` is ever called, `handle_add`'s
+  `validate_explicit_citation_hashes` (`src/commands/mcp.rs`) re-verifies
+  every evidence row with both a `citation_path` and a non-empty
+  `citation_hash`, rejecting *any* non-verified outcome — malformed range,
+  missing file, out-of-bounds range, or path escape, not only a hash
+  mismatch — with `evidence[i] citation_hash failed verification for
+  citation_path "...": <reason>` and code `validation_error`, before any
+  event append or database write. See "MCP write-time rejection" in
+  [Citation Semantics](./citation-semantics.md).
+- **Worktree citation warning:** `kb_add` (both CLI and MCP) prints
+  `warn: citation_path under .state/worktrees/ will go stale after the
+  worktree is removed: <paths>` for any `citation_path` beginning
+  `.state/worktrees/` (`add_validation::warn_nested_worktree_citations`).
+  This is advisory only; the write still succeeds.
 - **Before event append:** Resolution failures are loud write-time errors that reject the entire `kb_add` call, naming the problematic path and reason. A malformed citation or missing file causes the write to fail, never resulting in an unverifiable row in the database.
 - **Replay invariant:** Resolved fields are persisted in the event as-is; the verifier on later rebuilds or replay never re-resolves them. This means the hash and SHA captured at write time are preserved exactly as computed, unaffected by later file changes or git history rewrites.
 
@@ -20,12 +46,34 @@ Resolution can fail at write time if:
 |-----------|--------|----------|
 | Malformed `citation_path` | Path syntax invalid (e.g., range end before start) | Write rejected with parse error |
 | File not found | `citation_path` refers to a path that does not exist in the working tree | Write rejected with FileMissing |
-| Not a regular file | Path is a directory, symlink, or device file | Write rejected with FileMissing |
+| Symbolic-link component | Any path component is a symlink, whether its target is inside or outside the repository | Write rejected with SymlinkPathRejected |
+| Not a regular file | Path is a directory or device file | Write rejected with FileMissing |
 | Byte range outside bounds | Explicit range exceeds file size | Write rejected with RangeError |
 | File too large | Whole-file citation exceeds `MAX_FILE_BYTES` (64 MiB); range citation exceeds `MAX_RANGE_BYTES` (4 MiB) | Write rejected with FileTooLarge |
 | I/O errors | Filesystem errors during read | Write rejected with I/O error |
 
 All failures surface as rejections to the caller. There is no silent fallback, no partial writes, and no stored rows that are unverifiable due to resolution failure.
+
+### Symlink migration note
+
+Citation authorship, write-time resolution, direct verification, cited-file
+relocation, and repository relocation all use the same reject-all rule: every
+component of a citation path must be a non-symlink on every platform. The
+resolver seam is exercised by
+`symlink_citations_are_rejected_by_openat2_and_fallback_resolvers`; the join and
+walk sites are covered by `safe_join_rejects_symlink_components_and_parent_components`
+and `relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them`.
+
+The machine-readable reason is `symlink_path_rejected`. It discloses only that
+an in-repository path component is a symbolic link, not its target. In
+`Verifier::verify_evidence`, that reason returns immediately: it is never sent
+to excerpt relocation and therefore cannot produce an auto-heal event. The
+non-disclosure boundary is pinned by
+`test_kb_core_add_symlinked_citation_error_does_not_disclose_target_existence`.
+
+The A0 audit found 41 evidence rows and zero affected citations, so no stored
+row required migration. This audit result and the cross-platform rationale are
+recorded in ADR-5: Citation symlink policy (`docs/decisions/adr-5-symlink-policy.md`).
 
 ## Cheap Compliance: The Rationale
 
@@ -51,7 +99,7 @@ The entry-point call `kb_add` now succeeds or fails on its own, without requirin
 
 ### Evidence Status and the Soft Mandate
 
-The soft mandate on evidence (for observation, belief, and procedure kinds) does not block writes. Entries of these kinds are accepted with zero evidence rows, stored with `evidence_status="missing"`, and trigger a write-time warning to stderr. When evidence rows are provided, they need only include `citation_path`; the server resolves it to `citation_hash` and `citation_sha`. Evidence rows are capped at `MAX_EVIDENCE_ROWS_PER_ENTRY` (200), a limit enforced at both write and retrieval time.
+The soft mandate on evidence (for observation, belief, and procedure kinds) does not block writes. Entries of these kinds are accepted with zero evidence rows, stored with `evidence_status="missing"`, and trigger a write-time warning to stderr. When evidence rows are provided, they need only include `citation_path`; the server resolves it to `citation_hash` and `citation_sha`. If an evidence row has `kind="derived"`, it must include `derived_from` as a non-empty string no longer than 200 characters naming the supporting entry id. Evidence rows are capped at `MAX_EVIDENCE_ROWS_PER_ENTRY` (200), a limit enforced at both write and retrieval time.
 
 Entries of kind convention or memory are not subject to the soft mandate and may carry zero evidence rows.
 

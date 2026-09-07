@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Agent knowledge base CLI — JSONL event log + SQLite materialized cache with FTS5 and semantic search"
 
+[features]
+default = []
+crash-sim = []
+# Test-only: exposes `events::measure_event_log_reads`, the read-byte-budget
+# seam used by the tail-window regression tests. Never enabled for a plain
+# `cargo build`/`cargo build --release` — only for test targets, via the
+# self dev-dependency below.
+event-log-read-metrics = []
+# Test/benchmark-only escape hatch for corruption and legacy JSON fixtures.
+# Shipped command handlers go through `WriterEvent` instead.
+event-log-test-raw = []
+
 [[bin]]
 name = "kb"
 path = "src/bin/kb/main.rs"
@@ -50,7 +62,12 @@ harness = false
 name = "bench_interactive_surfaces"
 harness = false
 
+[[bench]]
+name = "write_path"
+harness = false
+
 [dev-dependencies]
+kb = { path = ".", features = ["event-log-read-metrics", "event-log-test-raw"] }
 libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.11.0"

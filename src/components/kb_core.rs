@@ -35,15 +35,21 @@
 //!   Layer 1 (inner): per-event append/apply gap within a single `kb_core::add` call.
 //!   Layer 2 (cross-batch): cross-invocation boundary between distinct `kb_core::add` calls.
 
-use crate::commands::add::acquire_lock;
-use crate::components::verification::{compute_citation_hash, parse_citation_path};
-use crate::components::{db, embedder, events, redactor};
+use crate::commands::add::{acquire_lock, Lock};
+use crate::components::verification::{
+    compute_citation_hash_and_size_from, open_citation_descriptor, parse_citation_path,
+    FileIdentity,
+};
+use crate::components::{cursor, db, embedder, events, redactor};
 use crate::config;
 use crate::models::Evidence;
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
+
+type CitationRange = Option<(usize, usize)>;
+type ResolvedCitationHashes = HashMap<(FileIdentity, CitationRange), String>;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -58,16 +64,52 @@ thread_local! {
     static CITATION_HASH_RESOLUTION_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Hash an already-open, resolver-vetted citation descriptor.
+///
+/// Takes `file` rather than `repo_root`/`file_rel` so callers open once via
+/// [`open_citation_descriptor`] (which rejects a symlinked `citation_path`
+/// before touching its target) and reuse that descriptor for both identity
+/// (`FileIdentity::of_file`) and hashing -- a second, unguarded open here
+/// would reintroduce the write-path symlink oracle this function exists to
+/// avoid.
 fn resolve_citation_hash(
-    repo_root: &std::path::Path,
+    file: &std::fs::File,
     file_rel: &str,
     range: Option<(usize, usize)>,
 ) -> Result<String> {
     #[cfg(test)]
     CITATION_HASH_RESOLUTION_CALLS.with(|c| c.set(c.get() + 1));
 
-    compute_citation_hash(repo_root, file_rel, range)
+    Ok(format!(
+        "sha256:{}",
+        compute_citation_hash_and_size_from(file, file_rel, range)?.sha256_hex
+    ))
 }
+
+#[derive(Clone)]
+struct ResolvedCitation {
+    citation_path: String,
+    identity: FileIdentity,
+    hash: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CITATION_REVERIFY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_citation_reverify_hook() {
+    BEFORE_CITATION_REVERIFY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_citation_reverify_hook() {}
 
 /// Input arguments for `kb_core::add`.
 ///
@@ -129,67 +171,138 @@ pub struct AddOutcome {
     pub similar_existing: Vec<SimilarEntry>,
 }
 
-/// Unified add primitive.
+/// Unified add primitive: acquires the write lock, opens for mutation, and
+/// delegates to [`add_locked`].
 ///
-/// Acquires the flock, then:
-/// 1. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
-/// 2. Builds expire events + the upsert event + evidence-add events.
-/// 3. Appends ALL events in ONE `events::append_events_batch` call (JSONL-first).
-/// 4. Applies each event to the DB in order, all under the held flock.
+/// A thin wrapper on purpose. Callers that already hold the lock — a locked
+/// batch import, any future multi-entry write path — must call [`add_locked`]
+/// directly; calling this one would re-acquire the flock and, before the
+/// re-entrancy registry existed, deadlock on itself (ADR-1).
 ///
 /// INVARIANT: this function NEVER reads `KB_NO_EMBED` from the environment.
 /// The caller must construct the Embedder before calling and pass it by reference.
 pub fn add(
     paths: &config::Paths,
     embedder: &dyn embedder::Embedder,
+    args: AddArgs,
+) -> Result<AddOutcome> {
+    let lock = acquire_lock(&paths.lock)?;
+    let conn = db::open_rw(paths, &lock)?;
+    add_locked(&lock, &conn, paths, embedder, args)
+}
+
+/// The add logic, for a caller that already holds this repository's write lock.
+///
+/// 1. Validates, redacts, and caps the inputs.
+/// 2. Collects any existing non-stale entry IDs at `args.path` (when `replace_path=true`).
+/// 3. Builds expire events + the upsert event + evidence-add events.
+/// 4. Appends ALL events in ONE span and applies them under the caller's flock,
+///    through the single applied-cursor writer (`cursor::append_and_apply`).
+///
+/// Input preparation runs inside the critical section rather than ahead of it,
+/// which is a deliberate trade: one code path for both entry points is worth
+/// more than the few milliseconds of citation hashing it adds to the lock hold.
+///
+/// `lock` is proof, not a resource: it is checked against `paths.lock` and never
+/// released here — the caller's guard still owns it.
+pub fn add_locked(
+    lock: &Lock,
+    conn: &Connection,
+    paths: &config::Paths,
+    embedder: &dyn embedder::Embedder,
     mut args: AddArgs,
 ) -> Result<AddOutcome> {
-    let repo_root = paths
-        .db
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("cannot determine repository root from KB database path"))?;
+    // Redundant but intentional: open_rw canonicalized paths.lock before it
+    // opened `conn`; re-checking here keeps add_locked self-contained for any
+    // future caller handed a live lock + connection pair from elsewhere.
+    let expected_lock = std::fs::canonicalize(&paths.lock).with_context(|| {
+        format!(
+            "canonicalize write lock {} (add_locked requires a live lock guard)",
+            paths.lock.display()
+        )
+    })?;
+    if lock.path() != expected_lock {
+        anyhow::bail!(
+            "add_locked: the supplied lock guards {}, but this repository's write lock is {}",
+            lock.path().display(),
+            expected_lock.display()
+        );
+    }
 
-    // Normalize path-only evidence before constructing any events. Explicit
-    // assertions are authoritative and are never replaced, even when wrong.
-    let mut resolved_hashes_by_path: HashMap<String, String> = HashMap::new();
+    let repo_root = &paths.root;
+
+    // Resolve and validate all in-repository path evidence while holding the
+    // flock. File identity, rather than path spelling, is the memoization key.
+    let mut resolved_hashes = ResolvedCitationHashes::new();
+    let mut resolved_citations = Vec::new();
     for evidence in &mut args.evidence_rows {
         let hash_missing = evidence
             .get("citation_hash")
             .and_then(Value::as_str)
             .map(str::is_empty)
             .unwrap_or(true);
-        if !hash_missing {
-            continue;
-        }
-        let citation_path = evidence
+        let Some(citation_path) = evidence
             .get("citation_path")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("evidence row missing required citation_path or citation_hash")
-            })?;
-        let (file_rel, range) = parse_citation_path(citation_path)
+            .map(str::to_string)
+        else {
+            if hash_missing {
+                anyhow::bail!("evidence row missing required citation_path or citation_hash");
+            }
+            continue;
+        };
+        let (file_rel, range) = parse_citation_path(&citation_path)
             .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
-        let citation_hash = if let Some(existing) = resolved_hashes_by_path.get(citation_path) {
+        let absolute_path = repo_root.join(file_rel);
+        // Open before deriving identity: `open_citation_descriptor` rejects
+        // a symlinked `citation_path` (any component, any target) before
+        // anything touches what it points to. Deriving identity from the
+        // open descriptor (`of_file`, an fstat) rather than from
+        // `FileIdentity::of(&absolute_path)` (a pathname `stat` that
+        // follows symlinks) keeps that rejection first on this write path
+        // too, not only on verification's read path.
+        let citation_file = open_citation_descriptor(repo_root, file_rel)
+            .map_err(|error| anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}"))?;
+        let identity = FileIdentity::of_file(&citation_file)
+            .with_context(|| format!("resolve citation_path {citation_path:?}"))?;
+        let citation_hash = if let Some(existing) = resolved_hashes.get(&(identity, range)) {
             existing.clone()
         } else {
-            let resolved = resolve_citation_hash(repo_root, file_rel, range).map_err(|error| {
-                anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
-            })?;
-            resolved_hashes_by_path.insert(citation_path.to_string(), resolved.clone());
+            let resolved =
+                resolve_citation_hash(&citation_file, file_rel, range).map_err(|error| {
+                    anyhow::anyhow!("resolve citation_path {citation_path:?}: {error}")
+                })?;
+            resolved_hashes.insert((identity, range), resolved.clone());
             resolved
         };
+        if !hash_missing {
+            let supplied = evidence
+                .get("citation_hash")
+                .and_then(Value::as_str)
+                .unwrap();
+            if supplied != citation_hash {
+                anyhow::bail!("citation_hash mismatch for {citation_path:?}");
+            }
+        }
         let object = evidence
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("evidence row must be a JSON object"))?;
-        object.insert("citation_hash".to_string(), Value::String(citation_hash));
-        if object.get("citation_sha").map_or(true, Value::is_null) {
-            if let Some(head) = config::git_head_sha() {
+        object.insert(
+            "citation_hash".to_string(),
+            Value::String(citation_hash.clone()),
+        );
+        if object.get("citation_sha").is_none_or(Value::is_null) {
+            let cited_dir = absolute_path.parent().unwrap_or(repo_root);
+            if let Some(head) = config::git_head_sha_at(cited_dir) {
                 object.insert("citation_sha".to_string(), Value::String(head));
             }
         }
+        resolved_citations.push(ResolvedCitation {
+            citation_path,
+            identity,
+            hash: citation_hash,
+        });
     }
 
     // Resource caps for cue anchors (mirrors evidence-row caps): bounded count
@@ -235,9 +348,6 @@ pub fn add(
         );
     }
 
-    let _lock = acquire_lock(&paths.lock)?;
-    let conn = db::open_db(&paths.db)?;
-
     // Near-duplicate probe (Memora pickup .5): semantic-only search for live
     // entries close to the incoming one. Runs BEFORE the new entry is written
     // so it can never self-match. Best-effort: a probe failure must not block
@@ -263,7 +373,7 @@ pub fn add(
                 recency_lambda: 0.0,
                 mmr_lambda: 0.0,
             };
-            match db::search_entries(&conn, embedder, &probe_text, &opts) {
+            match db::search_entries(conn, embedder, &probe_text, &opts) {
                 Ok(results) => results
                     .into_iter()
                     .filter(|r| r.score >= cutoff)
@@ -298,18 +408,50 @@ pub fn add(
         vec![]
     };
 
+    run_before_citation_reverify_hook();
+    let mut verified_identities = ResolvedCitationHashes::new();
+    for resolved in &resolved_citations {
+        let (file_rel, range) = parse_citation_path(&resolved.citation_path)?;
+        // Same reasoning as the resolve loop above: open first so a
+        // citation_path that has been swapped for a symlink since the
+        // first pass is rejected by the resolver, not stat'd by path.
+        let citation_file = open_citation_descriptor(repo_root, file_rel)
+            .with_context(|| format!("re-verify citation_path {:?}", resolved.citation_path))?;
+        let current_identity = FileIdentity::of_file(&citation_file)
+            .with_context(|| format!("re-verify citation_path {:?}", resolved.citation_path))?;
+        if current_identity != resolved.identity {
+            anyhow::bail!(
+                "citation changed before append: {:?}",
+                resolved.citation_path
+            );
+        }
+        let current_hash = if let Some(hash) = verified_identities.get(&(current_identity, range)) {
+            hash.clone()
+        } else {
+            let hash = resolve_citation_hash(&citation_file, file_rel, range)?;
+            verified_identities.insert((current_identity, range), hash.clone());
+            hash
+        };
+        if current_hash != resolved.hash {
+            anyhow::bail!(
+                "citation changed before append: {:?}",
+                resolved.citation_path
+            );
+        }
+    }
+
     // Build expire events (one per existing entry being replaced).
-    let expire_events: Vec<Value> = existing_ids
+    let expire_events: Result<Vec<_>> = existing_ids
         .iter()
         .map(|old_id| {
-            serde_json::json!({
+            events::entry_expire(serde_json::json!({
                 "action": "expire",
                 "table": "entries",
                 "id": old_id,
                 "reason": args.expire_reason,
                 "ts": args.ts,
                 "session": args.session,
-            })
+            }))
         })
         .collect();
 
@@ -336,7 +478,7 @@ pub fn add(
     }
 
     // Build evidence-add events (one per evidence row).
-    let evidence_events: Vec<Value> = args
+    let evidence_events: Result<Vec<_>> = args
         .evidence_rows
         .iter()
         .map(|ev| {
@@ -371,7 +513,11 @@ pub fn add(
                     .map(|s| s.to_string()),
                 recorded_at: Some(args.ts.clone()),
             };
-            events::evidence_add_event(&args.id, &evidence, args.version_ref.as_deref())
+            events::evidence_add(events::evidence_add_event(
+                &args.id,
+                &evidence,
+                args.version_ref.as_deref(),
+            ))
         })
         .collect();
 
@@ -379,14 +525,12 @@ pub fn add(
     // JSONL-first invariant: this append precedes all DB writes.
     // Order: expires, upsert, evidence-adds. The same Vec is then applied to the
     // DB in-order under the held flock, so no per-event clone is needed.
-    let mut batch: Vec<Value> = expire_events;
-    batch.push(add_event);
-    batch.extend(evidence_events);
-    events::append_events_batch(&paths.events, &batch)?;
-
-    for ev in &batch {
-        db::apply_event(&conn, embedder, ev)?;
-    }
+    let mut batch = expire_events?;
+    batch.push(events::entry_upsert(add_event)?);
+    batch.extend(evidence_events?);
+    // Writer 1 of 10. Append + sync + apply + cursor as one unit (C1/D3): the
+    // helper owns the kill points, the embedding prefetch, and the transaction.
+    cursor::append_and_apply_writer_events(lock, conn, paths, embedder, &batch)?;
 
     if args.evidence_status == "missing"
         && matches!(args.kind.as_str(), "observation" | "belief" | "procedure")
@@ -409,15 +553,17 @@ mod tests {
     use crate::components::embedder::NoopEmbedder;
     use crate::components::events as ev_mod;
     use crate::config::Paths;
+    use crate::crash_sim::KillPoint;
     use rusqlite::Connection;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn setup() -> (tempfile::TempDir, Paths) {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
-        let paths = Paths::from_root(&root);
+        let (paths, _conn) = db::test_db(&root);
         (dir, paths)
     }
 
@@ -441,6 +587,35 @@ mod tests {
             dedup_cutoff: None,
             cues: vec![],
         }
+    }
+
+    fn crash_gap_args(entry_id: &str) -> AddArgs {
+        AddArgs {
+            id: entry_id.to_string(),
+            path: "src/crash-gap.rs".to_string(),
+            summary: "crash gap".to_string(),
+            content: "persist me to the log first".to_string(),
+            tags: serde_json::json!(["crash", "test"]),
+            version_ref: Some("deadbeef".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "belief".to_string(),
+            evidence_status: "missing".to_string(),
+            evidence_rows: vec![],
+            ts: "2026-09-04T00:00:00Z".to_string(),
+            session: "test".to_string(),
+            session_id: None,
+            expire_reason: String::new(),
+            dedup_cutoff: None,
+            cues: vec![],
+        }
+    }
+
+    fn run_crash_gap_child() {
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = Paths::from_root(std::path::Path::new(&root));
+        add(&paths, &NoopEmbedder, crash_gap_args("crash-gap-entry")).unwrap();
+        panic!("child add returned without hitting the configured kill point");
     }
 
     fn load_test_evidence(conn: &Connection) -> Evidence {
@@ -493,6 +668,57 @@ mod tests {
     }
 
     #[test]
+    fn test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched() {
+        if std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some("after-sync") {
+            run_crash_gap_child();
+        }
+
+        let (dir, paths) = setup();
+        let entry_id = "crash-gap-entry";
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("test_crash_after_sync_before_apply_leaves_durable_log_and_db_untouched")
+            .arg("--nocapture")
+            .current_dir(dir.path())
+            .env("KB_CRASH_TEST_CASE", "after-sync")
+            .env("KB_CRASH_TEST_ROOT", dir.path())
+            .env("KB_CRASH_AFTER", KillPoint::AfterSync.to_string())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(137),
+            "crash simulation should terminate the subprocess with exit code 137"
+        );
+
+        let events = fs::read_to_string(&paths.events).unwrap();
+        assert!(
+            events.contains(entry_id),
+            "event log should contain the appended entry after the simulated crash"
+        );
+        let read = ev_mod::read_events(&paths.events).unwrap();
+        assert!(
+            read.events.iter().any(|event| event["id"] == entry_id),
+            "the synced span must be reader-accepted and committed"
+        );
+        assert_eq!(
+            read.committed_len,
+            fs::metadata(&paths.events).unwrap().len()
+        );
+
+        assert!(paths.db.exists(), "add opens the DB before appending");
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE id=?1",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "DB must not contain the entry after the crash");
+    }
+
+    #[test]
     fn test_kb_core_add_resolves_bare_citation_path() {
         use crate::components::verification::{
             compute_citation_hash, verify_evidence, RelocationPolicy,
@@ -511,7 +737,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         let evidence_status: String = conn
             .query_row(
@@ -522,18 +748,13 @@ mod tests {
             .unwrap();
         assert_eq!(evidence_status, "present");
         assert_eq!(evidence.citation_hash, expected_hash);
-        assert_eq!(evidence.citation_sha, config::git_head_sha());
+        assert_eq!(evidence.citation_sha, config::git_head_sha_at(dir.path()));
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
         assert_eq!(result.status, VerificationStatus::Verified);
 
-        let event_log = fs::read_to_string(&paths.events).unwrap();
-        let evidence_event: Value =
-            serde_json::from_str(event_log.lines().nth(1).unwrap()).unwrap();
+        let evidence_event = ev_mod::read_events(&paths.events).unwrap().events.remove(1);
         assert_eq!(evidence_event["evidence"]["citation_hash"], expected_hash);
-        assert_eq!(
-            evidence_event["evidence"]["citation_sha"],
-            config::git_head_sha().unwrap()
-        );
+        assert_eq!(evidence_event["evidence"]["citation_sha"], Value::Null);
     }
 
     #[test]
@@ -554,7 +775,7 @@ mod tests {
             })]),
         )
         .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence = load_test_evidence(&conn);
         assert_eq!(evidence.citation_hash, expected_hash);
         let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
@@ -581,7 +802,7 @@ mod tests {
         )
         .unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let evidence_rows = load_all_test_evidence(&conn);
         assert_eq!(evidence_rows.len(), 3);
         assert!(evidence_rows
@@ -589,31 +810,54 @@ mod tests {
             .all(|row| row.citation_hash == expected_hash));
         assert!(evidence_rows
             .iter()
-            .all(|row| row.citation_sha == config::git_head_sha()));
-        assert_eq!(CITATION_HASH_RESOLUTION_CALLS.with(|c| c.get()), 1);
+            .all(|row| row.citation_sha == config::git_head_sha_at(dir.path())));
+        assert_eq!(
+            CITATION_HASH_RESOLUTION_CALLS.with(|c| c.get()),
+            2,
+            "one resolution plus the mandatory pre-append re-verification"
+        );
     }
 
     #[test]
-    fn test_kb_core_add_preserves_explicit_citation_hash() {
-        use crate::components::verification::{verify_evidence, RelocationPolicy};
-        use crate::models::VerificationStatus;
-
+    fn test_kb_core_add_rejects_wrong_explicit_citation_hash() {
         let (dir, paths) = setup();
         fs::write(dir.path().join("cited.txt"), b"abcdef").unwrap();
         let explicit = "sha256:not-the-file-hash";
-        add(
+        let before = fs::read(&paths.events).unwrap_or_default();
+        let err = add(
             &paths,
             &NoopEmbedder,
             evidence_args(vec![serde_json::json!({
                 "kind": "code", "citation_path": "cited.txt", "citation_hash": explicit
             })]),
         )
-        .unwrap();
-        let conn = Connection::open(&paths.db).unwrap();
-        let evidence = load_test_evidence(&conn);
-        assert_eq!(evidence.citation_hash, explicit);
-        let result = verify_evidence(&evidence, dir.path(), RelocationPolicy::Never);
-        assert_eq!(result.status, VerificationStatus::Unverified);
+        .unwrap_err();
+        assert!(err.to_string().contains("citation_hash mismatch"), "{err}");
+        assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
+    }
+
+    #[test]
+    fn test_kb_core_add_catches_mutation_between_resolution_and_append() {
+        let (dir, paths) = setup();
+        let cited = dir.path().join("cited.txt");
+        fs::write(&cited, b"before").unwrap();
+        BEFORE_CITATION_REVERIFY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(&cited, b"after!").unwrap()));
+        });
+        let before = fs::read(&paths.events).unwrap_or_default();
+        let err = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![
+                serde_json::json!({"kind":"code","citation_path":"cited.txt"}),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("citation changed before append"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
     }
 
     #[test]
@@ -630,6 +874,62 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("missing.txt"), "{err}");
         assert_eq!(fs::read(&paths.events).unwrap_or_default(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_kb_core_add_symlinked_citation_error_does_not_disclose_target_existence() {
+        use std::os::unix::fs::symlink;
+
+        // Important 3 / write-path oracle: `FileIdentity::of` used to stat
+        // `citation_path` by pathname (following symlinks) before
+        // `resolve_citation_hash` ever rejected the link, so a symlinked
+        // `citation_path` stat'd its target -- including targets outside
+        // the repository -- and the error differed depending on whether
+        // that target existed. The fix opens through
+        // `open_citation_descriptor` (which rejects any symlink component
+        // before touching the target) first, for identity too, so both
+        // cases below must fail with the exact same shape of error.
+        let (dir, paths) = setup();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("real.txt"), b"outside content").unwrap();
+
+        symlink(
+            outside.path().join("real.txt"),
+            dir.path().join("link-to-real.txt"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("does-not-exist.txt"),
+            dir.path().join("link-to-missing.txt"),
+        )
+        .unwrap();
+
+        let err_existing_target = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "link-to-real.txt"
+            })]),
+        )
+        .unwrap_err();
+        let err_missing_target = add(
+            &paths,
+            &NoopEmbedder,
+            evidence_args(vec![serde_json::json!({
+                "kind": "code", "citation_path": "link-to-missing.txt"
+            })]),
+        )
+        .unwrap_err();
+
+        let normalize = |citation_path: &str, message: String| -> String {
+            message.replace(citation_path, "<citation_path>")
+        };
+        assert_eq!(
+            normalize("link-to-real.txt", err_existing_target.to_string()),
+            normalize("link-to-missing.txt", err_missing_target.to_string()),
+            "existing target: {err_existing_target:?}; missing target: {err_missing_target:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -670,13 +970,13 @@ mod tests {
                 "summary": "old", "content": "old", "tags": [],
                 "ts": "2024-01-01T00:00:00Z",
             });
-            ev_mod::append_event(&paths.events, &ev).unwrap();
-            let conn = db::open_db(&paths.db).unwrap();
-            db::apply_event(&conn, &emb, &ev).unwrap();
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[ev]).unwrap();
         }
 
         // Count lines before.
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
         assert_eq!(before_lines, 2, "seeded 2 events");
 
         let args = AddArgs {
@@ -701,28 +1001,27 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
-        // 2 seed events + 2 expire + 1 upsert = 5 total lines.
+        // 2 seed events + 2 expire + 1 upsert = 5 total events.
         assert_eq!(
             lines.len(),
             5,
-            "expected 5 lines (2 seed + 2 expire + 1 upsert), got {}",
+            "expected 5 events (2 seed + 2 expire + 1 upsert), got {}",
             lines.len()
         );
 
-        // Lines 2 and 3 (0-indexed) must be expire events.
-        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
-        let ev3: Value = serde_json::from_str(lines[3]).unwrap();
-        let ev4: Value = serde_json::from_str(lines[4]).unwrap();
-        assert_eq!(ev2["action"], "expire", "line[2] must be expire");
-        assert_eq!(ev3["action"], "expire", "line[3] must be expire");
-        assert_eq!(ev4["action"], "upsert", "line[4] must be upsert");
+        // Events 2 and 3 (0-indexed) must be expire events.
+        let ev2 = &lines[2];
+        let ev3 = &lines[3];
+        let ev4 = &lines[4];
+        assert_eq!(ev2["action"], "expire", "event[2] must be expire");
+        assert_eq!(ev3["action"], "expire", "event[3] must be expire");
+        assert_eq!(ev4["action"], "upsert", "event[4] must be upsert");
         assert_eq!(ev4["id"], "new-1");
 
         // DB: old entries must be stale, new entry active.
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         for seed_id in &["seed-1", "seed-2"] {
             let stale: i64 = conn
                 .query_row(
@@ -779,7 +1078,7 @@ mod tests {
         // Must succeed — the NoopEmbedder is injected and used, not looked up via env.
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE id='env-test-1'",
@@ -818,7 +1117,7 @@ mod tests {
 
         add(&paths, &emb, args).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let session_id: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id='sess-test-1'",
@@ -860,7 +1159,7 @@ mod tests {
         };
         seed_cmd.execute_with(&paths, &emb).unwrap();
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         // Now add with replace_path — all events must land in one batch.
         let cmd = Add {
@@ -879,8 +1178,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &emb).unwrap();
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
 
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
@@ -891,8 +1189,8 @@ mod tests {
             lines.len()
         );
         // The expire must appear BEFORE the upsert.
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire");
         assert_eq!(upsert_ev["action"], "upsert");
         assert_eq!(upsert_ev["id"], "conv-new-1");
@@ -913,12 +1211,13 @@ mod tests {
             "summary": "old", "content": "old", "tags": [],
             "ts": "2024-01-01T00:00:00Z",
         });
-        ev_mod::append_event(&paths.events, &seed_ev).unwrap();
-        let conn = db::open_db(&paths.db).unwrap();
-        db::apply_event(&conn, &emb, &seed_ev).unwrap();
-        drop(conn);
+        {
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(&paths, &lock).unwrap();
+            cursor::append_and_apply(&lock, &conn, &paths, &emb, &[seed_ev]).unwrap();
+        }
 
-        let before_lines = fs::read_to_string(&paths.events).unwrap().lines().count();
+        let before_lines = ev_mod::read_events(&paths.events).unwrap().events.len();
 
         let id = serde_json::json!("mcp-test");
         let req = serde_json::json!({
@@ -929,8 +1228,7 @@ mod tests {
         let resp = handle_add_for_test(&id, &req, &paths, &emb);
         assert_eq!(resp["type"], "ok", "resp: {resp}");
 
-        let after_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = after_content.lines().collect();
+        let lines = ev_mod::read_events(&paths.events).unwrap().events;
         // before_lines + 1 expire + 1 upsert
         assert_eq!(
             lines.len(),
@@ -939,8 +1237,8 @@ mod tests {
             before_lines + 2,
             lines.len()
         );
-        let expire_ev: Value = serde_json::from_str(lines[before_lines]).unwrap();
-        let upsert_ev: Value = serde_json::from_str(lines[before_lines + 1]).unwrap();
+        let expire_ev = &lines[before_lines];
+        let upsert_ev = &lines[before_lines + 1];
         assert_eq!(expire_ev["action"], "expire", "expire must come first");
         assert_eq!(upsert_ev["action"], "upsert");
     }
@@ -949,7 +1247,7 @@ mod tests {
     fn test_kb_core_add_replace_path_propagates_existing_id_decode_failure() {
         let (_dir, paths) = setup();
         let emb = NoopEmbedder;
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "INSERT INTO entries(
                 id, path, summary, content, tags, version_ref, permanent, is_stale,

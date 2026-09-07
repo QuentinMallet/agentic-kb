@@ -2,14 +2,71 @@
 
 use crate::components::embedder::Embedder;
 use crate::components::verification::{RelocationPolicy, VerificationOutcome};
+use crate::config;
 use crate::models::{
-    blob_to_f32s, cosine_similarity, decode_emb_blob, decode_f16_blob_into, f32s_to_blob,
-    f32s_to_f16_blob, Evidence, VerificationStatus, EMB_DIMS,
+    cosine_similarity, decode_emb_blob, decode_f16_blob_into, decode_legacy_f32_embedding,
+    normalize_embedding, normalized_f32s_to_f16_blob, Evidence, VerificationStatus, EMB_BLOB_BYTES,
+    EMB_DIMS,
 };
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, Error as SqlError, ErrorCode, OpenFlags, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExpireRefusal {
+    Permanent,
+}
+
+/// Refuse expiration of protected entries unless the caller explicitly forces it.
+pub fn expire_guard(
+    conn: &Connection,
+    entry_id: &str,
+    force: bool,
+) -> std::result::Result<(), ExpireRefusal> {
+    if force {
+        return Ok(());
+    }
+
+    let permanent: Option<i64> = conn
+        .query_row(
+            "SELECT permanent FROM entries WHERE id=?1",
+            params![entry_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if permanent == Some(1) {
+        Err(ExpireRefusal::Permanent)
+    } else {
+        Ok(())
+    }
+}
+
+/// Total relevance order shared by every Rust ranking lane.
+///
+/// Scores descend and ids ascend.  `-0.0` is canonicalised because SQLite
+/// compares both zero representations equal. FTS5's `rank` is BM25 ascending,
+/// i.e. the inverse-sign convention of the descending relevance scores here.
+pub fn compare_rank(score_a: f32, id_a: &str, score_b: f32, id_b: &str) -> std::cmp::Ordering {
+    let score_a = if score_a == 0.0 { 0.0 } else { score_a };
+    let score_b = if score_b == 0.0 { 0.0 } else { score_b };
+    score_b.total_cmp(&score_a).then_with(|| id_a.cmp(id_b))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchStats {
+    pub corrupt_embeddings: u64,
+}
+
+impl SearchStats {
+    pub fn snapshot() -> Self {
+        Self {
+            corrupt_embeddings: crate::models::corrupt_embedding_count(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Resource caps (br-h9g, security I2)
@@ -32,9 +89,11 @@ use std::path::{Path, PathBuf};
 //
 // Values are deliberately conservative — they sit well above any observed
 // agent workflow (typical limit=10, inline_verify_k=10, evidence rows ~5)
-// while keeping worst-case fan-out at 100 * 200 = 20k cited rows / 20 * 200
-// = 4k verification threads, which the test host tolerates.
+// while keeping worst-case fan-out bounded at
+// MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY.
 pub const MAX_LIMIT: usize = 100;
+pub const MAX_INLINE_VERIFY_K: usize = MAX_LIMIT;
+pub const MAX_VERIFY_POOL_SIZE: usize = 32;
 
 /// Relocation policy on the interactive search path — pinned to
 /// [`RelocationPolicy::Never`].
@@ -68,7 +127,18 @@ fn clamp_chars<'a>(s: &'a str, max: usize, field: &str, id: &str) -> std::borrow
         std::borrow::Cow::Owned(s.chars().take(max).collect())
     }
 }
-pub const MAX_INLINE_VERIFY_K: usize = 20;
+
+fn like_prefix_pattern(prefix: &str) -> String {
+    let mut escaped = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 pub const MAX_EVIDENCE_ROWS_PER_ENTRY: usize = 200;
 pub const MAX_PER_ENTRY_BYTES: usize = 8 * 1024 * 1024; // br-und: 8 MiB per entry
 
@@ -120,17 +190,31 @@ pub fn sweep_expired_peers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Shared TTL filter for consumer-visible peer reads.
+///
+/// ADR-1's peer TTL policy is "read-time filter, physical deletion later under
+/// the write lock". Every user-visible peer read must therefore splice this
+/// predicate into its SQL rather than rely on sweep timing.
+pub fn live_peer_predicate(alias: &str) -> String {
+    format!("({alias}.expires_at IS NULL OR {alias}.expires_at >= datetime('now'))")
+}
+
 /// Schema generation of THIS binary. Bump when derived-state shape changes
 /// in a way that requires replaying the event log (new tables/lanes whose
 /// rows only materialize through apply_event, changed embedding semantics).
 ///
 /// v1: implicit — every DB created before the stamp existed.
 /// v2: cues + kb_meta tables, cue rows materialized from upsert events.
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3: `run_history` keyed insertion (T3, `bd-21ef.1.8`) — a unique index on
+/// `run_id` plus `ON CONFLICT DO NOTHING` makes replay idempotent instead of
+/// duplicating a row per apply. A DB stamped below v3 may hold un-deduplicated
+/// rows from the old bare-INSERT arm; the forced rebuild replays the log
+/// through the new arm so the upgraded DB converges with a fresh one.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// True when the DB carries the current schema_version stamp.
 ///
-/// Only fresh DBs (created by `open_db`/`open_db_memory` from nothing) and
+/// Only fresh DBs (created by the initializing openers from nothing) and
 /// rebuild outputs are stamped — a pre-existing DB opened by a newer binary
 /// gets missing TABLES from `ensure_schema` but keeps reading as obsolete
 /// until a rebuild replays the log into them.
@@ -153,29 +237,577 @@ fn stamp_schema_version(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Open (or create) the SQLite database at the given path.
-pub fn open_db(db_path: &Path) -> Result<Connection> {
+// ---------------------------------------------------------------------------
+// The open split (C2/L1a, ADR-1)
+// ---------------------------------------------------------------------------
+//
+// One `open_db` used to serve pure reads, locked writes, and rebuild's private
+// tmp database alike — and it issued DDL plus two unlocked `DELETE`s on every
+// call, so no read was a read. It is now four functions with four different
+// obligations, and the write obligation is carried in the signature.
+
+/// The database does not exist yet, or exists without the `entries` table.
+///
+/// Distinct from every other open failure so pure read surfaces can map it to
+/// an empty result (first-run UX) while still reporting real I/O and corruption
+/// errors. `open_ro` never creates a database: initialization belongs to
+/// [`open_or_init`] and to the write paths, which hold the lock.
+#[derive(Debug, thiserror::Error)]
+#[error("knowledge base not initialized at {}", .db_path.display())]
+pub struct DbUninitialized {
+    pub db_path: PathBuf,
+}
+
+/// True when `err` is (or wraps) [`DbUninitialized`].
+pub fn is_db_uninitialized(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DbUninitialized>().is_some()
+}
+
+/// The one-line note a read surface prints when it serves an empty result
+/// because the database is not initialized (ADR-1's schema-creation policy,
+/// ADR-7's "readers never take the write lock").
+pub fn uninitialized_note(db_path: &Path) -> String {
+    format!(
+        "kb: no knowledge base at {} — returning an empty result; run `kb rebuild` to materialize it from the event log",
+        db_path.display()
+    )
+}
+
+/// Emit [`uninitialized_note`] on stderr. Reads stay silent on stdout so
+/// machine-readable output is unaffected.
+pub fn note_uninitialized(db_path: &Path) {
+    eprintln!("{}", uninitialized_note(db_path));
+}
+
+/// Open a read-write connection: WAL, durable commits, foreign keys, parent
+/// dirs. No DDL, no stamp, no sweep, no lock. Shared by the openers that are
+/// allowed to mutate.
+///
+/// `synchronous=FULL` is set explicitly rather than inherited. It is the
+/// bundled amalgamation's compile-time default today, but a system SQLite or a
+/// build carrying `-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1` would drop every WAL
+/// commit's fsync and make writers silently non-durable across power loss.
+/// That premise carries more weight since `defer_checkpoints`: a
+/// batched writer's close no longer performs a checkpoint whose own fsyncs
+/// used to make each batch durable regardless of this setting, so the commit's
+/// own fsync is now the only thing standing behind a committed row.
+/// `open_split.rs`'s `locked_writers_commit_durably` reads it back.
+fn open_conn_rw(db_path: &Path) -> Result<Connection> {
     if let Some(p) = db_path.parent() {
         fs::create_dir_all(p)?;
     }
     let conn =
         Connection::open(db_path).with_context(|| format!("open DB {}", db_path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    // Fresh-DB detection BEFORE ensure_schema: a DB with no entries table was
-    // just created and gets stamped current; a pre-existing DB keeps whatever
-    // stamp it has (none = legacy = obsolete) so callers can force a rebuild.
-    let is_fresh: bool = !table_exists(&conn, "entries");
-    ensure_schema(&conn)?;
-    if is_fresh {
-        stamp_schema_version(&conn)?;
-    }
-    sweep_expired_peers(&conn)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+    )?;
     Ok(conn)
+}
+
+/// Open a non-repository SQLite file whose lifecycle is managed by its owning
+/// component (currently the best-effort query-hit telemetry database).
+/// Repository databases must use `open_ro` or `open_rw` instead.
+pub(crate) fn open_auxiliary(db_path: &Path) -> rusqlite::Result<Connection> {
+    if is_live_db_path(db_path) {
+        return Err(rusqlite::Error::InvalidPath(db_path.to_path_buf()));
+    }
+    Connection::open(db_path)
+}
+
+/// D4 swap step 1's opener: a raw connection against the *live* DB path, with
+/// none of `open_rw`'s side effects. `ensure_schema`'s ALTERs and
+/// `sweep_expired_peers`' DELETE would each write fresh frames into the very
+/// WAL this connection exists to drain via `wal_checkpoint(TRUNCATE)` — this
+/// opener is the only place in the crate the checkpoint may start from. The
+/// deliberate inverse of `open_auxiliary` and `open_scratch`, which both
+/// refuse the live path; this one refuses everything else.
+///
+/// TOCTOU, not reachable in practice: this inherits `Connection::open`'s
+/// default `SQLITE_OPEN_CREATE`, so between `rebuild.rs`'s `!db_path.exists()`
+/// guard and this call, a file created at `db_path` in that window would be
+/// opened (not created) here, and a path that still doesn't exist would be
+/// created empty. Both are unreachable because the caller holds the rebuild
+/// flock (`paths.lock`) across this entire step, and every writer that could
+/// create the live DB file — `open_rw`, `open_or_init` — takes that same lock
+/// first.
+pub(crate) fn open_live_for_checkpoint(db_path: &Path) -> rusqlite::Result<Connection> {
+    debug_assert!(
+        is_live_db_path(db_path),
+        "open_live_for_checkpoint is the live-path opener; use open_scratch or \
+         open_auxiliary for anything else"
+    );
+    Connection::open(db_path)
+}
+
+/// Raw file opener for tests that intentionally bypass production policy to
+/// inspect or manufacture database states.
+#[doc(hidden)]
+pub fn open_unchecked_for_test(db_path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open(db_path)
+}
+
+/// Create the schema on a connection that may be opening a brand-new file.
+///
+/// Fresh-DB detection runs BEFORE `ensure_schema`: a DB with no `entries` table
+/// was just created and gets stamped current; a pre-existing DB keeps whatever
+/// stamp it has (none = legacy = obsolete) so callers can force a rebuild.
+fn ensure_schema_and_stamp(conn: &Connection) -> Result<()> {
+    let is_fresh: bool = !table_exists(conn, "entries");
+    ensure_schema(conn)?;
+    if is_fresh {
+        stamp_schema_version(conn)?;
+        // A brand-new database has applied nothing, so offset 0 is the truthful
+        // applied cursor (C1/D3). Seeding it here keeps a fresh database off the
+        // cursorless full-rebuild row: recovery replays the log incrementally
+        // instead, which is the same materialization for a fraction of the work.
+        crate::components::cursor::seed_fresh(conn)?;
+    }
+    Ok(())
+}
+
+/// Open an existing, schema-bearing DB for reading only.
+///
+/// `PRAGMA query_only=ON` gates write statements at the VDBE layer. It is
+/// deliberately NOT `SQLITE_OPEN_READ_ONLY`: a read-only *file handle* cannot
+/// write the `-shm` wal-index, so it cannot recover a database left hot by a
+/// crashed writer — a reader arriving after a crash would fail instead of
+/// recovering (ADR-1, Option D rejection; pinned by
+/// `tests/open_split.rs::open_ro_recovers_a_hot_wal_left_by_a_crashed_writer`).
+/// It also deliberately does NOT force `PRAGMA journal_mode=WAL`: a database
+/// left in DELETE mode by a pre-C1/T5a rebuild is not "healed" by readers.
+/// C1/T5a puts the tmp DB into WAL mode before rename, and C1/T4 wires
+/// [`open_or_init`] at process entry per ADR-7.
+///
+/// Returns [`DbUninitialized`] when the file or the `entries` table is absent.
+/// Never creates, never runs DDL, never sweeps.
+pub fn open_ro(db_path: &Path) -> Result<Connection> {
+    let conn = match Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(err) => return Err(err).with_context(|| format!("open DB {}", db_path.display())),
+    };
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA query_only=ON;")?;
+    // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
+    // corrupt file, an unreadable page — surface as themselves instead of
+    // being flattened into "uninitialized".
+    let entries_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema of {}", db_path.display()))?;
+    if entries_tables == 0 {
+        return Err(DbUninitialized {
+            db_path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(conn)
+}
+
+/// Percent-encode the characters that are meaningful to SQLite's URI-filename
+/// parser when they appear inside the path itself: `%` (the escape character,
+/// encoded first so the encodings below are not themselves re-escaped), `#`
+/// (introduces a fragment, which SQLite strips from the path), and `?`
+/// (introduces the query string — the very `?immutable=1` [`open_ro_peer`]
+/// appends). Left unencoded, any of these in a peer's path would misparse
+/// the URI; `open_ro_peer`'s caller treats every open failure as "peer
+/// unreachable" (search.rs warns and skips it), so the failure mode is a
+/// silently skipped peer rather than a crash — worth avoiding regardless.
+fn percent_encode_uri_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3f")
+}
+
+/// Open another repository's database for federated (peer) reads.
+///
+/// `open_ro`'s `PRAGMA query_only=ON` blocks logical SQL writes, but the file
+/// handle it opens is still `SQLITE_OPEN_READ_WRITE` so that a lone reader
+/// arriving after a crash can recover a hot WAL — that recovery, and the WAL
+/// checkpoint SQLite performs when the last connection to a WAL database
+/// closes, both write bytes to the file. That is acceptable for a
+/// repository's own database (ADR-1's crash-recovery contract) but never
+/// acceptable for a *peer's* database: this repository has no right to
+/// rewrite another repository's on-disk bytes, ever, for any reason.
+///
+/// A plain `SQLITE_OPEN_READ_ONLY` handle is not enough to guarantee that:
+/// when the peer's `-shm` wal-index already exists, SQLite still opens it
+/// read-write and updates the connection's "read mark" slot in it, to tell
+/// a future checkpoint how far back this reader still needs WAL frames —
+/// a real byte-level write to the peer's `-shm` file, even though the main
+/// db handle never writes the db or `-wal` file itself (pinned by
+/// `tests/open_split.rs::open_ro_peer_never_writes_and_ignores_a_hot_wal_when_shm_is_missing`
+/// and the federated byte-identity test in `commands::search::tests`).
+/// So this always opens with the `immutable=1` URI hint instead, which
+/// tells SQLite the file is a static snapshot and skips the WAL/locking
+/// machinery — and therefore the `-shm` file — entirely, reading only the
+/// main database file as of its last checkpoint. That can miss rows still
+/// sitting in an unmerged WAL, but it is the only way to guarantee zero
+/// bytes of the peer's `db`, `-wal`, or `-shm` files are ever written —
+/// the trade this function exists to make.
+///
+/// `immutable=1` is a promise *to* SQLite, not a guarantee it enforces: it
+/// tells SQLite this connection will take no locks on the file because
+/// nothing else can be writing it, which is true for our own database but
+/// not for a peer's — a peer is another repository with its own live
+/// writer, so its checkpoint can rewrite pages out from under this
+/// unlocked reader mid-query. SQLite's documented contract for that misuse
+/// is "incorrect query results or SQLITE_CORRUPT_VTAB errors", not a clean
+/// failure. In practice a mid-torn-read failure usually surfaces as an
+/// open or query error, which the caller (`search.rs`) already treats as
+/// "peer unreachable" and warns past — degrading safely — but a query that
+/// reads a torn page and still returns *some* row cannot be told apart
+/// from a correct one. That is acceptable only because federated peer
+/// search is best-effort by design (results are merged opportunistically,
+/// never the sole source of truth); this opener must never be reused for
+/// anything where a wrong-but-plausible answer would matter more than a
+/// missing one.
+///
+/// Returns [`DbUninitialized`] under the same conditions as [`open_ro`].
+pub fn open_ro_peer(db_path: &Path) -> Result<Connection> {
+    let uri = format!("file:{}?immutable=1", percent_encode_uri_path(db_path));
+    let conn = match Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(SqlError::SqliteFailure(sql_err, _)) if sql_err.code == ErrorCode::CannotOpen => {
+            return Err(DbUninitialized {
+                db_path: db_path.to_path_buf(),
+            }
+            .into());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open peer DB read-only {}", db_path.display()))
+        }
+    };
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // A COUNT (rather than a bare `is_ok` probe) so genuine failures — a
+    // corrupt file, an unreadable page — surface as themselves instead of
+    // being flattened into "uninitialized".
+    let entries_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("read schema of {}", db_path.display()))?;
+    if entries_tables == 0 {
+        return Err(DbUninitialized {
+            db_path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(conn)
+}
+
+/// Open for mutation, against proof that this repository's write lock is held.
+///
+/// `Paths` rather than a bare DB path because the lock is NOT derivable from
+/// the DB path — two layouts exist — and `lock` because a mutating open must
+/// carry its obligation in the signature. The guard's canonical path is checked
+/// against `paths.lock`, so holding *a* lock is not enough: it must be the one
+/// that governs this database.
+///
+/// Creates the schema when absent. That is legitimate DDL: the caller holds the
+/// exclusive lock.
+pub fn open_rw(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<Connection> {
+    require_live_write_lock(paths, lock)?;
+    let conn = open_conn_rw(&paths.db)?;
+    ensure_schema_and_stamp(&conn)?;
+    Ok(conn)
+}
+
+/// Open the current live database for mutation after a prior `open_rw` has
+/// established its schema. The governing lock is checked on every reopen;
+/// callers must revalidate any cached preflight when the live inode changes.
+pub fn open_rw_existing(
+    paths: &config::Paths,
+    lock: &crate::commands::add::Lock,
+) -> Result<Connection> {
+    require_live_write_lock(paths, lock)?;
+    open_conn_rw(&paths.db)
+}
+
+/// Keeps SQLite's own checkpoints out of a locked writer's lock window: the
+/// close-time one, by holding a second read-only handle on the live database
+/// for exactly as long as the writer's connection, and the automatic one, by
+/// setting `wal_autocheckpoint=0` on the writer.
+///
+/// Why this exists. `sqlite3WalClose` opportunistically checkpoints whenever
+/// it can take an EXCLUSIVE lock on the database file, which is whenever the
+/// closing connection is the last one open, and then unlinks `-wal`/`-shm`.
+/// For a writer that opens and closes once per batch — which the reembed lock
+/// contract requires, so that a `rebuild` swap is always picked up by
+/// pathname — that turns one durable commit into five fsyncs: the fresh WAL's
+/// header, the directory (because `-wal` and `-shm` were just created), the
+/// commit itself, the checkpoint's WAL sync, and the checkpoint's database
+/// sync. Only the third is durability. A syscall trace of the reembed batch
+/// path showed exactly that sequence, and the four non-commit fsyncs are the
+/// bulk of the measured lock-hold time.
+///
+/// The handle is opened `SQLITE_OPEN_READ_ONLY` on purpose, and that flag is
+/// load-bearing twice over: while it is alive the writer cannot take the
+/// EXCLUSIVE lock, so the writer skips both the checkpoint and the unlink;
+/// and when this handle is dropped it cannot take that lock either, because
+/// a POSIX write lock on a descriptor opened `O_RDONLY` fails, so it does not
+/// simply perform the checkpoint in the writer's place. This is the one place
+/// in the crate that wants a genuinely read-only file handle; [`open_ro`] is
+/// deliberately not one (it must be able to recover a hot WAL).
+///
+/// Durability is untouched. The writer's own commit still fsyncs the WAL
+/// under `synchronous=FULL`, and a crash replays those frames. What is
+/// deferred is only the backfill of committed frames into the database file.
+///
+/// The automatic checkpoint has to go with it. Once the WAL is no longer reset
+/// at every close it grows across batches, and SQLite's default
+/// `wal_autocheckpoint` of 1000 pages would eventually fire a passive
+/// checkpoint from inside a COMMIT — putting the very fsyncs this removes back
+/// into a lock window, on one unlucky batch in every few dozen. Deferring one
+/// checkpoint and not the other would just make the cost periodic instead of
+/// constant, so this disables it and hands the caller the whole obligation.
+///
+/// That obligation is real: with both deferred, nothing bounds the WAL except
+/// the caller. Drain it (`wal_checkpoint(TRUNCATE)`) on an interval of the
+/// caller's choosing, under the write lock but outside the windows it is
+/// protecting, and again before the run ends.
+///
+/// Swap safety. This handle is opened and dropped inside a single hold of the
+/// write lock, so no connection is open on the live inode when the lock is
+/// released and `rebuild` may replace the file — the invariant that rules out
+/// a connection retained across batches still holds. What it does leave at
+/// rest is a `-wal` carrying unbackfilled frames. `rebuild`'s D4 sequence is
+/// built for exactly that: step 1 drains the live WAL with
+/// `wal_checkpoint(TRUNCATE)` under this same lock, step 2 gates the swap on
+/// the resulting zero-length `-wal`, and step 5 unlinks the replaced inode's
+/// sidecars.
+pub struct DeferredCheckpoints {
+    /// Never read. Its lifetime is the whole mechanism: SQLite consults the
+    /// database file's lock state, not this value.
+    _conn: Connection,
+}
+
+/// Defer `writer`'s checkpoints. Call it only while holding the write lock and
+/// only after `writer` is open: the writer is what creates `-shm`, which a
+/// read-only handle cannot. Drop the returned guard immediately after
+/// `writer`, never before.
+///
+/// Returns `None` when either half fails: the pragma, or opening the read-only
+/// handle and taking its shared lock. Both halves are refused together on
+/// purpose — suppressing the close-time checkpoint while the automatic one is
+/// still armed is worse than deferring nothing, because the WAL then grows
+/// into a checkpoint fired from inside a COMMIT. Falling back to SQLite's own
+/// behaviour costs latency, never correctness, so this is not an error.
+pub fn defer_checkpoints(writer: &Connection, db_path: &Path) -> Option<DeferredCheckpoints> {
+    // Not discarded: a failure here would silently restore the 1000-page
+    // threshold, and the close-time suppression below would then let the WAL
+    // grow into an automatic checkpoint fired from inside a COMMIT — the exact
+    // in-window checkpoint this exists to prevent. Better to defer nothing.
+    writer.pragma_update(None, "wal_autocheckpoint", 0).ok()?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // A statement, not merely the open: in WAL mode SQLite takes the shared
+    // lock on the database file when the WAL is first opened, which happens on
+    // first access. `schema_version` reads the header rather than the parsed
+    // schema, so this is the cheapest read that still takes the lock.
+    conn.query_row("PRAGMA schema_version", [], |_| Ok(()))
+        .ok()?;
+    Some(DeferredCheckpoints { _conn: conn })
+}
+
+fn require_live_write_lock(paths: &config::Paths, lock: &crate::commands::add::Lock) -> Result<()> {
+    let expected = fs::canonicalize(&paths.lock).with_context(|| {
+        format!(
+            "canonicalize write lock {} (open_rw requires a live lock guard)",
+            paths.lock.display()
+        )
+    })?;
+    if lock.path() != expected {
+        anyhow::bail!(
+            "open_rw: the supplied lock guards {}, but this repository's write lock is {}",
+            lock.path().display(),
+            expected.display()
+        );
+    }
+    Ok(())
+}
+
+/// Open a scratch database — rebuild's private tmp file — with no governing
+/// lock. Refuses the live database, which may only be opened through
+/// [`open_ro`] or [`open_rw`].
+pub fn open_scratch(db_path: &Path) -> Result<Connection> {
+    if is_live_db_path(db_path) {
+        anyhow::bail!(
+            "open_scratch refuses the live database at {} — use open_ro or open_rw",
+            db_path.display()
+        );
+    }
+    let conn = open_conn_rw(db_path)?;
+    ensure_schema_and_stamp(&conn)?;
+    Ok(conn)
+}
+
+/// True when `db_path` names a repository's live database.
+///
+/// Rebuild's tmp files (`agent-kb.db.tmp.<pid>`) are distinct names, so the
+/// only path to refuse is exactly `<root>/.state/agent-kb/agent-kb.db`.
+pub(crate) fn is_live_db_path(db_path: &Path) -> bool {
+    let Some(file_name) = db_path.file_name() else {
+        return false;
+    };
+    if file_name != std::ffi::OsStr::new("agent-kb.db") {
+        return false;
+    }
+
+    let candidate = if db_path.exists() {
+        match db_path.parent().map(fs::canonicalize).transpose() {
+            Ok(Some(parent)) => parent.join(file_name),
+            _ => return false,
+        }
+    } else {
+        normalize_absolute_path(db_path)
+    };
+
+    candidate
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .is_some_and(|root| config::Paths::from_root(root).db == candidate)
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let base = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let mut normalized = base;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+/// Initialize a repository's knowledge base: parent dirs, schema, and the
+/// `schema_version` stamp.
+///
+/// Acquires and RELEASES `paths.lock` internally, and returns no connection —
+/// callers then choose [`open_ro`] or [`open_rw`], so no ungoverned handle
+/// escapes the split. Must not be called while this process already holds the
+/// write lock; the re-entrancy registry rejects that rather than deadlocking.
+pub fn open_or_init(paths: &config::Paths) -> Result<()> {
+    init_locked(paths)?; // released before recovery: its repairs take the lock
+                         // C1/D3 + C2/ADR-7: recovery fires at process entry, never on a read path.
+                         // `recover_if_needed` re-acquires the lock only when there is something to
+                         // repair, so the steady-state cost here is one cursor comparison.
+    let embedder = crate::commands::add::make_embedder(paths);
+    crate::commands::rebuild::recover_if_needed(paths, embedder.as_ref())?;
+    Ok(())
+}
+
+/// The initialization half of [`open_or_init`]: parent dirs, schema, stamp,
+/// and the seeded cursor. Separated so test fixtures can initialize a
+/// repository without dragging in recovery's production embedder.
+///
+/// Deliberately does NOT sweep expired peers: L1b's contract is that
+/// deletion happens only in locked writers (`tests/open_split.rs::
+/// open_or_init_does_not_sweep_expired_peers`), so init/recovery must leave
+/// them physically present.
+fn init_locked(paths: &config::Paths) -> Result<()> {
+    let lock = crate::commands::add::acquire_lock(&paths.lock)?;
+    let conn = open_rw(paths, &lock)?;
+    drop(conn);
+    drop(lock);
+    Ok(())
+}
+
+/// Test fixture: an initialized repository plus a writable connection to it.
+///
+/// One substitution for the ~50 `#[cfg(test)]` fixtures that used to call
+/// `open_db` directly, so the split does not cost 50 hand edits (ADR-1,
+/// Consequences). The connection is unlocked on purpose — a fixture is the
+/// single writer in its own tempdir.
+#[doc(hidden)]
+pub fn test_db(root: &Path) -> (config::Paths, Connection) {
+    let paths = config::Paths::from_root(root);
+    init_locked(&paths).expect("test_db: initialize the knowledge base");
+    let conn = open_conn_rw(&paths.db).expect("test_db: open the knowledge base");
+    (paths, conn)
 }
 
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let found = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == column);
+    Ok(found)
+}
+
+/// Idempotent migration: ensure `source_weights.updated_at` exists (D6 R2).
+///
+/// A no-op on a fresh DB, whose `CREATE TABLE IF NOT EXISTS source_weights`
+/// already declares the column. On a pre-existing DB missing it, adds a
+/// plain nullable column (no non-constant `DEFAULT`, which SQLite rejects
+/// via `ADD COLUMN` once the table has rows) and backfills existing rows in
+/// a separate `UPDATE`. Unexpected errors propagate rather than being
+/// swallowed, so a schema divergence is loud instead of silent.
+fn migrate_source_weights_updated_at(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "source_weights") {
+        return Ok(());
+    }
+    if column_exists(conn, "source_weights", "updated_at")? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE source_weights ADD COLUMN updated_at TEXT;")
+        .context("migrating source_weights: add updated_at column")?;
+    conn.execute(
+        "UPDATE source_weights SET updated_at = datetime('now') WHERE updated_at IS NULL",
+        [],
+    )
+    .context("migrating source_weights: backfill updated_at")?;
+    Ok(())
+}
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
         params![name],
         |_| Ok(()),
     )
@@ -253,7 +885,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS entries_emb (
             rowid    INTEGER PRIMARY KEY,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1))
         );
 
         -- Cue anchors (Memora pickup .4): agent-supplied semantic entry points,
@@ -263,7 +896,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             entry_id  TEXT NOT NULL,
             cue       TEXT NOT NULL,
-            embedding BLOB
+            embedding BLOB,
+            normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1))
         );
         CREATE INDEX IF NOT EXISTS idx_cues_entry ON cues(entry_id);
 
@@ -305,6 +939,27 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);
         "#,
     )?;
+    // T3 (bd-21ef.1.8, SCHEMA_VERSION 3): keyed idempotent insertion on
+    // run_history.run_id. Guarded by `index_exists` and run only once: a
+    // pre-existing DB may hold duplicate non-NULL run_id rows from the old
+    // bare-INSERT arm (double-apply before this fix, or a rebuild replaying
+    // a log against an already-populated DB), and creating the index over
+    // those would fail outright. Dedup keeps the earliest occurrence; NULL
+    // run_id rows are left untouched since SQLite never treats two NULLs as
+    // conflicting under a UNIQUE index. Once the index exists, `apply_event`
+    // never creates a new non-NULL duplicate (ON CONFLICT DO NOTHING), so
+    // this cleanup never needs to run again — subsequent opens see the index
+    // already present and skip straight to the (cheap, no-op) IF NOT EXISTS.
+    if !index_exists(conn, "idx_run_history_run_id") {
+        conn.execute_batch(
+            "DELETE FROM run_history WHERE run_id IS NOT NULL AND id NOT IN (
+                 SELECT MIN(id) FROM run_history WHERE run_id IS NOT NULL GROUP BY run_id
+             );",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_history_run_id ON run_history(run_id);",
+    )?;
     // Migration: add `permanent` column to existing DBs that pre-date this field.
     // SQLite does not support `ADD COLUMN IF NOT EXISTS` before 3.37; ignore "duplicate column" error.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN permanent INTEGER DEFAULT 0;");
@@ -315,6 +970,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE entries ADD COLUMN evidence_status TEXT DEFAULT 'n/a';");
     // Migration: add session_id column for Phase 5 audit confidence per-session weighting.
     let _ = conn.execute_batch("ALTER TABLE entries ADD COLUMN session_id TEXT;");
+    // The read kernel is selected per blob.  A database-level flag would let a
+    // mixed store use dot product for an unmigrated legacy row.
+    let _ = conn.execute_batch(
+        "ALTER TABLE entries_emb ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1));",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE cues ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0 CHECK(normalized IN (0, 1));",
+    );
     // Migration: add run_id to audit_runs for Phase 5 idempotency (INSERT OR IGNORE on unique index).
     let _ = conn.execute_batch("ALTER TABLE audit_runs ADD COLUMN run_id TEXT;");
     // Traffic-weighted audit sampling: arm metadata lives on the sampled
@@ -322,12 +985,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE audit_run_candidates ADD COLUMN arm TEXT NOT NULL DEFAULT 'uniform';",
     );
+    // MCP audit authorization (bd-1orr): every sampled run and recorded
+    // verdict carries the host-bound caller from the private port boundary.
+    // Existing rows are retained as legacy data but can never satisfy a new
+    // caller-owned record request.
+    let _ = conn
+        .execute_batch("ALTER TABLE audit_runs ADD COLUMN caller_id TEXT NOT NULL DEFAULT ''; ");
+    let _ = conn.execute_batch(
+        "ALTER TABLE audit_run_candidates ADD COLUMN caller_id TEXT NOT NULL DEFAULT '';",
+    );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
-    );
-    // Migration: add updated_at to source_weights for Phase 5 weight tracking.
-    let _ = conn.execute_batch(
-        "ALTER TABLE source_weights ADD COLUMN updated_at TEXT DEFAULT (datetime('now'));",
     );
     // New tables for evidence and audit runs (additive; no-op on already-migrated DBs).
     conn.execute_batch(
@@ -352,7 +1020,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id     TEXT NOT NULL,
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
-            evidence_ref TEXT
+            evidence_ref TEXT,
+            caller_id    TEXT NOT NULL DEFAULT ''
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry
             ON audit_runs(run_id, entry_id);
@@ -369,10 +1038,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id   TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             arm        TEXT NOT NULL DEFAULT 'uniform',
+            caller_id  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, entry_id)
         );
         "#,
     )?;
+    // Migration: add updated_at to source_weights for Phase 5 weight tracking
+    // (D6 R2). Guarded by PRAGMA table_info instead of a blind
+    // `let _ = ALTER ... DEFAULT (datetime('now'))`: SQLite rejects a
+    // non-constant default on ADD COLUMN once the table already holds rows,
+    // so the old migration silently never ran against an upgraded DB while
+    // still swallowing the error. Fresh DBs already have the column from the
+    // CREATE TABLE above; this only fires for a pre-existing table missing it.
+    migrate_source_weights_updated_at(conn)?;
     // AC-P6: peer graph tables (additive; no-op on already-migrated DBs).
     conn.execute_batch(
         r#"
@@ -420,6 +1098,70 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )?;
     maybe_drop_contentless_fts(conn)?;
     Ok(())
+}
+
+/// Rewrite every unmarked persisted embedding as a normalized f16 blob.
+///
+/// The transaction is deliberately all-or-nothing: validate and stage both
+/// entry and cue rows before updating either table.  A corrupt, non-finite, or
+/// zero-norm legacy blob aborts the transaction, leaving its marker clear so
+/// callers retain the cosine fallback instead of silently using dot product.
+/// The file-level command owns the backup and atomic database-file swap; this
+/// connection-level operation is also used by property tests against `:memory:`.
+pub fn migrate_embeddings(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut staged_entries = Vec::new();
+    let mut staged_cues = Vec::new();
+
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, embedding FROM entries_emb WHERE normalized=0 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, blob) = row?;
+            let vector = decode_legacy_f32_embedding(&blob);
+            if vector.is_empty() {
+                anyhow::bail!("cannot migrate corrupt entry embedding row {rowid}");
+            }
+            staged_entries.push((rowid, normalized_f32s_to_f16_blob(&vector)?));
+        }
+    }
+
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, embedding FROM cues WHERE embedding IS NOT NULL AND normalized=0 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (id, blob) = row?;
+            let vector = decode_legacy_f32_embedding(&blob);
+            if vector.is_empty() {
+                anyhow::bail!("cannot migrate corrupt cue embedding row {id}");
+            }
+            staged_cues.push((id, normalized_f32s_to_f16_blob(&vector)?));
+        }
+    }
+
+    let migrated = staged_entries.len() + staged_cues.len();
+    for (rowid, blob) in staged_entries {
+        tx.execute(
+            "UPDATE entries_emb SET embedding=?1, normalized=1 WHERE rowid=?2",
+            params![blob, rowid],
+        )?;
+    }
+    for (id, blob) in staged_cues {
+        tx.execute(
+            "UPDATE cues SET embedding=?1, normalized=1 WHERE id=?2",
+            params![blob, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(migrated)
 }
 
 #[derive(Debug, Clone)]
@@ -673,6 +1415,53 @@ pub fn entry_embed_text(
     }
 }
 
+/// Every text [`apply_event`] will hand to the embedder for one event.
+///
+/// The single source of truth for the D3 prefetch: it must mirror the
+/// `("upsert", "entries")` arm exactly, or a text the arm needs would miss the
+/// sealed cache and fail loudly inside the transaction. That loud failure is
+/// the intended feedback if the two ever drift.
+pub fn embed_texts_for_event(event: &serde_json::Value) -> Vec<String> {
+    if event["action"] != "upsert" || event["table"] != "entries" {
+        return Vec::new();
+    }
+    let (Some(id), Some(path), Some(summary), Some(content)) = (
+        event["id"].as_str(),
+        event["path"].as_str(),
+        event["summary"].as_str(),
+        event["content"].as_str(),
+    ) else {
+        return Vec::new();
+    };
+    let summary = clamp_chars(summary, MAX_SUMMARY_CHARS, "summary", id);
+    let content = clamp_chars(content, MAX_ENTRY_CONTENT_CHARS, "content", id);
+    let tags = event["tags"].to_string();
+    let mode = EmbedTextMode::from_env();
+    let mut texts = vec![entry_embed_text(
+        mode,
+        path,
+        summary.as_ref(),
+        content.as_ref(),
+        &tags,
+    )];
+    if let Some(cues) = event["cues"].as_array() {
+        texts.extend(cues.iter().filter_map(|c| c.as_str()).map(str::to_string));
+    }
+    texts
+}
+
+/// [`embed_texts_for_event`] over a batch.
+pub fn embed_texts_for_batch(batch: &[serde_json::Value]) -> Vec<String> {
+    batch.iter().flat_map(embed_texts_for_event).collect()
+}
+
+/// [`embed_texts_for_batch`] for a borrowed iterator (the recovery tail).
+pub fn embed_texts_for_batch_refs<'a>(
+    batch: impl Iterator<Item = &'a serde_json::Value>,
+) -> Vec<String> {
+    batch.flat_map(embed_texts_for_event).collect()
+}
+
 fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
     conn.execute_batch("SAVEPOINT apply_evt")?;
     match f() {
@@ -692,6 +1481,42 @@ fn with_apply_event_savepoint<T>(conn: &Connection, f: impl FnOnce() -> Result<T
     }
 }
 
+/// Run `f` inside a SAVEPOINT named `name`.
+///
+/// Like [`with_apply_event_savepoint`], a savepoint composes inside a
+/// caller-owned transaction (nesting) while still providing atomicity when
+/// called standalone (SQLite opens an implicit transaction for a top-level
+/// savepoint). A failure rolls back to the savepoint before propagating the
+/// error, so partial writes made by `f` never survive.
+///
+/// `name` must be a fixed, caller-controlled literal — it is interpolated
+/// directly into the SAVEPOINT/RELEASE/ROLLBACK statements, never built from
+/// request input.
+pub fn with_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+    match f() {
+        Ok(value) => {
+            if let Err(error) = conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+                let _ = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+                ));
+                return Err(error.into());
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"
+            ));
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 static CROSS_ENTRY_EVIDENCE_WARNINGS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -704,6 +1529,238 @@ fn warn_cross_entry_evidence_id(ev_id: &str, owner_entry_id: &str, attempted_ent
     CROSS_ENTRY_EVIDENCE_WARNINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Extract an event's `ts` for a replay-deterministic `updated_at` write
+/// (D6 R1). `Materialize` must be a pure function of the log: stamping
+/// `datetime('now')` on apply makes replaying the same log on two different
+/// days produce different `updated_at` values and different recency-weighted
+/// rankings. Legacy events with no `ts` return `None` so the caller leaves
+/// the existing row value untouched instead of stamping wall-clock.
+fn event_ts(event: &serde_json::Value) -> Option<&str> {
+    event["ts"].as_str().filter(|s| !s.is_empty())
+}
+
+/// Content hash of a `run_history` event that predates `run_id`.
+///
+/// `None` for anything else — a real writer's event (`run.rs`, `mcp.rs` have
+/// always minted a uuid `run_id`) or a different action entirely. Callers use
+/// this to decide whether an event needs a log occurrence index at all.
+pub fn legacy_run_content_hash(event: &serde_json::Value) -> Option<String> {
+    if event["action"] != "insert" || event["table"] != "run_history" {
+        return None;
+    }
+    if event["run_id"].as_str().is_some() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    for field in ["test_id", "result", "adapter", "detail", "ts"] {
+        hasher.update(event[field].as_str().unwrap_or("").as_bytes());
+        hasher.update([0u8]);
+    }
+    // Hex digest: only [0-9a-f], so the LIKE pattern below needs no escaping.
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Deterministic synthetic key for a `run_history` event that predates
+/// `run_id`.
+///
+/// The key is the event's content hash plus an ordinal, so two events with
+/// byte-identical content do not collapse into one row. Where the ordinal
+/// comes from decides whether replay is idempotent:
+///
+/// * `occurrence = Some(n)` — `n` is the event's index among identical-content
+///   events **in the log**, supplied by the replay driver. Re-applying an
+///   already-applied event then recomputes the same key and
+///   `ON CONFLICT DO NOTHING` makes it a no-op. This is what the applied-cursor
+///   tail replay passes (C1/T4), and it is the only ordinal that is a function
+///   of the log rather than of the replay boundary.
+/// * `occurrence = None` — fall back to counting rows already sharing the
+///   content hash. Correct for a materialization that starts from an empty
+///   table, which is every direct `apply_event` caller: `kb rebuild`'s replay,
+///   its catch-up onto the prefix it just replayed, and `kb compact`'s
+///   replay-and-compare. It is NOT idempotent against an already-populated
+///   table, which is exactly why the tail replay supplies the log index.
+fn synthetic_run_key(
+    conn: &Connection,
+    content_hash: &str,
+    occurrence: Option<u64>,
+) -> Result<String> {
+    let prefix = format!("legacy:{content_hash}:");
+    let ordinal = match occurrence {
+        Some(n) => n as i64,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM run_history WHERE run_id LIKE ?1",
+            params![format!("{prefix}%")],
+            |r| r.get(0),
+        )?,
+    };
+    Ok(format!("{prefix}{ordinal}"))
+}
+
+fn expire_entry_materialized(conn: &Connection, id: &str, ts: Option<&str>) -> Result<()> {
+    match ts {
+        Some(ts) => conn.execute(
+            "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=?2 WHERE id=?1",
+            params![id, ts],
+        ),
+        None => conn.execute(
+            "UPDATE entries SET is_stale=1, evidence_status='n/a' WHERE id=?1",
+            params![id],
+        ),
+    }?;
+    // ADR-2 intentionally does not cascade through derived_from:
+    // provenance edges on other entries may still name this stale
+    // entry, whose row remains available to provenance traversal.
+    conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
+    // Remove from FTS so expired entries don't appear in search.
+    // entries_fts may be gone after the deprecation gate fires; treat as no-op.
+    let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
+    // GC: remove embedding row so entries_emb stays in sync with live entries.
+    conn.execute(
+        "DELETE FROM entries_emb WHERE rowid = \
+         (SELECT rowid FROM entries WHERE id=?1)",
+        params![id],
+    )?;
+    // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
+    conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+    Ok(())
+}
+
+fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Result<()> {
+    let run_id = event["run_id"]
+        .as_str()
+        .context("audit_record_batch: missing run_id")?;
+    let caller_id = event["caller_id"]
+        .as_str()
+        .context("audit_record_batch: missing caller_id")?;
+    let audited_at = event["audited_at"]
+        .as_str()
+        .or_else(|| event["ts"].as_str())
+        .unwrap_or("");
+    let ts = event_ts(event);
+    let verdicts = event["verdicts"]
+        .as_array()
+        .context("audit_record_batch: missing verdicts")?;
+
+    with_apply_event_savepoint(conn, || -> Result<()> {
+        for verdict in verdicts {
+            let entry_id = verdict["entry_id"]
+                .as_str()
+                .context("audit_record_batch: missing verdict entry_id")?;
+            let verdict_bool = verdict["verdict"]
+                .as_bool()
+                .context("audit_record_batch: missing boolean verdict")?;
+            let note = verdict["note"].as_str();
+            let verdict_text = if verdict_bool { "true" } else { "false" };
+
+            let existing: Option<(String, Option<String>, String)> = conn
+                .query_row(
+                    "SELECT verdict, evidence_ref, caller_id FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, entry_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((existing_verdict, existing_note, existing_caller))
+                    if existing_verdict == verdict_text
+                        && existing_note.as_deref() == note
+                        && existing_caller == caller_id =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    anyhow::bail!(
+                        "audit_record_batch: conflicting replay for run_id '{run_id}' entry '{entry_id}'"
+                    );
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![run_id, entry_id, verdict_text, note, audited_at, caller_id],
+            )?;
+            crate::crash_sim::kill_point(crate::crash_sim::KillPoint::AuditAfterRunInsert);
+
+            let (entry_kind, entry_session_id): (String, String) = conn.query_row(
+                "SELECT kind, COALESCE(session_id,'__GLOBAL__') FROM entries WHERE id=?1",
+                params![entry_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+
+            let weight_sql = if verdict_bool {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,1,0)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET successes=successes+1"
+            } else {
+                "INSERT INTO source_weights(kind,session_id,successes,failures) VALUES(?1,?2,0,1)
+                 ON CONFLICT(kind,session_id) DO UPDATE SET failures=failures+1"
+            };
+            conn.execute(weight_sql, params![entry_kind, entry_session_id])?;
+
+            if !verdict_bool {
+                expire_entry_materialized(conn, entry_id, ts)?;
+            }
+        }
+
+        Ok(())
+    })
+}
+
+fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value) -> Result<()> {
+    let run_id = event["run_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing run_id")?;
+    let caller_id = event["caller_id"]
+        .as_str()
+        .context("audit_run_candidates_batch: missing caller_id")?;
+    let created_at = event["created_at"]
+        .as_str()
+        .or_else(|| event["ts"].as_str())
+        .unwrap_or("");
+    let candidates = event["candidates"]
+        .as_array()
+        .context("audit_run_candidates_batch: missing candidates")?;
+
+    with_apply_event_savepoint(conn, || -> Result<()> {
+        for candidate in candidates {
+            let entry_id = candidate["entry_id"]
+                .as_str()
+                .context("audit_run_candidates_batch: missing candidate entry_id")?;
+            let arm = candidate["arm"].as_str().unwrap_or("uniform");
+
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT caller_id, arm FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                    params![run_id, entry_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            match existing {
+                Some((existing_caller, existing_arm))
+                    if existing_caller == caller_id && existing_arm == arm =>
+                {
+                    continue;
+                }
+                Some(_) => {
+                    anyhow::bail!(
+                        "audit_run_candidates_batch: conflicting replay for run_id '{run_id}' entry '{entry_id}'"
+                    );
+                }
+                None => {}
+            }
+
+            conn.execute(
+                "INSERT INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![run_id, entry_id, created_at, arm, caller_id],
+            )?;
+        }
+        Ok(())
+    })
+}
+
 /// Apply a single event atomically.
 ///
 /// The operation uses a savepoint and therefore composes inside a caller-owned
@@ -712,6 +1769,20 @@ pub fn apply_event(
     conn: &Connection,
     embedder: &dyn Embedder,
     event: &serde_json::Value,
+) -> Result<()> {
+    apply_event_at(conn, embedder, event, None)
+}
+
+/// [`apply_event`], with the event's occurrence index in the log.
+///
+/// Only the run_id-less `run_history` arm reads it; see `synthetic_run_key`
+/// for why an incremental replay must supply it and a from-empty
+/// materialization need not.
+pub fn apply_event_at(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    event: &serde_json::Value,
+    occurrence: Option<u64>,
 ) -> Result<()> {
     let action = event["action"].as_str().unwrap_or("");
     let table = event["table"].as_str().unwrap_or("");
@@ -856,15 +1927,17 @@ pub fn apply_event(
                     params![id, path, summary, content, tags],
                 );
 
-                // Sync embedding store (f16 wire format — 768 bytes per entry)
+                // A marked blob is normalized before it is written.  The marker
+                // and bytes share this transaction, preserving the per-blob gate.
                 if !embedder.is_noop() {
                     let mode = EmbedTextMode::from_env();
                     check_embed_mode_vintage(conn, mode);
                     let text = entry_embed_text(mode, path, summary, content, &tags);
                     let emb = embedder.embed(&text)?;
-                    let blob = f32s_to_f16_blob(&emb);
+                    let blob = normalized_f32s_to_f16_blob(&emb)?;
                     conn.execute(
-                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding) VALUES(?1,?2)",
+                        "INSERT OR REPLACE INTO entries_emb(rowid, embedding, normalized) \
+                         VALUES(?1,?2,1)",
                         params![rowid, blob],
                     )?;
                 }
@@ -878,11 +1951,11 @@ pub fn apply_event(
                         let blob: Option<Vec<u8>> = if embedder.is_noop() {
                             None
                         } else {
-                            Some(f32s_to_f16_blob(&embedder.embed(cue)?))
+                            Some(normalized_f32s_to_f16_blob(&embedder.embed(cue)?)?)
                         };
                         conn.execute(
-                            "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1,?2,?3)",
-                            params![id, cue, blob],
+                            "INSERT INTO cues(entry_id, cue, embedding, normalized) VALUES(?1,?2,?3,?4)",
+                            params![id, cue, blob, i64::from(!embedder.is_noop())],
                         )?;
                     }
                 }
@@ -895,32 +1968,25 @@ pub fn apply_event(
 
         ("expire", "entries") => {
             let id = event["id"].as_str().context("missing id")?;
+            let ts = event_ts(event);
             // Single transaction: spec-conformant expire reset + FTS/emb/cue GC.
             // Resetting evidence_status to 'n/a' and deleting evidence mirrors
             // AgentKbEvidence.tla ApplyEventE's ADR-2 expire arm.
             //
             with_apply_event_savepoint(conn, || -> Result<()> {
-                conn.execute(
-                    "UPDATE entries SET is_stale=1, evidence_status='n/a', updated_at=datetime('now') WHERE id=?1",
-                    params![id],
-                )?;
-                // ADR-2 intentionally does not cascade through derived_from:
-                // provenance edges on other entries may still name this stale
-                // entry, whose row remains available to provenance traversal.
-                conn.execute("DELETE FROM evidence WHERE entry_id=?1", params![id])?;
-                // Remove from FTS so expired entries don't appear in search.
-                // entries_fts may be gone after the deprecation gate fires; treat as no-op.
-                let _ = conn.execute("DELETE FROM entries_fts WHERE id=?1", params![id]);
-                // GC: remove embedding row so entries_emb stays in sync with live entries.
-                conn.execute(
-                    "DELETE FROM entries_emb WHERE rowid = \
-                     (SELECT rowid FROM entries WHERE id=?1)",
-                    params![id],
-                )?;
-                // Cue rows die with their entry (CueBatch.tla S2 — no orphans).
-                conn.execute("DELETE FROM cues WHERE entry_id=?1", params![id])?;
+                expire_entry_materialized(conn, id, ts)?;
                 Ok(())
             })?;
+            increment_post_cutover_writes(conn);
+        }
+
+        ("audit_record_batch", "audit_runs") => {
+            apply_audit_record_batch(conn, event)?;
+            increment_post_cutover_writes(conn);
+        }
+
+        ("audit_run_candidates_batch", "audit_run_candidates") => {
+            apply_audit_run_candidates_batch(conn, event)?;
             increment_post_cutover_writes(conn);
         }
 
@@ -949,11 +2015,26 @@ pub fn apply_event(
             let adapter = event["adapter"].as_str();
             let detail = event["detail"].as_str();
             let ts = event["ts"].as_str().unwrap_or("");
-            let run_id = event["run_id"].as_str();
+            // T3 (bd-21ef.1.8): keyed idempotent insertion (CompactMaterialize.tla
+            // D5.1). Real writers (run.rs, mcp.rs) have always minted a uuid
+            // run_id; a run_id-less event is legacy data predating that, so it
+            // gets a deterministic synthetic key instead — see
+            // `synthetic_run_key` for the derivation. Either way `key` is
+            // never NULL, so `ON CONFLICT(run_id) DO NOTHING` makes replaying
+            // the same event any number of times a no-op after the first.
+            let key = match event["run_id"].as_str() {
+                Some(id) => id.to_string(),
+                None => {
+                    let content_hash = legacy_run_content_hash(event)
+                        .context("run_history: cannot derive a synthetic key")?;
+                    synthetic_run_key(conn, &content_hash, occurrence)?
+                }
+            };
             conn.execute(
                 "INSERT INTO run_history(test_id,result,adapter,detail,ts,run_id)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![test_id, result, adapter, detail, ts, run_id],
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(run_id) DO NOTHING",
+                params![test_id, result, adapter, detail, ts, key],
             )?;
         }
 
@@ -977,6 +2058,7 @@ pub fn apply_event(
             let citation_excerpt = ev["citation_excerpt"].as_str();
             let derived_from = ev["derived_from"].as_str();
             let recorded_at = ev["recorded_at"].as_str();
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 let existing_owner = conn
@@ -1027,10 +2109,16 @@ pub fn apply_event(
                 // The fix is to always call the soft-mandate helper after an evidence row
                 // change so both paths agree (br-f7y).
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -1065,6 +2153,7 @@ pub fn apply_event(
             let entry_id = event["entry_id"]
                 .as_str()
                 .context("evidence_expire: missing entry_id")?;
+            let ts = event_ts(event);
 
             with_apply_event_savepoint(conn, || -> Result<()> {
                 // Orphan-tolerant: absent and stale parents are equivalent under
@@ -1089,10 +2178,16 @@ pub fn apply_event(
                 )?;
 
                 let new_status = compute_evidence_status(conn, entry_id)?;
-                conn.execute(
-                    "UPDATE entries SET evidence_status=?1, updated_at=datetime('now') WHERE id=?2",
-                    params![new_status, entry_id],
-                )?;
+                match ts {
+                    Some(ts) => conn.execute(
+                        "UPDATE entries SET evidence_status=?1, updated_at=?3 WHERE id=?2",
+                        params![new_status, entry_id, ts],
+                    ),
+                    None => conn.execute(
+                        "UPDATE entries SET evidence_status=?1 WHERE id=?2",
+                        params![new_status, entry_id],
+                    ),
+                }?;
                 Ok(())
             })?;
         }
@@ -1121,18 +2216,16 @@ pub struct SearchOptions {
     pub inline_verify_k: usize,
     /// Repository root used for inline evidence verification.
     ///
-    /// Preferred for MCP and other long-running contexts where the process CWD
-    /// is not the repo (e.g. the MCP port is typically spawned with CWD `/`,
-    /// causing the CWD-based `find_repo_root()` walk to fail). MCP callers
-    /// derive this via `root_from_db()` (see `src/commands/mcp.rs:40-45`).
-    ///
-    /// When `None`, `search_entries` falls back to walking up from CWD via
-    /// `find_repo_root()`. CLI invocations may leave this `None` because the
-    /// user runs the binary from inside the repo tree.
+    /// Every caller resolves this from `config::Paths::root` — the same
+    /// layout-aware root `add`/`cite` hash evidence against — rather than
+    /// leaving it `None` for a CWD-based `.git` walk to (re)discover, which
+    /// could silently disagree (e.g. inside a nested checkout, or when the
+    /// process cwd isn't the repo at all, as with the MCP port typically
+    /// spawned with cwd `/`). When `None`, verification still runs but always
+    /// reports `Unverified` (no root to resolve citation paths against).
     pub repo_root: Option<PathBuf>,
-    /// Pool size for the bounded verify thread pool (br-23b.13).
-    /// Currently unused; reserved for forward-compatibility with the
-    /// 23b.13 task that replaces the per-request `thread::scope` path.
+    /// Pool size for the bounded verify thread pool.
+    /// Values above `MAX_VERIFY_POOL_SIZE` are clamped inside `search_entries`.
     pub verify_pool_size: Option<usize>,
     /// Recency-bias decay factor (λ in exp(-λ·days)) applied after RRF scoring.
     /// 0.0 disables the pass entirely (byte-identical behavior). Only applied
@@ -1215,6 +2308,63 @@ pub struct SearchEntry {
     pub origin_repo: Option<String>,
     /// DB `updated_at` for stale-warning checks in presentation layers.
     pub updated_at: String,
+}
+
+#[derive(Clone, Copy)]
+struct EffectiveSearchCaps {
+    limit: usize,
+    inline_verify_k: usize,
+    verify_pool_size: usize,
+}
+
+fn default_verify_pool_size() -> usize {
+    num_cpus::get_physical().max(1)
+}
+
+fn clamp_search_caps(opts: &SearchOptions) -> EffectiveSearchCaps {
+    EffectiveSearchCaps {
+        limit: opts.limit.min(MAX_LIMIT),
+        inline_verify_k: opts.inline_verify_k.min(MAX_INLINE_VERIFY_K),
+        verify_pool_size: opts
+            .verify_pool_size
+            .unwrap_or_else(default_verify_pool_size)
+            .clamp(1, MAX_VERIFY_POOL_SIZE),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchRuntimeStats {
+    effective_limit: usize,
+    effective_inline_verify_k: usize,
+    effective_verify_pool_size: usize,
+    scheduled_verification_tasks: usize,
+    spawned_verify_workers: usize,
+    semantic_materialized_rows: usize,
+    semantic_materialized_bytes: usize,
+    cue_materialized_rows: usize,
+    cue_materialized_bytes: usize,
+}
+
+#[cfg(test)]
+fn search_runtime_stats_cell() -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<SearchRuntimeStats>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn record_search_runtime_stats(stats: SearchRuntimeStats) {
+    *search_runtime_stats_cell().lock().unwrap() = Some(stats);
+}
+
+#[cfg(test)]
+fn take_search_runtime_stats() -> SearchRuntimeStats {
+    search_runtime_stats_cell()
+        .lock()
+        .unwrap()
+        .take()
+        .expect("search runtime stats must be recorded")
 }
 
 pub struct FetchEntryByIdResult {
@@ -1336,7 +2486,8 @@ pub fn fetch_evidence_for_entries(
         // Bind entry_id strings first, then the probe_limit.
         let rows_raw: Vec<Evidence> = {
             use rusqlite::types::ToSql;
-            let mut params_vec: Vec<&dyn ToSql> = chunk.iter().map(|s| s as &dyn ToSql).collect();
+            let mut params_vec: Vec<&dyn ToSql> =
+                chunk.iter().map(|s| -> &dyn ToSql { s }).collect();
             params_vec.push(&probe_limit);
 
             stmt.query_map(params_vec.as_slice(), |r| {
@@ -1346,14 +2497,13 @@ pub fn fetch_evidence_for_entries(
                     kind: r.get(2)?,
                     citation_path: r.get(3)?,
                     citation_sha: r.get(4)?,
-                    citation_hash: r.get(5).unwrap_or_default(),
+                    citation_hash: r.get(5)?,
                     citation_excerpt: r.get(6)?,
                     derived_from: r.get(7)?,
                     recorded_at: r.get(8)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .collect()
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         // Group rows by entry_id (rows are already sorted by entry_id via ORDER BY).
@@ -1397,32 +2547,28 @@ impl FtsReadPath {
     }
 }
 
-pub type FtsRow = (String, String, String, String, String, String);
+pub type FtsRow = (String, String, String, String, String, String, f64);
 
 pub fn fts_query_contentless(
     conn: &Connection,
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts f
          JOIN entries e ON e.id = f.id
          WHERE f.entries_fts MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                opts.path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -1431,6 +2577,7 @@ pub fn fts_query_contentless(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
@@ -1444,25 +2591,21 @@ pub fn fts_query_content_entries(
     safe_query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<FtsRow>> {
+    let path_prefix = opts.path_prefix.as_deref().map(like_prefix_pattern);
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at
+        "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, rank
          FROM entries_fts_v2 f
          JOIN entries e ON e.rowid = f.rowid
          WHERE f.entries_fts_v2 MATCH ?1
            AND e.is_stale = 0
-           AND (?2 IS NULL OR e.path LIKE (?2 || '%'))
+           AND (?2 IS NULL OR e.path LIKE (?2 || '%') ESCAPE '\\')
            AND (?3 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?3))
-         ORDER BY rank
+         ORDER BY rank, e.id
          LIMIT ?4",
     )?;
     let rows = stmt
         .query_map(
-            params![
-                safe_query,
-                opts.path_prefix,
-                opts.tag_filter,
-                opts.limit as i64
-            ],
+            params![safe_query, path_prefix, opts.tag_filter, opts.limit as i64],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -1471,12 +2614,47 @@ pub fn fts_query_content_entries(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+/// Fetch the requested prefix plus the complete BM25 tie run at its boundary.
+/// The query grows geometrically only while the final fetched row is still tied,
+/// avoiding the O(database-size) cost of an unlimited parity query.
+fn fts_rows_through_boundary_tie(
+    conn: &Connection,
+    path: FtsReadPath,
+    safe_query: &str,
+    opts: &SearchOptions,
+) -> Result<Vec<FtsRow>> {
+    let mut extended = opts.clone();
+    extended.limit = opts.limit.saturating_add(1);
+    loop {
+        let rows = match path {
+            FtsReadPath::Contentless => fts_query_contentless(conn, safe_query, &extended)?,
+            FtsReadPath::ContentEntries => fts_query_content_entries(conn, safe_query, &extended)?,
+        };
+        if opts.limit == 0 || rows.len() <= opts.limit {
+            return Ok(rows);
+        }
+        let boundary = rows[opts.limit - 1].6;
+        if rows.last().is_some_and(|row| row.6 != boundary) {
+            let end = rows
+                .iter()
+                .position(|row| row.6 != boundary && row.6 > boundary)
+                .unwrap_or(rows.len());
+            return Ok(rows.into_iter().take(end).collect());
+        }
+        if rows.len() < extended.limit || extended.limit == usize::MAX {
+            return Ok(rows);
+        }
+        extended.limit = extended.limit.saturating_mul(2);
+    }
 }
 
 /// Shared hybrid search used by both the CLI and MCP handler.
@@ -1598,7 +2776,8 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
     let mut stmt = conn.prepare(
         "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE is_stale = 0",
     )?;
-    let candidates: Vec<(String, String, String, String, String, String)> = stmt
+    type ExpandCandidate = (String, String, String, String, String, String);
+    let candidates: Vec<ExpandCandidate> = stmt
         .query_map([], |r| {
             Ok((
                 r.get(0)?,
@@ -1654,14 +2833,31 @@ pub fn expand_entries(conn: &Connection, ids: &[String], limit: usize) -> Result
             });
         }
     }
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    scored.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
     scored.truncate(limit);
     Ok(scored)
+}
+
+fn dot_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || !a.iter().chain(b.iter()).all(|value| value.is_finite()) {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(left, right)| left * right).sum();
+    if dot.is_finite() {
+        dot
+    } else {
+        0.0
+    }
+}
+
+/// Use the dot kernel only when each participating persisted blob was marked
+/// normalized in the same transaction that wrote its bytes.
+fn persisted_similarity(a: &[f32], a_normalized: bool, b: &[f32], b_normalized: bool) -> f32 {
+    if a_normalized && b_normalized && a.len() == EMB_DIMS && b.len() == EMB_DIMS {
+        dot_similarity(a, b)
+    } else {
+        cosine_similarity(a, b)
+    }
 }
 
 /// Greedy MMR re-rank of `entries` in place (Memora pickup .6).
@@ -1681,19 +2877,32 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT e.id, emb.embedding FROM entries e
+        "SELECT e.id, emb.embedding, emb.normalized FROM entries e
          JOIN entries_emb emb ON emb.rowid = e.rowid
          WHERE e.id IN ({})",
         placeholders
     );
-    let emb_map: std::collections::HashMap<String, Vec<f32>> = match conn.prepare(&sql) {
+    let emb_map: std::collections::HashMap<String, (Vec<f32>, bool)> = match conn.prepare(&sql) {
         Ok(mut stmt) => stmt
             .query_map(rusqlite::params_from_iter(ids.iter()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)? == 1,
+                ))
             })
             .map(|rows| {
                 rows.filter_map(|r| r.ok())
-                    .map(|(id, blob)| (id, decode_emb_blob(&blob)))
+                    .map(|(id, blob, normalized)| {
+                        let vector = if normalized && blob.len() == EMB_BLOB_BYTES {
+                            decode_emb_blob(&blob)
+                        } else if normalized {
+                            Vec::new()
+                        } else {
+                            decode_legacy_f32_embedding(&blob)
+                        };
+                        (id, (vector, normalized))
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -1717,22 +2926,75 @@ fn mmr_rerank(conn: &Connection, entries: &mut Vec<SearchEntry>, lambda: f32) {
                 let rel = cand.score / max_score;
                 let max_sim = emb_map
                     .get(&cand.id)
-                    .map(|cv| {
+                    .map(|(cv, cand_normalized)| {
                         selected
                             .iter()
                             .filter_map(|s| emb_map.get(&s.id))
-                            .map(|sv| cosine_similarity(cv, sv).max(0.0))
+                            .map(|(sv, selected_normalized)| {
+                                persisted_similarity(cv, *cand_normalized, sv, *selected_normalized)
+                                    .max(0.0)
+                            })
                             .fold(0.0f32, f32::max)
                     })
                     .unwrap_or(0.0);
                 (i, lambda * rel - (1.0 - lambda) * max_sim)
             })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| compare_rank(a.1, &remaining[a.0].id, b.1, &remaining[b.0].id))
             .unwrap_or((0, 0.0));
         selected.push(remaining.remove(best_idx));
     }
 
     *entries = selected;
+}
+
+type SearchMetadata = (String, String, String, String, String);
+
+fn fetch_search_metadata(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, SearchMetadata>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, path, summary, content, tags, updated_at FROM entries WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ),
+        ))
+    })?;
+    let mut metadata = std::collections::HashMap::with_capacity(ids.len());
+    for row in rows {
+        let (id, fields) = row?;
+        metadata.insert(id, fields);
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+fn materialization_size(
+    metadata: &std::collections::HashMap<String, SearchMetadata>,
+) -> (usize, usize) {
+    let bytes = metadata
+        .iter()
+        .map(|(id, (path, summary, content, tags, updated_at))| {
+            id.len() + path.len() + summary.len() + content.len() + tags.len() + updated_at.len()
+        })
+        .sum();
+    (metadata.len(), bytes)
 }
 
 pub fn search_entries(
@@ -1741,10 +3003,21 @@ pub fn search_entries(
     query: &str,
     opts: &SearchOptions,
 ) -> Result<Vec<SearchEntry>> {
+    let caps = clamp_search_caps(opts);
+    let mut effective_opts = opts.clone();
+    effective_opts.limit = caps.limit;
+    effective_opts.inline_verify_k = caps.inline_verify_k;
+    effective_opts.verify_pool_size = Some(caps.verify_pool_size);
+    let tag_filter = effective_opts.tag_filter.as_deref();
+
     let mut entries: Vec<SearchEntry> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    #[cfg(test)]
+    let mut semantic_materialized = (0usize, 0usize);
+    #[cfg(test)]
+    let mut cue_materialized = (0usize, 0usize);
 
-    if opts.do_fts {
+    if effective_opts.do_fts {
         // Quote each whitespace-delimited term individually to prevent FTS5
         // operator injection (AND/OR/NOT) while allowing multi-term recall.
         let safe_query: String = query
@@ -1755,24 +3028,32 @@ pub fn search_entries(
 
         let read_path = FtsReadPath::from_env();
         let rows = match read_path {
-            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, opts)?,
-            FtsReadPath::ContentEntries => fts_query_content_entries(conn, &safe_query, opts)?,
+            FtsReadPath::Contentless => fts_query_contentless(conn, &safe_query, &effective_opts)?,
+            FtsReadPath::ContentEntries => {
+                fts_query_content_entries(conn, &safe_query, &effective_opts)?
+            }
         };
 
-        // Divergence detection: compare both read paths and emit a warning when
-        // they disagree. In debug builds, assert equality to catch regressions
-        // early. In release builds, log only so production is never disrupted.
+        // Divergence detection compares ordered sequences. `ORDER BY rank,e.id`
+        // makes a tie crossing LIMIT deterministic without an unbounded debug
+        // query; geometric growth stops just past the complete boundary tie run,
+        // so ordinary parity overhead remains O(limit), not O(database size).
         #[cfg(debug_assertions)]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 debug_assert_eq!(
                     primary_ids, alt_ids,
                     "fts5_dual_write_divergence: primary={:?} alt={:?}",
@@ -1782,15 +3063,20 @@ pub fn search_entries(
         }
         #[cfg(not(debug_assertions))]
         {
-            let alt_rows = match read_path {
-                FtsReadPath::Contentless => fts_query_content_entries(conn, &safe_query, opts),
-                FtsReadPath::ContentEntries => fts_query_contentless(conn, &safe_query, opts),
-            };
-            if let Ok(alt) = alt_rows {
-                let primary_ids: std::collections::BTreeSet<&str> =
-                    rows.iter().map(|(id, ..)| id.as_str()).collect();
-                let alt_ids: std::collections::BTreeSet<&str> =
-                    alt.iter().map(|(id, ..)| id.as_str()).collect();
+            let primary =
+                fts_rows_through_boundary_tie(conn, read_path, &safe_query, &effective_opts);
+            let alt = fts_rows_through_boundary_tie(
+                conn,
+                match read_path {
+                    FtsReadPath::Contentless => FtsReadPath::ContentEntries,
+                    FtsReadPath::ContentEntries => FtsReadPath::Contentless,
+                },
+                &safe_query,
+                &effective_opts,
+            );
+            if let (Ok(primary), Ok(alt)) = (primary, alt) {
+                let primary_ids: Vec<&str> = primary.iter().map(|(id, ..)| id.as_str()).collect();
+                let alt_ids: Vec<&str> = alt.iter().map(|(id, ..)| id.as_str()).collect();
                 if primary_ids != alt_ids {
                     eprintln!(
                         "kb: fts5_dual_write_divergence read_path={:?} \
@@ -1813,7 +3099,7 @@ pub fn search_entries(
             );
         }
 
-        for (id, path, summary, content, tags, updated_at) in rows {
+        for (id, path, summary, content, tags, updated_at, _rank) in rows {
             seen_ids.insert(id.clone());
             entries.push(SearchEntry {
                 id,
@@ -1833,115 +3119,117 @@ pub fn search_entries(
         }
     }
 
-    if opts.do_semantic && !embedder.is_noop() {
-        let q_emb = embedder.embed(query)?;
+    if effective_opts.do_semantic && !embedder.is_noop() {
+        let q_emb = normalize_embedding(&embedder.embed(query)?)?;
+        let path_prefix = effective_opts
+            .path_prefix
+            .as_deref()
+            .map(like_prefix_pattern);
         let mut stmt = conn.prepare(
-            "SELECT e.id, e.path, e.summary, e.content, e.tags, e.updated_at, emb.embedding
+            "SELECT e.id, emb.embedding, emb.normalized
              FROM entries_emb emb
              JOIN entries e ON e.rowid = emb.rowid
              WHERE e.is_stale = 0
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
         )?;
         // TODO: O(n) brute-force scan — replace with ANN index (e.g. sqlite-vss) when entry count exceeds ~10k
         //
         // Scratch buffer allocated ONCE outside the loop — no per-row Vec allocation.
-        // decode_f16_blob_into clears and fills scratch in-place; cosine_similarity
-        // reads from it. Mismatch (corrupt/legacy blob) results in sim=0.0 via
-        // decode_emb_blob fallback via length dispatch.
-        let rows: Vec<(String, String, String, String, String, String, Vec<u8>)> = stmt
-            .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Vec<u8>>(6)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
+        // Marked rows decode through the canonical f16 path; unmarked rows
+        // decode only through the exact legacy f32 wire contract. This keeps a
+        // 768-byte half-dimension f32 blob from being misread as canonical f16.
         let mut scratch: Vec<f32> = Vec::with_capacity(EMB_DIMS);
-        let mut candidates: Vec<(f32, String, String, String, String, String, String)> =
-            Vec::with_capacity(rows.len());
-        for (id, path, summary, content, tags, updated_at, blob) in rows {
-            decode_f16_blob_into(&blob, &mut scratch);
-            let sim = if scratch.is_empty() {
-                // blob was not canonical f16 — fall back to graceful decode
-                let fallback = decode_emb_blob(&blob);
-                cosine_similarity(&q_emb, &fallback)
+        let mut candidates: Vec<(f32, String)> = Vec::new();
+        let rows = stmt.query_map(params![path_prefix.clone(), tag_filter], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)? == 1,
+            ))
+        })?;
+        for row in rows {
+            let (id, blob, normalized) = row?;
+            let sim = if normalized {
+                decode_f16_blob_into(&blob, &mut scratch);
+                persisted_similarity(&q_emb, true, &scratch, true)
             } else {
-                cosine_similarity(&q_emb, &scratch)
+                let fallback = decode_legacy_f32_embedding(&blob);
+                persisted_similarity(&q_emb, true, &fallback, false)
             };
-            candidates.push((sim, id, path, summary, content, tags, updated_at));
+            candidates.push((sim, id));
         }
 
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
 
         // Cue lane (Memora pickup .4): score each live entry by its best-cosine
         // cue anchor. Ranked separately so RRF fuses it as a third source.
         // Best-effort: absence of the cues table (pre-migration DB) is not an
         // error, just an empty lane.
-        let mut cue_ranked: Vec<(f32, String, String, String, String, String, String)> = Vec::new();
-        if opts.do_fts {
+        let mut cue_ranked: Vec<(f32, String)> = Vec::new();
+        if effective_opts.do_fts {
             if let Ok(mut stmt) = conn.prepare(
-            "SELECT c.entry_id, c.cue, c.embedding, e.path, e.summary, e.content, e.tags, e.updated_at
+                "SELECT c.entry_id, c.cue, c.embedding, c.normalized
              FROM cues c
              JOIN entries e ON e.id = c.entry_id
              WHERE e.is_stale = 0
                AND c.embedding IS NOT NULL
-               AND (?1 IS NULL OR e.path LIKE (?1 || '%'))
+               AND (?1 IS NULL OR e.path LIKE (?1 || '%') ESCAPE '\\')
                AND (?2 IS NULL OR EXISTS (SELECT 1 FROM json_each(e.tags) WHERE value = ?2))",
-        ) {
-            let cue_rows: Vec<(String, Vec<u8>, String, String, String, String, String)> = stmt
-                .query_map(params![opts.path_prefix, opts.tag_filter], |r| {
+            ) {
+                // Best cue score per entry.
+                let mut best: std::collections::HashMap<String, (f32, String)> =
+                    std::collections::HashMap::new();
+                let cue_rows = stmt.query_map(params![path_prefix, tag_filter], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, String>(7)?,
+                        r.get::<_, i64>(3)? == 1,
                     ))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-
-            // Best cue score per entry.
-            let mut best: std::collections::HashMap<String, (f32, String, String, String, String, String)> =
-                std::collections::HashMap::new();
-            for (entry_id, blob, path, summary, content, tags, updated_at) in cue_rows {
-                decode_f16_blob_into(&blob, &mut scratch);
-                let sim = if scratch.is_empty() {
-                    let fallback = decode_emb_blob(&blob);
-                    cosine_similarity(&q_emb, &fallback)
-                } else {
-                    cosine_similarity(&q_emb, &scratch)
-                };
-                match best.get(&entry_id) {
-                    Some((prev, ..)) if *prev >= sim => {}
-                    _ => {
-                        best.insert(entry_id, (sim, path, summary, content, tags, updated_at));
+                })?;
+                for row in cue_rows {
+                    let (entry_id, cue, blob, normalized) = row?;
+                    let sim = if normalized {
+                        decode_f16_blob_into(&blob, &mut scratch);
+                        persisted_similarity(&q_emb, true, &scratch, true)
+                    } else {
+                        let fallback = decode_legacy_f32_embedding(&blob);
+                        persisted_similarity(&q_emb, true, &fallback, false)
+                    };
+                    match best.get(&entry_id) {
+                        Some((prev, prev_cue, ..))
+                            if compare_rank(*prev, prev_cue, sim, &cue).is_lt() => {}
+                        _ => {
+                            best.insert(entry_id, (sim, cue));
+                        }
                     }
                 }
+                cue_ranked = best
+                    .into_iter()
+                    .map(|(id, (sim, _cue))| (sim, id))
+                    .collect();
+                cue_ranked.sort_by(|a, b| compare_rank(a.0, &a.1, b.0, &b.1));
+                cue_ranked.truncate(effective_opts.limit.saturating_mul(2));
             }
-            cue_ranked = best
-                .into_iter()
-                .map(|(id, (sim, path, summary, content, tags, updated_at))| {
-                    (sim, id, path, summary, content, tags, updated_at)
-                })
-                .collect();
-            cue_ranked
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            cue_ranked.truncate(opts.limit.saturating_mul(2));
-        }
         }
 
-        if opts.do_fts {
+        let materialize_limit = effective_opts.limit.saturating_mul(2);
+        let semantic_ids: Vec<String> = candidates
+            .iter()
+            .take(materialize_limit)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let cue_ids: Vec<String> = cue_ranked.iter().map(|(_, id)| id.clone()).collect();
+        let semantic_meta = fetch_search_metadata(conn, &semantic_ids)?;
+        let cue_meta = fetch_search_metadata(conn, &cue_ids)?;
+        #[cfg(test)]
+        {
+            semantic_materialized = materialization_size(&semantic_meta);
+            cue_materialized = materialization_size(&cue_meta);
+        }
+
+        if effective_opts.do_fts {
             // Hybrid mode: apply Reciprocal Rank Fusion (RRF, k=60) to combine
             // FTS and semantic rankings. Each entry's RRF score is the sum of
             // 1/(k+rank) across all sources it appears in, where rank is 1-based.
@@ -1961,14 +3249,14 @@ pub fn search_entries(
             }
 
             // Second RRF source: semantic candidate ranks.
-            for (sem_rank, (_, id, ..)) in candidates.iter().enumerate() {
+            for (sem_rank, (_, id)) in candidates.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (sem_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
             }
 
             // Third RRF source: cue-anchor lane (best cue cosine per entry).
-            for (cue_rank, (_, id, ..)) in cue_ranked.iter().enumerate() {
+            for (cue_rank, (_, id)) in cue_ranked.iter().enumerate() {
                 let contrib = 1.0 / (RRF_K + (cue_rank + 1) as f32);
                 let entry = rrf_scores.entry(id.clone()).or_insert(0.0);
                 *entry += contrib;
@@ -1984,10 +3272,15 @@ pub fn search_entries(
 
             // For semantic-only entries (not in FTS), create new SearchEntry values.
             // We cap to opts.limit * 2 candidates to avoid iterating all of them.
-            for (_, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit * 2)
+            for (_, id) in candidates
+                .into_iter()
+                .take(effective_opts.limit.saturating_mul(2))
             {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = semantic_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2009,8 +3302,12 @@ pub fn search_entries(
 
             // Cue-only entries (reached via a cue anchor, absent from both the
             // FTS and entry-embedding lanes) still need materializing.
-            for (_, id, path, summary, content, tags, updated_at) in cue_ranked.into_iter() {
+            for (_, id) in cue_ranked.into_iter() {
                 if !fts_meta.contains_key(&id) {
+                    let (path, summary, content, tags, updated_at) = cue_meta
+                        .get(&id)
+                        .cloned()
+                        .with_context(|| format!("cue metadata missing for entry {id}"))?;
                     fts_meta.insert(id.clone(), entries.len());
                     entries.push(SearchEntry {
                         id: id.clone(),
@@ -2040,22 +3337,18 @@ pub fn search_entries(
             // Sort by RRF score descending and cap at limit.
             // With MMR enabled, keep a 2×limit pool so diversification has
             // candidates to swap in; the final truncate happens after MMR.
-            entries.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let pool = if opts.mmr_lambda > 0.0 {
-                opts.limit.saturating_mul(2)
+            entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
+            let pool = if effective_opts.mmr_lambda > 0.0 {
+                effective_opts.limit.saturating_mul(2)
             } else {
-                opts.limit
+                effective_opts.limit
             };
             entries.truncate(pool);
 
             // Recency-bias post-RRF pass: multiply each entry's score by
             // exp(-λ·days_since_updated_at). Skip entirely when λ=0.0 to
             // preserve byte-identical behavior with pre-recency-bias code.
-            if opts.recency_lambda != 0.0 && !entries.is_empty() {
+            if effective_opts.recency_lambda != 0.0 && !entries.is_empty() {
                 let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
                 let placeholders: String = (1..=ids.len())
                     .map(|i| format!("?{}", i))
@@ -2083,7 +3376,7 @@ pub fn search_entries(
                                         (secs / 86400.0).max(0.0)
                                     })
                                     .unwrap_or(0.0);
-                                    let decay = (-opts.recency_lambda * days).exp();
+                                    let decay = (-effective_opts.recency_lambda * days).exp();
                                     (id, decay)
                                 })
                                 .collect()
@@ -2096,28 +3389,30 @@ pub fn search_entries(
                     entry.score *= decay;
                 }
                 // Re-sort: multiplication may change relative order.
-                entries.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                entries.sort_by(|a, b| compare_rank(a.score, &a.id, b.score, &b.id));
             }
 
             // MMR diversification pass (Memora pickup .6): greedy re-rank of
             // the pool penalizing similarity to already-selected results, then
             // cut to limit. Scores and score_kind are left untouched — MMR
             // changes ORDER and MEMBERSHIP, not the relevance signal.
-            if opts.mmr_lambda > 0.0 && entries.len() > 1 {
+            if effective_opts.mmr_lambda > 0.0 && entries.len() > 1 {
                 // Clamp to [0,1]: λ>1 would flip the diversity penalty into a
                 // similarity REWARD, actively clustering duplicates.
-                mmr_rerank(conn, &mut entries, opts.mmr_lambda.clamp(0.0, 1.0));
-                entries.truncate(opts.limit);
+                mmr_rerank(
+                    conn,
+                    &mut entries,
+                    effective_opts.mmr_lambda.clamp(0.0, 1.0),
+                );
+                entries.truncate(effective_opts.limit);
             }
         } else {
             // Semantic-only mode: no RRF, raw cosine scores, score_kind="semantic".
-            for (sim, id, path, summary, content, tags, updated_at) in
-                candidates.into_iter().take(opts.limit)
-            {
+            for (sim, id) in candidates.into_iter().take(effective_opts.limit) {
+                let (path, summary, content, tags, updated_at) = semantic_meta
+                    .get(&id)
+                    .cloned()
+                    .with_context(|| format!("semantic metadata missing for entry {id}"))?;
                 entries.push(SearchEntry {
                     id,
                     path,
@@ -2186,22 +3481,20 @@ pub fn search_entries(
 
     let mut evidence_map = fetch_evidence_for_entries(conn, &entry_ids)?;
 
-    // Resolve repo root: prefer explicit `opts.repo_root` (MCP path — CWD is
-    // typically `/`, so CWD-based discovery fails). Fall back to walking up
-    // from CWD via `find_repo_root()` (CLI path — user runs from inside repo).
-    let repo_root: Option<PathBuf> = opts.repo_root.clone().or_else(find_repo_root);
+    // Every caller now resolves and threads the repository root explicitly
+    // (config::Paths::root) instead of relying on a CWD-based `.git` walk,
+    // which could silently disagree with the root `add`/`cite` hash evidence
+    // against (e.g. inside a nested checkout). See docs/decisions/b3-root-derivation.md.
+    let repo_root: Option<PathBuf> = effective_opts.repo_root.clone();
 
-    let verify_count = opts.inline_verify_k.min(entries.len());
+    let verify_count = effective_opts.inline_verify_k.min(entries.len());
 
     // br-improvement-catalog-23b.13: bounded scoped pool.
     // ADR-C: explicit std::thread, not rayon.
     //
     // Pool size: opts.verify_pool_size → num_cpus::get_physical() fallback.
     // min(1) guards against systems returning 0 physical CPUs.
-    let pool_size = opts
-        .verify_pool_size
-        .unwrap_or_else(num_cpus::get_physical)
-        .max(1);
+    let pool_size = effective_opts.verify_pool_size.unwrap_or(1);
 
     // --- Phase 1: pre-collect per-entry evidence and byte-budget state ---
     // We need to move ev_rows out of evidence_map before the thread::scope so
@@ -2209,7 +3502,7 @@ pub fn search_entries(
 
     struct EntryWork {
         entry_idx: usize,
-        ev_rows: Vec<crate::models::Evidence>,
+        ev_rows: Vec<Evidence>,
         do_verify: bool,
         budget_exceeded: bool,
     }
@@ -2219,28 +3512,7 @@ pub fn search_entries(
         let ev_rows = evidence_map.remove(&entry.id).unwrap_or_default();
         let do_verify = idx < verify_count;
 
-        // br-und: compute total bytes for this entry's evidence rows (br-und security I3)
-        let mut total_bytes: usize = 0;
-        for ev in &ev_rows {
-            if let Some(ref citation_path) = ev.citation_path {
-                // Parse citation_path format "path:start-end" to extract byte range
-                if let Some(colon_idx) = citation_path.rfind(':') {
-                    let range_part = &citation_path[colon_idx + 1..];
-                    if let Some(dash_idx) = range_part.find('-') {
-                        if let (Ok(start), Ok(end)) = (
-                            range_part[..dash_idx].parse::<usize>(),
-                            range_part[dash_idx + 1..].parse::<usize>(),
-                        ) {
-                            if start <= end {
-                                total_bytes = total_bytes.saturating_add(end - start);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let budget_exceeded = total_bytes > MAX_PER_ENTRY_BYTES;
+        let (budget_exceeded, total_bytes) = evidence_byte_budget_exceeded(&ev_rows);
         if budget_exceeded {
             eprintln!(
                 "kb: entry {} evidence bytes capped at MAX_PER_ENTRY_BYTES={} (had {}); skipping verification",
@@ -2258,7 +3530,7 @@ pub fn search_entries(
 
     // --- Phase 2: flatten all verification tasks across entries ---
     // task_ranges[entry_idx] = Some(start..end) within outcomes_flat, or None.
-    let mut flat_tasks: Vec<crate::models::Evidence> = Vec::new();
+    let mut flat_tasks: Vec<Evidence> = Vec::new();
     let mut task_ranges: Vec<Option<std::ops::Range<usize>>> = vec![None; entries.len()];
     for item in &work_items {
         if item.do_verify && !item.budget_exceeded && !item.ev_rows.is_empty() {
@@ -2270,6 +3542,19 @@ pub fn search_entries(
 
     // --- Phase 3: run all verification tasks through the bounded pool ---
     let total_tasks = flat_tasks.len();
+    #[cfg(test)]
+    record_search_runtime_stats(SearchRuntimeStats {
+        effective_limit: effective_opts.limit,
+        effective_inline_verify_k: effective_opts.inline_verify_k,
+        effective_verify_pool_size: pool_size,
+        scheduled_verification_tasks: total_tasks,
+        spawned_verify_workers: if total_tasks > 0 { pool_size } else { 0 },
+        semantic_materialized_rows: semantic_materialized.0,
+        semantic_materialized_bytes: semantic_materialized.1,
+        cue_materialized_rows: cue_materialized.0,
+        cue_materialized_bytes: cue_materialized.1,
+    });
+
     let mut outcomes_flat: Vec<VerificationOutcome> = vec![
         VerificationOutcome {
             status: VerificationStatus::Unverified,
@@ -2289,12 +3574,12 @@ pub fn search_entries(
         // both channels are bounded and the main thread sends work while workers
         // try to enqueue results.
         //
-        // Total result count is bounded externally: at most
-        // MAX_INLINE_VERIFY_K * MAX_EVIDENCE_ROWS_PER_ENTRY (br-h9g security I2).
+        // Total result count here is bounded by the requested verify set:
+        // verify_count * MAX_EVIDENCE_ROWS_PER_ENTRY, where
+        // verify_count = min(opts.inline_verify_k, entries.len()).
         let work_chan_cap = (pool_size * 2).max(1);
         std::thread::scope(|scope| {
-            let (tx_work, rx_work) =
-                crossbeam_channel::bounded::<(usize, crate::models::Evidence)>(work_chan_cap);
+            let (tx_work, rx_work) = crossbeam_channel::bounded::<(usize, Evidence)>(work_chan_cap);
             let (tx_result, rx_result) =
                 crossbeam_channel::unbounded::<(usize, VerificationOutcome)>();
 
@@ -2391,18 +3676,95 @@ pub fn search_entries(
     Ok(entries)
 }
 
-/// Walk up from CWD to find a directory containing `.git`.
-/// Returns None if not found (e.g. in tempdir tests).
-fn find_repo_root() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut dir: &Path = &cwd;
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
+/// Search plus the number of corrupt embedding blobs observed by this call.
+pub fn search_entries_with_stats(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    query: &str,
+    opts: &SearchOptions,
+) -> Result<(Vec<SearchEntry>, SearchStats)> {
+    let before = crate::models::corrupt_embedding_count();
+    let entries = search_entries(conn, embedder, query, opts)?;
+    let after = crate::models::corrupt_embedding_count();
+    Ok((
+        entries,
+        SearchStats {
+            corrupt_embeddings: after.saturating_sub(before),
+        },
+    ))
+}
+
+fn evidence_byte_budget_exceeded(ev_rows: &[Evidence]) -> (bool, usize) {
+    let total_bytes = ev_rows.iter().fold(0usize, |total, ev| {
+        let Some(citation_path) = ev.citation_path.as_deref() else {
+            return total;
+        };
+        let Some((_, range)) = citation_path.rsplit_once(':') else {
+            return total;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return total;
+        };
+        match (start.parse::<usize>(), end.parse::<usize>()) {
+            (Ok(start), Ok(end)) if start <= end => total.saturating_add(end - start),
+            _ => total,
         }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return None,
+    });
+    (total_bytes > MAX_PER_ENTRY_BYTES, total_bytes)
+}
+
+/// Verify already-selected search results against the repository that produced
+/// each result. Federation calls this only after its global ranking and limit
+/// have been applied, so discarded peer rows never incur verification work.
+pub fn verify_search_entries(
+    entries: &mut [SearchEntry],
+    inline_verify_k: usize,
+    local_repo_root: Option<&Path>,
+) {
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        if idx >= inline_verify_k {
+            continue;
+        }
+        let Some(root) = entry
+            .origin_repo
+            .as_deref()
+            .map(Path::new)
+            .or(local_repo_root)
+        else {
+            continue;
+        };
+
+        let model_evidence: Vec<Evidence> = entry
+            .evidence
+            .iter()
+            .map(|ev| Evidence {
+                id: ev.id.clone(),
+                entry_id: entry.id.clone(),
+                kind: ev.kind.clone(),
+                citation_path: ev.citation_path.clone(),
+                citation_sha: ev.citation_sha.clone(),
+                citation_hash: ev.citation_hash.clone(),
+                citation_excerpt: ev.citation_excerpt.clone(),
+                derived_from: None,
+                recorded_at: None,
+            })
+            .collect();
+        let (budget_exceeded, total_bytes) = evidence_byte_budget_exceeded(&model_evidence);
+        if budget_exceeded {
+            eprintln!(
+                "kb: entry {} evidence bytes capped at MAX_PER_ENTRY_BYTES={} (had {}); skipping verification",
+                entry.id, MAX_PER_ENTRY_BYTES, total_bytes
+            );
+            continue;
+        }
+        for (ev, model_ev) in entry.evidence.iter_mut().zip(model_evidence) {
+            let outcome = crate::components::verification::verify_evidence(
+                &model_ev,
+                root,
+                SEARCH_PATH_RELOCATION_POLICY,
+            );
+            ev.verified = Some(outcome.is_verified());
+            ev.verification_status = Some(outcome.status);
         }
     }
 }
@@ -2411,11 +3773,107 @@ fn find_repo_root() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::components::embedder::NoopEmbedder;
+    use crate::models::f32s_to_blob;
+    use proptest::prelude::*;
     use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     static UPDATED_AT_FETCH_COUNT: AtomicUsize = AtomicUsize::new(0);
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    /// `open_auxiliary` exists so non-repository SQLite files (query-hit
+    /// telemetry) can bypass the repository lock/DDL discipline, but it must
+    /// still refuse a genuine repository db path — a caller bug that pointed
+    /// an "auxiliary" open at `agent-kb.db` must not silently start managing
+    /// the repository's real database outside the lock. Nothing previously
+    /// exercised this refusal: telemetry's only caller always passes a
+    /// `query-hits.db`-shaped path, which never matches it.
+    #[test]
+    fn open_auxiliary_refuses_a_live_repository_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        open_or_init(&paths).unwrap();
+
+        let err = open_auxiliary(&paths.db).unwrap_err();
+        assert!(
+            matches!(err, SqlError::InvalidPath(ref p) if *p == paths.db),
+            "open_auxiliary must refuse a live repository db path, got: {err:?}"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ranking_total_order_and_shuffle_invariant(seed in any::<u64>()) {
+            use rand::{seq::SliceRandom, SeedableRng};
+            let original = vec![(f32::NAN,"nan"),(f32::INFINITY,"inf"),(f32::NEG_INFINITY,"neg-inf"),(-0.0,"a-zero"),(0.0,"b-zero"),(1.0,"one-a"),(1.0,"one-b")];
+            let mut expected = original.clone();
+            expected.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+            let expected_bytes = expected.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+            // Semantic, cue, RRF, post-recency, expansion and MMR argmax all
+            // delegate to this same ordering contract.
+            for lane in 0..6 {
+                let mut shuffled = original.clone();
+                shuffled.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed ^ lane));
+                shuffled.sort_by(|a,b| compare_rank(a.0,a.1,b.0,b.1));
+                let actual = shuffled.iter().map(|row| row.1).collect::<Vec<_>>().join("\0").into_bytes();
+                prop_assert_eq!(&actual, &expected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_zero_ties_match_sql_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ranked(id TEXT, score REAL); INSERT INTO ranked VALUES('b',0.0),('a',-0.0);").unwrap();
+        let sql: Vec<String> = conn
+            .prepare("SELECT id FROM ranked ORDER BY score DESC,id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut rust = vec![(-0.0, "a"), (0.0, "b")];
+        rust.sort_by(|a, b| compare_rank(a.0, a.1, b.0, b.1));
+        assert_eq!(
+            sql,
+            rust.into_iter()
+                .map(|x| x.1.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn open_rw_existing_reopens_the_replaced_live_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = config::Paths::from_root(dir.path());
+        open_or_init(&paths).unwrap();
+
+        let replacement = paths.db.with_extension("replacement");
+        std::fs::copy(&paths.db, &replacement).unwrap();
+        let replacement_conn = open_unchecked_for_test(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value TEXT)")
+            .unwrap();
+        drop(replacement_conn);
+
+        let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+        let first = open_rw_existing(&paths, &lock).unwrap();
+        drop(first);
+        std::fs::rename(&replacement, &paths.db).unwrap();
+
+        let live = open_rw_existing(&paths, &lock).unwrap();
+        let marker_exists: i64 = live
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='replacement_marker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker_exists, 1,
+            "the fast reopen must target the new live inode"
+        );
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
@@ -2441,7 +3899,10 @@ mod tests {
             } else {
                 0.9
             };
-            Ok(vec![first, (1.0_f32 - first * first).sqrt()])
+            let mut v = vec![0.0f32; EMB_DIMS];
+            v[0] = first;
+            v[1] = (1.0_f32 - first * first).sqrt();
+            Ok(v)
         }
 
         fn is_noop(&self) -> bool {
@@ -2475,6 +3936,20 @@ mod tests {
         }
     }
 
+    fn seed_path_prefix_search_corpus(conn: &Connection, rows: &[(&str, &str)]) {
+        let embedder = NoopEmbedder;
+        for (id, path) in rows {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": path, "summary": "pathprefixneedle",
+                "content": "pathprefixneedle body", "tags": [],
+                "kind": "observation", "evidence_status": "missing",
+                "is_stale": false, "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(conn, &embedder, &event).unwrap();
+        }
+    }
+
     fn single_fetch_opts(do_fts: bool, do_semantic: bool, recency_lambda: f32) -> SearchOptions {
         SearchOptions {
             limit: 10,
@@ -2488,6 +3963,332 @@ mod tests {
             recency_lambda,
             mmr_lambda: 0.0,
         }
+    }
+
+    /// Post-S1/pre-P1 ordered-id baseline consumed by bd-21ef.3.12.
+    #[test]
+    fn post_s1_pre_p1_ordering_baseline() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let ids: Vec<String> = search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+        assert_eq!(ids, ["rank-a", "rank-b", "rank-c"]);
+    }
+
+    #[test]
+    fn p1_ordering_baseline_is_byte_identical_in_hybrid_and_semantic_modes() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        for (do_fts, expected) in [
+            (true, vec!["rank-a", "rank-b", "rank-c"]),
+            (false, vec!["rank-a", "rank-b", "rank-c"]),
+        ] {
+            let rows = search_entries(
+                &conn,
+                &SearchTestEmbedder,
+                "sealedwaiver",
+                &single_fetch_opts(do_fts, true, 0.0),
+            )
+            .unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, expected);
+            let actual_bytes: Vec<(String, u32, &'static str, &'static str)> = rows
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits(), row.source, row.score_kind))
+                .collect();
+            let expected_bytes = if do_fts {
+                vec![
+                    (
+                        "rank-a".into(),
+                        (1.0f32 / 61.0 + 1.0 / 61.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-b".into(),
+                        (1.0f32 / 62.0 + 1.0 / 62.0).to_bits(),
+                        "fts",
+                        "rrf",
+                    ),
+                    (
+                        "rank-c".into(),
+                        (1.0f32 / 63.0).to_bits(),
+                        "semantic",
+                        "rrf",
+                    ),
+                ]
+            } else {
+                vec![
+                    ("rank-a".into(), 1065351018, "semantic", "semantic"),
+                    ("rank-b".into(), 1065041172, "semantic", "semantic"),
+                    ("rank-c".into(), 1064372691, "semantic", "semantic"),
+                ]
+            };
+            assert_eq!(actual_bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    fn p1_metadata_materialization_is_bounded_to_twice_limit_per_lane() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let cue_blob = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        for id in ["rank-a", "rank-b", "rank-c"] {
+            conn.execute(
+                "INSERT INTO cues(entry_id, cue, embedding) VALUES(?1, ?2, ?3)",
+                params![id, format!("cue-{id}"), &cue_blob],
+            )
+            .unwrap();
+        }
+        let mut opts = single_fetch_opts(true, true, 0.0);
+        opts.limit = 1;
+        search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+        assert_eq!(stats.semantic_materialized_rows, 2);
+        assert_eq!(stats.cue_materialized_rows, 2);
+    }
+
+    #[test]
+    fn semantic_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute("UPDATE entries_emb SET embedding = 7 WHERE rowid = (SELECT rowid FROM entries WHERE id='rank-a')", []).unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_propagates_sql_row_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-a','best',7)",
+            [],
+        )
+        .unwrap();
+        assert!(search_entries(
+            &conn,
+            &SearchTestEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(true, true, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cue_lane_keeps_best_cue_per_entry() {
+        let conn = open_db_memory().unwrap();
+        seed_single_fetch_search_corpus(&conn);
+        let best = f32s_to_blob(&SearchTestEmbedder.embed("sealedwaiver").unwrap());
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','best',?1)",
+            [&best],
+        )
+        .unwrap();
+        let opts = single_fetch_opts(true, true, 0.0);
+        let before: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        let mut worse_vec = vec![0.0f32; EMB_DIMS];
+        worse_vec[0] = -0.9;
+        worse_vec[1] = (1.0_f32 - 0.9 * 0.9).sqrt();
+        let worse = f32s_to_blob(&worse_vec);
+        conn.execute(
+            "INSERT INTO cues(entry_id, cue, embedding) VALUES('rank-c','worse',?1)",
+            [&worse],
+        )
+        .unwrap();
+        let after: Vec<(String, u32)> =
+            search_entries(&conn, &SearchTestEmbedder, "sealedwaiver", &opts)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.id, row.score.to_bits()))
+                .collect();
+        assert_eq!(
+            after, before,
+            "an inferior extra cue must not replace the entry's best cue"
+        );
+    }
+
+    #[test]
+    #[ignore = "10k materialization measurement; run explicitly on the host"]
+    fn p1_materialization_measurement_10k() {
+        let conn = open_db_memory().unwrap();
+        let embedder = crate::bench_fixture::BenchEmbedder::new(crate::bench_fixture::DEFAULT_SEED);
+        crate::bench_fixture::seed_db(&conn, &embedder, 10_000, crate::bench_fixture::DEFAULT_SEED)
+            .unwrap();
+        for (lane, do_fts) in [("semantic", false), ("cue", true)] {
+            let mut opts = single_fetch_opts(do_fts, true, 0.0);
+            opts.limit = 100;
+            search_entries(&conn, &embedder, "architecture vector", &opts).unwrap();
+            let stats = take_search_runtime_stats();
+            eprintln!(
+                "{lane}: semantic_rows={} semantic_bytes={} cue_rows={} cue_bytes={}",
+                stats.semantic_materialized_rows,
+                stats.semantic_materialized_bytes,
+                stats.cue_materialized_rows,
+                stats.cue_materialized_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn parity_gate_compares_ordered_tie_run_past_limit() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[("tie-c", "t/c"), ("tie-a", "t/a"), ("tie-b", "t/b")],
+        );
+        let mut opts = single_fetch_opts(true, false, 0.0);
+        opts.limit = 1;
+        let v1 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::Contentless,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
+        let v2 = fts_rows_through_boundary_tie(
+            &conn,
+            FtsReadPath::ContentEntries,
+            "\"pathprefixneedle\"",
+            &opts,
+        )
+        .unwrap();
+        assert!(v1.len() > opts.limit, "the boundary tie must be extended");
+        assert_eq!(
+            v1.iter().map(|r| &r.0).collect::<Vec<_>>(),
+            v2.iter().map(|r| &r.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// 384-dim analogue of `SearchTestEmbedder`. The shared 2-element test
+    /// embedder round-trips its blobs through `decode_emb_blob`'s legacy-f32
+    /// branch (any 4-byte-multiple length, including a 2-element f16 blob's 4
+    /// bytes), which reinterprets the bytes as a *different-length* vector and
+    /// always mismatches the query embedding's length — every candidate scores
+    /// 0.0 regardless of corruption, which would mask the behavior this test
+    /// exists to check. Padding to `EMB_DIMS` makes the stored blob exactly
+    /// `EMB_BLOB_BYTES`, so it takes the canonical f16 decode path and produces
+    /// a genuine, differentiated cosine score.
+    struct FullDimEmbedder;
+
+    impl crate::components::embedder::Embedder for FullDimEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let first = if text.contains("rank-c") {
+                0.7
+            } else if text.contains("rank-b") {
+                0.8
+            } else {
+                0.9
+            };
+            let mut v = vec![0.0f32; EMB_DIMS];
+            v[0] = first;
+            v[1] = (1.0_f32 - first * first).sqrt();
+            Ok(v)
+        }
+
+        fn is_noop(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn malformed_normalized_f16_blob_is_zero_scored_and_reported_in_search_stats() {
+        let conn = open_db_memory().unwrap();
+        for (id, summary) in [
+            ("rank-a", "sealedwaiver sealedwaiver rank-a"),
+            (
+                "rank-b",
+                "sealedwaiver rank-b with deliberately longer filler text",
+            ),
+            ("rank-c", "semantic-only rank-c"),
+        ] {
+            let event = serde_json::json!({
+                "action": "upsert", "table": "entries", "id": id,
+                "path": format!("tests/{id}.md"), "summary": summary,
+                "content": "fixed corpus", "tags": [], "kind": "observation",
+                "evidence_status": "missing", "is_stale": false,
+                "ts": "2999-01-01 00:00:00"
+            });
+            apply_event(&conn, &FullDimEmbedder, &event).unwrap();
+        }
+        let blob = vec![0_u8; EMB_BLOB_BYTES - 1];
+        conn.execute("UPDATE entries_emb SET embedding=?1 WHERE rowid=(SELECT rowid FROM entries WHERE id='rank-a')", [blob]).unwrap();
+        let (rows, stats) = search_entries_with_stats(
+            &conn,
+            &FullDimEmbedder,
+            "sealedwaiver",
+            &single_fetch_opts(false, true, 0.0),
+        )
+        .unwrap();
+        assert!(stats.corrupt_embeddings >= 1);
+        assert_eq!(rows.last().map(|r| r.id.as_str()), Some("rank-a"));
+        assert_eq!(rows.last().map(|r| r.score), Some(0.0));
+    }
+
+    #[test]
+    fn deferred_verification_preserves_byte_cap_and_origin_root() {
+        let peer = tempfile::tempdir().unwrap();
+        let cited = peer.path().join("cited.rs");
+        let bytes = b"origin-root citation";
+        std::fs::write(&cited, bytes).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(bytes);
+        let hash = format!("sha256:{:x}", digest.finalize());
+
+        let mut entries = vec![SearchEntry {
+            id: "survivor".into(),
+            path: "survivor.rs".into(),
+            summary: String::new(),
+            content: String::new(),
+            tags: "[]".into(),
+            score: 1.0,
+            source: "fts",
+            score_kind: "fts",
+            evidence: vec![SearchEvidence {
+                id: "ev-survivor".into(),
+                kind: "code".into(),
+                citation_path: Some("cited.rs:0-20".into()),
+                citation_sha: None,
+                citation_hash: hash,
+                citation_excerpt: Some("origin-root citation".into()),
+                verified: None,
+                verification_status: None,
+            }],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: Some(peer.path().to_string_lossy().into_owned()),
+            updated_at: String::new(),
+        }];
+
+        verify_search_entries(&mut entries, 1, None);
+        assert_eq!(entries[0].evidence[0].verified, Some(true));
+
+        entries[0].evidence[0].citation_path =
+            Some(format!("cited.rs:0-{}", MAX_PER_ENTRY_BYTES + 1));
+        entries[0].evidence[0].verified = None;
+        entries[0].evidence[0].verification_status = None;
+        verify_search_entries(&mut entries, 1, None);
+        assert_eq!(entries[0].evidence[0].verified, None);
+        assert_eq!(entries[0].evidence[0].verification_status, None);
     }
 
     #[test]
@@ -2562,6 +4363,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_like_prefix_pattern_escapes_backslash() {
+        assert_eq!(like_prefix_pattern(r"src\dir"), r"src\\dir");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_percent() {
+        assert_eq!(like_prefix_pattern("src/%"), r"src/\%");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_underscore() {
+        assert_eq!(like_prefix_pattern("src/_"), r"src/\_");
+    }
+
+    #[test]
+    fn test_like_prefix_pattern_escapes_mixed_meta_chars() {
+        assert_eq!(like_prefix_pattern(r"src\_%\mix"), r"src\\\_\%\\mix");
+    }
+
+    #[test]
+    fn test_search_path_prefix_matches_literal_underscore_prefix_only() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-percent", "src/%y"),
+            ],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/_".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let ids: Vec<String> = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["pp-under".to_string()],
+            "path_prefix=src/_ must match only the literal underscore prefix"
+        );
+    }
+
+    #[test]
+    fn test_search_path_prefix_percent_is_literal_and_can_return_empty() {
+        let conn = open_db_memory().unwrap();
+        seed_path_prefix_search_corpus(
+            &conn,
+            &[
+                ("pp-under", "src/_x"),
+                ("pp-alpha", "src/ax"),
+                ("pp-doc", "docs/%y"),
+            ],
+        );
+
+        let opts = SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: Some("src/%".to_string()),
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: None,
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let rows = search_entries(&conn, &NoopEmbedder, "pathprefixneedle", &opts).unwrap();
+
+        assert!(
+            rows.is_empty(),
+            "path_prefix=src/% must not expand to every src/* path"
+        );
+    }
+
     fn seed_entry_row(conn: &Connection, id: &str, path: &str, summary: &str, is_stale: i64) {
         conn.execute(
             "INSERT INTO entries (id, path, summary, content, tags, is_stale, updated_at)
@@ -2618,6 +4508,216 @@ mod tests {
         assert!(tables.contains(&"source_weights".to_string()));
     }
 
+    // -----------------------------------------------------------------
+    // T3 (bd-21ef.1.8): run_history keyed insertion — idempotent replay.
+    // CompactMaterialize.tla D5.1.
+    // -----------------------------------------------------------------
+
+    fn run_history_test_case_event() -> serde_json::Value {
+        serde_json::json!({
+            "action": "upsert", "table": "test_cases",
+            "id": "t1", "app": "kb", "name": "n", "protocol": "rust_tool",
+            "config": "{}", "ts": "2024-01-01T00:00:00Z"
+        })
+    }
+
+    fn run_history_rows(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        conn.prepare("SELECT test_id, result, run_id FROM run_history ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// The model's fixed arm saturates counts at one; `ON CONFLICT(run_id)
+    /// DO NOTHING` is the same statement. Applying the identical event N
+    /// times must leave exactly one row.
+    #[test]
+    fn test_apply_event_run_history_keyed_insertion_is_n_replay_invariant() {
+        let conn = open_db_memory().unwrap();
+        let embedder = crate::components::embedder::NoopEmbedder;
+        apply_event(&conn, &embedder, &run_history_test_case_event()).unwrap();
+
+        let run_event = serde_json::json!({
+            "action": "insert", "table": "run_history",
+            "test_id": "t1", "result": "pass",
+            "ts": "2024-01-01T00:00:00Z", "run_id": "run-1"
+        });
+        for _ in 0..5 {
+            apply_event(&conn, &embedder, &run_event).unwrap();
+        }
+
+        let rows = run_history_rows(&conn);
+        assert_eq!(
+            rows.len(),
+            1,
+            "replaying the same run_id 5 times must leave exactly one row"
+        );
+        assert_eq!(
+            rows[0],
+            (
+                "t1".to_string(),
+                "pass".to_string(),
+                Some("run-1".to_string())
+            )
+        );
+    }
+
+    /// Legacy (run_id-less) events get a deterministic synthetic key: a
+    /// function of event content plus ordinal position, so two full
+    /// replays of one log into fresh DBs produce a row-for-row identical
+    /// `run_history` table — not just an identical row count, which would
+    /// also pass under a naive content-only hash that collapsed distinct
+    /// occurrences.
+    #[test]
+    fn test_apply_event_run_history_legacy_synthetic_key_replays_deterministically() {
+        let log = vec![
+            run_history_test_case_event(),
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "pass", "ts": "2024-01-01T00:00:00Z"
+            }),
+            // Same content as the previous run event: exercises the ordinal
+            // component of the synthetic key, not just the content hash.
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "pass", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "insert", "table": "run_history",
+                "test_id": "t1", "result": "fail", "ts": "2024-01-01T00:01:00Z"
+            }),
+        ];
+
+        let replay = || {
+            let conn = open_db_memory().unwrap();
+            let embedder = crate::components::embedder::NoopEmbedder;
+            for ev in &log {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            run_history_rows(&conn)
+        };
+
+        let first = replay();
+        let second = replay();
+        assert_eq!(
+            first.len(),
+            3,
+            "all three legacy run events must materialize (no accidental collapse)"
+        );
+        assert_eq!(
+            first, second,
+            "two replays of one log must produce an identical run_history table"
+        );
+    }
+
+    /// SCHEMA_VERSION 2 -> 3: a pre-T3 DB (old bare-INSERT arm) may already
+    /// hold duplicate non-NULL run_id rows from a double-apply. The migration
+    /// must deduplicate before creating the unique index rather than fail
+    /// outright — NULL run_id rows (also legacy) are left alone since SQLite
+    /// never treats two NULLs as conflicting.
+    #[test]
+    fn test_ensure_schema_dedupes_legacy_run_history_duplicates_before_indexing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE test_cases (id TEXT PRIMARY KEY, app TEXT, name TEXT, protocol TEXT, config TEXT);
+             INSERT INTO test_cases(id,app,name,protocol,config) VALUES('t1','kb','n','rust_tool','{}');
+             CREATE TABLE run_history (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 test_id  TEXT NOT NULL REFERENCES test_cases(id),
+                 result   TEXT NOT NULL CHECK(result IN ('pass','fail')),
+                 adapter  TEXT,
+                 detail   TEXT,
+                 ts       TEXT DEFAULT (datetime('now')),
+                 run_id   TEXT
+             );
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','2024-01-01T00:00:00Z','run-dup');
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','2024-01-01T00:00:00Z','run-dup');
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','fail','2024-01-01T00:01:00Z',NULL);
+             INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','fail','2024-01-01T00:01:00Z',NULL);",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let dup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_history WHERE run_id='run-dup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dup_count, 1,
+            "duplicate non-NULL run_id rows must be deduped before indexing"
+        );
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_history WHERE run_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_count, 2,
+            "NULL run_id rows are untouched — SQLite never treats two NULLs as conflicting"
+        );
+
+        // The index now exists and enforces uniqueness on future inserts.
+        let err = conn
+            .execute(
+                "INSERT INTO run_history(test_id,result,ts,run_id) VALUES('t1','pass','x','run-dup')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "index must now enforce uniqueness: {err}"
+        );
+    }
+
+    /// T3 acceptance: the upgraded DB's `run_history` column shape must equal
+    /// a fresh DB's. SCHEMA_VERSION 3 adds an index, not a column, so this
+    /// holds by construction, but the property is exactly what the upgrade
+    /// path promises.
+    #[test]
+    fn test_run_history_table_info_matches_after_v3_migration() {
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE test_cases (id TEXT PRIMARY KEY, app TEXT, name TEXT, protocol TEXT, config TEXT);
+                 CREATE TABLE run_history (
+                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     test_id  TEXT NOT NULL REFERENCES test_cases(id),
+                     result   TEXT NOT NULL CHECK(result IN ('pass','fail')),
+                     adapter  TEXT,
+                     detail   TEXT,
+                     ts       TEXT DEFAULT (datetime('now')),
+                     run_id   TEXT
+                 );",
+            )
+            .unwrap();
+        ensure_schema(&legacy).unwrap();
+
+        let fresh = open_db_memory().unwrap();
+
+        fn cols(conn: &Connection) -> Vec<(String, String)> {
+            conn.prepare("PRAGMA table_info(run_history)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        }
+
+        assert_eq!(
+            cols(&legacy),
+            cols(&fresh),
+            "migrated DB's run_history column shape must equal a fresh DB's"
+        );
+    }
+
     #[test]
     fn test_init_creates_source_weights_table() {
         let conn = open_db_memory().unwrap();
@@ -2632,6 +4732,99 @@ mod tests {
         assert!(cols.contains(&"session_id".to_string()));
         assert!(cols.contains(&"successes".to_string()));
         assert!(cols.contains(&"failures".to_string()));
+    }
+
+    #[test]
+    fn test_source_weights_migration_matches_fresh_schema_on_upgraded_db() {
+        // D6 R2 (failing-test-first regression): simulate a pre-migration
+        // DB where `source_weights` exists WITH ROWS but lacks
+        // `updated_at` (the column was added after the table's original
+        // release). SQLite rejects `ALTER TABLE ... ADD COLUMN ... DEFAULT
+        // (datetime('now'))` once a table has existing rows (non-constant
+        // default), so the prior `let _ =`-swallowed migration silently
+        // never added the column here — an upgraded DB's schema diverged
+        // from a fresh DB's while the swallow hid the failure.
+        let legacy = rusqlite::Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE source_weights (
+                    kind        TEXT NOT NULL,
+                    session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                    successes   INTEGER NOT NULL DEFAULT 0,
+                    failures    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, session_id)
+                );
+                INSERT INTO source_weights(kind, successes, failures) VALUES ('code', 3, 1);",
+            )
+            .unwrap();
+
+        ensure_schema(&legacy).unwrap();
+
+        let fresh = open_db_memory().unwrap();
+        let table_info = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("PRAGMA table_info(source_weights)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            table_info(&legacy),
+            table_info(&fresh),
+            "an upgraded DB must expose identical PRAGMA table_info for source_weights as a fresh DB"
+        );
+
+        let updated_at: Option<String> = legacy
+            .query_row(
+                "SELECT updated_at FROM source_weights WHERE kind='code'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            updated_at.is_some(),
+            "existing rows must be backfilled with a non-null updated_at"
+        );
+    }
+
+    #[test]
+    fn test_source_weights_migration_is_noop_when_column_already_present() {
+        // Idempotency: running the migration twice (e.g. two `open_db` calls
+        // against the same file) must not error or clobber the column.
+        let conn = open_db_memory().unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+        migrate_source_weights_updated_at(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_source_weights_migration_propagates_unexpected_errors() {
+        // D6 R2 acceptance: an unexpected migration error propagates rather
+        // than being swallowed. Force the backfill UPDATE to fail via a
+        // trigger and confirm the caller observes an Err, not a silent Ok.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_weights (
+                kind        TEXT NOT NULL,
+                session_id  TEXT NOT NULL DEFAULT '__GLOBAL__',
+                successes   INTEGER NOT NULL DEFAULT 0,
+                failures    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (kind, session_id)
+            );
+            INSERT INTO source_weights(kind) VALUES ('code');
+            CREATE TRIGGER source_weights_reject_backfill
+            BEFORE UPDATE ON source_weights
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated backfill failure');
+            END;",
+        )
+        .unwrap();
+
+        let result = migrate_source_weights_updated_at(&conn);
+        assert!(
+            result.is_err(),
+            "an unexpected migration error must propagate, not be swallowed"
+        );
     }
 
     #[test]
@@ -3148,6 +5341,205 @@ mod tests {
         assert_eq!(evidence_status, "n/a");
     }
 
+    /// D6 R1 (failing-test-first regression): replaying the identical log
+    /// must materialize identical `updated_at` values no matter when the
+    /// replay runs. `updated_at` is derived from the event's own `ts`, not
+    /// wall-clock, on every arm that writes it (expire, evidence_add,
+    /// evidence_expire) — Materialize being a pure function of the log is
+    /// an assumption every spec in `.state/agent-kb/tla/` already makes.
+    #[test]
+    fn test_replay_expire_updated_at_is_derived_from_event_ts_not_wall_clock() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-expire-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "expire", "table": "entries", "id": "replay-expire-ts",
+                "ts": "2024-06-01T12:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-06-01T12:00:00Z");
+
+        // Replay the identical log again as if hours had passed on the wall
+        // clock — the materialized value must be byte-identical.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_expire_event_without_ts_leaves_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-expire-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy expire event carries no "ts" field.
+        let expire = serde_json::json!({
+            "action": "expire", "table": "entries", "id": "legacy-expire-ts"
+        });
+        apply_event(&conn, &embedder, &expire).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-expire-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "a legacy event with no ts must leave the existing updated_at untouched"
+        );
+    }
+
+    #[test]
+    fn test_replay_evidence_add_and_evidence_expire_updated_at_derived_from_event_ts() {
+        let embedder = NoopEmbedder;
+        let events = [
+            serde_json::json!({
+                "action": "upsert", "table": "entries", "id": "replay-evidence-ts",
+                "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+                "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_add", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence": {
+                    "id": "ev-replay-evidence-ts", "entry_id": "replay-evidence-ts",
+                    "kind": "code", "citation_path": "src/lib.rs:1-1",
+                    "citation_sha": null, "citation_hash": "sha256:abc",
+                    "citation_excerpt": null, "derived_from": null,
+                    "recorded_at": "2024-03-01T00:00:00Z"
+                },
+                "ts": "2024-03-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "action": "evidence_expire", "table": "evidence",
+                "entry_id": "replay-evidence-ts",
+                "evidence_id": "ev-replay-evidence-ts", "reason": "test",
+                "ts": "2024-09-01T00:00:00Z"
+            }),
+        ];
+
+        let updated_at_of = |events: &[serde_json::Value]| -> String {
+            let conn = open_db_memory().unwrap();
+            for ev in events {
+                apply_event(&conn, &embedder, ev).unwrap();
+            }
+            conn.query_row(
+                "SELECT updated_at FROM entries WHERE id='replay-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        let first_replay = updated_at_of(&events);
+        assert_eq!(first_replay, "2024-09-01T00:00:00Z");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_replay = updated_at_of(&events);
+        assert_eq!(
+            first_replay, second_replay,
+            "replaying the same log twice must produce identical updated_at"
+        );
+    }
+
+    #[test]
+    fn test_legacy_evidence_add_and_evidence_expire_without_ts_leave_updated_at_unchanged() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries", "id": "legacy-evidence-ts",
+            "path": "src/lib.rs", "summary": "s", "content": "c", "tags": [],
+            "kind": "belief", "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        let before: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Legacy evidence_add event carries no "ts" field.
+        let evidence_add = serde_json::json!({
+            "action": "evidence_add", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence": {
+                "id": "ev-legacy-evidence-ts", "entry_id": "legacy-evidence-ts",
+                "kind": "code", "citation_path": "src/lib.rs:1-1",
+                "citation_sha": null, "citation_hash": "sha256:abc",
+                "citation_excerpt": null, "derived_from": null,
+                "recorded_at": "2024-03-01T00:00:00Z"
+            }
+        });
+        apply_event(&conn, &embedder, &evidence_add).unwrap();
+        let after_add: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_add,
+            "a legacy evidence_add with no ts must leave updated_at untouched"
+        );
+
+        // Legacy evidence_expire event carries no "ts" field.
+        let evidence_expire = serde_json::json!({
+            "action": "evidence_expire", "table": "evidence",
+            "entry_id": "legacy-evidence-ts",
+            "evidence_id": "ev-legacy-evidence-ts", "reason": "test"
+        });
+        apply_event(&conn, &embedder, &evidence_expire).unwrap();
+        let after_expire: String = conn
+            .query_row(
+                "SELECT updated_at FROM entries WHERE id='legacy-evidence-ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_expire,
+            "a legacy evidence_expire with no ts must leave updated_at untouched"
+        );
+    }
+
     #[test]
     fn test_apply_event_evidence_add_rolls_back_on_status_update_failure() {
         let conn = open_db_memory().unwrap();
@@ -3632,6 +6024,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_fetch_evidence_for_entries_propagates_decode_errors() {
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "decode-host", "path": "src/decode.rs", "summary": "decode host",
+            "content": "c", "tags": [], "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+
+        conn.execute(
+            "INSERT INTO evidence(
+                id, entry_id, kind, citation_path, citation_hash, recorded_at
+             ) VALUES (?1, ?2, 'code', ?3, 'sha256:test', '2024-01-01T00:00:00Z')",
+            params![
+                "ev-decode-bad",
+                "decode-host",
+                rusqlite::types::Value::Blob(vec![0x80, 0x81, 0x82]),
+            ],
+        )
+        .unwrap();
+
+        let result = fetch_evidence_for_entries(&conn, &["decode-host".to_string()]);
+        assert!(
+            result.is_err(),
+            "corrupt evidence rows must surface as Err, never be dropped as absent"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // br-23b.12: batch evidence fetch order-equivalence.
     //
@@ -3783,20 +6206,21 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // br-bhg: explicit SearchOptions.repo_root threads through to verification.
-    // Regression for MCP cwd=/ case where find_repo_root() walks from CWD and
-    // returns None (or the wrong root), causing verified=false on every row.
+    // Regression for MCP cwd=/ case where a CWD-based repo-root walk returned
+    // None (or the wrong root), causing verified=false on every row.
     // -----------------------------------------------------------------------
 
     /// When `opts.repo_root` is `Some(path)`, inline evidence verification must
-    /// resolve citation_path relative to that path — not relative to whatever
-    /// repo `find_repo_root()` discovers from the current working directory.
+    /// resolve citation_path relative to that path — not against the process
+    /// cwd, which no caller relies on any more (every caller resolves
+    /// `repo_root` explicitly from `config::Paths::root`).
     ///
     /// Construction: write a cited file under a tempdir at a unique relative
-    /// path that does NOT exist under the test runner's CWD-discovered repo.
-    /// If `search_entries` honors `opts.repo_root`, verification reads bytes
-    /// from `<tempdir>/<rel>` and succeeds. If it falls back to CWD discovery,
-    /// the file is missing under the wrong root and verification returns
-    /// `Some(false)`.
+    /// path that does NOT exist under the test runner's own cwd. If
+    /// `search_entries` honors `opts.repo_root`, verification reads bytes
+    /// from `<tempdir>/<rel>` and succeeds. If it silently ignored
+    /// `opts.repo_root`, the file would be missing and verification would
+    /// return `Some(false)`.
     #[test]
     fn test_search_uses_explicit_repo_root_when_cwd_is_unrelated() {
         use sha2::{Digest, Sha256};
@@ -3804,10 +6228,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Unique relative path so it cannot collide with any file in the real
-        // worktree (the CWD-discovered repo root). If find_repo_root() were
-        // used instead of opts.repo_root, the verifier would look here:
-        //   <real-worktree>/src/__br_bhg_regression_explicit_root__.rs
+        // Unique relative path so it cannot collide with any file under the
+        // test runner's own cwd. If `opts.repo_root` were ignored, the
+        // verifier would look here:
+        //   <test-runner-cwd>/src/__br_bhg_regression_explicit_root__.rs
         // ...which does not exist, and verified would be Some(false).
         let rel = "src/__br_bhg_regression_explicit_root__.rs";
         let cited_content = b"// br-bhg regression: explicit repo_root\n";
@@ -3881,8 +6305,8 @@ mod tests {
         assert_eq!(
             entry.evidence[0].verified,
             Some(true),
-            "explicit opts.repo_root must be used for verification — CWD-based \
-             find_repo_root() would not find the cited file under the tempdir, \
+            "explicit opts.repo_root must be used for verification — the test \
+             runner's own cwd would not find the cited file under the tempdir, \
              so a Some(true) here proves repo_root threading works (MCP cwd=/ fix)"
         );
     }
@@ -4194,8 +6618,6 @@ mod tests {
     /// embeddings directly via the entries_emb table so we control both lanes.
     #[test]
     fn test_rrf_fusion_dual_source_beats_high_raw_semantic_score() {
-        use crate::models::{blob_to_f32s, f32s_to_blob};
-
         let conn = open_db_memory().unwrap();
         let embedder = NoopEmbedder;
 
@@ -4241,13 +6663,17 @@ mod tests {
             })
             .unwrap();
 
-        // Query vector: [1.0, 0.0] (unit vector along dim-0)
-        let q_vec: Vec<f32> = vec![1.0, 0.0];
+        // Query vector: unit vector along dim-0.
+        let mut q_vec: Vec<f32> = vec![0.0; EMB_DIMS];
+        q_vec[0] = 1.0;
 
-        // Entry A embedding: moderate similarity = [0.8, 0.6] → sim ≈ 0.8
-        let emb_a: Vec<f32> = vec![0.8, 0.6];
-        // Entry B embedding: very high similarity = [1.0, 0.0] → sim = 1.0
-        let emb_b: Vec<f32> = vec![1.0, 0.0];
+        // Entry A embedding: moderate similarity ≈ 0.8.
+        let mut emb_a: Vec<f32> = vec![0.0; EMB_DIMS];
+        emb_a[0] = 0.8;
+        emb_a[1] = 0.6;
+        // Entry B embedding: very high similarity = 1.0.
+        let mut emb_b: Vec<f32> = vec![0.0; EMB_DIMS];
+        emb_b[0] = 1.0;
 
         // Insert embeddings
         conn.execute(
@@ -4261,7 +6687,7 @@ mod tests {
         )
         .unwrap();
 
-        // Use a FakeEmbedder that returns q_vec = [1.0, 0.0]
+        // Use a FakeEmbedder that returns q_vec.
         struct FixedEmbedder(Vec<f32>);
         impl crate::components::embedder::Embedder for FixedEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
@@ -4336,12 +6762,14 @@ mod tests {
     /// actual entries_emb row on upsert. After expire the row must be gone.
     #[test]
     fn test_expire_deletes_entries_emb_row() {
-        use crate::models::f32s_to_blob;
-
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![0.1_f32, 0.2_f32, 0.3_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 0.1;
+                v[1] = 0.2;
+                v[2] = 0.3;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false
@@ -4406,12 +6834,13 @@ mod tests {
     /// replays a stale upsert — the embedding orphan must be cleaned up.
     #[test]
     fn test_stale_upsert_deletes_entries_emb_row() {
-        use crate::models::f32s_to_blob;
-
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![0.4_f32, 0.5_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 0.4;
+                v[1] = 0.5;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false
@@ -4717,7 +7146,9 @@ mod tests {
         struct FakeEmbedder;
         impl crate::components::embedder::Embedder for FakeEmbedder {
             fn embed(&self, _: &str) -> anyhow::Result<Vec<f32>> {
-                Ok(vec![1.0_f32, 0.0_f32])
+                let mut v = vec![0.0f32; EMB_DIMS];
+                v[0] = 1.0;
+                Ok(v)
             }
             fn is_noop(&self) -> bool {
                 false
@@ -4873,6 +7304,122 @@ mod tests {
              pool_size={pool_size}, allowed={allowed}. \
              Old unbounded code peaks at 50+ threads (one per evidence row)."
         );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_limit_and_inline_verify_k_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        for i in 0..(MAX_LIMIT + 5) {
+            let entry_id = format!("caps-entry-{i:03}");
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": entry_id,
+                "path": format!("src/caps_{i}.rs"),
+                "summary": "boundary clamp needle",
+                "content": format!("content {i}"),
+                "tags": ["caps"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+            for j in 0..2usize {
+                conn.execute(
+                    "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+                     VALUES(?1, ?2, 'code', 'sha256:caps', ?3)",
+                    params![
+                        format!("caps-ev-{i:03}-{j:02}"),
+                        format!("caps-entry-{i:03}"),
+                        format!("2024-01-01T00:00:{:02}Z", j)
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let opts = SearchOptions {
+            limit: 10_000,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 10_000,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 10),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let results = search_entries(&conn, &embedder, "boundary clamp needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(
+            results.len(),
+            MAX_LIMIT,
+            "limit must be clamped at the boundary"
+        );
+        assert_eq!(stats.effective_limit, MAX_LIMIT);
+        assert_eq!(stats.effective_inline_verify_k, MAX_INLINE_VERIFY_K);
+        assert_eq!(
+            stats.scheduled_verification_tasks,
+            MAX_LIMIT * 2,
+            "scheduled verification tasks must be clamped to limit × evidence rows per returned entry"
+        );
+        assert_eq!(
+            stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE,
+            "worker count must use the clamped verify pool size"
+        );
+    }
+
+    #[test]
+    fn test_search_entries_clamps_verify_pool_size_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let conn = open_db_memory().unwrap();
+        let embedder = NoopEmbedder;
+
+        let upsert = serde_json::json!({
+            "action": "upsert", "table": "entries",
+            "id": "pool-cap-entry",
+            "path": "src/pool_cap.rs",
+            "summary": "pool cap needle",
+            "content": "pool cap body",
+            "tags": ["pool-cap"],
+            "kind": "observation",
+            "evidence_status": "present",
+            "ts": "2024-01-01T00:00:00Z"
+        });
+        apply_event(&conn, &embedder, &upsert).unwrap();
+        conn.execute(
+            "INSERT INTO evidence(id, entry_id, kind, citation_hash, recorded_at)
+             VALUES('pool-cap-ev', 'pool-cap-entry', 'code', 'sha256:pool', '2024-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let opts = SearchOptions {
+            limit: 1,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 1,
+            repo_root: Some(root.to_path_buf()),
+            verify_pool_size: Some(MAX_VERIFY_POOL_SIZE + 500),
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+
+        let _results = search_entries(&conn, &embedder, "pool cap needle", &opts).unwrap();
+        let stats = take_search_runtime_stats();
+
+        assert_eq!(stats.effective_verify_pool_size, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE);
+        assert_eq!(stats.scheduled_verification_tasks, 1);
     }
 
     #[test]

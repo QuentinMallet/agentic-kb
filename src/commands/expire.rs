@@ -2,7 +2,7 @@
 
 use crate::commands::add::{acquire_lock, read_omc_session};
 use crate::components::embedder::{Embedder, NoopEmbedder};
-use crate::components::{db, events};
+use crate::components::{cursor, db, events};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
@@ -43,8 +43,8 @@ impl Expire {
         paths: &config::Paths,
         embedder: &dyn Embedder,
     ) -> anyhow::Result<()> {
-        let _lock = acquire_lock(&paths.lock)?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &lock)?;
 
         // Guard: refuse to expire permanent entries unless --force
         if !self.force {
@@ -64,7 +64,7 @@ impl Expire {
         let ts = chrono::Utc::now().to_rfc3339();
         let (session, omc_session_id) = read_omc_session();
 
-        let event = serde_json::json!({
+        let event = events::entry_expire(serde_json::json!({
             "action": "expire",
             "table": "entries",
             "id": self.id,
@@ -72,10 +72,10 @@ impl Expire {
             "ts": ts,
             "session": session,
             "session_id": omc_session_id,
-        });
+        }))?;
 
-        events::append_event(&paths.events, &event)?;
-        db::apply_event(&conn, embedder, &event)?;
+        // Writer 2 of 10.
+        cursor::append_and_apply_writer_events(&lock, &conn, paths, embedder, &[event])?;
 
         println!("expired {}", self.id);
         Ok(())
@@ -88,7 +88,6 @@ mod tests {
     use crate::commands::add::Add;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
 
@@ -125,7 +124,7 @@ mod tests {
         };
         expire_cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let is_stale: i64 = conn
             .query_row(
                 "SELECT is_stale FROM entries WHERE id='expire-test-1'",
@@ -205,7 +204,7 @@ mod tests {
         };
         expire_cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let is_stale: i64 = conn
             .query_row(
                 "SELECT is_stale FROM entries WHERE id='perm-expire-2'",

@@ -2,8 +2,9 @@
 
 use crate::commands::add::{acquire_lock, make_embedder};
 use crate::components::embedder::Embedder;
-use crate::components::{db, events};
+use crate::components::{cursor, db, events, fsync::sync_parent_dir};
 use crate::config;
+use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
 use anyhow::Context;
 use clap::Parser;
@@ -28,18 +29,6 @@ struct Phase2TestHook {
     mutation_done: Option<std::sync::Arc<std::sync::Barrier>>,
     phase3_timings: Option<std::sync::Arc<std::sync::Mutex<Vec<Phase3Timing>>>>,
     attempts: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-}
-
-#[cfg(test)]
-pub(crate) fn set_phase2_barrier(b: std::sync::Arc<std::sync::Barrier>) {
-    let m = PHASE2_BARRIER.get_or_init(|| std::sync::Mutex::new(None));
-    *m.lock().unwrap() = Some(Phase2TestHook {
-        events_path: None,
-        barrier: b,
-        mutation_done: None,
-        phase3_timings: None,
-        attempts: None,
-    });
 }
 
 #[cfg(test)]
@@ -93,33 +82,100 @@ fn take_phase2_barrier(events_path: &Path) -> Option<Phase2TestHook> {
 struct Phase3Timing {
     lock_acquired: std::time::Instant,
     catchup_finished: std::time::Instant,
-    unlink_finished: std::time::Instant,
+    checkpoint_finished: std::time::Instant,
     rename_finished: std::time::Instant,
+    unlink_finished: std::time::Instant,
+    dir_sync_finished: std::time::Instant,
     lock_released: std::time::Instant,
 }
 
-/// Force a one-time rebuild when the DB predates the current schema
-/// generation (br-23b-handoff-tomorrow-uob).
+/// Converge the database with the event log (C1/D3, renamed from
+/// `rebuild_if_schema_obsolete`).
 ///
-/// Legacy DBs (created before the `schema_version` stamp existed) have their
-/// missing tables created empty by `ensure_schema`, but rows that only
-/// materialize through `apply_event` (cue rows, embedding vintages) stay
-/// absent until the log is replayed. Entry points (MCP startup, CLI
-/// search/add/eval) call this once per interaction; it is a cheap stamp read
-/// in the steady state.
+/// Implements the D3 recovery table in full. The obsolete-schema rebuild it
+/// grew out of is now one of its eight rows; the other seven are the applied
+/// cursor's. Called at process entry (MCP startup, CLI dispatch of a mutating
+/// subcommand) and before every write path. **Never from a read path**: reads
+/// detect the same condition and warn, but never take the write lock and never
+/// change content (C2/ADR-7, `crate::components::cursor::warn_if_behind`).
 ///
-/// Returns `Ok(true)` when a rebuild was performed.
-pub fn rebuild_if_schema_obsolete(
+/// | Condition | Action |
+/// |---|---|
+/// | no cursor rows present | full rebuild (the D3 migration path) |
+/// | schema stamp obsolete | full rebuild |
+/// | generation ≠ the log's generation | full rebuild (compacted or rewritten) |
+/// | tail hash mismatches the log at that offset | full rebuild |
+/// | offset > `committed_len` | full rebuild |
+/// | log unreadable | defer with a warning |
+/// | `committed_len` > offset | replay the tail, then advance the cursor |
+/// | `committed_len` == offset | no-op |
+///
+/// Returns `Ok(true)` when a full rebuild was performed.
+pub fn recover_if_needed(paths: &config::Paths, embedder: &dyn Embedder) -> anyhow::Result<bool> {
+    // Detection is lock-free and read-only. A repository whose database has
+    // never been created has nothing to converge — open_ro no longer creates
+    // it, so DbUninitialized is "nothing to do", not an error.
+    let decision = match db::open_ro(&paths.db) {
+        Ok(conn) => cursor::inspect(&conn, paths),
+        Err(e) if db::is_db_uninitialized(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match decision {
+        cursor::Decision::NoOp => Ok(false),
+        cursor::Decision::Defer(message) => {
+            // Row 6. Deferring keeps every entry point alive; failing here
+            // would take all of them down over one malformed middle line.
+            eprintln!("kb: WARNING deferring event-log recovery — {message}");
+            Ok(false)
+        }
+        cursor::Decision::LogMissing(path) => {
+            // Not a rebuild: replaying a log that is not there would delete
+            // every entry it covered. Not a hard error either — reads keep
+            // working. The write guard is what stops a write from resurrecting
+            // the log and orphaning those entries.
+            eprintln!(
+                "kb: WARNING the event log is missing at {} — the database is \
+                 serving state no log backs. Restore the log, or run `kb rebuild` \
+                 deliberately if the empty log should win.",
+                path.display()
+            );
+            Ok(false)
+        }
+        cursor::Decision::ReplayTail { from, to } => {
+            eprintln!(
+                "kb: applying {} event-log byte(s) the database is missing \
+                 (applied cursor at {from}, log committed to {to})...",
+                to - from
+            );
+            let lock = acquire_lock(&paths.lock)?;
+            let conn = db::open_rw(paths, &lock)?;
+            match cursor::replay_tail_locked(&lock, &conn, paths, embedder) {
+                Ok(applied) => {
+                    eprintln!("kb: recovery applied {applied} event(s).");
+                    Ok(false)
+                }
+                // The tail was readable when `inspect` classified it and is not
+                // now — a concurrent writer, or damage that landed in between.
+                // Same disposition as row 6: warn, keep every entry point
+                // alive, do not propagate a parse error out of recovery.
+                Err(error) if cursor::is_log_unreadable(&error) => {
+                    eprintln!("kb: WARNING deferring event-log recovery — {error}");
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        cursor::Decision::FullRebuild(reason) => full_rebuild_for(paths, embedder, reason),
+    }
+}
+
+/// The full-rebuild rows of the D3 table, with the guards the schema-upgrade
+/// rebuild has always carried.
+fn full_rebuild_for(
     paths: &config::Paths,
     embedder: &dyn Embedder,
+    reason: cursor::RebuildReason,
 ) -> anyhow::Result<bool> {
-    // Fast path: no lock for the steady-state stamp read.
-    {
-        let conn = db::open_db(&paths.db)?;
-        if db::schema_is_current(&conn) {
-            return Ok(false);
-        }
-    }
     // Single-flight (codex review finding): concurrent first interactions
     // serialize on a dedicated upgrade lock — distinct from the write flock,
     // which Rebuild's phases acquire and release internally (holding THAT
@@ -128,8 +184,16 @@ pub fn rebuild_if_schema_obsolete(
     let upgrade_lock = paths.lock.with_extension("schema-upgrade.lock");
     let _flight = acquire_lock(&upgrade_lock)?;
     {
-        let conn = db::open_db(&paths.db)?;
-        if db::schema_is_current(&conn) {
+        // This block may stamp schema_version, so it holds the repository write
+        // lock as well as the schema-upgrade single-flight lock.
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &lock)?;
+        // Re-check under the single-flight lock: the loser of the race finds
+        // the winner's work already done.
+        if !matches!(
+            cursor::inspect(&conn, paths),
+            cursor::Decision::FullRebuild(_)
+        ) {
             return Ok(false);
         }
         // Missing/empty event log: only a DB with ZERO entries is genuinely
@@ -147,6 +211,17 @@ pub fn rebuild_if_schema_obsolete(
                 conn.execute(
                     "INSERT OR REPLACE INTO kb_meta(key, value) VALUES('schema_version', ?1)",
                     rusqlite::params![db::SCHEMA_VERSION.to_string()],
+                )?;
+                // Nothing to materialize, so the empty database IS current with
+                // the (empty or unreachable) log: give it a cursor rather than
+                // leaving it on the cursorless full-rebuild row forever.
+                cursor::write(
+                    &conn,
+                    &cursor::Cursor {
+                        generation: cursor::read_generation(&paths.events),
+                        offset: 0,
+                        tail_sha: cursor::tail_sha(&paths.events, 0)?,
+                    },
                 )?;
             } else {
                 eprintln!(
@@ -196,7 +271,7 @@ pub fn rebuild_if_schema_obsolete(
         // it is obviously not this DB's history (truncated / foreign / wrong
         // path). Replaying it would drop those entries outright — refuse loudly
         // and let the operator reconcile rather than silently mangle the KB.
-        let conn = db::open_db(&paths.db)?;
+        let conn = db::open_ro(&paths.db)?;
         let live_ids: Vec<String> = conn
             .prepare("SELECT id FROM entries WHERE is_stale=0")?
             .query_map([], |r| r.get(0))?
@@ -224,16 +299,15 @@ pub fn rebuild_if_schema_obsolete(
     // interaction with a real embedder comes along.
     if embedder.is_noop() {
         eprintln!(
-            "kb: DB schema predates v{} but KB_NO_EMBED is set — deferring the \
-             upgrade rebuild to avoid dropping embeddings",
-            db::SCHEMA_VERSION
+            "kb: a full rebuild is due ({}) but KB_NO_EMBED is set — deferring it \
+             to avoid dropping embeddings; rerun with an embedder or `kb rebuild`",
+            reason.as_str()
         );
         return Ok(false);
     }
     eprintln!(
-        "kb: DB schema predates v{} — replaying the event log once to \
-         materialize new derived state (cue rows, embedding vintage stamp)...",
-        db::SCHEMA_VERSION
+        "kb: rebuilding the database from the event log — {}.",
+        reason.as_str()
     );
     // Non-destructive by construction: snapshot the pre-upgrade DB before the
     // rebuild swap. Even if the log is subtly stale in a way coverage cannot
@@ -250,8 +324,8 @@ pub fn rebuild_if_schema_obsolete(
         // snapshot. VACUUM INTO takes a read transaction and emits a single
         // transactionally-consistent file with no WAL sidecar — unlike a raw
         // fs::copy of a live WAL database, which can capture a torn state.
-        let _wlock = acquire_lock(&paths.lock)?;
-        let conn = db::open_db(&paths.db)?;
+        let wlock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(paths, &wlock)?;
         let _ = fs::remove_file(&backup);
         // Escape single quotes in the path for the SQL string literal (the
         // path is ours, but repo paths can legitimately contain quotes).
@@ -266,7 +340,7 @@ pub fn rebuild_if_schema_obsolete(
     } // release the write flock — Rebuild re-acquires it per phase
     eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
     (Rebuild).execute_with(paths, embedder)?;
-    eprintln!("kb: schema upgrade rebuild complete.");
+    eprintln!("kb: rebuild complete.");
     Ok(true)
 }
 
@@ -328,8 +402,12 @@ impl Rebuild {
             // Phase 1: snapshot a byte identity under a brief lock. Hashing the
             // complete prefix is intentionally simple and robust: it detects
             // compaction, reordering, truncation, and same-size rewrites.
-            let (snapshot_len, snapshot_byte_len, snapshot_hash) = {
-                let _lock = acquire_lock(&paths.lock)?;
+            let (snapshot_byte_len, snapshot_hash) = {
+                let lock = acquire_lock(&paths.lock)?;
+                {
+                    let conn = db::open_rw(paths, &lock)?;
+                    db::sweep_expired_peers(&conn)?;
+                }
                 let snapshot = events::read_events(&paths.events)?;
                 if let Some(torn_tail) = &snapshot.torn_tail {
                     eprintln!(
@@ -345,13 +423,13 @@ impl Rebuild {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                     Err(error) => return Err(error.into()),
                 };
-                let complete_len = snapshot.torn_tail.as_ref().map_or(bytes.len(), |tail| {
-                    bytes.len().saturating_sub(tail.bytes.len())
-                });
+                // The snapshot boundary must be a committed_len value: no span
+                // straddles it, so Phase 2's prefix and Phase 3's catch-up
+                // cannot split a batch (plan §4 D1, Principle 3).
+                let committed_len = (snapshot.committed_len as usize).min(bytes.len());
                 (
-                    snapshot.events.len(),
-                    complete_len as u64,
-                    Sha256::digest(&bytes[..complete_len]).to_vec(),
+                    committed_len as u64,
+                    Sha256::digest(&bytes[..committed_len]).to_vec(),
                 )
             };
 
@@ -372,11 +450,11 @@ impl Rebuild {
             };
 
             {
-                // Stop at snapshot_len so we never encounter a partial tail line
-                // that a concurrent writer may be mid-writing after Phase 1.
-                let evts = events::read_events_up_to(&paths.events, snapshot_len)?;
-                let conn = db::open_db(tmp.path())?;
-                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
+                // Replay exactly the byte prefix Phase 1 hashed, so we never
+                // encounter a partial tail line, or a span, that a concurrent
+                // writer may be mid-writing after Phase 1.
+                let evts = events::read_events_prefix(&paths.events, snapshot_byte_len)?;
+                let conn = db::open_scratch(tmp.path())?;
                 if let Some(torn_tail) = &evts.torn_tail {
                     eprintln!(
                         "kb: WARNING event log at {} has a torn final line {} ({} bytes) — \
@@ -386,8 +464,25 @@ impl Rebuild {
                         torn_tail.bytes.len()
                     );
                 }
-                eprintln!("replaying {} events...", evts.events.len());
-                for event in &evts.events {
+                // Materialization skips quarantined records (D3 poison policy,
+                // `DurableBatch.tla` Materialize(log, quarantined)): a rebuild
+                // that re-applied a dead-lettered event would fail on exactly
+                // the record recovery already gave up on.
+                let quarantined = cursor::DeadLetter::load(&paths.events).quarantined();
+                let live: Vec<&serde_json::Value> = evts
+                    .events
+                    .iter()
+                    .filter(|event| !quarantined.contains(&cursor::fingerprint(event)))
+                    .collect();
+                if live.len() != evts.events.len() {
+                    eprintln!(
+                        "kb: skipping {} quarantined event(s) — see {}",
+                        evts.events.len() - live.len(),
+                        cursor::dead_letter_path(&paths.events).display()
+                    );
+                }
+                eprintln!("replaying {} events...", live.len());
+                for event in live {
                     db::apply_event(&conn, embedder, event)
                         .with_context(|| format!("apply event: {}", event))?;
                 }
@@ -419,39 +514,145 @@ impl Rebuild {
                     torn_tail.bytes.len()
                 );
             }
-            if !catchup.events.is_empty() {
-                eprintln!("catching up {} new event(s)...", catchup.events.len());
-                let conn = db::open_db(tmp.path())?;
-                conn.execute_batch("PRAGMA journal_mode=DELETE")?;
-                for event in &catchup.events {
-                    db::apply_event(&conn, embedder, event)
-                        .with_context(|| format!("apply event (catch-up): {}", event))?;
+            {
+                // Opened unconditionally so the WAL-mode assertion runs on every
+                // swap, not only on the paths that have catch-up work. Dropping
+                // this connection at the end of the block is D4 step 3's tmp
+                // finalization: a clean close checkpoints and unlinks the tmp's
+                // sidecars, which is what makes the renamed file self-contained.
+                let conn = db::open_scratch(tmp.path())?;
+                let tmp_mode: String = conn
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .with_context(|| "read rebuilt tmp DB journal mode")?;
+                anyhow::ensure!(
+                    tmp_mode.eq_ignore_ascii_case("wal"),
+                    "rebuilt tmp DB is in journal mode {tmp_mode:?}, expected WAL; \
+                     the swapped-in DB must be WAL-headered because C2's open_ro \
+                     no longer self-heals the journal mode after the rename"
+                );
+                let quarantined = cursor::DeadLetter::load(&paths.events).quarantined();
+                let live: Vec<&serde_json::Value> = catchup
+                    .events
+                    .iter()
+                    .filter(|event| !quarantined.contains(&cursor::fingerprint(event)))
+                    .collect();
+                if !live.is_empty() {
+                    eprintln!("catching up {} new event(s)...", live.len());
+                    for event in live {
+                        db::apply_event(&conn, embedder, event)
+                            .with_context(|| format!("apply event (catch-up): {}", event))?;
+                    }
                 }
+                // T5b: `kb_meta` keys do NOT survive the rename — the tmp DB is
+                // fresh and receives only `schema_version` and
+                // `embed_text_mode`. Without writing the D3 cursor rows here,
+                // the first `recover_if_needed` after any rebuild takes the
+                // cursorless full-rebuild row and loops forever. The generation
+                // is read under this Phase-3 lock, which is the same lock
+                // compaction bumps it under.
+                let converged_len = catchup.committed_len.max(snapshot_byte_len);
+                cursor::write(
+                    &conn,
+                    &cursor::Cursor {
+                        generation: cursor::read_generation(&paths.events),
+                        offset: converged_len,
+                        tail_sha: cursor::tail_sha(&paths.events, converged_len)?,
+                    },
+                )?;
             }
             #[cfg(test)]
             let phase3_catchup_finished = std::time::Instant::now();
 
-            // Remove old WAL/SHM before rename. This is required: the tmp DB uses
-            // journal_mode=DELETE (no WAL), so if the old WAL files remain after
-            // the rename, new SQLite connections would attempt WAL recovery against
-            // the rebuilt DB, producing corruption or an error.
+            // C2/ADR-1: after the open split, readers no longer heal
+            // journal_mode, so C1/T5a must ensure the tmp DB is already in WAL
+            // mode before rename. If old WAL files remained here while tmp were
+            // still DELETE-mode, a new connection could recover against the
+            // wrong journal state and corrupt or reject the rebuilt DB.
+            //
+            // The D4 swap sequence. Each step is kill-point instrumented and the
+            // labels map one-for-one onto `RebuildProtocol.tla`'s `phase` values.
+            //
+            // Ordering safety, amended for the WAL-mode swap (was: unlink first,
+            // rename second, tmp in journal_mode=DELETE). The old argument leaned
+            // on the tmp being a DELETE-mode file: SQLite would then ignore any
+            // sidecar that survived the rename outright. The tmp is now renamed in
+            // WAL mode, because C2's `open_ro` drops `open_db`'s unconditional
+            // `PRAGMA journal_mode=WAL` and with it the self-heal that made a
+            // DELETE-mode swap survivable. With a WAL-headered file the header no
+            // longer ignores a stale sidecar, so the guarantee rests entirely on
+            // step 2: a zero-length `-wal` carries no valid header, recovery
+            // adopts no frames, and `walIndexRecover` rebuilds the stale `-shm`
+            // when no live holder remains. Steps 1-2 are therefore load-bearing,
+            // not belt-and-braces; step 5's unlink is only hygiene. Renaming
+            // before unlinking is also what keeps the name's committed WAL state
+            // covered by an atomic replacement at all times (T0b, CE4).
+            //
             // Safety (Linux): the per-request connection model means no MCP handler
             // holds a connection across the lock boundary, so no reader has the WAL
             // open when we unlink it. On Linux, any FD open at unlink time remains
             // valid (the inode persists until the last close), so this is safe even
             // if a reader opened just before the lock was acquired. fs::rename then
             // atomically replaces the DB file in one syscall.
+            //
+            // Safety, re-derived after C2/L1c: MCP's read entry points (`src/commands/mcp.rs`'s
+            // `handle_search`, `handle_kb_get`, and similar) open through
+            // `db::open_ro`, which is genuinely read-only (`PRAGMA
+            // query_only=ON`, no `ensure_schema` ALTERs, no peer sweep) and
+            // never takes `paths.lock`, by design — "reader" is no longer a
+            // misnomer for MCP's own read paths. Every MCP mutation now opens
+            // through `open_rw` and serializes on that same lock, which
+            // rebuild holds across this step.
+            //
+            // CLI readers now follow that same `open_ro` contract, and CLI
+            // mutations initialize or open under `paths.lock`. The bounded
+            // checkpoint retry remains necessary for an ordinary in-flight
+            // reader; a persistently busy DB aborts rather than swapping
+            // unsafely.
+            kill_point(KillPoint::SwapPreCheckpoint);
+
+            // Step 1: drain the live WAL under the flock, with a bounded retry.
+            let live_conn = checkpoint_live_db(&paths.db)?;
+            #[cfg(test)]
+            let phase3_checkpoint_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapPostCheckpoint);
+
+            // Step 2: the real gate. `wal_checkpoint(TRUNCATE)` reports
+            // (busy, log, checkpointed) = (0, 0, 0) for a successful truncation
+            // and for a no-op alike, so only the zero-length `-wal` proves the
+            // live DB file is self-contained. Do not weaken this check.
+            verify_live_wal_drained(&paths.db)?;
+
+            // Step 3: drop the live connection BEFORE the rename. SQLite's close
+            // path checkpoints and unlinks `<db>-wal` *by name*, so closing after
+            // the rename would act on the newly swapped-in DB's WAL instead.
+            drop(live_conn);
+            finalize_tmp_db(tmp.path())?;
+            kill_point(KillPoint::SwapPostTmpSync);
+
+            // Step 4: rename tmp over the live DB.
+            fs::rename(tmp.path(), &paths.db).with_context(|| "rename rebuilt DB into place")?;
+            tmp.disarm();
+            #[cfg(test)]
+            let phase3_rename_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapAfterRename);
+
+            // Step 5: hygiene — drop the sidecars the replaced inode left behind.
             let db_str = paths.db.to_string_lossy();
             let _ = fs::remove_file(format!("{}-wal", db_str));
             let _ = fs::remove_file(format!("{}-shm", db_str));
             #[cfg(test)]
             let phase3_unlink_finished = std::time::Instant::now();
-            fs::rename(tmp.path(), &paths.db).with_context(|| "rename rebuilt DB into place")?;
-            tmp.disarm();
+            kill_point(KillPoint::SwapAfterUnlink);
+
+            // Step 6: fsync the containing directory so the rename itself is
+            // durable, not just the bytes it points at.
+            sync_parent_dir(&paths.db)?;
+            #[cfg(test)]
+            let phase3_dir_sync_finished = std::time::Instant::now();
+            kill_point(KillPoint::SwapPostDirSync);
 
             #[cfg(test)]
             {
-                let phase3_rename_finished = std::time::Instant::now();
                 // The measured swap window is the complete Phase-3 flock lifetime,
                 // so release the guard before taking its final timestamp.
                 drop(_lock);
@@ -460,8 +661,10 @@ impl Rebuild {
                     sink.lock().unwrap().push(Phase3Timing {
                         lock_acquired: phase3_lock_acquired,
                         catchup_finished: phase3_catchup_finished,
-                        unlink_finished: phase3_unlink_finished,
+                        checkpoint_finished: phase3_checkpoint_finished,
                         rename_finished: phase3_rename_finished,
+                        unlink_finished: phase3_unlink_finished,
+                        dir_sync_finished: phase3_dir_sync_finished,
                         lock_released: phase3_lock_released,
                     });
                 }
@@ -537,6 +740,106 @@ fn sweep_dead_tmp_files(db_path: &Path, own_tmp: &Path) {
     }
 }
 
+/// D4 step 1: drain the live DB's WAL with `wal_checkpoint(TRUNCATE)`, retrying
+/// a bounded number of times while it reports busy, then aborting.
+///
+/// Returns the connection that performed the checkpoint so the caller can drop
+/// it at the exact point D4 requires (step 3, before the rename). Returns `None`
+/// when there is no live DB yet — the first rebuild has nothing to drain.
+///
+/// Aborting leaves the live DB untouched: nothing has been renamed or unlinked
+/// at this point, and the caller's `TmpDbGuard` removes the abandoned tmp.
+fn checkpoint_live_db(db_path: &Path) -> anyhow::Result<Option<rusqlite::Connection>> {
+    /// Bounded so a persistently busy live DB aborts instead of spinning under
+    /// the Phase-3 flock, which every writer is blocked on.
+    const ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    // `open_live_for_checkpoint` is a bare `Connection::open` with no
+    // `ensure_schema` ALTERs and no peer sweep — it must stay that way to
+    // satisfy the "rebuild swap precondition" invariant row in
+    // docs/src/lock-contract.md: while `paths.lock` is held across this
+    // connection (from here through `Rebuild::execute_with`'s rename), no
+    // other opener may write a WAL frame or take a second lock against the
+    // live DB, so the live database has no uncheckpointed frames at the
+    // rename step.
+    let conn = db::open_live_for_checkpoint(db_path)
+        .with_context(|| format!("open live DB {} for checkpoint", db_path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+
+    let mut last_busy = 0i64;
+    for attempt in 1..=ATTEMPTS {
+        let (busy, _log, _checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .with_context(|| format!("checkpoint live DB {}", db_path.display()))?;
+        if busy == 0 {
+            return Ok(Some(conn));
+        }
+        last_busy = busy;
+        if attempt < ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    anyhow::bail!(
+        "live DB {} could not be checkpointed after {ATTEMPTS} attempts (busy={last_busy}): \
+         another connection holds an open read or write transaction. The live DB is untouched \
+         and no swap was performed. Stop the concurrent readers/writers (the MCP server opens \
+         the DB outside the rebuild lock today) and re-run.",
+        db_path.display()
+    )
+}
+
+/// D4 step 2: prove the live DB file is self-contained.
+///
+/// `wal_checkpoint(TRUNCATE)` reports `(0, 0, 0)` both for a successful
+/// truncation and for a no-op, so its return value cannot distinguish them. A
+/// zero-length (or absent) `-wal` can: it carries no valid header, so recovery
+/// initialises an empty index and adopts no frames.
+fn verify_live_wal_drained(db_path: &Path) -> anyhow::Result<()> {
+    let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+    match fs::metadata(&wal) {
+        Ok(meta) => {
+            anyhow::ensure!(
+                meta.len() == 0,
+                "live WAL {} is {} bytes after the checkpoint — refusing to swap while it may \
+                 still hold committed frames",
+                wal.display(),
+                meta.len()
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("stat live WAL {}", wal.display())),
+    }
+}
+
+/// D4 step 3, tmp half: the tmp's last connection has just been dropped, so
+/// SQLite's clean close has already checkpointed and unlinked its sidecars.
+/// Assert that, then flush the file — after the rename it is the whole database.
+fn finalize_tmp_db(tmp_path: &Path) -> anyhow::Result<()> {
+    let raw = tmp_path.to_string_lossy().to_string();
+    let wal = PathBuf::from(format!("{raw}-wal"));
+    anyhow::ensure!(
+        !wal.exists(),
+        "rebuilt tmp DB still has a WAL sidecar at {} — refusing to rename a database whose \
+         frames are not in the file being renamed",
+        wal.display()
+    );
+    // The clean close removes this too; unlink defensively so a stray tmp-shm is
+    // never left behind by the rename, which only moves the DB file itself.
+    let _ = fs::remove_file(format!("{raw}-shm"));
+    fs::File::open(tmp_path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("fsync rebuilt DB {}", tmp_path.display()))?;
+    Ok(())
+}
+
 fn prefix_matches(events_path: &Path, byte_len: u64, expected: &[u8]) -> anyhow::Result<bool> {
     use std::io::Read;
     let Ok(file) = fs::File::open(events_path) else {
@@ -555,7 +858,7 @@ mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
-    use rusqlite::Connection;
+    use crate::crash_sim::KillPoint;
     use std::fs;
     use std::process::Command as Cmd;
     use std::thread;
@@ -601,10 +904,302 @@ mod tests {
     }
 
     fn count_entries(paths: &Paths) -> i64 {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap()
+    }
+
+    fn insert_expired_peer(paths: &Paths) {
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES('rebuild-peer-graph', 'dep', 'repo-a', '2024-01-01T00:00:00Z', '2000-01-01 00:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES(
+                'rebuild-peer-expired', 'rebuild-peer-graph', 'repo-a', 'repo-b', 'member',
+                '2024-01-01T00:00:00Z', '2000-01-01 00:00:00'
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    // ---------------------------------------------------------------- D4 swap
+    //
+    // The six kill points are exercised by re-executing this test binary as a
+    // child with KB_CRASH_AFTER set. Two children run per case: a seeder that
+    // materializes the log into the live DB and then exits *without* SQLite's
+    // close path, leaving committed frames in the live `-wal` exactly as a
+    // killed writer would, and the rebuild itself, which dies at the kill
+    // point. The parent then inspects the on-disk state with a plain
+    // `Connection::open` and no journal-mode pragma — the future `open_ro`.
+
+    /// Entries seeded into the log AND materialized into the live DB before the
+    /// swap runs.
+    const SWAP_SEEDED: u32 = 6;
+    /// Extra events appended to the log after the live DB was materialized, so
+    /// the pre-swap and post-swap databases have different contents. Without
+    /// this the two are indistinguishable and every kill-point assertion is
+    /// vacuous — a stale WAL adopted over the renamed file would still report
+    /// the expected rows.
+    const SWAP_APPENDED: u32 = 3;
+    const SWAP_TOTAL: u32 = SWAP_SEEDED + SWAP_APPENDED;
+
+    /// Runs in the re-executed child when `KB_SWAP_CRASH_ROLE` is set; returns
+    /// immediately in the parent so the same `#[test]` body serves both.
+    fn swap_crash_child_dispatch() {
+        let Ok(role) = std::env::var("KB_SWAP_CRASH_ROLE") else {
+            return;
+        };
+        let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+        let paths = Paths::from_root(Path::new(&root));
+        match role.as_str() {
+            "seed" => {
+                let (_, conn) = db::test_db(Path::new(&root));
+                for event in &events::read_events(&paths.events).unwrap().events {
+                    db::apply_event(&conn, &NoopEmbedder, event).unwrap();
+                }
+                // exit(0) skips destructors, so SQLite's close path never runs
+                // and the committed frames stay in the live `-wal`. Dropping the
+                // connection would checkpoint and unlink it, which is precisely
+                // the state the swap must not depend on.
+                std::process::exit(0);
+            }
+            "rebuild" => {
+                let result = Rebuild.execute_with(&paths, &NoopEmbedder);
+                panic!("child rebuild returned {result:?} without hitting the kill point");
+            }
+            other => panic!("unknown swap crash role {other:?}"),
+        }
+    }
+
+    fn spawn_swap_child(
+        dir: &Path,
+        test_name: &str,
+        role: &str,
+        kill: Option<KillPoint>,
+    ) -> Option<i32> {
+        let mut cmd = Cmd::new(std::env::current_exe().unwrap());
+        // libtest filters on the full test path, which is what `--exact` matches.
+        cmd.arg(format!("commands::rebuild::tests::{test_name}"))
+            .arg("--exact")
+            .arg("--nocapture")
+            .current_dir(dir)
+            .env("KB_SWAP_CRASH_ROLE", role)
+            .env("KB_CRASH_TEST_ROOT", dir);
+        if let Some(point) = kill {
+            cmd.env("KB_CRASH_AFTER", point.to_string());
+        }
+        cmd.status().unwrap().code()
+    }
+
+    /// Seeds the log, materializes a prefix of it into a live DB that still
+    /// carries an undrained `-wal`, appends more events, then crashes a rebuild
+    /// at `kill`.
+    ///
+    /// `expected` is `SWAP_SEEDED` for a kill before the rename and
+    /// `SWAP_TOTAL` after it: the DB a plain reader sees must be exactly one of
+    /// the two whole databases, never a mixture, and must never lose a row it
+    /// already held.
+    fn assert_swap_kill_leaves_self_contained_db(test_name: &str, kill: KillPoint, expected: u32) {
+        let (dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+
+        assert_eq!(
+            spawn_swap_child(dir.path(), test_name, "seed", None),
+            Some(0),
+            "seeding child must materialize the log into the live DB"
+        );
+        let wal = PathBuf::from(format!("{}-wal", paths.db.to_string_lossy()));
+        assert!(
+            wal.exists() && fs::metadata(&wal).unwrap().len() > 0,
+            "fixture must leave committed frames in the live WAL at {}",
+            wal.display()
+        );
+        for idx in SWAP_SEEDED..SWAP_TOTAL {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+
+        assert_eq!(
+            spawn_swap_child(dir.path(), test_name, "rebuild", Some(kill)),
+            Some(137),
+            "rebuild child must terminate at kill point {kill}"
+        );
+
+        // Plain open, no journal_mode pragma: this is what C2's open_ro will do.
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "a crash at {kill} must leave a structurally intact DB"
+        );
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let want: Vec<String> = (0..expected).map(|idx| format!("swap{idx}")).collect();
+        assert_eq!(
+            ids, want,
+            "a crash at {kill} must leave exactly the pre-swap or post-swap database, \
+             with every transaction it committed"
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_pre_checkpoint_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_pre_checkpoint_leaves_self_contained_db",
+            KillPoint::SwapPreCheckpoint,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_checkpoint_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_checkpoint_leaves_self_contained_db",
+            KillPoint::SwapPostCheckpoint,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_tmp_sync_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_tmp_sync_leaves_self_contained_db",
+            KillPoint::SwapPostTmpSync,
+            SWAP_SEEDED,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_rename_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_rename_leaves_self_contained_db",
+            KillPoint::SwapAfterRename,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_unlink_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_unlink_leaves_self_contained_db",
+            KillPoint::SwapAfterUnlink,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_kill_at_post_dir_sync_leaves_self_contained_db() {
+        swap_crash_child_dispatch();
+        assert_swap_kill_leaves_self_contained_db(
+            "test_swap_kill_at_post_dir_sync_leaves_self_contained_db",
+            KillPoint::SwapPostDirSync,
+            SWAP_TOTAL,
+        );
+    }
+
+    #[test]
+    fn test_swap_renames_wal_headered_db_readable_without_journal_pragma() {
+        let (_dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+
+        // Header bytes 18/19 are the write/read file format versions: 2 means
+        // WAL. This is the regression test for the self-heal C2's open_ro
+        // removes — nothing after the swap re-applies journal_mode=WAL.
+        let header = fs::read(&paths.db).unwrap();
+        assert_eq!(
+            (header[18], header[19]),
+            (2, 2),
+            "swapped-in DB must be WAL-headered, got file format versions {:?}",
+            (header[18], header[19])
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", paths.db.to_string_lossy()));
+            assert!(
+                !sidecar.exists(),
+                "swapped-in DB must have no {suffix} sidecar, found {}",
+                sidecar.display()
+            );
+        }
+
+        // Plain open, no pragmas at all: the future open_ro.
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, SWAP_SEEDED as i64);
+    }
+
+    #[test]
+    fn test_swap_aborts_cleanly_when_checkpoint_stays_busy() {
+        let (dir, paths) = setup_repo();
+        for idx in 0..SWAP_SEEDED {
+            events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
+        }
+        let (_, live) = db::test_db(&paths.root);
+        for event in &events::read_events(&paths.events).unwrap().events {
+            db::apply_event(&live, &NoopEmbedder, event).unwrap();
+        }
+
+        // A separate connection holding an open read transaction takes a WAL
+        // read mark, so wal_checkpoint(TRUNCATE) cannot reset the WAL and keeps
+        // reporting busy for as long as the transaction is open.
+        let reader = db::open_unchecked_for_test(&paths.db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let held: i64 = reader
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, SWAP_SEEDED as i64);
+
+        let error = Rebuild
+            .execute_with(&paths, &NoopEmbedder)
+            .expect_err("a persistently busy checkpoint must abort the rebuild");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not be checkpointed"),
+            "abort must name the checkpoint as the cause, got: {message}"
+        );
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            count_entries(&paths),
+            SWAP_SEEDED as i64,
+            "an aborted swap must leave the live DB untouched"
+        );
+        let leftovers: Vec<String> = fs::read_dir(paths.db.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".db.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an aborted swap must not leave tmp DB files behind, found {leftovers:?}"
+        );
+        drop(dir);
     }
 
     #[test]
@@ -635,21 +1230,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_rebuild_physically_removes_expired_peers() {
+        let (_dir, paths) = setup_repo();
+        let emb = NoopEmbedder;
+        db::open_or_init(&paths).unwrap();
+        fs::write(&paths.events, "").unwrap();
+        insert_expired_peer(&paths);
+
+        Rebuild.execute_with(&paths, &emb).unwrap();
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let peers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE id='rebuild-peer-expired'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(peers, 0, "rebuild must not leave expired peers behind");
+    }
+
     /// DB cleared (e.g. corrupted or missing) — rebuild reconstructs from event log.
     #[test]
     fn test_rebuild_restores_cleared_db() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..10u32 {
             let e = upsert(&format!("id{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
         assert_eq!(count_entries(&paths), 10);
 
         // Corrupt DB
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .execute("DELETE FROM entries", [])
             .unwrap();
@@ -660,7 +1277,7 @@ mod tests {
     }
 
     fn entry_content(paths: &Paths, id: &str) -> Option<String> {
-        Connection::open(&paths.db)
+        db::open_unchecked_for_test(&paths.db)
             .unwrap()
             .query_row(
                 "SELECT content FROM entries WHERE id=?1 AND is_stale=0",
@@ -749,12 +1366,22 @@ mod tests {
 
         let events_path = paths.events.clone();
         let attempts = run_with_phase2_mutation(&paths, move || {
-            let rewritten = format!(
-                "{}\n{}\n",
-                serde_json::to_string(&second).unwrap(),
-                serde_json::to_string(&first).unwrap()
-            );
-            fs::write(&events_path, rewritten).unwrap();
+            // Swap the two event lines in place, leaving the commit envelopes
+            // where they are, so the rewrite is byte-length-preserving under
+            // the D1 framing exactly as it was under the un-framed format.
+            let raw = fs::read_to_string(&events_path).unwrap();
+            let first_line = serde_json::to_string(&first).unwrap();
+            let second_line = serde_json::to_string(&second).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            let event_at: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l == first_line || **l == second_line)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(event_at.len(), 2, "expected both event lines in {raw}");
+            lines.swap(event_at[0], event_at[1]);
+            fs::write(&events_path, format!("{}\n", lines.join("\n"))).unwrap();
             assert_eq!(fs::metadata(&events_path).unwrap().len(), original_len);
         });
 
@@ -811,6 +1438,7 @@ mod tests {
     fn test_rebuild_with_concurrent_evidence_writes_converges() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         // Seed: 5 entries with explicit kind='observation' so evidence_add
         // triggers evidence_status updates (status != 'n/a').
@@ -823,7 +1451,7 @@ mod tests {
                 "ts": "2024-01-01T00:00:00Z"
             });
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path_a = paths.events.clone();
@@ -866,7 +1494,7 @@ mod tests {
             db::apply_event(&ref_conn, &emb, ev).unwrap();
         }
 
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<(String, String)> = live_conn
             .prepare("SELECT id, COALESCE(evidence_status,'n/a') FROM entries ORDER BY id")
@@ -934,11 +1562,12 @@ mod tests {
     fn test_rebuild_concurrent_writes_converge() {
         let (_dir, paths) = setup_repo();
         let emb = NoopEmbedder;
+        db::test_db(&paths.root);
 
         for i in 0..20u32 {
             let e = upsert(&format!("base{i}"), i);
             events::append_event(&paths.events, &e).unwrap();
-            db::apply_event(&db::open_db(&paths.db).unwrap(), &emb, &e).unwrap();
+            db::apply_event(&db::open_unchecked_for_test(&paths.db).unwrap(), &emb, &e).unwrap();
         }
 
         let events_path = paths.events.clone();
@@ -997,6 +1626,7 @@ mod tests {
 
         fn clone_paths(paths: &Paths) -> Paths {
             Paths {
+                root: paths.root.clone(),
                 lock: paths.lock.clone(),
                 events: paths.events.clone(),
                 db: paths.db.clone(),
@@ -1007,10 +1637,13 @@ mod tests {
         }
 
         fn seed(paths: &Paths, emb: &NoopEmbedder) {
+            // Through the applied-cursor writer, so the seeded repository is
+            // converged and the writers under test are not refused.
+            let lock = acquire_lock(&paths.lock).unwrap();
+            let conn = db::open_rw(paths, &lock).unwrap();
             for i in 0..SEEDED as u32 {
                 let event = upsert(&format!("seed{i}"), i);
-                events::append_event(&paths.events, &event).unwrap();
-                db::apply_event(&db::open_db(&paths.db).unwrap(), emb, &event).unwrap();
+                cursor::append_and_apply(&lock, &conn, paths, emb, &[event]).unwrap();
             }
         }
 
@@ -1134,16 +1767,24 @@ mod tests {
             .collect();
         let swap_window = phase3.lock_released.duration_since(phase3.lock_acquired);
         let catchup_time = phase3.catchup_finished.duration_since(phase3.lock_acquired);
-        let unlink_time = phase3
-            .unlink_finished
+        let checkpoint_time = phase3
+            .checkpoint_finished
             .duration_since(phase3.catchup_finished);
         let rename_time = phase3
             .rename_finished
+            .duration_since(phase3.checkpoint_finished);
+        let unlink_time = phase3
+            .unlink_finished
+            .duration_since(phase3.rename_finished);
+        let dir_sync_time = phase3
+            .dir_sync_finished
             .duration_since(phase3.unlink_finished);
         let dominant = [
             ("catch_up_replay", catchup_time),
-            ("wal_shm_unlink", unlink_time),
+            ("wal_checkpoint", checkpoint_time),
             ("rename", rename_time),
+            ("wal_shm_unlink", unlink_time),
+            ("dir_fsync", dir_sync_time),
         ]
         .into_iter()
         .max_by_key(|(_, duration)| *duration)
@@ -1215,9 +1856,11 @@ mod tests {
             },
             "phase3_subphases_ms": {
                 "catch_up_replay": ms(catchup_time),
-                "wal_shm_unlink": ms(unlink_time),
+                "wal_checkpoint": ms(checkpoint_time),
                 "rename": ms(rename_time),
-                "post_rename_lock_release": ms(phase3.lock_released.duration_since(phase3.rename_finished)),
+                "wal_shm_unlink": ms(unlink_time),
+                "dir_fsync": ms(dir_sync_time),
+                "post_swap_lock_release": ms(phase3.lock_released.duration_since(phase3.dir_sync_finished)),
                 "dominant": dominant
             },
             "overlap_evidence": {
@@ -1282,7 +1925,7 @@ mod tests {
         for ev in &all_events.events {
             db::apply_event(&ref_conn, emb.as_ref(), ev).unwrap();
         }
-        let live_conn = db::open_db(&paths.db).unwrap();
+        let live_conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         let live_entries: Vec<String> = live_conn
             .prepare("SELECT id FROM entries ORDER BY id")

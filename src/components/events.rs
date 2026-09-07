@@ -1,10 +1,397 @@
-//! Event log operations (JSONL append + read)
+//! Event log operations (JSONL append + read).
+//!
+//! # Line format (C1/D1)
+//!
+//! Every append — batch *and* single event — is wrapped in an in-band commit
+//! envelope:
+//!
+//! ```jsonl
+//! {"action":"batch_begin","batch_id":"<uuid>","n":3}
+//! … the 3 event lines, unchanged …
+//! {"action":"batch_commit","batch_id":"<uuid>","n":3}
+//! ```
+//!
+//! A span counts as committed only when its `batch_commit` line is present
+//! **and** newline-terminated. The reader rules are:
+//!
+//! | Log shape | Meaning |
+//! |---|---|
+//! | line outside any span (legacy log) | committed standalone event |
+//! | span with a newline-terminated `batch_commit` | all its events committed |
+//! | dangling `batch_begin` at EOF | uncommitted; dropped by every reader |
+//! | dangling `batch_begin` mid-log | hard error, never a silent drop |
+//! | `n` disagreeing with the observed line count | hard error |
+//!
+//! Marker lines are **not events**: they are consumed by the reader, never
+//! returned, never reach `apply_event`, and never counted by rebuild or
+//! compact. Logs written before this format contain no markers, so every one of
+//! their lines is standalone-committed and replays unchanged — there is no
+//! migration.
+//!
+//! Downgrading to a binary that predates the envelope: run `kb compact` first.
+//! Compact rewrites the log from the reader's output, which is marker-free by
+//! construction.
 
+use crate::crash_sim::{kill_point, KillPoint};
 use crate::models::Evidence;
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Read-byte-budget instrumentation for every event-log reader.
+///
+/// Confined to test targets: `measure_event_log_reads` is only compiled with
+/// `cfg(any(test, feature = "event-log-read-metrics"))`, which the crate
+/// enables on itself as a dev-dependency so integration tests (e.g.
+/// `tests/log_framing.rs`) can call it without the seam becoming permanent
+/// public API in the shipped `kb` binary. A plain `cargo build`/`cargo build
+/// --release` never activates this feature, so `MeasuredRead` compiles to
+/// the transparent, zero-cost pass-through below instead.
+mod read_metrics {
+    pub(super) struct MeasuredRead<R>(pub R);
+
+    #[cfg(any(test, feature = "event-log-read-metrics"))]
+    mod instrumented {
+        use super::MeasuredRead;
+        use std::cell::Cell;
+        use std::io::{Read, Seek, SeekFrom};
+
+        thread_local! {
+            static MEASURED_READ_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        }
+
+        impl<R: Read> Read for MeasuredRead<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.0.read(buf)?;
+                MEASURED_READ_BYTES.with(|total| {
+                    if let Some(before) = total.get() {
+                        total.set(Some(before + read as u64));
+                    }
+                });
+                Ok(read)
+            }
+        }
+
+        impl<R: Seek> Seek for MeasuredRead<R> {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+
+        /// Test-only seam returning the bytes read from event logs by `operation`.
+        #[doc(hidden)]
+        pub fn measure_event_log_reads<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+            MEASURED_READ_BYTES.with(|total| {
+                let previous = total.replace(Some(0));
+                let result = operation();
+                let measured = total.replace(previous).unwrap_or(0);
+                (result, measured)
+            })
+        }
+    }
+
+    #[cfg(not(any(test, feature = "event-log-read-metrics")))]
+    mod uninstrumented {
+        use super::MeasuredRead;
+        use std::io::{Read, Seek, SeekFrom};
+
+        impl<R: Read> Read for MeasuredRead<R> {
+            #[inline(always)]
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+
+        impl<R: Seek> Seek for MeasuredRead<R> {
+            #[inline(always)]
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "event-log-read-metrics"))]
+    pub use instrumented::measure_event_log_reads;
+}
+
+#[cfg(any(test, feature = "event-log-read-metrics"))]
+pub use read_metrics::measure_event_log_reads;
+use read_metrics::MeasuredRead;
+
+/// `action` value of the marker line that opens a commit span.
+pub const BATCH_BEGIN: &str = "batch_begin";
+/// `action` value of the marker line that closes a commit span.
+pub const BATCH_COMMIT: &str = "batch_commit";
+
+/// The log is deliberately marker-framed but otherwise unversioned.  A future
+/// schema that cannot be read by deployed binaries must change this constant
+/// as part of the same patch; the registry's const assertions make forgetting
+/// that transition a compile error.
+const WRITER_LOG_FORMAT_VERSION: Option<u16> = None;
+
+/// Whether a writer schema is safe for marker-less legacy readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterCompatibility {
+    LegacyCompatible,
+    RequiresLogFormat,
+}
+
+impl WriterCompatibility {
+    const fn requires_log_format(self) -> bool {
+        matches!(self, Self::RequiresLogFormat)
+    }
+}
+
+/// Closed description of one production event writer.
+///
+/// `payload_type` names the Rust-facing payload category at the writer
+/// boundary.  It is intentionally data rather than a reader constraint: old
+/// logs remain raw JSON and must continue to replay unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterSchema {
+    pub action: &'static str,
+    pub table: &'static str,
+    pub payload_version: u16,
+    pub payload_type: &'static str,
+    compatibility: WriterCompatibility,
+}
+
+impl WriterSchema {
+    pub const fn requires_log_format(&self) -> bool {
+        self.compatibility.requires_log_format()
+    }
+}
+
+macro_rules! writer_schema_registry {
+    ($(($action:literal, $table:literal, $version:expr, $payload:literal, $compat:ident)),+ $(,)?) => {
+        const WRITER_SCHEMAS: &[WriterSchema] = &[
+            $(WriterSchema {
+                action: $action,
+                table: $table,
+                payload_version: $version,
+                payload_type: $payload,
+                compatibility: WriterCompatibility::$compat,
+            }),+
+        ];
+
+        $(const _: () = {
+            assert!(
+                !WriterCompatibility::$compat.requires_log_format()
+                    || WRITER_LOG_FORMAT_VERSION.is_some(),
+                "a RequiresLogFormat writer schema needs an in-band log_format version"
+            );
+        };)+
+    };
+}
+
+// This is the only inventory production writers may target.  Keep the audit
+// batch records here: they are durable events even though they do not map to
+// the older entry/evidence/test-case tables.
+writer_schema_registry!(
+    ("upsert", "entries", 1, "EntryUpsert", LegacyCompatible),
+    ("expire", "entries", 1, "EntryExpire", LegacyCompatible),
+    (
+        "evidence_add",
+        "evidence",
+        1,
+        "EvidenceAdd",
+        LegacyCompatible
+    ),
+    (
+        "citation_healed",
+        "evidence",
+        1,
+        "CitationHealed",
+        LegacyCompatible
+    ),
+    (
+        "evidence_expire",
+        "evidence",
+        1,
+        "EvidenceExpire",
+        LegacyCompatible
+    ),
+    (
+        "upsert",
+        "test_cases",
+        1,
+        "TestCaseUpsert",
+        LegacyCompatible
+    ),
+    (
+        "insert",
+        "run_history",
+        1,
+        "RunHistoryInsert",
+        LegacyCompatible
+    ),
+    (
+        "audit_run_candidates_batch",
+        "audit_run_candidates",
+        1,
+        "AuditRunCandidatesBatch",
+        LegacyCompatible
+    ),
+    (
+        "audit_record_batch",
+        "audit_runs",
+        1,
+        "AuditRecordBatch",
+        LegacyCompatible
+    ),
+);
+
+/// Return the complete production writer schema inventory.
+pub fn writer_schema_registry() -> &'static [WriterSchema] {
+    WRITER_SCHEMAS
+}
+
+/// A JSON event admitted by the closed production writer registry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriterEvent(serde_json::Value);
+
+impl WriterEvent {
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+/// A compile-time writer payload identity.  The payload remains JSON on disk;
+/// these zero-sized types prevent a production call site from choosing an
+/// arbitrary action/table pair at runtime.
+pub trait WriterPayload {
+    const ACTION: &'static str;
+    const TABLE: &'static str;
+    const VERSION: u16;
+}
+
+macro_rules! writer_payload {
+    ($name:ident, $action:literal, $table:literal) => {
+        pub struct $name;
+        impl WriterPayload for $name {
+            const ACTION: &'static str = $action;
+            const TABLE: &'static str = $table;
+            const VERSION: u16 = 1;
+        }
+    };
+}
+
+writer_payload!(EntryUpsert, "upsert", "entries");
+writer_payload!(EntryExpire, "expire", "entries");
+writer_payload!(EvidenceAdd, "evidence_add", "evidence");
+writer_payload!(CitationHealed, "citation_healed", "evidence");
+writer_payload!(EvidenceExpire, "evidence_expire", "evidence");
+writer_payload!(TestCaseUpsert, "upsert", "test_cases");
+writer_payload!(RunHistoryInsert, "insert", "run_history");
+writer_payload!(
+    AuditRunCandidatesBatch,
+    "audit_run_candidates_batch",
+    "audit_run_candidates"
+);
+writer_payload!(AuditRecordBatch, "audit_record_batch", "audit_runs");
+
+/// Admit a production event under a compile-time payload identity.  Readers
+/// deliberately remain raw-JSON compatible, while every shipped writer gets
+/// one explicit schema/version/compatibility entry.
+pub fn writer_event<P: WriterPayload>(value: serde_json::Value) -> Result<WriterEvent> {
+    let Some(schema) = WRITER_SCHEMAS
+        .iter()
+        .find(|schema| schema.action == P::ACTION && schema.table == P::TABLE)
+    else {
+        anyhow::bail!(
+            "unregistered production event schema: {}:{}",
+            P::ACTION,
+            P::TABLE
+        );
+    };
+    if schema.payload_version != P::VERSION {
+        anyhow::bail!(
+            "writer payload version disagrees with registry for {}:{}",
+            P::ACTION,
+            P::TABLE
+        );
+    }
+    if value["action"].as_str() != Some(schema.action)
+        || value["table"].as_str() != Some(schema.table)
+    {
+        anyhow::bail!(
+            "writer event does not match registered schema {}:{}",
+            schema.action,
+            schema.table
+        );
+    }
+    Ok(WriterEvent(value))
+}
+
+macro_rules! writer_constructor {
+    ($name:ident, $payload:ty) => {
+        pub fn $name(value: serde_json::Value) -> Result<WriterEvent> {
+            writer_event::<$payload>(value)
+        }
+    };
+}
+
+writer_constructor!(entry_upsert, EntryUpsert);
+writer_constructor!(entry_expire, EntryExpire);
+writer_constructor!(evidence_add, EvidenceAdd);
+writer_constructor!(citation_healed, CitationHealed);
+writer_constructor!(evidence_expire, EvidenceExpire);
+writer_constructor!(test_case_upsert, TestCaseUpsert);
+writer_constructor!(run_history_insert, RunHistoryInsert);
+writer_constructor!(audit_run_candidates_batch, AuditRunCandidatesBatch);
+writer_constructor!(audit_record_batch, AuditRecordBatch);
+
+/// Canonical samples provide an executable, exhaustive corpus for the writer
+/// registry.  They are intentionally ordinary v1 JSON so this release does
+/// not add a `log_format` line or alter existing event bytes.
+pub fn writer_schema_samples() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"action":"upsert","table":"entries","id":"schema-entry","path":"schema.rs","summary":"schema","content":"registry sample","tags":[],"kind":"observation","evidence_status":"present","ts":"2024-01-01T00:00:00Z"}),
+        serde_json::json!({"action":"evidence_add","table":"evidence","entry_id":"schema-entry","evidence":{"id":"schema-evidence","entry_id":"schema-entry","kind":"code","citation_hash":"sha256:sample"},"version_ref":null,"ts":"2024-01-01T00:00:02Z"}),
+        serde_json::json!({"action":"citation_healed","table":"evidence","entry_id":"schema-entry","evidence_id":"schema-evidence","old_path":"old.rs","new_path":"new.rs","citation_hash":"sha256:sample","version_ref":null,"ts":"2024-01-01T00:00:03Z"}),
+        serde_json::json!({"action":"evidence_expire","table":"evidence","entry_id":"schema-entry","evidence_id":"schema-evidence","reason":"sample","ts":"2024-01-01T00:00:04Z"}),
+        serde_json::json!({"action":"upsert","table":"test_cases","id":"schema-test","app":"kb","name":"schema","protocol":"rust_tool","config":"{}","ts":"2024-01-01T00:00:05Z"}),
+        serde_json::json!({"action":"insert","table":"run_history","test_id":"schema-test","run_id":"schema-run","result":"pass","detail":"sample","adapter":"rust_tool","ts":"2024-01-01T00:00:06Z"}),
+        serde_json::json!({"action":"audit_run_candidates_batch","table":"audit_run_candidates","run_id":"schema-audit","caller_id":"schema-caller","created_at":"2024-01-01T00:00:07Z","ts":"2024-01-01T00:00:07Z","candidates":[{"entry_id":"schema-entry","arm":"uniform"}]}),
+        serde_json::json!({"action":"audit_record_batch","table":"audit_runs","run_id":"schema-audit","caller_id":"schema-caller","audited_at":"2024-01-01T00:00:08Z","ts":"2024-01-01T00:00:08Z","verdicts":[{"entry_id":"schema-entry","verdict":true,"note":"sample"}]}),
+        serde_json::json!({"action":"expire","table":"entries","id":"schema-entry","reason":"sample","ts":"2024-01-01T00:00:09Z"}),
+    ]
+}
+
+/// Build every canonical sample through its matching compile-time payload
+/// marker.  The match is deliberately exhaustive over the closed registry so
+/// a newly declared writer cannot obtain a sample by falling back to raw JSON.
+pub fn writer_schema_sample_events() -> Result<Vec<WriterEvent>> {
+    writer_schema_samples()
+        .into_iter()
+        .map(
+            |event| match (event["action"].as_str(), event["table"].as_str()) {
+                (Some("upsert"), Some("entries")) => entry_upsert(event),
+                (Some("expire"), Some("entries")) => entry_expire(event),
+                (Some("evidence_add"), Some("evidence")) => evidence_add(event),
+                (Some("citation_healed"), Some("evidence")) => citation_healed(event),
+                (Some("evidence_expire"), Some("evidence")) => evidence_expire(event),
+                (Some("upsert"), Some("test_cases")) => test_case_upsert(event),
+                (Some("insert"), Some("run_history")) => run_history_insert(event),
+                (Some("audit_run_candidates_batch"), Some("audit_run_candidates")) => {
+                    audit_run_candidates_batch(event)
+                }
+                (Some("audit_record_batch"), Some("audit_runs")) => audit_record_batch(event),
+                (action, table) => anyhow::bail!(
+                    "canonical sample has no typed writer payload: {}:{}",
+                    action.unwrap_or("<missing>"),
+                    table.unwrap_or("<missing>")
+                ),
+            },
+        )
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TornTail {
@@ -16,6 +403,36 @@ pub struct TornTail {
 pub struct ReadEvents {
     pub events: Vec<serde_json::Value>,
     pub torn_tail: Option<TornTail>,
+    /// Byte offset one past the end of the last committed record, excluding any
+    /// span left open at the tail.
+    ///
+    /// This is the only offset that may cross a process or phase boundary: no
+    /// span straddles it, so the bytes before it can never be reinterpreted by
+    /// bytes that arrive later (plan §4 Principle 3).
+    pub committed_len: u64,
+}
+
+/// Depth of event-log flocks held by this process.
+///
+/// The repair path truncates uncommitted spans, so its "a dangling begin is
+/// only ever at the tail" precondition is enforced rather than documented.
+static LOG_LOCK_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that this process acquired the event-log flock.
+pub fn note_log_lock_acquired() {
+    LOG_LOCK_DEPTH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Record that this process released the event-log flock.
+pub fn note_log_lock_released() {
+    let _ = LOG_LOCK_DEPTH.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+        Some(depth.saturating_sub(1))
+    });
+}
+
+/// Whether this process currently holds the event-log flock.
+pub fn log_lock_held() -> bool {
+    LOG_LOCK_DEPTH.load(Ordering::SeqCst) > 0
 }
 
 enum EventLineParseError {
@@ -109,43 +526,131 @@ pub fn evidence_expire_event(entry_id: &str, evidence_id: &str, reason: &str) ->
     })
 }
 
-/// Append multiple events to the JSONL log in one pass.
-///
-/// The caller must hold the flock before calling (same contract as
-/// [`append_event`]).  Each event is written as a separate `writeln!` to
-/// preserve the one-JSON-object-per-line invariant that `read_events` relies on.
-pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
-    if let Some(p) = events_path.parent() {
-        fs::create_dir_all(p)?;
-    }
-    repair_torn_tail_before_append(events_path)?;
-    let mut f = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(events_path)
-        .with_context(|| format!("open events {}", events_path.display()))?;
+/// Write one commit span: `batch_begin`, the event lines verbatim, `batch_commit`.
+fn write_span(f: &mut File, events: &[serde_json::Value]) -> Result<()> {
+    let batch_id = uuid::Uuid::new_v4().to_string();
+    let n = events.len();
+    let marker = |action: &str| {
+        serde_json::json!({ "action": action, "batch_id": batch_id, "n": n }).to_string()
+    };
+    writeln!(f, "{}", marker(BATCH_BEGIN))?;
     for event in events {
         writeln!(f, "{}", serde_json::to_string(event)?)?;
+        kill_point(KillPoint::AfterLogLine);
     }
+    writeln!(f, "{}", marker(BATCH_COMMIT))?;
+    kill_point(KillPoint::AfterCommitMarker);
     Ok(())
 }
 
-/// Append a single event to the JSONL log.
-pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<()> {
-    if let Some(p) = events_path.parent() {
-        fs::create_dir_all(p)?;
+/// Append multiple events to the JSONL log as one commit span.
+///
+/// The caller must hold the flock before calling. Nothing in the span is
+/// reader-accepted until its `batch_commit` line lands with its newline, so an
+/// interrupted append contributes zero events rather than a prefix.
+/// Returns the log's `committed_len` after the append: the span just written
+/// closed cleanly and everything before it was already committed, so it is the
+/// file length. The applied cursor (C1/D3) records exactly this value, and
+/// taking it from the writer keeps the cost of a write O(bytes appended)
+/// rather than O(log size).
+#[cfg(feature = "event-log-test-raw")]
+pub fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
+    append_events_batch_impl(events_path, events)
+}
+
+/// Internal raw append used by the typed writer boundary.  This remains crate
+/// visible in release builds so the format layer can serialize `WriterEvent`,
+/// but external callers only receive the raw `Value` API in test/benchmark
+/// builds where legacy and corruption fixtures need it.
+#[cfg(not(feature = "event-log-test-raw"))]
+pub(crate) fn append_events_batch(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
+    append_events_batch_impl(events_path, events)
+}
+
+fn append_events_batch_impl(events_path: &Path, events: &[serde_json::Value]) -> Result<u64> {
+    append_events_batch_with_sync(
+        events_path,
+        events,
+        File::sync_data,
+        crate::components::fsync::sync_dir,
+    )
+}
+
+/// Append registered production events without accepting raw JSON from the
+/// caller.  This is the event-log half of the typed writer boundary; the
+/// cursor half additionally applies the same batch and advances its cursor.
+pub fn append_writer_events_batch(events_path: &Path, events: &[WriterEvent]) -> Result<u64> {
+    let raw: Vec<serde_json::Value> = events
+        .iter()
+        .map(|event| event.as_value().clone())
+        .collect();
+    append_events_batch_impl(events_path, &raw)
+}
+
+/// Implementation seam used to prove sync ordering and failure behavior.
+fn append_events_batch_with_sync<S, D>(
+    events_path: &Path,
+    events: &[serde_json::Value],
+    mut sync_file: S,
+    mut sync_dir: D,
+) -> Result<u64>
+where
+    S: FnMut(&File) -> std::io::Result<()>,
+    D: FnMut(&Path) -> Result<()>,
+{
+    if events.is_empty() {
+        return Ok(read_events(events_path)?.committed_len);
     }
-    repair_torn_tail_before_append(events_path)?;
+    let file_was_created = !events_path.exists();
+    let parent = events_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_was_created = parent.is_some_and(|p| !p.exists());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    repair_uncommitted_tail_before_append(events_path)?;
     let mut f = OpenOptions::new()
         .append(true)
         .create(true)
         .open(events_path)
         .with_context(|| format!("open events {}", events_path.display()))?;
-    writeln!(f, "{}", serde_json::to_string(event)?)?;
-    Ok(())
+    write_span(&mut f, events)?;
+
+    // Do not retry a failed sync and then trust a later success: on Linux an
+    // fsync error may report and clear an earlier writeback error. Propagate the
+    // first failure so callers cannot proceed to any DB apply.
+    sync_file(&f).with_context(|| format!("sync event log {}", events_path.display()))?;
+
+    if file_was_created {
+        if let Some(parent) = parent {
+            sync_dir(parent)?;
+        }
+    }
+    if parent_was_created {
+        if let Some(grandparent) = parent.and_then(Path::parent) {
+            sync_dir(grandparent)?;
+        }
+    }
+    // "AfterSync" means the complete log durability boundary: data plus any
+    // directory entries created by this append are stable before DB apply.
+    kill_point(KillPoint::AfterSync);
+    Ok(f.metadata()?.len())
+}
+
+/// Append a single event to the JSONL log.
+///
+/// Single events are enveloped too. A lone `writeln!` is self-framing against a
+/// *crash*, but not against a *write error*: the body write can succeed and the
+/// newline write fail, and without a span the next append would classify that
+/// complete-JSON tail as reader-accepted and promote an event the caller
+/// reported as failed.
+#[cfg(feature = "event-log-test-raw")]
+pub fn append_event(events_path: &Path, event: &serde_json::Value) -> Result<u64> {
+    append_event_impl(events_path, event)
+}
+
+#[cfg(feature = "event-log-test-raw")]
+fn append_event_impl(events_path: &Path, event: &serde_json::Value) -> Result<u64> {
+    append_events_batch(events_path, std::slice::from_ref(event))
 }
 
 /// Preserve a torn final record using the event-log sidecar naming convention.
@@ -170,64 +675,521 @@ pub(crate) fn preserve_torn_tail(events_path: &Path, torn_tail: &[u8]) -> Result
     Ok(sidecar)
 }
 
-/// Repair an unterminated final record while the caller holds the event-log flock.
+/// Whether the uncommitted tail begins with a `batch_begin` marker.
+fn tail_opens_span(tail: &[u8]) -> bool {
+    let first = tail.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    matches!(parse_event_line(first), Ok(Some(value)) if value["action"] == BATCH_BEGIN)
+}
+
+/// Bytes scanned backwards when checking whether the log ends on an intact span.
+const TAIL_WINDOW: u64 = 64 * 1024;
+
+/// Upper bound on how far [`dangling_span_start`] grows its backward search
+/// for a `batch_begin` with no commit marker. A log with no framing at all —
+/// the shape `kb compact` produces — has no begin marker anywhere, so an
+/// uncapped search would grow to file start, re-parsing roughly the whole log
+/// from scratch at every doubling before giving up and falling back to the
+/// full scan anyway. A dangling span from an actual in-process batch is
+/// already outside what the append path can practically write in one shot
+/// once it passes this bound, so treating it as a full-scan case costs
+/// nothing real; an unframed multi-megabyte log is common (right after
+/// compact) and this is what keeps that case from paying for the search
+/// twice on top of the scan.
+const DANGLING_SPAN_SEARCH_CAP: u64 = TAIL_WINDOW * 8;
+
+/// `window_len` is always `<= len` and every caller reads it into one
+/// contiguous buffer; on a 32-bit target a log past `u32::MAX` bytes must
+/// hard-error here rather than let the cast silently truncate and
+/// desynchronize `start` from the bytes actually read.
+fn window_alloc_len(window_len: u64) -> Result<usize> {
+    usize::try_from(window_len).with_context(|| {
+        format!("events: a {window_len}-byte read window does not fit this platform's usize")
+    })
+}
+
+/// Whether the log ends on an intact, newline-terminated commit span.
 ///
-/// Classification intentionally matches [`read_events_up_to`]: valid UTF-8 that
-/// parses as a complete JSON value (or a line the reader skips as blank) is
-/// reader-accepted, so only its missing newline is appended. Invalid UTF-8 or
-/// incomplete JSON is preserved in a sidecar and truncated. Append must never
-/// destroy an event that the reader would already have accepted.
-fn repair_torn_tail_before_append(events_path: &Path) -> Result<()> {
+/// Every span this binary writes is appended to a log it has already scanned in
+/// full, so an intact closing span at end of file means `committed_len == len`
+/// without re-scanning. The suffix doubles until it contains the declared
+/// number of event lines and their begin marker. Non-framed tails return false;
+/// the caller separately recognizes a dangling final span before falling back
+/// to the full scan where the D7 hard errors live.
+///
+/// Accepting a span only checks its body lines for a *marker* conflict (an
+/// embedded `batch_begin`/`batch_commit`), the same as the pre-fix fixed
+/// window did for spans under 64 KiB — it does not re-validate that every
+/// body line is well-formed JSON. A malformed body line the reader would
+/// reject is not detected here; that is the full scan's job, and it is only
+/// reached for spans that fail this shortcut.
+fn ends_on_intact_span<R: Read + Seek>(file: &mut R, len: u64) -> Result<bool> {
+    let mut window_len = len.min(TAIL_WINDOW);
+    loop {
+        let start = len - window_len;
+        file.seek(SeekFrom::Start(start))?;
+        let mut window = vec![0_u8; window_alloc_len(window_len)?];
+        file.read_exact(&mut window)?;
+        if !window.ends_with(b"\n") {
+            return Ok(false);
+        }
+        let mut lines: Vec<&[u8]> = window[..window.len() - 1]
+            .split(|byte| *byte == b'\n')
+            .collect();
+        if start > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let Some(Ok(Some(commit))) = lines.last().map(|line| parse_event_line(line)) else {
+            return Ok(false);
+        };
+        if commit["action"] != BATCH_COMMIT {
+            return Ok(false);
+        }
+        let (Some(batch_id), Some(n)) = (commit["batch_id"].as_str(), commit["n"].as_u64()) else {
+            return Ok(false);
+        };
+        let Ok(n) = usize::try_from(n) else {
+            return Ok(false);
+        };
+        if lines.len() >= n.saturating_add(2) {
+            let begin_index = lines.len() - n - 2;
+            let body = &lines[begin_index + 1..lines.len() - 1];
+            if body.iter().any(|line| {
+                matches!(parse_event_line(line), Ok(Some(value))
+                    if value["action"] == BATCH_BEGIN || value["action"] == BATCH_COMMIT)
+            }) {
+                return Ok(false);
+            }
+            let Ok(Some(begin)) = parse_event_line(lines[begin_index]) else {
+                return Ok(false);
+            };
+            return Ok(begin["action"] == BATCH_BEGIN
+                && begin["batch_id"].as_str() == Some(batch_id)
+                && begin["n"].as_u64() == Some(n as u64));
+        }
+        if start == 0 {
+            return Ok(false);
+        }
+        window_len = len.min(window_len.saturating_mul(2));
+    }
+}
+
+/// Locate a structurally valid final span whose commit marker is missing.
+fn dangling_span_start<R: Read + Seek>(file: &mut R, len: u64) -> Result<Option<u64>> {
+    let mut window_len = len.min(TAIL_WINDOW);
+    loop {
+        let start = len - window_len;
+        file.seek(SeekFrom::Start(start))?;
+        let mut window = vec![0_u8; window_alloc_len(window_len)?];
+        file.read_exact(&mut window)?;
+        let skip = if start == 0 {
+            0
+        } else {
+            window
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(window.len(), |i| i + 1)
+        };
+        let complete_start = start + skip as u64;
+        let mut offset = complete_start;
+        let mut parsed = Vec::new();
+        for line in window[skip..].split_inclusive(|byte| *byte == b'\n') {
+            let content = line.strip_suffix(b"\n").unwrap_or(line);
+            parsed.push((offset, content));
+            offset += line.len() as u64;
+        }
+        if parsed.last().is_some_and(|(_, line)| line.is_empty()) {
+            parsed.pop();
+        }
+        for (index, (begin_offset, line)) in parsed.iter().enumerate().rev() {
+            let Ok(Some(begin)) = parse_event_line(line) else {
+                continue;
+            };
+            if begin["action"] != BATCH_BEGIN {
+                continue;
+            }
+            // A missing *or empty* batch_id is the same hard error
+            // `marker_batch_id` gives the full scan — fall through to it
+            // rather than accepting the span here.
+            if begin["batch_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let Some(n) = begin["n"].as_u64().and_then(|n| usize::try_from(n).ok()) else {
+                return Ok(None);
+            };
+            // Redundant with the caller's `ends_on_intact_span(file, start)`
+            // recheck on the candidate's own prefix, which also catches an
+            // earlier begin lying outside this window — kept here so the
+            // common in-window case never pays for a second seek-and-read.
+            let preceding_marker = parsed[..index].iter().rev().find_map(|(_, line)| {
+                let Ok(Some(value)) = parse_event_line(line) else {
+                    return None;
+                };
+                match value["action"].as_str() {
+                    Some(BATCH_BEGIN) => Some(BATCH_BEGIN),
+                    Some(BATCH_COMMIT) => Some(BATCH_COMMIT),
+                    _ => None,
+                }
+            });
+            if preceding_marker == Some(BATCH_BEGIN) {
+                return Ok(None);
+            }
+            let body = &parsed[index + 1..];
+            if body.iter().any(|(_, line)| {
+                matches!(parse_event_line(line), Ok(Some(value))
+                    if value["action"] == BATCH_BEGIN || value["action"] == BATCH_COMMIT)
+            }) {
+                return Ok(None);
+            }
+            // Blank lines never count toward a span's arity — same rule
+            // `scan_events` applies inside an open span. A non-newline-
+            // terminated, unparsable final chunk may be the partially
+            // written commit marker; like `scan_events`, do not count that
+            // torn chunk as an event line either.
+            let non_blank = body
+                .iter()
+                .filter(|(_, line)| !matches!(parse_event_line(line), Ok(None)))
+                .count();
+            let body_len = non_blank
+                - usize::from(
+                    !window.ends_with(b"\n")
+                        && body
+                            .last()
+                            .is_some_and(|(_, line)| parse_event_line(line).is_err()),
+                );
+            anyhow::ensure!(
+                body_len <= n,
+                "events: batch declared {n} event(s) but observed more before EOF"
+            );
+            return Ok(Some(*begin_offset));
+        }
+        if start == 0 || window_len >= DANGLING_SPAN_SEARCH_CAP {
+            return Ok(None);
+        }
+        window_len = len.min(window_len.saturating_mul(2));
+    }
+}
+
+/// Drop everything past `committed_len` while the caller holds the event-log flock.
+///
+/// Two shapes of uncommitted tail exist and they are repaired differently:
+///
+/// * **A dangling span.** It was never reader-accepted, so truncating it is
+///   sufficient and safe, and the sidecar must never block that: on ENOSPC — a
+///   motivating fault for this whole change — a preserve-then-truncate order
+///   would leave the dangling span in place. The sidecar is best-effort here.
+/// * **A torn final line outside any span** (a legacy log, or a log this binary
+///   has never appended to). Unchanged behaviour: valid UTF-8 that parses as a
+///   complete JSON value is already reader-accepted and only needs its newline;
+///   anything else is preserved in a sidecar and truncated.
+///
+/// The scan hard-errors on a mid-log dangling `batch_begin` or an `n` mismatch,
+/// so a skewed-binary log stops the append loudly instead of being repaired
+/// into something lossy.
+fn repair_uncommitted_tail_before_append(events_path: &Path) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(events_path)
         .with_context(|| format!("open events {} for tail repair", events_path.display()))?;
     let len = file.metadata()?.len();
     if len == 0 {
         return Ok(());
     }
-
-    file.seek(SeekFrom::End(-1))?;
-    let mut last = [0_u8; 1];
-    file.read_exact(&mut last)?;
-    if last[0] == b'\n' {
+    if ends_on_intact_span(&mut MeasuredRead(&mut file), len)? {
         return Ok(());
     }
 
-    const SCAN_CHUNK: u64 = 8192;
-    let mut cursor = len;
-    let mut tail_start = 0_u64;
-    let mut scan = vec![0_u8; SCAN_CHUNK as usize];
-    while cursor > 0 {
-        let start = cursor.saturating_sub(SCAN_CHUNK);
-        let count = (cursor - start) as usize;
-        file.seek(SeekFrom::Start(start))?;
-        file.read_exact(&mut scan[..count])?;
-        if let Some(offset) = scan[..count].iter().rposition(|byte| *byte == b'\n') {
-            tail_start = start + offset as u64 + 1;
+    let dangling_start = dangling_span_start(&mut MeasuredRead(&mut file), len)?;
+    let trusted_dangling_start = match dangling_start {
+        Some(0) => Some(0),
+        Some(start) if ends_on_intact_span(&mut MeasuredRead(&mut file), start)? => Some(start),
+        _ => None,
+    };
+    if let Some(committed_len) = trusted_dangling_start {
+        file.seek(SeekFrom::Start(committed_len))?;
+        let mut tail = Vec::with_capacity((len - committed_len) as usize);
+        MeasuredRead(&mut file).read_to_end(&mut tail)?;
+        if !log_lock_held() {
+            anyhow::bail!("events: refusing to truncate the uncommitted span in {} without the event-log flock — every log-writing call site must hold it", events_path.display());
+        }
+        match preserve_torn_tail(events_path, &tail) {
+            Ok(sidecar) => eprintln!("events: WARNING truncated an uncommitted span ({} bytes) from {}, preserved in {}", tail.len(), events_path.display(), sidecar.display()),
+            Err(error) => eprintln!("events: WARNING truncated an uncommitted span ({} bytes) from {}; sidecar not written: {error}", tail.len(), events_path.display()),
+        }
+        file.set_len(committed_len)?;
+        return Ok(());
+    }
+
+    let committed_len = read_events(events_path)?.committed_len;
+    if committed_len < len {
+        file.seek(SeekFrom::Start(committed_len))?;
+        let mut tail = Vec::with_capacity((len - committed_len) as usize);
+        MeasuredRead(&mut file).read_to_end(&mut tail)?;
+        if tail_opens_span(&tail) {
+            if !log_lock_held() {
+                anyhow::bail!(
+                    "events: refusing to truncate the uncommitted span in {} without the \
+                     event-log flock — every log-writing call site must hold it",
+                    events_path.display()
+                );
+            }
+            match preserve_torn_tail(events_path, &tail) {
+                Ok(sidecar) => eprintln!(
+                    "events: WARNING truncated an uncommitted span ({} bytes) from {}, preserved in {}",
+                    tail.len(),
+                    events_path.display(),
+                    sidecar.display()
+                ),
+                Err(error) => eprintln!(
+                    "events: WARNING truncated an uncommitted span ({} bytes) from {}; \
+                     sidecar not written: {error}",
+                    tail.len(),
+                    events_path.display()
+                ),
+            }
+            file.set_len(committed_len)?;
+        } else {
+            let sidecar = preserve_torn_tail(events_path, &tail)?;
+            file.set_len(committed_len)?;
+            eprintln!(
+                "events: WARNING preserved torn final record ({} bytes) to {} and truncated {} before append",
+                tail.len(),
+                sidecar.display(),
+                events_path.display()
+            );
+        }
+    }
+
+    // What survives may end on a reader-accepted record that never got its
+    // newline. Give it one so the next span starts on its own line.
+    let end = file.metadata()?.len();
+    if end > 0 {
+        file.seek(SeekFrom::Start(end - 1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+/// A span held open while its event lines accumulate.
+struct OpenSpan {
+    batch_id: String,
+    n: usize,
+    line: usize,
+    pending: Vec<serde_json::Value>,
+}
+
+/// Result of one span-aware scan, with `committed` relative to where the scan started.
+struct SpanScan {
+    events: Vec<serde_json::Value>,
+    torn_tail: Option<TornTail>,
+    committed: u64,
+}
+
+fn marker_n(value: &serde_json::Value, action: &str, line: usize) -> Result<usize> {
+    value["n"]
+        .as_u64()
+        .map(|n| n as usize)
+        .ok_or_else(|| anyhow::anyhow!("events line {line}: {action} marker has no integer n"))
+}
+
+fn marker_batch_id(value: &serde_json::Value, action: &str, line: usize) -> Result<String> {
+    let id = value["batch_id"].as_str().unwrap_or_default();
+    if id.is_empty() {
+        anyhow::bail!("events line {line}: {action} marker has no batch_id");
+    }
+    Ok(id.to_string())
+}
+
+/// Read events, honouring the D1 commit envelope.
+///
+/// Stops once `max` committed events have been collected and no span is open,
+/// so a limit can never split a span.
+fn scan_events<R: BufRead>(mut reader: R, max: usize) -> Result<SpanScan> {
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    let mut open: Option<OpenSpan> = None;
+    let mut committed = 0_u64;
+    let mut offset = 0_u64;
+    let mut line = 0_usize;
+    let mut buf = Vec::new();
+
+    loop {
+        if events.len() >= max && open.is_none() {
             break;
         }
-        cursor = start;
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        line += 1;
+        offset += read as u64;
+        let record_end = offset;
+        let has_newline = buf.ends_with(b"\n");
+        let chunk = if has_newline {
+            &buf[..buf.len() - 1]
+        } else {
+            buf.as_slice()
+        };
+        let torn_tail = || TornTail {
+            line,
+            bytes: chunk.to_vec(),
+        };
+
+        let parsed = match parse_event_line(chunk) {
+            Ok(parsed) => parsed,
+            // A torn final chunk. Any span still open is uncommitted and dropped.
+            Err(EventLineParseError::Utf8(_) | EventLineParseError::Json(_)) if !has_newline => {
+                return Ok(SpanScan {
+                    events,
+                    torn_tail: Some(torn_tail()),
+                    committed,
+                });
+            }
+            Err(EventLineParseError::Utf8(e)) => {
+                return Err(e).with_context(|| format!("decode events line {line}"));
+            }
+            Err(EventLineParseError::Json(e)) => {
+                return Err(e).with_context(|| format!("parse events line {line}"));
+            }
+        };
+
+        let Some(value) = parsed else {
+            // Blank lines are skipped and never count toward a span's arity.
+            if open.is_none() {
+                committed = record_end;
+            }
+            continue;
+        };
+
+        match value["action"].as_str() {
+            Some(BATCH_BEGIN) => {
+                if let Some(previous) = &open {
+                    anyhow::bail!(
+                        "events line {line}: batch_begin while the span opened at line {} is still \
+                         open — a mid-log dangling batch_begin is never dropped silently; run \
+                         `kb compact` under this binary to produce a marker-free log",
+                        previous.line
+                    );
+                }
+                open = Some(OpenSpan {
+                    batch_id: marker_batch_id(&value, BATCH_BEGIN, line)?,
+                    n: marker_n(&value, BATCH_BEGIN, line)?,
+                    line,
+                    pending: Vec::new(),
+                });
+            }
+            Some(BATCH_COMMIT) => {
+                let Some(span) = open.take() else {
+                    anyhow::bail!(
+                        "events line {line}: batch_commit without a matching batch_begin"
+                    );
+                };
+                let batch_id = marker_batch_id(&value, BATCH_COMMIT, line)?;
+                if batch_id != span.batch_id {
+                    anyhow::bail!(
+                        "events line {line}: batch_commit batch_id {batch_id:?} does not match the \
+                         batch_begin at line {} ({:?})",
+                        span.line,
+                        span.batch_id
+                    );
+                }
+                let declared = marker_n(&value, BATCH_COMMIT, line)?;
+                if declared != span.n || span.pending.len() != span.n {
+                    anyhow::bail!(
+                        "events line {line}: span n mismatch — batch_begin at line {} declared \
+                         n={}, batch_commit declared n={declared}, {} event line(s) observed",
+                        span.line,
+                        span.n,
+                        span.pending.len()
+                    );
+                }
+                if !has_newline {
+                    // The commit marker never got its newline: the span is uncommitted.
+                    return Ok(SpanScan {
+                        events,
+                        torn_tail: None,
+                        committed,
+                    });
+                }
+                events.extend(span.pending);
+                committed = record_end;
+            }
+            _ => match open.as_mut() {
+                Some(span) => {
+                    if span.pending.len() >= span.n {
+                        anyhow::bail!(
+                            "events line {line}: span n mismatch — batch_begin at line {} declared \
+                             n={} but a further event line follows",
+                            span.line,
+                            span.n
+                        );
+                    }
+                    span.pending.push(value);
+                }
+                None => {
+                    events.push(value);
+                    committed = record_end;
+                }
+            },
+        }
     }
 
-    file.seek(SeekFrom::Start(tail_start))?;
-    let mut bytes = Vec::with_capacity((len - tail_start) as usize);
-    file.read_to_end(&mut bytes)?;
-    if parse_event_line(&bytes).is_ok() {
-        file.write_all(b"\n")?;
-        return Ok(());
+    // A span still open at EOF was never committed: drop it.
+    Ok(SpanScan {
+        events,
+        torn_tail: None,
+        committed,
+    })
+}
+
+fn empty_read() -> ReadEvents {
+    ReadEvents {
+        events: vec![],
+        torn_tail: None,
+        committed_len: 0,
     }
-    let sidecar = preserve_torn_tail(events_path, &bytes)?;
-    file.set_len(tail_start)?;
-    eprintln!(
-        "events: WARNING preserved torn final record ({} bytes) to {} and truncated {} before append",
-        bytes.len(),
-        sidecar.display(),
-        events_path.display()
-    );
-    Ok(())
+}
+
+/// The log's `committed_len` without materializing its events.
+///
+/// Takes the same intact-span shortcut the append path does: a log this binary
+/// has already appended to ends on a closed span, so `committed_len` is the
+/// file length and no scan is needed. A structurally valid dangling final span
+/// similarly yields its begin offset. Legacy or otherwise ambiguous tails fall
+/// through to the full span-aware scan, which is also where the D7 hard errors
+/// live.
+///
+/// The applied-cursor write guard calls this on every write, so the shortcut is
+/// what keeps a write O(bytes appended) instead of O(log size).
+pub fn committed_len(events_path: &Path) -> Result<u64> {
+    if !events_path.exists() {
+        return Ok(0);
+    }
+    let mut file = File::open(events_path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    if ends_on_intact_span(&mut MeasuredRead(&mut file), len)? {
+        return Ok(len);
+    }
+    if let Some(start) = dangling_span_start(&mut MeasuredRead(&mut file), len)? {
+        if start == 0 || ends_on_intact_span(&mut MeasuredRead(&mut file), start)? {
+            return Ok(start);
+        }
+    }
+    Ok(read_events(events_path)?.committed_len)
 }
 
 /// Read all events from a JSONL file.
@@ -235,154 +1197,125 @@ pub fn read_events(events_path: &Path) -> Result<ReadEvents> {
     read_events_up_to(events_path, usize::MAX)
 }
 
-/// Read complete events beginning at a known JSONL record boundary.
-///
-/// Rebuild records this byte offset while holding the event-log flock and
-/// verifies the bytes before it have not changed before using this reader.
-pub fn read_events_from_offset(events_path: &Path, offset: u64) -> Result<ReadEvents> {
-    if !events_path.exists() {
-        return Ok(ReadEvents {
-            events: vec![],
-            torn_tail: None,
-        });
-    }
-    let mut f = File::open(events_path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    read_events_from_reader(BufReader::new(f))
-}
-
 /// Read at most `max` complete events from a JSONL file.
 ///
-/// This function stops only when `max` events have been collected or EOF is
-/// reached. The "snapshot" guarantee used by Phase 2 of rebuild comes from the
-/// caller passing the Phase-1 `snapshot_len` while holding the flock, not from
-/// any byte-offset coordination inside this reader.
-///
-/// Soundness assumption: [`append_event`] and [`append_events_batch`] write the
-/// serialized JSON bytes first and then the trailing newline to an unbuffered
-/// `File`. A crash can therefore truncate only the final unterminated chunk; it
-/// cannot produce a newline-terminated-but-partial JSON record in the middle of
-/// the log.
+/// The limit is applied only at span boundaries, so it can never expose a
+/// partially-committed batch.
 pub fn read_events_up_to(events_path: &Path, max: usize) -> Result<ReadEvents> {
     if !events_path.exists() {
-        return Ok(ReadEvents {
-            events: vec![],
-            torn_tail: None,
-        });
+        return Ok(empty_read());
     }
-    let f = File::open(events_path)?;
-    let mut reader = BufReader::new(f);
-    let mut events = Vec::new();
-    let mut buf = Vec::new();
-    let mut line = 0usize;
-
-    loop {
-        if events.len() >= max {
-            break;
-        }
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
-        }
-        line += 1;
-        let has_newline = buf.ends_with(b"\n");
-        let chunk = if has_newline {
-            &buf[..buf.len() - 1]
-        } else {
-            buf.as_slice()
-        };
-        let torn_tail = || TornTail {
-            line,
-            bytes: chunk.to_vec(),
-        };
-        let event = match parse_event_line(chunk) {
-            Ok(event) => event,
-            Err(EventLineParseError::Utf8(_)) if !has_newline => {
-                return Ok(ReadEvents {
-                    events,
-                    torn_tail: Some(torn_tail()),
-                });
-            }
-            Err(EventLineParseError::Utf8(e)) => {
-                return Err(e).with_context(|| format!("decode events line {line}"));
-            }
-            Err(EventLineParseError::Json(_)) if !has_newline => {
-                return Ok(ReadEvents {
-                    events,
-                    torn_tail: Some(torn_tail()),
-                });
-            }
-            Err(EventLineParseError::Json(e)) => {
-                return Err(e).with_context(|| format!("parse events line {line}"));
-            }
-        };
-        if let Some(event) = event {
-            events.push(event);
-        }
-    }
+    let file = File::open(events_path)?;
+    let scan = scan_events(BufReader::new(MeasuredRead(file)), max)?;
     Ok(ReadEvents {
-        events,
-        torn_tail: None,
+        events: scan.events,
+        torn_tail: scan.torn_tail,
+        committed_len: scan.committed,
     })
 }
 
-fn read_events_from_reader<R: BufRead>(mut reader: R) -> Result<ReadEvents> {
-    let mut events = Vec::new();
+/// Read the byte prefix `[0, len)` of the log.
+///
+/// `len` must be a [`ReadEvents::committed_len`] value: no span straddles such
+/// an offset, so the prefix is self-interpreting and the events it yields are
+/// exactly the ones the snapshot saw.
+pub fn read_events_prefix(events_path: &Path, len: u64) -> Result<ReadEvents> {
+    if !events_path.exists() {
+        return Ok(empty_read());
+    }
+    let file = File::open(events_path)?;
+    let scan = scan_events(BufReader::new(MeasuredRead(file).take(len)), usize::MAX)?;
+    Ok(ReadEvents {
+        events: scan.events,
+        torn_tail: scan.torn_tail,
+        committed_len: scan.committed,
+    })
+}
+
+/// Byte offset of the first line at or after `from` that the reader cannot
+/// parse.
+///
+/// `None` when every line parses — the read may still have failed structurally
+/// (a mid-log dangling `batch_begin`, an `n` mismatch), which is a property of
+/// the span rather than of one line, and the caller then names the boundary it
+/// started from instead.
+///
+/// Used to point an operator at the damage rather than at the whole log.
+pub fn first_unreadable_offset(events_path: &Path, from: u64) -> Option<u64> {
+    let mut file = File::open(events_path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut reader = BufReader::new(MeasuredRead(file));
+    let mut offset = from;
     let mut buf = Vec::new();
-    let mut line = 0usize;
     loop {
         buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            break;
+        let read = reader.read_until(b'\n', &mut buf).ok()?;
+        if read == 0 {
+            return None;
         }
-        line += 1;
         let has_newline = buf.ends_with(b"\n");
         let chunk = if has_newline {
             &buf[..buf.len() - 1]
         } else {
             buf.as_slice()
         };
-        let torn_tail = || TornTail {
-            line,
-            bytes: chunk.to_vec(),
-        };
-        let event = match parse_event_line(chunk) {
-            Ok(event) => event,
-            Err(EventLineParseError::Utf8(_)) if !has_newline => {
-                return Ok(ReadEvents {
-                    events,
-                    torn_tail: Some(torn_tail()),
-                });
-            }
-            Err(EventLineParseError::Utf8(e)) => {
-                return Err(e).with_context(|| format!("decode events line {line}"));
-            }
-            Err(EventLineParseError::Json(_)) if !has_newline => {
-                return Ok(ReadEvents {
-                    events,
-                    torn_tail: Some(torn_tail()),
-                });
-            }
-            Err(EventLineParseError::Json(e)) => {
-                return Err(e).with_context(|| format!("parse events line {line}"));
-            }
-        };
-        if let Some(event) = event {
-            events.push(event);
+        // A torn final chunk is the ordinary uncommitted tail, not damage.
+        if parse_event_line(chunk).is_err() && has_newline {
+            return Some(offset);
+        }
+        offset += read as u64;
+    }
+}
+
+/// Read complete events beginning at a known committed boundary.
+///
+/// Rebuild records this byte offset while holding the event-log flock and
+/// verifies the bytes before it have not changed before using this reader. The
+/// offset must be a span boundary: an offset inside a span would hide the
+/// span's `batch_begin` and its remaining lines would read as standalone
+/// committed events, which is exactly the half-applied batch this format
+/// exists to prevent. Both halves of that are rejected — a non-record-boundary
+/// offset here, and an unmatched `batch_commit` in the scan.
+pub fn read_events_from_offset(events_path: &Path, offset: u64) -> Result<ReadEvents> {
+    if !events_path.exists() {
+        return Ok(empty_read());
+    }
+    let mut file = File::open(events_path)?;
+    let len = file.metadata()?.len();
+    if offset >= len {
+        return Ok(ReadEvents {
+            events: vec![],
+            torn_tail: None,
+            committed_len: offset,
+        });
+    }
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut previous = [0_u8; 1];
+        MeasuredRead(&mut file).read_exact(&mut previous)?;
+        if previous[0] != b'\n' {
+            anyhow::bail!(
+                "read_events_from_offset: {offset} is not a record boundary in {}",
+                events_path.display()
+            );
         }
     }
+    file.seek(SeekFrom::Start(offset))?;
+    let scan = scan_events(BufReader::new(MeasuredRead(file)), usize::MAX)?;
     Ok(ReadEvents {
-        events,
-        torn_tail: None,
+        events: scan.events,
+        torn_tail: scan.torn_tail,
+        committed_len: offset + scan.committed,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
+    use std::io;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     fn torn_sidecars(dir: &Path) -> Vec<PathBuf> {
@@ -396,6 +1329,114 @@ mod tests {
                     .is_some_and(|name| name.starts_with("events.jsonl.torn-"))
             })
             .collect()
+    }
+
+    #[test]
+    fn test_append_sync_precedes_caller_apply() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let sync_order = Rc::clone(&order);
+
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "ordered"})],
+            move |_| {
+                sync_order.borrow_mut().push("sync_data");
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        // This represents the first operation the caller may perform after a
+        // successful append; the append cannot return before the sync hook.
+        order.borrow_mut().push("apply_event");
+
+        assert_eq!(&*order.borrow(), &["sync_data", "apply_event"]);
+    }
+
+    #[test]
+    fn test_sync_failure_returns_once_and_caller_applies_nothing() {
+        let dir = tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        let sync_attempts = Rc::new(RefCell::new(0));
+        let attempts = Rc::clone(&sync_attempts);
+        let mut db_writes = 0;
+
+        let append = append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "sync-fail"})],
+            move |_| {
+                *attempts.borrow_mut() += 1;
+                Err(io::Error::other("injected sync failure"))
+            },
+            |_| Ok(()),
+        );
+        if append.is_ok() {
+            db_writes += 1;
+        }
+
+        assert!(append.unwrap_err().to_string().contains("sync event log"));
+        assert_eq!(
+            *sync_attempts.borrow(),
+            1,
+            "sync failure must not be retried"
+        );
+        assert_eq!(db_writes, 0, "a failed sync must prevent every DB write");
+    }
+
+    #[test]
+    fn test_directory_syncs_only_for_created_file_or_directory() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join(".state");
+        fs::create_dir(&state).unwrap();
+        let log_dir = state.join("agent-kb");
+        let events_path = log_dir.join("events.jsonl");
+
+        let synced = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "first"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*synced.borrow(), &[log_dir.clone(), state.clone()]);
+
+        synced.borrow_mut().clear();
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "second"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            synced.borrow().is_empty(),
+            "existing entries need no directory sync"
+        );
+
+        fs::remove_file(&events_path).unwrap();
+        let record = Rc::clone(&synced);
+        append_events_batch_with_sync(
+            &events_path,
+            &[serde_json::json!({"action": "upsert", "id": "recreated"})],
+            |_| Ok(()),
+            move |path| {
+                record.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*synced.borrow(), &[log_dir]);
     }
 
     #[test]
@@ -650,6 +1691,98 @@ mod tests {
 
         let err = read_events(&events_path).unwrap_err();
         assert!(err.to_string().contains("decode events line 2"));
+    }
+
+    // -----------------------------------------------------------------
+    // Crash harness (T1a). `kill_point` is armed by `cfg(test)`, which only
+    // holds inside the library's own test build — these must live here, not in
+    // an integration test, or the child never dies.
+    // -----------------------------------------------------------------
+
+    fn crash_log(root: &str) -> PathBuf {
+        Path::new(root).join("events.jsonl")
+    }
+
+    fn spawn_crash_child(test_name: &str, case: &str, root: &Path, kill: KillPoint) -> Option<i32> {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test_name)
+            .arg("--nocapture")
+            .current_dir(root)
+            .env("KB_CRASH_TEST_CASE", case)
+            .env("KB_CRASH_TEST_ROOT", root)
+            .env("KB_CRASH_AFTER", kill.to_string())
+            .status()
+            .unwrap()
+            .code()
+    }
+
+    fn is_crash_child(case: &str) -> bool {
+        std::env::var("KB_CRASH_TEST_CASE").ok().as_deref() == Some(case)
+    }
+
+    fn crash_upsert(id: &str) -> serde_json::Value {
+        serde_json::json!({"action": "upsert", "table": "entries", "id": id})
+    }
+
+    #[test]
+    fn test_crash_mid_batch_leaves_zero_reader_accepted_events() {
+        if is_crash_child("mid-batch") {
+            let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+            append_events_batch(
+                &crash_log(&root),
+                &[crash_upsert("m0"), crash_upsert("m1"), crash_upsert("m2")],
+            )
+            .unwrap();
+            panic!("child append returned without hitting the configured kill point");
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        fs::write(&path, format!("{}\n", crash_upsert("pre-existing"))).unwrap();
+        let committed_before = read_events(&path).unwrap().committed_len;
+
+        let code = spawn_crash_child(
+            "test_crash_mid_batch_leaves_zero_reader_accepted_events",
+            "mid-batch",
+            dir.path(),
+            KillPoint::AfterLogLine,
+        );
+        assert_eq!(code, Some(137), "the child must die at the kill point");
+
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("m0"), "the partial span must be on disk");
+        let read = read_events(&path).unwrap();
+        assert_eq!(
+            read.events,
+            vec![crash_upsert("pre-existing")],
+            "no event of the interrupted batch may be reader-accepted"
+        );
+        assert_eq!(read.committed_len, committed_before);
+    }
+
+    #[test]
+    fn test_crash_after_commit_marker_leaves_the_whole_batch_committed() {
+        if is_crash_child("after-commit") {
+            let root = std::env::var("KB_CRASH_TEST_ROOT").unwrap();
+            append_events_batch(&crash_log(&root), &[crash_upsert("c0"), crash_upsert("c1")])
+                .unwrap();
+            panic!("child append returned without hitting the configured kill point");
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+
+        let code = spawn_crash_child(
+            "test_crash_after_commit_marker_leaves_the_whole_batch_committed",
+            "after-commit",
+            dir.path(),
+            KillPoint::AfterCommitMarker,
+        );
+        assert_eq!(code, Some(137), "the child must die at the kill point");
+
+        let read = read_events(&path).unwrap();
+        assert_eq!(read.events, vec![crash_upsert("c0"), crash_upsert("c1")]);
+        assert_eq!(read.committed_len, fs::metadata(&path).unwrap().len());
     }
 
     #[test]

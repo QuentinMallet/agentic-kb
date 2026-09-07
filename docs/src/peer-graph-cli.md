@@ -78,3 +78,26 @@ Usage: `kb peers import peer-seeds/<slug>.json` from machines_conf via `agentic-
 Per-query override: `kb search --dep-depth N` to use N instead of the config default.
 
 **Note:** epic-type edges are never auto-included in search; they exist only for explicit inspection via `kb peers edge list --epic-slug <slug>`.
+
+## Verification order under federation
+
+With `--peers` or `--reachable-from`, evidence verification is not applied
+per repository during retrieval. `Search::execute_with` zeroes
+`inline_verify_k` before running each repository's local search, merges and
+truncates the combined results to `--limit`, and only then calls
+`db::verify_search_entries` once against the final, already-selected result
+set. Each entry is verified against its own `origin_repo` rather than the
+local root, so a peer's evidence is checked against that peer's working
+tree. See "Federation (Multi-Peer Search)" in `docs/src/search-tuning.md`
+and the federated exception noted in `docs/decisions/s5-search-caps-packet.md`.
+
+A peer is read through `db::open_ro_peer`, which opens with `immutable=1` so
+that it cannot write a single byte of the peer's files, and therefore reads
+the peer's database as of its last checkpoint and ignores any write-ahead log.
+Since `reembed` defers its checkpoints (see the reembed rows in
+`docs/src/lock-contract.md`), a peer that ran `kb reembed` and crashed before
+its drain, or whose drain failed and warned, presents an undrained log at rest.
+Federated search silently omits that run's rows until the peer's next local
+write, drain, or `kb rebuild` checkpoints it. Accepted: federated results are
+best-effort and never the sole source of truth, and the omission is a missing
+row rather than a wrong one.

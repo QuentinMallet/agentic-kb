@@ -1,5 +1,6 @@
 //! `peers` subcommand — manage peer repo graph edges
 
+use crate::commands::add::acquire_lock;
 use crate::components::db;
 use crate::config;
 use abscissa_core::{Command, Runnable};
@@ -7,6 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use rusqlite::params;
 use serde_json::json;
+use std::io::{self, Write};
 
 // ---------------------------------------------------------------------------
 // Top-level enum
@@ -30,32 +32,41 @@ pub enum Peers {
     Edge(PeersEdge),
 }
 
+impl Peers {
+    pub(crate) fn mutates(&self) -> bool {
+        match self {
+            Peers::Add(_) => true,
+            Peers::List(_) => false,
+            Peers::Remove(_) => true,
+            Peers::Show(_) => false,
+            Peers::Import(_) => true,
+            Peers::Edge(cmd) => cmd.mutates(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Detect the source repo path from the DB path or fall back to cwd.
+/// The source repo identity used to key peer graph edges.
 ///
-/// Convention: db lives at `<repo>/.state/agent-kb/agent-kb.db` (or via the
-/// `agent-kb/` symlink). Walking two parents from the db file therefore gives
-/// the repo root. We prefer the git-reported toplevel when available so the
-/// path is canonical.
-fn detect_source_repo(db_path: &std::path::Path) -> String {
-    // Try git first — most reliable canonical path.
-    if let Some(root) = config::git_repo_root() {
-        return root.to_string_lossy().to_string();
+/// Always `paths.root` -- the same layout-aware repository root the MCP
+/// port uses for `handle_kb_peers_add` -- rather than a CWD-based
+/// `config::git_repo_root()` git subprocess (which could disagree, e.g.
+/// inside a managed `.state` git worktree) or an unconditional two-parent
+/// walk from the db path (wrong for the legacy layout). One repository must
+/// register under one identity regardless of whether it's addressed from
+/// the CLI or the port.
+fn detect_source_repo(paths: &config::Paths) -> String {
+    paths.root.to_string_lossy().to_string()
+}
+
+fn maybe_sweep_expired_peers(conn: &rusqlite::Connection, did_mutate: bool) -> anyhow::Result<()> {
+    if did_mutate {
+        db::sweep_expired_peers(conn)?;
     }
-    // Fall back to walking up from the DB path.
-    db_path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -97,8 +108,9 @@ impl PeersAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
-        let source_repo = detect_source_repo(&paths.db);
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
+        let source_repo = detect_source_repo(&paths);
         let now = chrono::Utc::now().to_rfc3339();
 
         // Compute optional expires_at via SQLite datetime arithmetic.
@@ -160,6 +172,7 @@ impl PeersAdd {
                 expires_at,
             ],
         )?;
+        maybe_sweep_expired_peers(&conn, true)?;
 
         println!("{peer_id}");
         Ok(())
@@ -190,11 +203,30 @@ impl Runnable for PeersList {
 impl PeersList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
-        let source_repo = detect_source_repo(&paths.db);
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
+
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let source_repo = detect_source_repo(paths);
 
         let rows = query_peers_for_repo(&conn, &source_repo, self.graph_type.as_deref())?;
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
@@ -222,15 +254,17 @@ impl Runnable for PeersRemove {
 impl PeersRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
-        conn.execute("DELETE FROM peers WHERE id=?1", params![self.peer_id])?;
+        let deleted = conn.execute("DELETE FROM peers WHERE id=?1", params![self.peer_id])?;
 
         // Delete orphaned graphs (graphs with no remaining peer edges).
         conn.execute(
             "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
             [],
         )?;
+        maybe_sweep_expired_peers(&conn, deleted > 0)?;
 
         Ok(())
     }
@@ -259,7 +293,26 @@ impl Runnable for PeersShow {
 impl PeersShow {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
+
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         // Try as-is and canonicalized path.
         let canonical = std::fs::canonicalize(&self.repo_path)
@@ -283,7 +336,7 @@ impl PeersShow {
             rows.extend(canon_rows);
         }
 
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
@@ -297,13 +350,17 @@ fn query_peers_for_repo(
     source_repo: &str,
     graph_type_filter: Option<&str>,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let sql = "SELECT p.id, p.source_repo, p.target_repo, \
-               g.graph_type, p.epic_slug, p.created_at, p.expires_at \
-               FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
-               WHERE p.source_repo = ?1 \
-               AND (?2 IS NULL OR g.graph_type = ?2)";
+    let sql = format!(
+        "SELECT p.id, p.source_repo, p.target_repo, \
+         g.graph_type, p.epic_slug, p.created_at, p.expires_at \
+         FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+         WHERE p.source_repo = ?1 \
+         AND {} \
+         AND (?2 IS NULL OR g.graph_type = ?2)",
+        db::live_peer_predicate("p"),
+    );
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![source_repo, graph_type_filter], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -336,12 +393,16 @@ fn query_peers_by_either_repo(
     conn: &rusqlite::Connection,
     repo_path: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let sql = "SELECT p.id, p.source_repo, p.target_repo, \
-               g.graph_type, p.epic_slug, p.created_at, p.expires_at \
-               FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
-               WHERE p.source_repo = ?1 OR p.target_repo = ?1";
+    let sql = format!(
+        "SELECT p.id, p.source_repo, p.target_repo, \
+         g.graph_type, p.epic_slug, p.created_at, p.expires_at \
+         FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+         WHERE (p.source_repo = ?1 OR p.target_repo = ?1) \
+         AND {}",
+        db::live_peer_predicate("p"),
+    );
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![repo_path], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -427,7 +488,8 @@ impl PeersImport {
         let entries: Vec<PeerSeedEntry> = serde_json::from_slice(&file_bytes)
             .with_context(|| format!("parse seeds file: {}", self.seeds_file))?;
 
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut added = 0usize;
 
@@ -436,7 +498,8 @@ impl PeersImport {
                 anyhow::bail!("--type must be 'epic' or 'dep', got '{}'", entry.graph_type);
             }
 
-            // Skip if this peer edge already exists.
+            // Waiver site 6: duplicate suppression must see expired-but-
+            // present rows too because the peers table has no UNIQUE constraint.
             let existing: Option<String> = conn
                 .query_row(
                     "SELECT id FROM peers WHERE source_repo=?1 AND target_repo=?2 \
@@ -510,6 +573,7 @@ impl PeersImport {
             )?;
             added += 1;
         }
+        maybe_sweep_expired_peers(&conn, added > 0)?;
 
         // Write stamp file so re-runs are skipped.
         fs::write(&stamp_path, "")?;
@@ -534,6 +598,17 @@ pub enum PeersEdge {
     Remove(PeersEdgeRemove),
     /// Delete all edges for an epic slug and orphan-clean graphs
     CleanupEpic(PeersEdgeCleanupEpic),
+}
+
+impl PeersEdge {
+    fn mutates(&self) -> bool {
+        match self {
+            PeersEdge::Add(_) => true,
+            PeersEdge::List(_) => false,
+            PeersEdge::Remove(_) => true,
+            PeersEdge::CleanupEpic(_) => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +653,8 @@ impl PeersEdgeAdd {
         }
 
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let expires_at: Option<String> = if let Some(days) = self.ttl_days {
@@ -639,6 +715,7 @@ impl PeersEdgeAdd {
                 expires_at,
             ],
         )?;
+        maybe_sweep_expired_peers(&conn, true)?;
 
         println!("{peer_id}");
         Ok(())
@@ -669,41 +746,29 @@ impl Runnable for PeersEdgeList {
 impl PeersEdgeList {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        self.execute_with(&paths, &mut stdout.lock(), &mut stderr.lock())
+    }
 
-        let sql = "SELECT p.id, p.source_repo, p.target_repo, \
-                   g.graph_type, p.epic_slug, p.created_at, p.expires_at \
-                   FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
-                   WHERE (?1 IS NULL OR p.epic_slug = ?1)";
+    pub fn execute_with<W: Write, E: Write>(
+        &self,
+        paths: &config::Paths,
+        out: &mut W,
+        err: &mut E,
+    ) -> anyhow::Result<()> {
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => conn,
+            Err(e) if db::is_db_uninitialized(&e) => {
+                writeln!(err, "{}", db::uninitialized_note(&paths.db))?;
+                writeln!(out, "[]")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let rows = query_peer_edges(&conn, self.epic_slug.as_deref())?;
 
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![self.epic_slug], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-            ))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, src, tgt, gtype, slug, created, expires) = row?;
-            out.push(serde_json::json!({
-                "id": id,
-                "source_repo": src,
-                "target_repo": tgt,
-                "graph_type": gtype,
-                "epic_slug": slug,
-                "created_at": created,
-                "expires_at": expires,
-            }));
-        }
-
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
         Ok(())
     }
 }
@@ -731,15 +796,17 @@ impl Runnable for PeersEdgeRemove {
 impl PeersEdgeRemove {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
-        conn.execute("DELETE FROM peers WHERE id=?1", params![self.edge_id])?;
+        let deleted = conn.execute("DELETE FROM peers WHERE id=?1", params![self.edge_id])?;
 
         // Delete orphaned graphs (graphs with no remaining peer edges).
         conn.execute(
             "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
             [],
         )?;
+        maybe_sweep_expired_peers(&conn, deleted > 0)?;
 
         Ok(())
     }
@@ -768,15 +835,17 @@ impl Runnable for PeersEdgeCleanupEpic {
 impl PeersEdgeCleanupEpic {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
-        let conn = db::open_db(&paths.db)?;
+        let lock = acquire_lock(&paths.lock)?;
+        let conn = db::open_rw(&paths, &lock)?;
 
-        conn.execute("DELETE FROM peers WHERE epic_slug = ?1", params![self.slug])?;
+        let deleted = conn.execute("DELETE FROM peers WHERE epic_slug = ?1", params![self.slug])?;
 
         // Delete orphaned graphs (graphs with no remaining peer edges).
         conn.execute(
             "DELETE FROM graphs WHERE id NOT IN (SELECT DISTINCT graph_id FROM peers WHERE graph_id IS NOT NULL)",
             [],
         )?;
+        maybe_sweep_expired_peers(&conn, deleted > 0)?;
 
         Ok(())
     }
@@ -788,14 +857,107 @@ impl PeersEdgeCleanupEpic {
 
 use rusqlite::OptionalExtension;
 
+fn query_peer_edges(
+    conn: &rusqlite::Connection,
+    epic_slug: Option<&str>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let sql = format!(
+        "SELECT p.id, p.source_repo, p.target_repo, \
+         g.graph_type, p.epic_slug, p.created_at, p.expires_at \
+         FROM peers p LEFT JOIN graphs g ON p.graph_id = g.id \
+         WHERE {} AND (?1 IS NULL OR p.epic_slug = ?1)",
+        db::live_peer_predicate("p"),
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![epic_slug], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, src, tgt, gtype, slug, created, expires) = row?;
+        out.push(json!({
+            "id": id,
+            "source_repo": src,
+            "target_repo": tgt,
+            "graph_type": gtype,
+            "epic_slug": slug,
+            "created_at": created,
+            "expires_at": expires,
+        }));
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::components::db;
+    use crate::config::Paths;
     use rusqlite::params;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command as Cmd;
+    use tempfile::tempdir;
+
+    struct CwdGuard(PathBuf);
+
+    impl CwdGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let orig = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self(orig)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn setup_repo() -> (tempfile::TempDir, Paths) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init", "-b", "master"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "T"],
+        ] {
+            Cmd::new("git")
+                .args(&args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+        }
+        fs::write(root.join("README"), "init").unwrap();
+        Cmd::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Cmd::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        (dir, paths)
+    }
 
     // Helper: insert a graph + peer edge directly into an in-memory DB.
     fn insert_peer(
@@ -824,6 +986,17 @@ mod tests {
         .unwrap();
 
         peer_id
+    }
+
+    fn insert_peer_row(
+        conn: &rusqlite::Connection,
+        source: &str,
+        target: &str,
+        graph_type: &str,
+        epic_slug: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> String {
+        insert_peer(conn, source, target, graph_type, epic_slug, expires_at)
     }
 
     #[test]
@@ -894,6 +1067,129 @@ mod tests {
             )
             .unwrap();
         assert_eq!(s2_count, 1, "s2 edge must survive s1 cleanup");
+    }
+
+    #[test]
+    fn test_peers_read_helpers_filter_expired_rows_without_deleting_them() {
+        let (_dir, paths) = setup_repo();
+        db::open_or_init(&paths).unwrap();
+        let root = paths
+            .db
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let canonical_root = std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let target_repo = "/tmp/peer-live";
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+
+        insert_peer_row(
+            &conn,
+            &canonical_root,
+            "/tmp/peer-expired",
+            "epic",
+            Some("ttl"),
+            Some("2000-01-01 00:00:00"),
+        );
+        insert_peer_row(
+            &conn,
+            &canonical_root,
+            target_repo,
+            "epic",
+            Some("ttl"),
+            None,
+        );
+
+        let list_rows = query_peers_for_repo(&conn, &canonical_root, None).unwrap();
+        assert_eq!(list_rows.len(), 1, "list must hide the expired peer");
+        assert_eq!(list_rows[0]["target_repo"], target_repo);
+
+        let show_rows = query_peers_by_either_repo(&conn, &canonical_root).unwrap();
+        assert_eq!(show_rows.len(), 1, "show must hide the expired peer");
+        assert_eq!(show_rows[0]["target_repo"], target_repo);
+
+        let edge_rows = query_peer_edges(&conn, None).unwrap();
+        assert_eq!(edge_rows.len(), 1, "edge-list must hide the expired peer");
+        assert_eq!(edge_rows[0]["target_repo"], target_repo);
+
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 2,
+            "the expired peer must remain physically present until a locked sweep deletes it"
+        );
+    }
+
+    #[test]
+    fn test_peers_import_skips_expired_but_present_duplicate() {
+        let (_dir, paths) = setup_repo();
+        let root = paths
+            .db
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let canonical_root = std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _cwd = CwdGuard::set(root);
+        db::open_or_init(&paths).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+
+        insert_peer_row(
+            &conn,
+            &canonical_root,
+            "/tmp/existing-peer",
+            "dep",
+            Some("seed-slug"),
+            Some("2000-01-01 00:00:00"),
+        );
+        drop(conn);
+
+        let seeds_file = paths
+            .db
+            .parent()
+            .unwrap()
+            .join("expired-duplicate-seeds.json");
+        fs::write(
+            &seeds_file,
+            serde_json::to_vec(&serde_json::json!([{
+                "source_repo": canonical_root,
+                "target_repo": "/tmp/existing-peer",
+                "graph_type": "dep",
+                "epic_slug": "seed-slug"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        PeersImport {
+            seeds_file: seeds_file.to_string_lossy().to_string(),
+        }
+        .execute()
+        .unwrap();
+
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM peers WHERE target_repo='/tmp/existing-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "duplicate suppression must treat an expired-but-present peer as already existing"
+        );
     }
 
     #[test]

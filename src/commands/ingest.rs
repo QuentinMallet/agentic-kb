@@ -123,7 +123,7 @@ impl Ingest {
         // Construct embedder without env::set_var.
         // Directive: env::set_var is unsafe in Rust 2024 — never reintroduce.
         let embedder = add::make_embedder_with_opts(&paths, self.no_embed);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with(&paths, embedder.as_ref())
     }
 }
@@ -151,8 +151,7 @@ fn split_sections(text: &str) -> Vec<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-        let is_heading = hashes >= 1
-            && hashes <= 3
+        let is_heading = (1..=3).contains(&hashes)
             && trimmed.len() > hashes
             && trimmed.as_bytes().get(hashes) == Some(&b' ');
 
@@ -287,9 +286,9 @@ fn advance_char_boundary(s: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::db;
     use crate::components::embedder::NoopEmbedder;
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
 
@@ -370,7 +369,7 @@ mod tests {
         };
         ingest.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='docs/test.md' AND is_stale=0",
@@ -418,7 +417,7 @@ mod tests {
         };
         ingest.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='docs/legacy.md' AND is_stale=0",
@@ -501,7 +500,7 @@ mod tests {
                 version_ref: Some("sha-a".to_string()),
             };
             ingest.execute_with(&paths, &embedder).unwrap();
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path='docs/a.md' AND is_stale=0",
@@ -532,7 +531,7 @@ mod tests {
                 version_ref: Some("sha-b".to_string()),
             };
             ingest.execute_with(&paths, &embedder).unwrap();
-            let conn = Connection::open(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM entries WHERE path='docs/b.md' AND is_stale=0",

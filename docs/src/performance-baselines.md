@@ -2,6 +2,11 @@
 
 `agentic-kb` keeps two benchmark lanes for interactive performance.
 
+The write-lane (`kb add`) baseline and its acceptance gate live separately in
+`docs/benchmarks/write-path-baseline.md`, re-baselined 2026-09-07 after the D2
+fdatasync-ordering fix retired the earlier absolute 90.5 ms / 95.5 ms figures
+in favor of a like-for-like ratio gate.
+
 ## Why Two Lanes
 
 Criterion is the attribution lane. It isolates in-process components, keeps stable per-component history, and makes regression continuity possible across optimization work. The relevant benches here are `bench_interactive_surfaces` and `bench_search_vs_size`.
@@ -88,6 +93,11 @@ Model cache requirement:
 - `scripts/bench-interactive.sh` exports `FASTEMBED_CACHE_PATH` before running the hybrid lane.
 - The intended cache is the repo-local `.fastembed-cache`; the harness also checks the sibling repository root when invoked from a worktree.
 - `src/config.rs:275` honors `FASTEMBED_CACHE_PATH` first, so the benchmark lane uses that cache instead of falling back to `$HOME/.cache/fastembed`.
+
+Write lane specifics:
+
+- Since bd-21ef.1.19, `kb-bench-fixture` seeds every fixture in framed batches through the event-log writer, so the database and its event log converge on disk. Only the write lane depends on this: `kb add` refuses to write against a database whose event log is missing or behind.
+- Each write-lane Hyperfine sample runs against a fresh copy of the seeded fixture; `--prepare` copies the whole fixture directory so the database and its event-log/cursor sidecars travel together as one unit.
 
 ### Criterion attribution lane
 

@@ -220,7 +220,7 @@ fn read_digest_hash(paths: &config::Paths, kb_path: &str) -> Result<String> {
     use crate::components::db;
     use rusqlite::params;
 
-    let conn = db::open_db(&paths.db)?;
+    let conn = db::open_ro(&paths.db)?;
     let row: Option<String> = conn
         .query_row(
             "SELECT tags FROM entries WHERE path=?1 AND is_stale=0 ORDER BY created_at DESC LIMIT 1",
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(outcome.turns_processed, 5);
         assert!(!outcome.skipped_no_change);
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE path='sessions/test-sess-basic/digest' AND is_stale=0",

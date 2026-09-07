@@ -21,9 +21,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-#[cfg(not(target_os = "linux"))]
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum file size allowed for verification: 64 MiB.
 /// Per D3 (2026-09-02), whole-file citations use this as their only size cap;
@@ -51,7 +52,16 @@ pub const MIN_EXCERPT_BYTES: usize = 64;
 pub const MIN_EXCERPT_LINES: usize = 2;
 
 /// Directory names never descended into during a repo-wide relocation search.
-const EXCLUDED_DIRS: [&str; 3] = [".git", "target", "node_modules"];
+///
+/// `.state` holds the KB's own managed files (`agent-kb.db`,
+/// `agent-kb-events.jsonl`, ...) on the canonical layout; `agent-kb` holds
+/// the same files directly at the repository root on the tolerated legacy
+/// layout (`<root>/agent-kb/agent-kb.db`, no `.state` wrapper). Both store
+/// every recorded `citation_excerpt` verbatim as row/event data. Without
+/// these exclusions a repo-wide scan matches its own database as a second
+/// "candidate" location for any excerpt the KB has ever recorded, turning a
+/// legitimate unique relocation into a false `NonUnique`.
+const EXCLUDED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".state", "agent-kb"];
 
 /// How hard to look for a citation whose hash no longer matches.
 ///
@@ -79,6 +89,8 @@ pub enum UnverifiedReason {
     MalformedCitationPath,
     /// `citation_path` escapes the repo root.
     PathEscape,
+    /// A component of `citation_path` is a symbolic link.
+    SymlinkPathRejected,
     /// No file at `citation_path`.
     FileMissing,
     /// Cited byte range lies outside the file.
@@ -115,6 +127,7 @@ impl UnverifiedReason {
             UnverifiedReason::MissingCitationPath => "missing_citation_path",
             UnverifiedReason::MalformedCitationPath => "malformed_citation",
             UnverifiedReason::PathEscape => "path_escape",
+            UnverifiedReason::SymlinkPathRejected => "symlink_path_rejected",
             UnverifiedReason::FileMissing => "file_missing",
             UnverifiedReason::RangeOutOfBounds => "range_out_of_bounds",
             UnverifiedReason::FileTooLarge => "file_too_large",
@@ -177,26 +190,40 @@ impl VerificationOutcome {
 /// Safely join `rel` onto `repo_root`, rejecting any path that escapes the root.
 ///
 /// Rejects: absolute paths, any `..` / root / prefix components.
-/// Canonicalizes both sides and verifies containment.
-/// Returns `None` on any rejection or I/O error during canonicalization.
+/// Walks existing components without following symbolic links.
+/// Returns `None` on any rejection or filesystem error.
 pub(crate) fn safe_join(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return None;
     }
+    let mut candidate = repo_root.to_path_buf();
+    let mut saw_normal_component = false;
     for c in rel_path.components() {
         match c {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-            _ => {}
+            Component::CurDir => continue,
+            Component::Normal(name) => {
+                saw_normal_component = true;
+                candidate.push(name);
+                if std::fs::symlink_metadata(&candidate)
+                    .ok()?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return None;
+                }
+            }
         }
     }
-    let candidate = repo_root.join(rel_path);
-    let canon_root = repo_root.canonicalize().ok()?;
-    let canon_cand = candidate.canonicalize().ok()?;
-    if !canon_cand.starts_with(&canon_root) {
+    // A component-free `rel` ("", ".", "./.", ...) would otherwise return
+    // `repo_root` itself unchecked -- reject it instead of silently handing
+    // back the repository root to a caller that read `citation_path` from
+    // stored data (e.g. `commands::mcp::returned_entries_stale_warning`).
+    if !saw_normal_component {
         return None;
     }
-    Some(canon_cand)
+    Some(candidate)
 }
 
 /// Parse a whole-file `path` or ranged `path:start-end` citation.
@@ -283,23 +310,64 @@ pub(crate) fn compute_citation_hash_and_size(
     })
 }
 
+pub(crate) fn open_citation_descriptor(repo_root: &Path, file_rel: &str) -> Result<File> {
+    if syntactically_escapes_root(file_rel) {
+        bail!("citation path escapes repository root");
+    }
+    let file_abs = repo_root.join(file_rel);
+    let file = open_citation_file(repo_root, Path::new(file_rel))
+        .map_err(|error| anyhow!("open citation file {file_rel:?}: {error}"))?;
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        bail!("opened citation file is outside repository root");
+    }
+    Ok(file)
+}
+
+pub(crate) fn compute_citation_hash_and_size_from(
+    file: &File,
+    rel_path: &str,
+    range: Option<(usize, usize)>,
+) -> Result<CitationHash> {
+    hash_citation_bytes_from(file, range).map_err(|reason| {
+        let detail = match reason {
+            UnverifiedReason::FileTooLarge => {
+                format!("file exceeds MAX_FILE_BYTES ({} bytes)", MAX_FILE_BYTES)
+            }
+            UnverifiedReason::RangeTooLarge => {
+                format!("range exceeds MAX_RANGE_BYTES ({} bytes)", MAX_RANGE_BYTES)
+            }
+            UnverifiedReason::RangeOutOfBounds => match (range, file.metadata()) {
+                (Some((_, end)), Ok(metadata)) if end as u64 > metadata.len() => {
+                    format!("end offset {end} exceeds file size {}", metadata.len())
+                }
+                _ => reason.as_str().to_string(),
+            },
+            _ => reason.as_str().to_string(),
+        };
+        anyhow!("compute citation hash for {rel_path:?}: {detail}")
+    })
+}
+
 fn hash_citation_bytes(
     repo_root: &Path,
     file_rel: &str,
     range: Option<(usize, usize)>,
 ) -> std::result::Result<CitationHash, UnverifiedReason> {
-    if syntactically_escapes_root(file_rel) {
-        return Err(UnverifiedReason::PathEscape);
-    }
-    let file_abs = repo_root.join(file_rel);
-    let mut file = match open_citation_file(repo_root, Path::new(file_rel)) {
-        Ok(f) => f,
-        Err(_) => return Err(UnverifiedReason::FileMissing),
-    };
+    let reporter = NoopCapabilityReporter;
+    let already_emitted = AtomicBool::new(true);
+    Verifier::with_capabilities(
+        repo_root,
+        VerificationCapabilities::platform_default(),
+        &reporter,
+        &already_emitted,
+    )
+    .hash_citation_bytes(file_rel, range)
+}
 
-    if !opened_file_within_repo(&file, &file_abs, repo_root) {
-        return Err(UnverifiedReason::ReadError);
-    }
+fn hash_citation_bytes_from(
+    file: &File,
+    range: Option<(usize, usize)>,
+) -> std::result::Result<CitationHash, UnverifiedReason> {
     let metadata = match file.metadata() {
         Ok(m) => m,
         Err(_) => return Err(UnverifiedReason::ReadError),
@@ -330,7 +398,8 @@ fn hash_citation_bytes(
         None => (0usize, file_size as usize),
     };
 
-    if file.seek(SeekFrom::Start(start as u64)).is_err() {
+    let mut reader = file;
+    if reader.seek(SeekFrom::Start(start as u64)).is_err() {
         return Err(UnverifiedReason::ReadError);
     }
 
@@ -340,7 +409,7 @@ fn hash_citation_bytes(
 
     while remaining > 0 {
         let chunk_len = remaining.min(HASH_READ_BUFFER_BYTES as u64) as usize;
-        let read = match file.read(&mut buffer[..chunk_len]) {
+        let read = match reader.read(&mut buffer[..chunk_len]) {
             Ok(read) => read,
             Err(_) => return Err(UnverifiedReason::ReadError),
         };
@@ -364,8 +433,19 @@ fn hash_citation_bytes(
 /// rejects symlinks at every level with `O_NOFOLLOW`.
 #[cfg(unix)]
 fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<File> {
+    open_citation_file_with_resolver(repo_root, rel_path, Resolver::platform_default())
+}
+
+#[cfg(unix)]
+fn open_citation_file_with_resolver(
+    repo_root: &Path,
+    rel_path: &Path,
+    resolver: Resolver,
+) -> rustix::io::Result<File> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = resolver;
     #[cfg(target_os = "linux")]
-    {
+    if resolver == Resolver::Openat2 {
         use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
 
         let root = open(
@@ -378,7 +458,7 @@ fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<F
             rel_path,
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
         ) {
             Ok(fd) => return Ok(File::from(fd)),
             Err(rustix::io::Errno::NOSYS) => {}
@@ -389,6 +469,60 @@ fn open_citation_file(repo_root: &Path, rel_path: &Path) -> rustix::io::Result<F
     open_citation_file_fallback(repo_root, rel_path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolver {
+    #[cfg(target_os = "linux")]
+    Openat2,
+    // On Linux this is only reached through `open_citation_file_with_resolver`'s
+    // NOSYS fallthrough (which calls `open_citation_file_fallback` directly,
+    // without constructing this value) and through the test seam -- never by
+    // constructing `Self::Fallback` in production code, since `platform_default`
+    // only does so on non-Linux Unix. That makes the variant itself "never
+    // constructed" on a Linux build, which is expected, not a sign the fallback
+    // path is unreachable in practice.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Fallback,
+}
+
+impl Resolver {
+    fn platform_default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Openat2
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Fallback
+        }
+    }
+}
+
+/// Classify an open failure as a symlink rejection or a plain miss.
+///
+/// `ELOOP` is the uniform "a path component is a symlink" signal on every
+/// resolver: `openat2` with `RESOLVE_NO_SYMLINKS` reports it directly, and
+/// `open_citation_file_fallback` normalizes its own ambiguous `ENOTDIR` to
+/// `ELOOP` before returning (see its symlink disambiguation there), so no
+/// resolver-conditional branch belongs here. A resolver value is still
+/// accepted for symmetry with the not(unix) stub and in case a future
+/// resolver needs one, but the classification itself must not depend on it:
+/// classifying by which resolver was *requested* is wrong exactly when the
+/// requested resolver (e.g. `Openat2`) differs from the one that actually
+/// ran (a NOSYS fallthrough to the fallback walk).
+#[cfg(unix)]
+fn open_failure_reason(error: rustix::io::Errno, _resolver: Resolver) -> UnverifiedReason {
+    if error == rustix::io::Errno::LOOP {
+        UnverifiedReason::SymlinkPathRejected
+    } else {
+        UnverifiedReason::FileMissing
+    }
+}
+
+#[cfg(not(unix))]
+fn open_failure_reason(_error: std::io::Error, _resolver: Resolver) -> UnverifiedReason {
+    UnverifiedReason::FileMissing
+}
+
 #[cfg(not(unix))]
 fn open_citation_file(_repo_root: &Path, _rel_path: &Path) -> std::io::Result<File> {
     // The supported deployment targets are Unix. Fail closed rather than
@@ -397,6 +531,15 @@ fn open_citation_file(_repo_root: &Path, _rel_path: &Path) -> std::io::Result<Fi
         std::io::ErrorKind::Unsupported,
         "descriptor-relative citation opens require openat",
     ))
+}
+
+#[cfg(not(unix))]
+fn open_citation_file_with_resolver(
+    repo_root: &Path,
+    rel_path: &Path,
+    _resolver: Resolver,
+) -> std::io::Result<File> {
+    open_citation_file(repo_root, rel_path)
 }
 
 #[cfg(unix)]
@@ -412,6 +555,7 @@ fn open_citation_file_fallback(repo_root: &Path, rel_path: &Path) -> rustix::io:
     if components.peek().is_none() {
         return Err(rustix::io::Errno::NOENT);
     }
+    let mut candidate = repo_root.to_path_buf();
 
     while let Some(component) = components.next() {
         let name = match component {
@@ -419,12 +563,33 @@ fn open_citation_file_fallback(repo_root: &Path, rel_path: &Path) -> rustix::io:
             Component::CurDir => continue,
             _ => return Err(rustix::io::Errno::XDEV),
         };
+        candidate.push(name);
         let is_last = components.peek().is_none();
         let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         if !is_last {
             flags |= OFlags::DIRECTORY;
         }
-        current = openat(&current, name, flags, Mode::empty())?;
+        current = match openat(&current, name, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            // A non-final component opened with O_DIRECTORY|O_NOFOLLOW
+            // fails with ENOTDIR both when the component is a
+            // symlink-to-directory (the kernel refuses to follow it) and
+            // when it is an ordinary regular file used as a directory
+            // component. Those are different reasons -- only the first is
+            // a symlink rejection -- so disambiguate with a NOFOLLOW stat
+            // that never resolves the link before classifying.
+            Err(rustix::io::Errno::NOTDIR) if !is_last => {
+                let is_symlink = std::fs::symlink_metadata(&candidate)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false);
+                return Err(if is_symlink {
+                    rustix::io::Errno::LOOP
+                } else {
+                    rustix::io::Errno::NOTDIR
+                });
+            }
+            Err(error) => return Err(error),
+        };
     }
 
     Ok(File::from(current))
@@ -462,17 +627,49 @@ enum HashCheck {
 ///
 /// Never propagates I/O errors as `Err` — those are folded into
 /// [`HashCheck::Failed`] per AC16.
+#[cfg(test)]
 fn hash_check_at_citation(
     repo_root: &Path,
     file_rel: &str,
     range: Option<(usize, usize)>,
     expected: &str,
 ) -> HashCheck {
-    let computed = match hash_citation_bytes(repo_root, file_rel, range) {
+    let reporter = NoopCapabilityReporter;
+    let already_emitted = AtomicBool::new(true);
+    Verifier::with_capabilities(
+        repo_root,
+        VerificationCapabilities::platform_default(),
+        &reporter,
+        &already_emitted,
+    )
+    .hash_check_at_citation(file_rel, range, expected)
+}
+
+const DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE: &str =
+    "verification: descriptor containment degraded on this platform; falling back to canonicalized path checks";
+
+static DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE_EMITTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerificationCapabilities {
+    descriptor_containment_degraded: bool,
+    resolver: Resolver,
+}
+
+impl VerificationCapabilities {
+    fn platform_default() -> Self {
+        Self {
+            descriptor_containment_degraded: cfg!(not(target_os = "linux")),
+            resolver: Resolver::platform_default(),
+        }
+    }
+}
+
+fn hash_check_from(file: &File, range: Option<(usize, usize)>, expected: &str) -> HashCheck {
+    let computed = match hash_citation_bytes_from(file, range) {
         Ok(computed) => computed.sha256_hex,
         Err(reason) => return HashCheck::Failed(reason),
     };
-
     if computed.eq_ignore_ascii_case(strip_hash_prefix(expected)) {
         HashCheck::Match
     } else {
@@ -480,38 +677,433 @@ fn hash_check_at_citation(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-static DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE: Once = Once::new();
+trait CapabilityReporter {
+    fn report_descriptor_containment_degraded(&self);
+}
 
-fn opened_file_within_repo(file: &File, file_abs: &Path, repo_root: &Path) -> bool {
-    let canonical_root = match repo_root.canonicalize() {
-        Ok(root) => root,
-        Err(_) => return false,
-    };
+struct StderrCapabilityReporter;
 
-    #[cfg(target_os = "linux")]
-    {
-        let fd = file.as_raw_fd();
-        let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
-            Ok(path) => path,
-            Err(_) => return false,
-        };
-        return resolved.starts_with(&canonical_root);
+impl CapabilityReporter for StderrCapabilityReporter {
+    fn report_descriptor_containment_degraded(&self) {
+        eprintln!("{DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE}");
+    }
+}
+
+struct NoopCapabilityReporter;
+
+impl CapabilityReporter for NoopCapabilityReporter {
+    fn report_descriptor_containment_degraded(&self) {}
+}
+
+struct Verifier<'a, R: CapabilityReporter> {
+    repo_root: &'a Path,
+    capabilities: VerificationCapabilities,
+    reporter: &'a R,
+    capability_notice_emitted: &'a AtomicBool,
+}
+
+impl<'a, R: CapabilityReporter> Verifier<'a, R> {
+    fn new(repo_root: &'a Path, reporter: &'a R) -> Self {
+        Self::with_capabilities(
+            repo_root,
+            VerificationCapabilities::platform_default(),
+            reporter,
+            &DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE_EMITTED,
+        )
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = file;
-        DESCRIPTOR_CONTAINMENT_DEGRADED_NOTE.call_once(|| {
-            eprintln!(
-                "verification: descriptor containment degraded on this platform; falling back to canonicalized path checks"
-            );
-        });
-        let resolved = match file_abs.canonicalize() {
-            Ok(path) => path,
+    fn with_capabilities(
+        repo_root: &'a Path,
+        capabilities: VerificationCapabilities,
+        reporter: &'a R,
+        capability_notice_emitted: &'a AtomicBool,
+    ) -> Self {
+        let verifier = Self {
+            repo_root,
+            capabilities,
+            reporter,
+            capability_notice_emitted,
+        };
+        verifier.emit_capability_notice();
+        verifier
+    }
+
+    fn emit_capability_notice(&self) {
+        if self.capabilities.descriptor_containment_degraded
+            && self
+                .capability_notice_emitted
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.reporter.report_descriptor_containment_degraded();
+        }
+    }
+
+    fn opened_file_within_repo(&self, file: &File, file_abs: &Path) -> bool {
+        let canonical_root = match self.repo_root.canonicalize() {
+            Ok(root) => root,
             Err(_) => return false,
         };
-        return resolved.starts_with(&canonical_root);
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = file_abs;
+            let fd = file.as_raw_fd();
+            let resolved = match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
+            resolved.starts_with(&canonical_root)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = file;
+            let resolved = match file_abs.canonicalize() {
+                Ok(path) => path,
+                Err(_) => return false,
+            };
+            resolved.starts_with(&canonical_root)
+        }
+    }
+
+    fn hash_citation_bytes(
+        &self,
+        file_rel: &str,
+        range: Option<(usize, usize)>,
+    ) -> std::result::Result<CitationHash, UnverifiedReason> {
+        if syntactically_escapes_root(file_rel) {
+            return Err(UnverifiedReason::PathEscape);
+        }
+        let file_abs = self.repo_root.join(file_rel);
+        let mut file = match open_citation_file_with_resolver(
+            self.repo_root,
+            Path::new(file_rel),
+            self.capabilities.resolver,
+        ) {
+            Ok(f) => f,
+            Err(error) => return Err(open_failure_reason(error, self.capabilities.resolver)),
+        };
+
+        if !self.opened_file_within_repo(&file, &file_abs) {
+            return Err(UnverifiedReason::ReadError);
+        }
+        let metadata = match file.metadata() {
+            Ok(m) => m,
+            Err(_) => return Err(UnverifiedReason::ReadError),
+        };
+        if !metadata.is_file() {
+            return Err(UnverifiedReason::FileMissing);
+        }
+
+        let file_size = metadata.len();
+        if file_size > MAX_FILE_BYTES {
+            return Err(UnverifiedReason::FileTooLarge);
+        }
+
+        let (start, end) = match range {
+            Some((start, end)) => {
+                if end <= start {
+                    return Err(UnverifiedReason::RangeOutOfBounds);
+                }
+                if start as u64 > file_size || end as u64 > file_size {
+                    return Err(UnverifiedReason::RangeOutOfBounds);
+                }
+                let range_size = (end - start) as u64;
+                if range_size > MAX_RANGE_BYTES {
+                    return Err(UnverifiedReason::RangeTooLarge);
+                }
+                (start, end)
+            }
+            None => (0usize, file_size as usize),
+        };
+
+        if file.seek(SeekFrom::Start(start as u64)).is_err() {
+            return Err(UnverifiedReason::ReadError);
+        }
+
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; HASH_READ_BUFFER_BYTES];
+        let mut remaining = (end - start) as u64;
+
+        while remaining > 0 {
+            let chunk_len = remaining.min(HASH_READ_BUFFER_BYTES as u64) as usize;
+            let read = match file.read(&mut buffer[..chunk_len]) {
+                Ok(read) => read,
+                Err(_) => return Err(UnverifiedReason::ReadError),
+            };
+            if read == 0 {
+                return Err(UnverifiedReason::ReadError);
+            }
+            hasher.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+
+        Ok(CitationHash {
+            sha256_hex: format!("{:x}", hasher.finalize()),
+            file_size,
+        })
+    }
+
+    #[cfg(test)]
+    fn hash_check_at_citation(
+        &self,
+        file_rel: &str,
+        range: Option<(usize, usize)>,
+        expected: &str,
+    ) -> HashCheck {
+        let computed = match self.hash_citation_bytes(file_rel, range) {
+            Ok(computed) => computed.sha256_hex,
+            Err(reason) => return HashCheck::Failed(reason),
+        };
+
+        if computed.eq_ignore_ascii_case(strip_hash_prefix(expected)) {
+            HashCheck::Match
+        } else {
+            HashCheck::Mismatch
+        }
+    }
+
+    fn scan_file(&self, path: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
+        // Descriptor-relative, symlink-rejecting open -- no pathname
+        // check-then-open gap. `path` is either repo_root-relative already
+        // (the direct citation, from `safe_join`) or canon_root-relative
+        // (a repo-walk candidate); try both bases so a symlinked repo root
+        // (e.g. macOS `/tmp` -> `/private/tmp`) still resolves.
+        let rel = match path.strip_prefix(self.repo_root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => match self.repo_root.canonicalize() {
+                Ok(canon_root) => match path.strip_prefix(&canon_root) {
+                    Ok(rel) => rel.to_path_buf(),
+                    Err(_) => return FileScan::Skipped,
+                },
+                Err(_) => return FileScan::Skipped,
+            },
+        };
+        let file = match open_citation_file_with_resolver(
+            self.repo_root,
+            &rel,
+            self.capabilities.resolver,
+        ) {
+            Ok(file) => file,
+            Err(_) => return FileScan::Skipped,
+        };
+        let meta = match file.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => return FileScan::Skipped,
+        };
+        if !self.opened_file_within_repo(&file, path) {
+            return FileScan::Skipped;
+        }
+        let size = meta.len();
+        if size > MAX_FILE_BYTES || (size as usize) < needle.len() {
+            return FileScan::Skipped;
+        }
+        if size > *budget {
+            return FileScan::CapExceeded;
+        }
+        *budget -= size;
+
+        let mut bytes = Vec::with_capacity(size as usize);
+        if file.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
+            return FileScan::Skipped;
+        }
+        let (count, first) = count_occurrences(&bytes, needle);
+        FileScan::Hits {
+            count,
+            first: first.unwrap_or(0),
+            size,
+        }
+    }
+
+    fn search_for_excerpt(
+        &self,
+        cited_rel: &str,
+        excerpt: &str,
+        policy: RelocationPolicy,
+    ) -> ExcerptSearch {
+        let needle = excerpt.as_bytes();
+        let mut budget = MAX_RELOCATION_SCAN_BYTES;
+        let mut found: Option<Candidate> = None;
+        let mut total = 0usize;
+        let mut cited_identity = None;
+
+        if let Some(abs) = safe_join(self.repo_root, cited_rel) {
+            cited_identity = FileIdentity::of(&abs).ok();
+            match self.scan_file(&abs, needle, &mut budget) {
+                FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
+                FileScan::Hits { count, first, size } if count > 0 => {
+                    if count > 1 {
+                        return ExcerptSearch::NonUnique(count);
+                    }
+                    total = count;
+                    found = Some(Candidate {
+                        rel_path: normalize_rel(cited_rel),
+                        offset: first,
+                        file_size: size,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if policy != RelocationPolicy::FileThenRepo {
+            return match found {
+                Some(candidate) => ExcerptSearch::Unique(candidate),
+                None => ExcerptSearch::NotFound,
+            };
+        }
+
+        let canon_root = match self.repo_root.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return ExcerptSearch::NotFound,
+        };
+        let excluded = excluded_names(&canon_root);
+        let mut stack = vec![canon_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+                Err(_) => continue,
+            };
+            // Deterministic traversal order: the same tree must always yield the
+            // same candidate, or `prop_relocation_is_idempotent` is a lie.
+            entries.sort();
+
+            for path in entries {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if excluded.contains(&name) {
+                    continue;
+                }
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                if cited_identity
+                    .is_some_and(|identity| FileIdentity::of(&path).ok() == Some(identity))
+                {
+                    continue;
+                }
+
+                match self.scan_file(&path, needle, &mut budget) {
+                    FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
+                    FileScan::Hits { count, first, size } if count > 0 => {
+                        total += count;
+                        if total > 1 {
+                            return ExcerptSearch::NonUnique(total);
+                        }
+                        let rel = path
+                            .strip_prefix(&canon_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        found = Some(Candidate {
+                            rel_path: rel,
+                            offset: first,
+                            file_size: size,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        match found {
+            Some(c) => ExcerptSearch::Unique(c),
+            None => ExcerptSearch::NotFound,
+        }
+    }
+
+    #[cfg(test)]
+    fn verify_evidence(&self, ev: &Evidence, policy: RelocationPolicy) -> VerificationOutcome {
+        if ev.kind != "code" {
+            return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
+        }
+
+        let raw_path = match &ev.citation_path {
+            Some(p) => p,
+            None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
+        };
+
+        let (file_rel, range) = match parse_citation_path(raw_path) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath)
+            }
+        };
+
+        let decayed = match self.hash_check_at_citation(file_rel, range, &ev.citation_hash) {
+            HashCheck::Match => return VerificationOutcome::verified(),
+            HashCheck::Mismatch => UnverifiedReason::HashMismatch,
+            HashCheck::Failed(reason) => reason,
+        };
+
+        if policy == RelocationPolicy::Never {
+            return VerificationOutcome::unverified(decayed);
+        }
+
+        if matches!(
+            decayed,
+            UnverifiedReason::PathEscape
+                | UnverifiedReason::SymlinkPathRejected
+                | UnverifiedReason::FileMissing
+        ) {
+            return VerificationOutcome::unverified(decayed);
+        }
+
+        let excerpt = match &ev.citation_excerpt {
+            Some(e) if excerpt_is_strong(e) => e.as_str(),
+            _ => {
+                return VerificationOutcome::unverified(
+                    if decayed == UnverifiedReason::HashMismatch {
+                        UnverifiedReason::ExcerptTooWeak
+                    } else {
+                        decayed
+                    },
+                )
+            }
+        };
+
+        let candidate = match self.search_for_excerpt(file_rel, excerpt, policy) {
+            ExcerptSearch::Unique(c) => c,
+            ExcerptSearch::NotFound => {
+                return VerificationOutcome::unverified(UnverifiedReason::NoCandidate)
+            }
+            ExcerptSearch::NonUnique(candidates) => {
+                return VerificationOutcome::unverified(UnverifiedReason::NonUnique { candidates })
+            }
+            ExcerptSearch::CapExceeded => {
+                return VerificationOutcome::unverified(UnverifiedReason::ScanCapExceeded)
+            }
+        };
+
+        let new_range = range.map(|(start, end)| {
+            let new_start = candidate.offset;
+            (new_start, new_start + (end - start))
+        });
+        if new_range.is_some_and(|(_, new_end)| new_end as u64 > candidate.file_size) {
+            return VerificationOutcome::unverified(UnverifiedReason::RangeOutOfBounds);
+        }
+
+        let new_path = format_citation_path(&candidate.rel_path, new_range, candidate.file_size);
+        if new_path == *raw_path {
+            return VerificationOutcome::unverified(decayed);
+        }
+
+        VerificationOutcome::relocated(new_path)
     }
 }
 
@@ -539,23 +1131,69 @@ pub fn verify_evidence(
     repo_root: &Path,
     policy: RelocationPolicy,
 ) -> VerificationOutcome {
-    // Only "code" kind is verified in Phase 1. Other kinds deferred to Phase 2.
-    // TODO(Phase 2): add test/command/user/derived verification paths.
-    if ev.kind != "code" {
-        return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
-    }
-
     let raw_path = match &ev.citation_path {
         Some(p) => p,
         None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
     };
 
+    let (file_rel, _) = match parse_citation_path(raw_path) {
+        Ok(parsed) => parsed,
+        Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
+    };
+
+    if syntactically_escapes_root(file_rel) {
+        return VerificationOutcome::unverified(UnverifiedReason::PathEscape);
+    }
+    let file_abs = repo_root.join(file_rel);
+    let file = match open_citation_file(repo_root, Path::new(file_rel)) {
+        Ok(file) => file,
+        Err(error) => {
+            return VerificationOutcome::unverified(open_failure_reason(
+                error,
+                Resolver::platform_default(),
+            ))
+        }
+    };
+    if !opened_file_within_repo(&file, &file_abs, repo_root) {
+        return VerificationOutcome::unverified(UnverifiedReason::ReadError);
+    }
+    verify_evidence_from(&file, ev, repo_root, policy)
+}
+
+/// Verify evidence using an already-open citation descriptor.
+///
+/// Cite callers retain this descriptor through hashing, self-check, and the
+/// final pathname identity check. This provides snapshot consistency: the
+/// emitted hash describes bytes actually read from one open file. The stored
+/// `(citation_path, citation_hash)` pair cannot be atomic against a rename
+/// after that identity check; C3 explicitly accepts that residual window.
+///
+/// Constructs a [`Verifier`] up front so the descriptor-containment-degraded
+/// capability note (if any) is emitted once, at verifier init, regardless of
+/// how this evidence row resolves — never as a side effect of the relocation
+/// search reaching a particular file.
+pub fn verify_evidence_from(
+    file: &File,
+    ev: &Evidence,
+    repo_root: &Path,
+    policy: RelocationPolicy,
+) -> VerificationOutcome {
+    let reporter = StderrCapabilityReporter;
+    let verifier = Verifier::new(repo_root, &reporter);
+
+    if ev.kind != "code" {
+        return VerificationOutcome::unverified(UnverifiedReason::NotCodeKind);
+    }
+    let raw_path = match &ev.citation_path {
+        Some(p) => p,
+        None => return VerificationOutcome::unverified(UnverifiedReason::MissingCitationPath),
+    };
     let (file_rel, range) = match parse_citation_path(raw_path) {
         Ok(parsed) => parsed,
         Err(_) => return VerificationOutcome::unverified(UnverifiedReason::MalformedCitationPath),
     };
 
-    let decayed = match hash_check_at_citation(repo_root, file_rel, range, &ev.citation_hash) {
+    let decayed = match hash_check_from(file, range, &ev.citation_hash) {
         HashCheck::Match => return VerificationOutcome::verified(),
         HashCheck::Mismatch => UnverifiedReason::HashMismatch,
         HashCheck::Failed(reason) => reason,
@@ -567,7 +1205,9 @@ pub fn verify_evidence(
 
     if matches!(
         decayed,
-        UnverifiedReason::PathEscape | UnverifiedReason::FileMissing
+        UnverifiedReason::PathEscape
+            | UnverifiedReason::SymlinkPathRejected
+            | UnverifiedReason::FileMissing
     ) {
         return VerificationOutcome::unverified(decayed);
     }
@@ -583,7 +1223,7 @@ pub fn verify_evidence(
         }
     };
 
-    let candidate = match search_for_excerpt(repo_root, file_rel, excerpt, policy) {
+    let candidate = match verifier.search_for_excerpt(file_rel, excerpt, policy) {
         ExcerptSearch::Unique(c) => c,
         ExcerptSearch::NotFound => {
             return VerificationOutcome::unverified(UnverifiedReason::NoCandidate)
@@ -618,6 +1258,18 @@ pub fn verify_evidence(
     VerificationOutcome::relocated(new_path)
 }
 
+fn opened_file_within_repo(file: &File, file_abs: &Path, repo_root: &Path) -> bool {
+    let reporter = NoopCapabilityReporter;
+    let already_emitted = AtomicBool::new(true);
+    Verifier::with_capabilities(
+        repo_root,
+        VerificationCapabilities::platform_default(),
+        &reporter,
+        &already_emitted,
+    )
+    .opened_file_within_repo(file, file_abs)
+}
+
 /// A single location the excerpt was found at.
 struct Candidate {
     /// Repo-relative path, `/`-separated.
@@ -626,6 +1278,49 @@ struct Candidate {
     offset: usize,
     /// Size of the containing file, for range-overflow checking.
     file_size: u64,
+}
+
+/// Stable filesystem identity for excluding an already-scanned file from a
+/// repository walk. V3's write path can reuse this instead of treating path
+/// spellings as object identity.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    /// Resolve `path` and return its `(st_dev, st_ino)` identity.
+    ///
+    /// Follows symlinks (`std::fs::metadata`), so callers on a citation
+    /// write/re-verify path must not call this on a raw path derived from
+    /// `citation_path` before the path has been rejected as a symlink --
+    /// use [`FileIdentity::of_file`] on an already-open, resolver-vetted
+    /// descriptor instead.
+    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
+    /// Identity of an already-open file descriptor.
+    ///
+    /// This is an `fstat`, not a pathname lookup, so it is safe to call
+    /// after opening through a symlink-rejecting resolver (e.g.
+    /// [`open_citation_descriptor`]): unlike [`FileIdentity::of`], it can
+    /// never re-resolve a symlink the open already refused, so it never
+    /// stats a target the open path rejected.
+    pub(crate) fn of_file(file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
 }
 
 enum ExcerptSearch {
@@ -642,107 +1337,30 @@ enum ExcerptSearch {
 ///
 /// Stops as soon as a second candidate is seen: the answer "not unique" needs
 /// no further evidence, and stopping bounds the work.
+///
+/// Budget decision: exhaustion before any candidate and exhaustion after one
+/// candidate both return [`ExcerptSearch::CapExceeded`]. The latter must not
+/// degrade to `Unique`: in the TLA refinement, `candidates` is the saturating
+/// `min(actual repo-wide overlapping match locations, MaxCandidates)`.
+/// `CapExceeded` maps to an `Unverified` outcome, but has no single
+/// `candidates` image because the unscanned bytes leave the actual repo-wide
+/// count unknown (its model image is the set of such unverified states).
+#[cfg(test)]
 fn search_for_excerpt(
     repo_root: &Path,
     cited_rel: &str,
     excerpt: &str,
     policy: RelocationPolicy,
 ) -> ExcerptSearch {
-    let needle = excerpt.as_bytes();
-    let mut budget = MAX_RELOCATION_SCAN_BYTES;
-
-    // -- the cited file first: an in-file move is the cheap, common case --
-    if let Some(abs) = safe_join(repo_root, cited_rel) {
-        match scan_file(&abs, repo_root, needle, &mut budget) {
-            FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
-            FileScan::Hits { count, first, size } if count > 0 => {
-                if count > 1 {
-                    return ExcerptSearch::NonUnique(count);
-                }
-                return ExcerptSearch::Unique(Candidate {
-                    rel_path: normalize_rel(cited_rel),
-                    offset: first,
-                    file_size: size,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    if policy != RelocationPolicy::FileThenRepo {
-        return ExcerptSearch::NotFound;
-    }
-
-    // -- repo walk --
-    let canon_root = match repo_root.canonicalize() {
-        Ok(r) => r,
-        Err(_) => return ExcerptSearch::NotFound,
-    };
-    let excluded = excluded_names(&canon_root);
-    let mut found: Option<Candidate> = None;
-    let mut total = 0usize;
-    let mut stack = vec![canon_root.clone()];
-
-    while let Some(dir) = stack.pop() {
-        let mut entries: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-            Err(_) => continue,
-        };
-        // Deterministic traversal order: the same tree must always yield the
-        // same candidate, or `prop_relocation_is_idempotent` is a lie.
-        entries.sort();
-
-        for path in entries {
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if excluded.contains(&name) {
-                continue;
-            }
-            // Do not follow symlinks: they invite cycles and escapes.
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !meta.is_file() {
-                continue;
-            }
-
-            match scan_file(&path, &canon_root, needle, &mut budget) {
-                FileScan::CapExceeded => return ExcerptSearch::CapExceeded,
-                FileScan::Hits { count, first, size } if count > 0 => {
-                    total += count;
-                    if total > 1 {
-                        return ExcerptSearch::NonUnique(total);
-                    }
-                    let rel = path
-                        .strip_prefix(&canon_root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    found = Some(Candidate {
-                        rel_path: rel,
-                        offset: first,
-                        file_size: size,
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    match found {
-        Some(c) => ExcerptSearch::Unique(c),
-        None => ExcerptSearch::NotFound,
-    }
+    let reporter = NoopCapabilityReporter;
+    let already_emitted = AtomicBool::new(true);
+    Verifier::with_capabilities(
+        repo_root,
+        VerificationCapabilities::platform_default(),
+        &reporter,
+        &already_emitted,
+    )
+    .search_for_excerpt(cited_rel, excerpt, policy)
 }
 
 enum FileScan {
@@ -755,52 +1373,22 @@ enum FileScan {
     CapExceeded,
 }
 
-/// Read `path` and count non-overlapping occurrences of `needle`, charging the
+/// Read `path` and count overlapping occurrences of `needle`, charging the
 /// bytes read against `budget`.
+#[cfg(test)]
 fn scan_file(path: &Path, repo_root: &Path, needle: &[u8], budget: &mut u64) -> FileScan {
-    // Reject links immediately before opening, then validate the opened object.
-    // All subsequent metadata and bytes come from this descriptor: the path is
-    // never reopened after the containment check.
-    let path_meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return FileScan::Skipped,
-    };
-    if path_meta.file_type().is_symlink() || !path_meta.is_file() {
-        return FileScan::Skipped;
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return FileScan::Skipped,
-    };
-    let meta = match file.metadata() {
-        Ok(m) if m.is_file() => m,
-        _ => return FileScan::Skipped,
-    };
-    if !opened_file_within_repo(&file, path, repo_root) {
-        return FileScan::Skipped;
-    }
-    let size = meta.len();
-    if size > MAX_FILE_BYTES || (size as usize) < needle.len() {
-        return FileScan::Skipped;
-    }
-    if size > *budget {
-        return FileScan::CapExceeded;
-    }
-    *budget -= size;
-
-    let mut bytes = Vec::with_capacity(size as usize);
-    if file.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
-        return FileScan::Skipped;
-    }
-    let (count, first) = count_occurrences(&bytes, needle);
-    FileScan::Hits {
-        count,
-        first: first.unwrap_or(0),
-        size,
-    }
+    let reporter = NoopCapabilityReporter;
+    let already_emitted = AtomicBool::new(true);
+    Verifier::with_capabilities(
+        repo_root,
+        VerificationCapabilities::platform_default(),
+        &reporter,
+        &already_emitted,
+    )
+    .scan_file(path, needle, budget)
 }
 
-/// Count non-overlapping occurrences of `needle` in `hay`, returning the count
+/// Count overlapping occurrences of `needle` in `hay`, returning the count
 /// and the first offset.
 ///
 /// Deliberately a plain first-byte-skip scan: the inner comparison only runs on
@@ -820,7 +1408,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> (usize, Option<usize>) {
                 first = Some(i);
             }
             count += 1;
-            i += needle.len();
+            i += 1;
         } else {
             i += 1;
         }
@@ -868,7 +1456,30 @@ mod tests {
     use proptest::prelude::*;
     use sha2::{Digest, Sha256};
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::NamedTempFile;
+
+    struct RecordingCapabilityReporter {
+        calls: AtomicUsize,
+    }
+
+    impl RecordingCapabilityReporter {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CapabilityReporter for RecordingCapabilityReporter {
+        fn report_descriptor_containment_degraded(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn make_evidence(citation_path: Option<String>, citation_hash: String, kind: &str) -> Evidence {
         Evidence {
@@ -888,6 +1499,114 @@ mod tests {
         let mut h = Sha256::new();
         h.update(b);
         format!("{:x}", h.finalize())
+    }
+
+    #[test]
+    fn test_verifier_init_emits_identical_capability_output_for_existing_and_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("present.rs"), b"present").unwrap();
+
+        let existing = make_evidence(
+            Some("present.rs".to_string()),
+            hash_bytes(b"present"),
+            "code",
+        );
+        let missing = make_evidence(
+            Some("missing.rs".to_string()),
+            hash_bytes(b"missing"),
+            "code",
+        );
+
+        let existing_reporter = RecordingCapabilityReporter::new();
+        let existing_notice = AtomicBool::new(false);
+        let existing_verifier = Verifier::with_capabilities(
+            dir.path(),
+            VerificationCapabilities {
+                descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
+            },
+            &existing_reporter,
+            &existing_notice,
+        );
+        let _ = existing_verifier.verify_evidence(&existing, RelocationPolicy::Never);
+
+        let missing_reporter = RecordingCapabilityReporter::new();
+        let missing_notice = AtomicBool::new(false);
+        let missing_verifier = Verifier::with_capabilities(
+            dir.path(),
+            VerificationCapabilities {
+                descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
+            },
+            &missing_reporter,
+            &missing_notice,
+        );
+        let _ = missing_verifier.verify_evidence(&missing, RelocationPolicy::Never);
+
+        assert_eq!(existing_reporter.call_count(), 1);
+        assert_eq!(missing_reporter.call_count(), 1);
+    }
+
+    #[test]
+    fn test_verifier_init_emits_capability_warning_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("present.rs"), b"present").unwrap();
+
+        let reporter = RecordingCapabilityReporter::new();
+        let notice = AtomicBool::new(false);
+        let verifier = Verifier::with_capabilities(
+            dir.path(),
+            VerificationCapabilities {
+                descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
+            },
+            &reporter,
+            &notice,
+        );
+        let existing = make_evidence(
+            Some("present.rs".to_string()),
+            hash_bytes(b"present"),
+            "code",
+        );
+        let missing = make_evidence(
+            Some("missing.rs".to_string()),
+            hash_bytes(b"missing"),
+            "code",
+        );
+
+        let _ = verifier.verify_evidence(&existing, RelocationPolicy::Never);
+        let _ = verifier.verify_evidence(&missing, RelocationPolicy::Never);
+        let second = Verifier::with_capabilities(
+            dir.path(),
+            VerificationCapabilities {
+                descriptor_containment_degraded: true,
+                resolver: Resolver::platform_default(),
+            },
+            &reporter,
+            &notice,
+        );
+        let _ = second.verify_evidence(&existing, RelocationPolicy::Never);
+
+        assert_eq!(reporter.call_count(), 1);
+    }
+
+    #[test]
+    fn test_verifier_init_suppresses_capability_warning_when_not_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = RecordingCapabilityReporter::new();
+        let notice = AtomicBool::new(false);
+
+        let _ = Verifier::with_capabilities(
+            dir.path(),
+            VerificationCapabilities {
+                descriptor_containment_degraded: false,
+                resolver: Resolver::platform_default(),
+            },
+            &reporter,
+            &notice,
+        );
+
+        assert_eq!(reporter.call_count(), 0);
     }
 
     #[test]
@@ -911,10 +1630,7 @@ mod tests {
         let citation_path = format!("{}:{}-{}", file_name, start, end);
 
         let ev = make_evidence(Some(citation_path), expected_hash, "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            true
-        );
+        assert!(verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -935,10 +1651,7 @@ mod tests {
 
         // Wrong hash
         let ev = make_evidence(Some(citation_path), "sha256:deadbeef".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -949,10 +1662,7 @@ mod tests {
             "code",
         );
         // Must return false, not panic or Err
-        assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -972,10 +1682,7 @@ mod tests {
         let citation_path = format!("{}:1000-2000", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1167,6 +1874,130 @@ mod tests {
     }
 
     #[test]
+    fn test_repo_search_rejects_match_in_cited_and_other_file_as_non_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "fn duplicated_relocation_candidate() {\n",
+            "    let marker = \"this excerpt is deliberately strong and duplicated\";\n",
+            "}\n"
+        );
+        std::fs::write(
+            dir.path().join("cited.rs"),
+            format!("changed prefix\n{excerpt}"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("other.rs"), excerpt).unwrap();
+        let mut evidence = make_evidence(
+            Some(format!("cited.rs:0-{}", excerpt.len())),
+            hash_bytes(excerpt.as_bytes()),
+            "code",
+        );
+        evidence.citation_excerpt = Some(excerpt.to_string());
+
+        let outcome = verify_evidence(&evidence, dir.path(), RelocationPolicy::FileThenRepo);
+        assert_eq!(outcome.status, VerificationStatus::Unverified);
+        assert_eq!(
+            outcome.reason,
+            Some(UnverifiedReason::NonUnique { candidates: 2 })
+        );
+        assert_eq!(outcome.relocated_to, None);
+    }
+
+    #[test]
+    fn test_repo_search_cap_after_one_candidate_is_cap_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "fn candidate_before_budget_exhaustion() {\n",
+            "    let marker = \"the first candidate must never become false unique\";\n",
+            "}\n"
+        );
+        std::fs::write(dir.path().join("a-cited.rs"), excerpt).unwrap();
+        let oversized = File::create(dir.path().join("z-oversized.rs")).unwrap();
+        oversized.set_len(MAX_RELOCATION_SCAN_BYTES).unwrap();
+
+        assert!(matches!(
+            search_for_excerpt(
+                dir.path(),
+                "a-cited.rs",
+                excerpt,
+                RelocationPolicy::FileThenRepo,
+            ),
+            ExcerptSearch::CapExceeded
+        ));
+    }
+
+    /// br-<store-exclusion>: pins the `EXCLUDED_DIRS` contract by name for
+    /// both supported layouts. The KB's own store (wherever it lives)
+    /// stores every recorded `citation_excerpt` verbatim, so a file placed
+    /// there containing the same excerpt as a real source file must never
+    /// count as a second relocation candidate — on the canonical layout
+    /// (`.state/agent-kb/...`) or the tolerated legacy layout
+    /// (`agent-kb/...`).
+    #[test]
+    fn search_never_treats_the_kb_store_as_a_relocation_candidate() {
+        for store_rel in [".state/agent-kb", "agent-kb"] {
+            let dir = tempfile::tempdir().unwrap();
+            let excerpt = concat!(
+                "fn store_exclusion_contract() {\n",
+                "    let marker = \"the kb's own store is never a relocation candidate\";\n",
+                "}\n"
+            );
+            std::fs::write(dir.path().join("real.rs"), excerpt).unwrap();
+            let store_dir = dir.path().join(store_rel);
+            std::fs::create_dir_all(&store_dir).unwrap();
+            // Stands in for the evidence row that recorded this excerpt
+            // verbatim — a real agent-kb.db would contain the same bytes.
+            std::fs::write(store_dir.join("agent-kb.db"), excerpt).unwrap();
+
+            let result = search_for_excerpt(
+                dir.path(),
+                "real.rs",
+                excerpt,
+                RelocationPolicy::FileThenRepo,
+            );
+            assert!(
+                matches!(&result, ExcerptSearch::Unique(c) if c.rel_path == "real.rs"),
+                "store dir {store_rel:?} must not be a relocation candidate"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_repo_search_is_unique_iff_one_file_identity_has_a_match(
+            copies in 0usize..5,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let excerpt = concat!(
+                "fn property_relocation_candidate() {\n",
+                "    let marker = \"generated trees count each matching file identity once\";\n",
+                "}\n"
+            );
+            let cited_rel = if copies == 0 {
+                std::fs::write(dir.path().join("cited.rs"), b"changed\n").unwrap();
+                "cited.rs"
+            } else {
+                for i in 0..copies {
+                    std::fs::write(dir.path().join(format!("copy-{i}.rs")), excerpt).unwrap();
+                }
+                std::fs::hard_link(
+                    dir.path().join("copy-0.rs"),
+                    dir.path().join("cited-link.rs"),
+                ).unwrap();
+                "cited-link.rs"
+            };
+
+            let result = search_for_excerpt(
+                dir.path(), cited_rel, excerpt, RelocationPolicy::FileThenRepo,
+            );
+            prop_assert_eq!(matches!(&result, ExcerptSearch::Unique(_)), copies == 1);
+            if copies > 1 {
+                prop_assert!(matches!(&result, ExcerptSearch::NonUnique(_)));
+            }
+        }
+    }
+
+    #[test]
     fn test_verify_evidence_hash_with_prefix() {
         // sha256: prefix must be stripped and still match
         let mut tmp = NamedTempFile::new().unwrap();
@@ -1187,10 +2018,7 @@ mod tests {
         let prefixed_hash = format!("sha256:{bare_hash}");
 
         let ev = make_evidence(Some(citation_path), prefixed_hash, "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            true
-        );
+        assert!(verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1237,8 +2065,106 @@ mod tests {
 
         assert!(matches!(
             hash_check_at_citation(&repo, "citation.txt", None, &hash_bytes(secret)),
-            HashCheck::Failed(UnverifiedReason::FileMissing)
+            HashCheck::Failed(UnverifiedReason::SymlinkPathRejected)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_citations_are_rejected_by_openat2_and_fallback_resolvers() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo = sandbox.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("inside.txt"), b"inside").unwrap();
+        std::fs::write(sandbox.path().join("outside.txt"), b"outside").unwrap();
+        let outside_dir = sandbox.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("nested.txt"), b"nested").unwrap();
+        std::fs::write(repo.join("plain.txt"), b"plain").unwrap();
+
+        symlink(repo.join("inside.txt"), repo.join("inside-link.txt")).unwrap();
+        symlink(
+            sandbox.path().join("outside.txt"),
+            repo.join("outside-link.txt"),
+        )
+        .unwrap();
+        // Mid-path symlink: the directory component itself is a link, not
+        // the cited file. This is the case the fallback resolver's
+        // O_DIRECTORY|O_NOFOLLOW open reports as ENOTDIR rather than
+        // ELOOP, which must still classify as SymlinkPathRejected under
+        // both resolvers (Important 1/2 regression coverage).
+        symlink(&outside_dir, repo.join("linked-dir")).unwrap();
+
+        // (citation path, expected bytes, expected reason) -- covers a
+        // final-component symlink pointing inside the repo, one pointing
+        // outside, a mid-path directory symlink, and a plain regular file
+        // used as a directory component (which must NOT be classified as
+        // a symlink rejection, even though it also raises ENOTDIR under
+        // the fallback resolver).
+        let cases: [(&str, &[u8], UnverifiedReason); 4] = [
+            (
+                "inside-link.txt",
+                b"inside",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            (
+                "outside-link.txt",
+                b"outside",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            (
+                "linked-dir/nested.txt",
+                b"nested",
+                UnverifiedReason::SymlinkPathRejected,
+            ),
+            ("plain.txt/child", b"plain", UnverifiedReason::FileMissing),
+        ];
+
+        for (link, content, expected) in cases {
+            for resolver in [Resolver::Openat2, Resolver::Fallback] {
+                let reporter = NoopCapabilityReporter;
+                let emitted = AtomicBool::new(true);
+                let verifier = Verifier::with_capabilities(
+                    &repo,
+                    VerificationCapabilities {
+                        descriptor_containment_degraded: false,
+                        resolver,
+                    },
+                    &reporter,
+                    &emitted,
+                );
+                let evidence = make_evidence(Some(link.to_string()), hash_bytes(content), "code");
+                let outcome = verifier.verify_evidence(&evidence, RelocationPolicy::FileThenRepo);
+                assert_eq!(
+                    outcome.reason,
+                    Some(expected.clone()),
+                    "resolver={resolver:?}, link={link}"
+                );
+                assert_eq!(outcome.relocated_to, None);
+            }
+        }
+    }
+
+    // `Resolver::Openat2` only exists on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_failure_reason_ignores_a_stale_resolver_label() {
+        // Regression for Important 2: after a NOSYS fallthrough on Linux,
+        // the descriptor walk that actually ran is Fallback even though
+        // `capabilities.resolver` still reads `Openat2`. Classification
+        // must not depend on which resolver was requested, only on the
+        // errno the walk that ran actually produced -- so passing the
+        // "wrong" resolver label must not change the outcome.
+        assert_eq!(
+            open_failure_reason(rustix::io::Errno::LOOP, Resolver::Openat2),
+            UnverifiedReason::SymlinkPathRejected
+        );
+        assert_eq!(
+            open_failure_reason(rustix::io::Errno::NOTDIR, Resolver::Openat2),
+            UnverifiedReason::FileMissing
+        );
     }
 
     #[cfg(unix)]
@@ -1254,7 +2180,30 @@ mod tests {
         std::fs::write(outside.join("citation.txt"), b"secret").unwrap();
         symlink(&outside, repo.join("linked-dir")).unwrap();
 
-        assert!(open_citation_file_fallback(&repo, Path::new("linked-dir/citation.txt")).is_err());
+        // A mid-path symlink-to-directory fails the O_DIRECTORY|O_NOFOLLOW
+        // open with ENOTDIR, not ELOOP, but must still be normalized to
+        // ELOOP by the walk itself so open_failure_reason classifies it as
+        // SymlinkPathRejected rather than FileMissing (Important 1).
+        assert_eq!(
+            open_citation_file_fallback(&repo, Path::new("linked-dir/citation.txt")).unwrap_err(),
+            rustix::io::Errno::LOOP
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_descriptor_walk_fallback_regular_file_as_dir_component_is_not_a_symlink_rejection() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("plain.txt"), b"plain").unwrap();
+
+        // A regular file used as a directory component also fails with
+        // ENOTDIR, but it is not a symlink, so the walk must leave it as
+        // ENOTDIR (which classifies as FileMissing) rather than
+        // normalizing it to ELOOP like the symlink case above.
+        assert_eq!(
+            open_citation_file_fallback(repo.path(), Path::new("plain.txt/child")).unwrap_err(),
+            rustix::io::Errno::NOTDIR
+        );
     }
 
     #[cfg(unix)]
@@ -1358,10 +2307,7 @@ mod tests {
             "code",
         );
         // Must return Ok(false) — no panic, no Err, no read outside repo.
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
         // Confirm we did not create any artifact inside the tempdir from this call.
         assert_eq!(stdfs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -1378,10 +2324,7 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1392,10 +2335,7 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1406,9 +2346,107 @@ mod tests {
 
         let result = safe_join(dir.path(), "probe.txt");
         assert!(result.is_some());
-        // Canonical path must be inside the tempdir.
-        let canon = result.unwrap();
-        assert!(canon.starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(result.unwrap(), file_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_symlink_components_and_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("plain/nested")).unwrap();
+        symlink(dir.path().join("plain"), dir.path().join("sym")).unwrap();
+
+        assert_eq!(
+            safe_join(dir.path(), "plain/nested"),
+            Some(dir.path().join("plain/nested"))
+        );
+        assert!(safe_join(dir.path(), "sym/nested").is_none());
+        assert!(safe_join(dir.path(), "plain/../plain").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_join_rejects_a_component_free_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(safe_join(dir.path(), "").is_none());
+        assert!(safe_join(dir.path(), ".").is_none());
+        assert!(safe_join(dir.path(), "./.").is_none());
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        #[test]
+        fn prop_safe_join_accepts_exactly_existing_plain_relative_paths(
+            components in prop::collection::vec(
+                prop_oneof![
+                    Just("a"), Just("b"), Just("."), Just(".."),
+                    Just("symdir"), Just("symfile"), Just("missing"),
+                ],
+                0..8,
+            )
+        ) {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_file = outside.path().join("target-file");
+            std::fs::write(&outside_file, b"outside file").unwrap();
+
+            // Walk the same components safe_join will walk, building up the
+            // expected accepted path (skipping "." exactly as safe_join
+            // does) and creating on disk only the prefix that is reachable
+            // before the first component that must reject the whole path:
+            // a syntactic "..", a symlink (of either kind, at any position,
+            // not only trailing), or a component that is never created at
+            // all (the "component does not exist" branch).
+            let mut prefix = dir.path().to_path_buf();
+            let mut saw_normal_component = false;
+            let mut expect_none = false;
+            for component in &components {
+                match *component {
+                    "." => continue,
+                    ".." => {
+                        expect_none = true;
+                        break;
+                    }
+                    "a" | "b" => {
+                        saw_normal_component = true;
+                        prefix.push(*component);
+                        std::fs::create_dir_all(&prefix).unwrap();
+                    }
+                    "symdir" => {
+                        saw_normal_component = true;
+                        prefix.push("symdir");
+                        symlink(outside.path(), &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "symfile" => {
+                        saw_normal_component = true;
+                        prefix.push("symfile");
+                        symlink(&outside_file, &prefix).unwrap();
+                        expect_none = true;
+                        break;
+                    }
+                    "missing" => {
+                        saw_normal_component = true;
+                        expect_none = true;
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            let rel = components.join("/");
+            let expected = if expect_none || !saw_normal_component {
+                None
+            } else {
+                Some(prefix)
+            };
+            prop_assert_eq!(safe_join(dir.path(), &rel), expected);
+        }
     }
 
     #[test]
@@ -1419,10 +2457,7 @@ mod tests {
             "sha256:anything".to_string(),
             "test",
         );
-        assert_eq!(
-            verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, Path::new("/tmp"), RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
@@ -1446,17 +2481,14 @@ mod tests {
         let citation_path = format!("{}:0-5242880", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     #[test]
     fn test_verify_evidence_rejects_out_of_bounds_end() {
         // Citation with end beyond file size must be rejected.
         let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&vec![0u8; 100]).unwrap(); // 100 bytes
+        tmp.write_all(&[0u8; 100]).unwrap(); // 100 bytes
         tmp.flush().unwrap();
 
         let file_name = tmp
@@ -1471,10 +2503,7 @@ mod tests {
         let citation_path = format!("{}:0-200", file_name);
 
         let ev = make_evidence(Some(citation_path), "sha256:anything".to_string(), "code");
-        assert_eq!(
-            verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),
-            false
-        );
+        assert!(!verify_evidence(&ev, dir, RelocationPolicy::Never).is_verified(),);
     }
 
     /// The relocation scan budget is a hard cap, not a hint: a single file
@@ -1558,6 +2587,57 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_file_has_no_check_then_open_window_under_either_resolver() {
+        // Before this fix, scan_file stat'd `path` (rejecting a symlink)
+        // and then re-opened it by pathname -- two syscalls, with a window
+        // between them an attacker could win by swapping a regular file
+        // for a symlink. The fix replaces both with a single
+        // resolver-based open, so there is no window left to race:
+        // confirm a symlinked candidate is rejected under both resolvers
+        // and nothing outside the repo is ever charged or read, using the
+        // same swap sequence as `test_scan_file_swap_to_symlink_never_matches_outside_content`.
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside secret needle").unwrap();
+        let candidate = repo.path().join("candidate.txt");
+
+        for resolver in [Resolver::Openat2, Resolver::Fallback] {
+            std::fs::write(&candidate, b"inside only").unwrap();
+            std::fs::remove_file(&candidate).unwrap();
+            symlink(outside.path(), &candidate).unwrap();
+
+            let reporter = NoopCapabilityReporter;
+            let emitted = AtomicBool::new(true);
+            let verifier = Verifier::with_capabilities(
+                repo.path(),
+                VerificationCapabilities {
+                    descriptor_containment_degraded: false,
+                    resolver,
+                },
+                &reporter,
+                &emitted,
+            );
+            let mut budget = 1024;
+            assert!(
+                matches!(
+                    verifier.scan_file(&candidate, b"outside secret", &mut budget),
+                    FileScan::Skipped
+                ),
+                "resolver={resolver:?}"
+            );
+            assert_eq!(
+                budget, 1024,
+                "resolver={resolver:?}: outside target must not be charged or read"
+            );
+
+            std::fs::remove_file(&candidate).unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_containment_rejects_sibling_prefix_path() {
@@ -1595,14 +2675,52 @@ mod tests {
 
         let outcome = verify_evidence(&ev, &repo, RelocationPolicy::FileOnly);
         assert_eq!(outcome.status, VerificationStatus::Unverified);
-        // Non-disclosure rule (bd-eho3): a resolution-level escape (symlink,
-        // no ".." in the syntactic path) is not distinguishable from a plain
-        // missing file without probing outside containment, so it folds to
-        // FileMissing rather than PathEscape. Only syntactic escapes ("..",
-        // absolute paths) report PathEscape now.
-        assert_eq!(outcome.reason, Some(UnverifiedReason::FileMissing));
+        // Non-disclosure rule (bd-eho3): reporting SymlinkPathRejected here
+        // does not create an existence oracle for the sibling target. The
+        // fact being disclosed is that `linked.txt`, a component that lives
+        // inside the repo, is itself a symlink -- metadata read from within
+        // the repository, not from wherever the link resolves to. Whether
+        // the target exists, and whether it is inside or outside the repo,
+        // never affects this reason, so no side channel about the outside
+        // world is opened. Contrast with PathEscape/FileMissing folding,
+        // which exists precisely to avoid disclosing outside-repo state.
+        assert_eq!(outcome.reason, Some(UnverifiedReason::SymlinkPathRejected));
         assert_eq!(outcome.relocated_to, None);
         assert!(!outcome.is_verified(), "sibling content must never verify");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let excerpt = concat!(
+            "a strong relocation excerpt must be long enough to search\n",
+            "and must contain enough lines to satisfy the verifier\n"
+        );
+        std::fs::write(dir.path().join("cited.rs"), b"changed bytes").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target.rs"), excerpt).unwrap();
+        symlink(
+            outside.path().join("target.rs"),
+            dir.path().join("candidate.rs"),
+        )
+        .unwrap();
+
+        let mut evidence = make_evidence(
+            Some("cited.rs".to_string()),
+            hash_bytes(b"original bytes"),
+            "code",
+        );
+        evidence.citation_excerpt = Some(excerpt.to_string());
+        let skipped = verify_evidence(&evidence, dir.path(), RelocationPolicy::FileThenRepo);
+        assert_eq!(skipped.status, VerificationStatus::Unverified);
+        assert_eq!(skipped.reason, Some(UnverifiedReason::NoCandidate));
+        assert_eq!(
+            skipped.relocated_to, None,
+            "no relocation means no heal plan"
+        );
     }
 
     #[cfg(unix)]
@@ -1627,8 +2745,17 @@ mod tests {
     }
 
     #[test]
-    fn test_count_occurrences_is_non_overlapping_and_reports_first() {
-        assert_eq!(count_occurrences(b"aaaa", b"aa"), (2, Some(0)));
+    fn test_count_occurrences_counts_overlapping_periodic_multiline_excerpt() {
+        let period = b"abcdefghijklmnopqrstuvwxyzABCDE\n";
+        let needle = [period.as_slice(), period.as_slice()].concat();
+        let hay = [period.as_slice(), period.as_slice(), period.as_slice()].concat();
+        assert!(needle.len() >= MIN_EXCERPT_BYTES);
+        assert_eq!(count_occurrences(&hay, &needle), (2, Some(0)));
+    }
+
+    #[test]
+    fn test_count_occurrences_reports_first() {
+        assert_eq!(count_occurrences(b"aaaa", b"aa"), (3, Some(0)));
         assert_eq!(count_occurrences(b"xxabab", b"ab"), (2, Some(2)));
         assert_eq!(count_occurrences(b"abc", b"zz"), (0, None));
         assert_eq!(count_occurrences(b"ab", b"abcdef"), (0, None));
@@ -1664,9 +2791,8 @@ mod tests {
             "sha256:anything".to_string(),
             "code",
         );
-        assert_eq!(
-            verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
-            false,
+        assert!(
+            !verify_evidence(&ev, dir.path(), RelocationPolicy::Never).is_verified(),
             "files larger than MAX_FILE_BYTES must return Ok(false)"
         );
     }

@@ -1,4 +1,4 @@
-use kb::bench_fixture::{logical_checksum, seed_db, BenchEmbedder, DEFAULT_SEED};
+use kb::bench_fixture::{logical_checksum, seed_fixture, BenchEmbedder, DEFAULT_SEED};
 use kb::components::db;
 use std::fs;
 use std::io;
@@ -66,10 +66,12 @@ fn main() -> anyhow::Result<()> {
         root.join("kb.toml"),
         "inline_verify_k = 10\n[embed]\nenabled = false\n",
     )?;
-    let db_path = root.join(".state/agent-kb/agent-kb.db");
-    let conn = db::open_db(&db_path)?;
+    let paths = kb::config::Paths::from_root(&root);
+    db::open_or_init(&paths)?;
+    let lock = kb::commands::add::acquire_lock(&paths.lock)?;
+    let conn = db::open_rw(&paths, &lock)?;
     let emb = BenchEmbedder::new(seed);
-    seed_db(&conn, &emb, size, seed)?;
+    seed_fixture(&lock, &conn, &paths, &emb, size, seed)?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     println!(
         "{}",

@@ -5,7 +5,64 @@ use crate::components::{db, query_hits};
 use crate::config;
 use abscissa_core::{Command, Runnable};
 use clap::Parser;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+fn compare_federated_rows(a: &db::SearchEntry, b: &db::SearchEntry) -> std::cmp::Ordering {
+    db::compare_rank(a.score, "", b.score, "")
+        .then_with(|| match (&a.origin_repo, &b.origin_repo) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.cmp(b),
+        })
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+/// Merge already-ranked repository batches, deduplicate globally, and apply the
+/// sole federated truncation. The optional batch origin is stamped on peer rows.
+fn merge_federated_results(
+    batches: Vec<(Option<String>, Vec<db::SearchEntry>)>,
+    limit: usize,
+) -> Vec<db::SearchEntry> {
+    let mut by_origin_and_id: HashMap<(Option<String>, String), db::SearchEntry> = HashMap::new();
+
+    for (batch_origin, rows) in batches {
+        for mut candidate in rows {
+            candidate.origin_repo = batch_origin.clone();
+
+            let collision_key = by_origin_and_id
+                .keys()
+                .find(|(_, id)| id == &candidate.id)
+                .cloned();
+            if let Some(key) = collision_key {
+                let existing = by_origin_and_id.get(&key).expect("collision key exists");
+                // Local wins by contract. Spell this out instead of depending on
+                // Option's derived ordering to happen to put None first.
+                let replace = match (
+                    existing.origin_repo.is_none(),
+                    candidate.origin_repo.is_none(),
+                ) {
+                    (true, _) => false,
+                    (false, true) => true,
+                    (false, false) => compare_federated_rows(&candidate, existing).is_lt(),
+                };
+                if replace {
+                    by_origin_and_id.remove(&key);
+                } else {
+                    continue;
+                }
+            }
+
+            let key = (candidate.origin_repo.clone(), candidate.id.clone());
+            by_origin_and_id.insert(key, candidate);
+        }
+    }
+
+    let mut merged: Vec<_> = by_origin_and_id.into_values().collect();
+    merged.sort_by(compare_federated_rows);
+    merged.truncate(limit);
+    merged
+}
 
 fn evidence_display_line(ev: &db::SearchEvidence) -> String {
     let verified_str = match ev.verified {
@@ -20,6 +77,19 @@ fn evidence_display_line(ev: &db::SearchEvidence) -> String {
         ev.status_str(),
         verified_str
     )
+}
+
+fn parse_limit(arg: &str) -> Result<usize, String> {
+    let value: usize = arg
+        .parse()
+        .map_err(|_| format!("invalid value '{arg}' for '--limit': expected an integer"))?;
+    if !(1..=db::MAX_LIMIT).contains(&value) {
+        return Err(format!(
+            "invalid value '{arg}' for '--limit': must be in 1..={}",
+            db::MAX_LIMIT
+        ));
+    }
+    Ok(value)
 }
 
 /// Search knowledge entries (default: hybrid FTS5 + semantic re-rank)
@@ -37,7 +107,7 @@ pub struct Search {
     #[arg(long)]
     pub repo: Option<std::path::PathBuf>,
     /// Maximum number of results (default: 10)
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = parse_limit)]
     pub limit: usize,
     /// Include full content in output
     #[arg(long)]
@@ -83,8 +153,32 @@ impl Search {
             config::Paths::discover()?
         };
         let emb = crate::commands::add::make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, emb.as_ref())?;
         self.execute_with(&paths, emb.as_ref())
+    }
+
+    /// Build the `SearchOptions` for this invocation, resolving `repo_root`
+    /// from the already-discovered repository root instead of leaving it
+    /// `None` for `search_entries` to re-derive from CWD. `add`/`cite` hash
+    /// evidence against `paths.root`; `search --verify`'s citation
+    /// verification must resolve against that same root, not a CWD-based
+    /// `.git` walk that can point at a different (e.g. nested) repository.
+    fn build_search_options(
+        &self,
+        kb_config: &config::KbConfig,
+        paths: &config::Paths,
+    ) -> db::SearchOptions {
+        db::SearchOptions {
+            limit: self.limit,
+            do_fts: self.fts || !self.semantic,
+            do_semantic: self.semantic || !self.fts,
+            path_prefix: self.path_prefix.clone(),
+            tag_filter: self.tag.clone(),
+            inline_verify_k: self.limit, // verify all results by default, capped in search_entries
+            repo_root: Some(paths.root.clone()),
+            verify_pool_size: kb_config.verify_pool_size,
+            recency_lambda: kb_config.recency_lambda,
+            mmr_lambda: kb_config.mmr_lambda,
+        }
     }
 
     /// Execute with explicit paths and embedder (for testing).
@@ -94,43 +188,56 @@ impl Search {
         embedder: &dyn embedder::Embedder,
     ) -> anyhow::Result<()> {
         let kb_config = config::KbConfig::from_paths(paths);
-        // CLI: repo_root left None; search_entries falls back to find_repo_root()
-        // walking from CWD, which is correct for the CLI invocation pattern (user
-        // runs `kb search` from inside the repo). MCP path sets repo_root explicitly
-        // via root_from_db (mcp.rs:40-45) because MCP CWD is typically '/' and CWD
-        // discovery would fail.
-        let opts = db::SearchOptions {
-            limit: self.limit,
-            do_fts: self.fts || !self.semantic,
-            do_semantic: self.semantic || !self.fts,
-            path_prefix: self.path_prefix.clone(),
-            tag_filter: self.tag.clone(),
-            inline_verify_k: self.limit, // verify all results by default
-            repo_root: None,
-            verify_pool_size: kb_config.verify_pool_size,
-            recency_lambda: kb_config.recency_lambda,
-            mmr_lambda: kb_config.mmr_lambda,
+        let federated = !self.local_only && (self.peers || self.reachable_from.is_some());
+        let mut opts = self.build_search_options(&kb_config, paths);
+        if federated {
+            // Federation verifies only after the global merge/truncate below.
+            opts.inline_verify_k = 0;
+        }
+
+        // A pure read: open_ro, never the write lock (ADR-7). An uninitialized
+        // repository serves an empty result plus a one-line stderr note, which
+        // is the first-run behaviour the pre-split read path produced by
+        // silently creating the database.
+        let conn = match db::open_ro(&paths.db) {
+            Ok(conn) => Some(conn),
+            Err(e) if db::is_db_uninitialized(&e) => {
+                db::note_uninitialized(&paths.db);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        // C2/ADR-7 + C1/D3: a read DETECTS that the database is behind the log
+        // and says so on stderr. It never repairs, and never takes the write
+        // lock — under open_ro's `PRAGMA query_only` it could not anyway.
+        if let Some(conn) = &conn {
+            crate::components::cursor::warn_if_behind(conn, paths);
+        }
+        let local_results = match &conn {
+            Some(conn) => db::search_entries(conn, embedder, &self.query, &opts)?,
+            None => Vec::new(),
         };
 
-        let conn = db::open_db(&paths.db)?;
-        let local_results = db::search_entries(&conn, embedder, &self.query, &opts)?;
-
         // Peer federation: collect results from peer DBs and merge.
-        let results = if !self.local_only && (self.peers || self.reachable_from.is_some()) {
+        let mut results = if let (Some(conn), true) = (conn.as_ref(), federated) {
             let peer_paths = collect_peer_paths(
-                &conn,
+                conn,
                 self.reachable_from.as_deref(),
                 self.max_hops,
                 self.slug.as_deref(),
             );
 
-            // Deduplicate: local results take priority.
-            let local_ids: HashSet<String> = local_results.iter().map(|r| r.id.clone()).collect();
-            let mut merged = local_results;
+            let mut batches = vec![(None, local_results)];
 
             for peer_path in peer_paths {
                 let peer_db = config::Paths::from_root(std::path::Path::new(&peer_path)).db;
-                let peer_conn = match db::open_db(&peer_db) {
+                // A peer's DB belongs to another repository: reading it must
+                // never create it, run DDL against it, sweep its rows, or
+                // write so much as a WAL checkpoint to its files. open_ro
+                // (used for the local DB above) tolerates the write-back a
+                // hot-WAL recovery or checkpoint can cause; open_ro_peer is
+                // strictly read-only and never touches the peer's bytes.
+                let peer_conn = match db::open_ro_peer(&peer_db) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("warn: peer {peer_path}: {e}");
@@ -153,23 +260,18 @@ impl Search {
                     ..opts.clone()
                 };
                 match db::search_entries(&peer_conn, embedder, &self.query, &peer_opts) {
-                    Ok(mut peer_results) => {
-                        for r in &mut peer_results {
-                            r.origin_repo = Some(peer_path.clone());
-                        }
-                        for r in peer_results {
-                            if !local_ids.contains(&r.id) {
-                                merged.push(r);
-                            }
-                        }
-                    }
+                    Ok(peer_results) => batches.push((Some(peer_path), peer_results)),
                     Err(e) => eprintln!("warn: peer {peer_path} search: {e}"),
                 }
             }
-            merged
+            merge_federated_results(batches, self.limit)
         } else {
             local_results
         };
+
+        if federated {
+            db::verify_search_entries(&mut results, self.limit, Some(&paths.root));
+        }
 
         // Determine display mode: RRF hybrid produces unified results;
         // single-lane modes keep separate FTS / semantic sections.
@@ -291,10 +393,20 @@ fn query_direct_peers(conn: &rusqlite::Connection, slug_filter: Option<&str>) ->
     match slug_filter {
         Some(slug) => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE epic_slug = ?1",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE {} AND p.epic_slug = ?1",
+                db::live_peer_predicate("p"),
+            ),
             &[&slug],
         ),
-        None => query_target_repos(conn, "SELECT DISTINCT target_repo FROM peers", &[]),
+        None => query_target_repos(
+            conn,
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE {}",
+                db::live_peer_predicate("p"),
+            ),
+            &[],
+        ),
     }
 }
 
@@ -337,12 +449,18 @@ fn query_neighbors(
     match slug_filter {
         Some(slug) => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1 AND epic_slug = ?2",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE p.source_repo = ?1 AND {} AND p.epic_slug = ?2",
+                db::live_peer_predicate("p"),
+            ),
             &[&source_repo, &slug],
         ),
         None => query_target_repos(
             conn,
-            "SELECT DISTINCT target_repo FROM peers WHERE source_repo = ?1",
+            &format!(
+                "SELECT DISTINCT p.target_repo FROM peers p WHERE p.source_repo = ?1 AND {}",
+                db::live_peer_predicate("p"),
+            ),
             &[&source_repo],
         ),
     }
@@ -359,13 +477,226 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[test]
+    fn federated_results_are_ranked_and_truncated_before_verification() {
+        let merged = merge_federated_results(
+            vec![
+                (
+                    None,
+                    vec![crate::components::db::SearchEntry {
+                        id: "low".into(),
+                        path: "low".into(),
+                        summary: String::new(),
+                        content: String::new(),
+                        tags: "[]".into(),
+                        score: 0.1,
+                        source: "fts",
+                        score_kind: "fts",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: None,
+                        updated_at: String::new(),
+                    }],
+                ),
+                (
+                    Some("peer".into()),
+                    vec![crate::components::db::SearchEntry {
+                        id: "high".into(),
+                        path: "high".into(),
+                        summary: String::new(),
+                        content: String::new(),
+                        tags: "[]".into(),
+                        score: 0.9,
+                        source: "fts",
+                        score_kind: "fts",
+                        evidence: vec![],
+                        confidence: 0.5,
+                        audit_n: 0,
+                        origin_repo: Some("peer".into()),
+                        updated_at: String::new(),
+                    }],
+                ),
+            ],
+            1,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "high");
+    }
+
     const FAST_PROPTEST_CASES: u32 = 16;
+
+    fn federated_row(id: &str, score: f32, origin_repo: Option<&str>) -> db::SearchEntry {
+        db::SearchEntry {
+            id: id.to_string(),
+            path: format!("{id}.md"),
+            summary: format!("summary {id}"),
+            content: String::new(),
+            tags: "[]".to_string(),
+            score,
+            source: "rrf",
+            score_kind: "rrf",
+            evidence: vec![],
+            confidence: 0.5,
+            audit_n: 0,
+            origin_repo: origin_repo.map(str::to_string),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn federated_contract_fixture(peer_order: &[&str]) -> Vec<db::SearchEntry> {
+        let local =
+            (0..8).map(|i| federated_row(&format!("local-{i}"), 1.0 / (60.0 + i as f32), None));
+        let mut batches = vec![(None, local.collect())];
+        for peer in peer_order {
+            let rows = match *peer {
+                "peer-a" => vec![
+                    federated_row("shared-peer", 1.0 / 61.0, Some(peer)),
+                    federated_row("shared-local", 1.0 / 62.0, Some(peer)),
+                    federated_row("peer-a-only", 1.0 / 63.0, Some(peer)),
+                ],
+                "peer-b" => vec![
+                    federated_row("shared-peer", 1.0 / 61.0, Some(peer)),
+                    federated_row("peer-b-only", 1.0 / 62.0, Some(peer)),
+                ],
+                _ => unreachable!(),
+            };
+            batches.push((Some((*peer).to_string()), rows));
+        }
+        batches[0]
+            .1
+            .push(federated_row("shared-local", 1.0 / 64.0, None));
+        merge_federated_results(batches, 10)
+    }
+
+    #[test]
+    fn test_federated_global_limit_dedup_and_local_collision_contract() {
+        let results = federated_contract_fixture(&["peer-a", "peer-b"]);
+        assert_eq!(
+            results.len(),
+            10,
+            "--limit is global across local and two peers"
+        );
+        assert_eq!(
+            results.iter().filter(|row| row.id == "shared-peer").count(),
+            1,
+            "an id present in two peers must appear once"
+        );
+        let collision = results.iter().find(|row| row.id == "shared-local").unwrap();
+        assert!(
+            collision.origin_repo.is_none(),
+            "the local row must explicitly win a local/peer id collision"
+        );
+    }
+
+    #[test]
+    fn test_federated_order_is_byte_stable_under_peer_traversal_permutation() {
+        fn bytes(rows: &[db::SearchEntry]) -> Vec<u8> {
+            rows.iter()
+                .flat_map(|row| {
+                    format!("{:?}\t{}\t{}\n", row.origin_repo, row.id, row.score).into_bytes()
+                })
+                .collect()
+        }
+        assert_eq!(
+            bytes(&federated_contract_fixture(&["peer-a", "peer-b"])),
+            bytes(&federated_contract_fixture(&["peer-b", "peer-a"])),
+        );
+    }
+
+    #[test]
+    fn test_federated_rank_position_top_tiny_peer_outranks_mid_local() {
+        let rows = merge_federated_results(
+            vec![
+                (None, vec![federated_row("local-mid", 1.0 / 62.0, None)]),
+                (
+                    Some("tiny-peer".to_string()),
+                    vec![federated_row("peer-top", 1.0 / 61.0, Some("tiny-peer"))],
+                ),
+            ],
+            10,
+        );
+        // This is by design: cross-repo RRF scores encode within-repo rank position,
+        // not relevance calibrated across differently sized corpora.
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["peer-top", "local-mid"]
+        );
+    }
 
     fn proptest_cases(default_full: u32) -> u32 {
         env::var("PROPTEST_CASES")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(FAST_PROPTEST_CASES.min(default_full))
+    }
+
+    /// The CLI's `search --verify` path must resolve citation verification
+    /// against the already-discovered repository root (`paths.root`), the
+    /// same root `add`/`cite` hash evidence against — not a CWD-based `.git`
+    /// walk that can silently resolve to a different repository.
+    #[test]
+    fn test_build_search_options_uses_paths_root_as_repo_root() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(dir.path());
+        let kb_config = config::KbConfig::from_paths(&paths);
+        let cmd = Search {
+            query: "q".to_string(),
+            fts: false,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            path_prefix: None,
+            tag: None,
+            content: false,
+            local_only: false,
+            peers: false,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        };
+
+        let opts = cmd.build_search_options(&kb_config, &paths);
+
+        assert_eq!(
+            opts.repo_root,
+            Some(paths.root.clone()),
+            "search options must carry the discovered repo root explicitly, \
+             not leave it None for a CWD-based .git walk to (re)discover"
+        );
+    }
+
+    fn insert_peer_edge(
+        conn: &rusqlite::Connection,
+        source_repo: &str,
+        target_repo: &str,
+        expires_at: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo, created_at, expires_at)
+             VALUES(?1, 'dep', ?2, '2024-01-01T00:00:00Z', ?3)",
+            rusqlite::params![
+                format!("graph-{source_repo}-{target_repo}"),
+                source_repo,
+                expires_at
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peers(
+                id, graph_id, source_repo, target_repo, edge_type, created_at, expires_at
+             ) VALUES(?1, ?2, ?3, ?4, 'dep', '2024-01-01T00:00:00Z', ?5)",
+            rusqlite::params![
+                format!("peer-{source_repo}-{target_repo}"),
+                format!("graph-{source_repo}-{target_repo}"),
+                source_repo,
+                target_repo,
+                expires_at
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -515,6 +846,102 @@ mod tests {
             slug: None,
         };
         search_cmd.execute_with(&paths, &embedder).unwrap();
+    }
+
+    #[test]
+    fn test_collect_peer_paths_filters_expired_rows_without_deleting_them() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        db::open_or_init(&paths).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+
+        insert_peer_edge(&conn, "repo-a", "repo-expired", Some("2000-01-01 00:00:00"));
+        insert_peer_edge(&conn, "repo-a", "repo-live", None);
+
+        // `reachable_from=None` queries direct peers with no source_repo scope
+        // (used when there is no single starting repo), so this second hop is
+        // seeded only after the direct-peers assertion below to keep that
+        // assertion scoped to repo-a's own edges.
+        let direct = collect_peer_paths(&conn, None, 1, None);
+        assert_eq!(direct, vec!["repo-live".to_string()]);
+
+        insert_peer_edge(&conn, "repo-live", "repo-live-2", None);
+
+        let bfs = collect_peer_paths(&conn, Some("repo-a"), 2, None);
+        assert_eq!(
+            bfs,
+            vec!["repo-live".to_string(), "repo-live-2".to_string()],
+            "expired edges must be invisible to traversal and to federated peer collection"
+        );
+
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 3,
+            "the expired peer row must still be physically present before any locked sweep runs"
+        );
+    }
+
+    #[test]
+    fn test_federated_global_limit_ignores_physically_present_expired_peer() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        let paths = Paths::from_root(root);
+        db::open_or_init(&paths).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+
+        insert_peer_edge(&conn, "local", "peer-live-a", None);
+        insert_peer_edge(&conn, "local", "peer-expired", Some("2000-01-01 00:00:00"));
+        insert_peer_edge(&conn, "local", "peer-live-b", None);
+
+        let peer_paths = collect_peer_paths(&conn, None, 1, None);
+        let batches = peer_paths
+            .iter()
+            .map(|peer| {
+                let rows = (0..4)
+                    .map(|i| {
+                        federated_row(&format!("{peer}-{i}"), 1.0 / (61.0 + i as f32), Some(peer))
+                    })
+                    .collect();
+                (Some(peer.clone()), rows)
+            })
+            .collect();
+        let results = merge_federated_results(batches, 6);
+
+        assert_eq!(
+            results.len(),
+            6,
+            "expired peers must not consume the global limit"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|row| row.origin_repo.as_deref() != Some("peer-expired")),
+            "no result may come from the physically present expired peer"
+        );
+        let physical_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            physical_rows, 3,
+            "the fixture must retain the expired row physically"
+        );
+    }
+
+    #[test]
+    fn test_cmd_search_limit_rejects_out_of_range_value() {
+        let too_large = (db::MAX_LIMIT + 1).to_string();
+        let err =
+            Search::try_parse_from(["kb", "needle", "--limit", too_large.as_str()]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&format!("must be in 1..={}", db::MAX_LIMIT)),
+            "expected explicit range error, got: {rendered}"
+        );
     }
 
     #[test]
@@ -677,13 +1104,13 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
 
-        // Override CWD-based repo root discovery by using the db search directly
-        // with the root as repo root. Since find_repo_root() walks from CWD (not
-        // the tempdir), we test verification via the MCP path which passes repo_root
-        // explicitly. Instead, verify the evidence array is populated and the
-        // verified field is Some (true or false) — not None.
+        // repo_root is left None here (this test drives db::search_entries
+        // directly rather than through Search::build_search_options), so
+        // verification runs with no root to resolve citation paths against
+        // and always reports Unverified. Just check the evidence array is
+        // populated and verified is attempted (Some), not that it succeeded.
         let results =
             crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts)
                 .unwrap();
@@ -692,8 +1119,8 @@ mod tests {
         let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
         assert_eq!(entry.evidence.len(), 1, "entry must have 1 evidence row");
 
-        // verified is Some(bool) — inline verification was attempted
-        // (true if CWD happens to be the tempdir, false otherwise — both are acceptable)
+        // verified is Some(bool) — inline verification was attempted, even
+        // with no repo_root (it reports Unverified rather than being skipped).
         assert!(
             entry.evidence[0].verified.is_some(),
             "verified must not be null for top-K results"
@@ -760,7 +1187,7 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_db(&paths.db).unwrap();
+        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
         let results = crate::components::db::search_entries(
             &conn,
             &embedder,
@@ -811,9 +1238,9 @@ mod tests {
             ]
         }
 
-        /// Invariant: arbitrary FTS queries don't panic and FTS keywords
-        /// are treated as literals, not operators. Quote/backslash escaping
-        /// preserves valid FTS5 syntax.
+        // Invariant: arbitrary FTS queries don't panic and FTS keywords
+        // are treated as literals, not operators. Quote/backslash escaping
+        // preserves valid FTS5 syntax.
         proptest! {
             #![proptest_config(proptest::prelude::ProptestConfig {
                 cases: proptest_cases(256),
@@ -851,7 +1278,7 @@ mod tests {
                 add_cmd.execute_with(&paths, &embedder).unwrap();
 
                 // Connect to DB and search with adversarial query
-                let conn = crate::components::db::open_db(&paths.db).unwrap();
+                let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
                 let opts = crate::components::db::SearchOptions {
                     limit: 10,
                     do_fts: true,
@@ -915,9 +1342,7 @@ mod tests {
         let local_dir = tempdir().unwrap();
         let local_root = local_dir.path();
         fs::create_dir_all(local_root.join(".state/agent-kb")).unwrap();
-        let local_paths = Paths::from_root(local_root);
-
-        let local_conn = crate::components::db::open_db(&local_paths.db).unwrap();
+        let (_local_paths, local_conn) = crate::components::db::test_db(local_root);
         let peer_root_str = peer_root.to_str().unwrap().to_string();
         local_conn
             .execute(
@@ -947,7 +1372,7 @@ mod tests {
         };
 
         let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;
-        let peer_conn = crate::components::db::open_db(&peer_db).unwrap();
+        let peer_conn = crate::components::db::open_unchecked_for_test(&peer_db).unwrap();
         let peer_opts = crate::components::db::SearchOptions {
             repo_root: Some(std::path::PathBuf::from(&peer_root_str)),
             ..opts.clone()
@@ -978,5 +1403,151 @@ mod tests {
             );
         }
         assert!(!peer_results.is_empty(), "peer FTS must return the entry");
+    }
+
+    #[test]
+    fn test_federated_search_does_not_modify_peer_database() {
+        use crate::commands::add::acquire_lock;
+
+        let peer_dir = tempdir().unwrap();
+        let peer_paths = Paths::from_root(peer_dir.path());
+        let embedder = NoopEmbedder;
+        Add {
+            path: "peer/immutable.rs".to_string(),
+            summary: "immutable peer database marker".to_string(),
+            content: "federated read only".to_string(),
+            tags: "peer".to_string(),
+            version_ref: None,
+            id: Some("immutable-peer-entry".to_string()),
+            permanent: false,
+            replace_path: false,
+            kind: "convention".to_string(),
+            evidence: vec![],
+            evidence_file: None,
+            cues: vec![],
+        }
+        .execute_with(&peer_paths, &embedder)
+        .unwrap();
+
+        // Leave the peer's WAL genuinely hot rather than pre-checkpointing it:
+        // open a second WAL-mode connection with auto-checkpoint disabled and
+        // `mem::forget` it instead of closing it, so SQLite's "checkpoint the
+        // last connection to close" behavior never fires. A test that
+        // checkpoints before snapshotting can't catch a federated search that
+        // itself triggers that same checkpoint on close.
+        let keep_wal_hot = db::open_unchecked_for_test(&peer_paths.db).unwrap();
+        keep_wal_hot
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        keep_wal_hot
+            .execute(
+                "INSERT INTO entries(id, path, summary, content, tags)
+                 VALUES('hot-wal-marker','p/hot','hot wal summary','hot wal content','[]')",
+                [],
+            )
+            .unwrap();
+        std::mem::forget(keep_wal_hot);
+
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", peer_paths.db.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", peer_paths.db.display()));
+        assert!(
+            fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "precondition: the peer must have a live, unmerged WAL before federated search runs"
+        );
+
+        let db_bytes_before = fs::read(&peer_paths.db).unwrap();
+        let wal_bytes_before = fs::read(&wal_path).unwrap();
+        let shm_bytes_before = fs::read(&shm_path).unwrap();
+
+        let local_dir = tempdir().unwrap();
+        let local_paths = Paths::from_root(local_dir.path());
+        let lock = acquire_lock(&local_paths.lock).unwrap();
+        let local_conn = db::open_rw(&local_paths, &lock).unwrap();
+        local_conn.execute(
+            "INSERT INTO graphs(id, graph_type, source_repo) VALUES('immutable-g', 'dep', 'local')",
+            [],
+        ).unwrap();
+        local_conn
+            .execute(
+                "INSERT INTO peers(id, graph_id, source_repo, target_repo, edge_type) \
+             VALUES('immutable-p', 'immutable-g', 'local', ?1, 'dep')",
+                rusqlite::params![peer_dir.path().to_string_lossy()],
+            )
+            .unwrap();
+
+        // Prove the federation traversal actually reaches the registered peer
+        // before running the real command, so the byte-identity assertions
+        // below cannot pass vacuously against a peer nothing ever queried.
+        let peer_paths_found = collect_peer_paths(&local_conn, None, 1, None);
+        assert!(
+            peer_paths_found
+                .iter()
+                .any(|p| std::path::Path::new(p) == peer_dir.path()),
+            "the registered peer edge must be reachable via collect_peer_paths, got {peer_paths_found:?}"
+        );
+        drop(local_conn);
+        drop(lock);
+
+        Search {
+            query: "immutable".to_string(),
+            fts: true,
+            semantic: false,
+            repo: None,
+            limit: 10,
+            content: false,
+            path_prefix: None,
+            tag: None,
+            local_only: false,
+            peers: true,
+            reachable_from: None,
+            max_hops: 1,
+            slug: None,
+        }
+        .execute_with(&local_paths, &embedder)
+        .unwrap();
+
+        // Prove the federated search actually returned a peer row — the same
+        // mechanism `Search::execute_with` uses internally (`open_ro_peer` +
+        // `search_entries` against the peer db) must find the marker entry —
+        // so this test cannot pass vacuously if the peer were silently
+        // skipped (e.g. `collect_peer_paths` finding it but the search
+        // itself failing to open or query it).
+        let peer_conn = db::open_ro_peer(&peer_paths.db).unwrap();
+        let peer_opts = db::SearchOptions {
+            limit: 10,
+            do_fts: true,
+            do_semantic: false,
+            path_prefix: None,
+            tag_filter: None,
+            inline_verify_k: 0,
+            repo_root: Some(peer_dir.path().to_path_buf()),
+            verify_pool_size: None,
+            recency_lambda: 0.0,
+            mmr_lambda: 0.0,
+        };
+        let peer_results =
+            db::search_entries(&peer_conn, &embedder, "immutable", &peer_opts).unwrap();
+        let peer_result_ids: Vec<&str> = peer_results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            peer_result_ids.contains(&"immutable-peer-entry"),
+            "federated search must be able to find the peer's marker entry, got {peer_result_ids:?}"
+        );
+        drop(peer_conn);
+
+        assert_eq!(
+            fs::read(&peer_paths.db).unwrap(),
+            db_bytes_before,
+            "federated search must never rewrite the peer's main db file"
+        );
+        assert_eq!(
+            fs::read(&wal_path).unwrap(),
+            wal_bytes_before,
+            "federated search must never touch the peer's -wal file"
+        );
+        assert_eq!(
+            fs::read(&shm_path).unwrap(),
+            shm_bytes_before,
+            "federated search must never touch the peer's -shm file"
+        );
     }
 }

@@ -53,13 +53,65 @@ The following are hard rejections:
 | `src/foo.rs:100-100` | Empty range (start == end) |
 | `src/` | Directories are not cited |
 
-The intent is loud failure: a typo in a citation path must surface as a parse error, never as silent fallback to whole-file. If a citation was recorded and later appears malformed in the database, verification surfaces it as an `UnverifiedReason` rather than an error.
+The intent is loud failure: a typo in a citation path must surface as a parse error, never as silent fallback to whole-file. If a citation was recorded and later appears malformed in the database, verification surfaces it as an `UnverifiedReason` rather than an error — this is the read-path (verification) behavior. The MCP write path is stricter: see "MCP write-time rejection" below.
 
 ### Special Cases
 
 **Empty files.** A whole-file citation of an empty file is legal and meaningful. It asserts that the file is empty (0 bytes). The hash is `sha256("")` = `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. If the file later gains bytes, the hash changes and the evidence row is flagged as unverified.
 
-**Non-regular files.** Directories, symlinks, and device files are rejected as `FileMissing`. A file opened with `File::open()` must be a regular file (`metadata.is_file()` check required).
+**Non-regular files.** Directories and device files are rejected as `FileMissing`. Any symbolic-link component, whether it points inside or outside the repository, is rejected as `SymlinkPathRejected` (`symlink_path_rejected` on machine-readable surfaces). This reason is not eligible for relocation or auto-heal. A file opened for verification must be a regular file (`metadata.is_file()` check required).
+
+This reject-all policy is identical at every citation resolution site and on
+every platform (`symlink_citations_are_rejected_by_openat2_and_fallback_resolvers`,
+`safe_join_rejects_symlink_components_and_parent_components`, and
+`relocation_scan_skips_symlinked_candidates_and_never_auto_heals_them`). The
+reason reveals only that an in-repository component is a symlink, not where it
+points. The compatibility audit found 41 evidence rows and zero affected; see
+ADR-5: Citation symlink policy (`docs/decisions/adr-5-symlink-policy.md`)
+rather than duplicating its security rationale here.
+
+**Caller-supplied hashes.** Supplying `citation_hash` does not bypass
+authorship validation. `kb_core::add` computes the file hash and
+rejects a mismatch before append; this is pinned by
+`test_kb_core_add_rejects_wrong_explicit_citation_hash`. `parse_cite_target`
+and `parse_citation_path` both require `start < end`, so empty and reversed
+ranges are rejected (`test_parse_cite_target_rejects_start_greater_than_end`
+and `test_parse_cite_target_rejects_empty_range_exactly`).
+
+### MCP write-time rejection
+
+The MCP `add` handler validates caller-supplied hashes more broadly than
+`kb_core::add` alone. Before `handle_add` appends any event or performs any
+database write, `validate_explicit_citation_hashes` (`src/commands/mcp.rs`)
+re-verifies every evidence row that carries both a `citation_path` and a
+non-empty `citation_hash`, using the same `verify_evidence` path- and
+range-hashing policy described above. Any non-verified outcome — a
+malformed range, a missing file, an out-of-bounds range, or a path-escape
+attempt — rejects the whole `kb_add` call with:
+
+```
+evidence[i] citation_hash failed verification for citation_path "...": <reason>
+```
+
+and error code `validation_error`. This is stricter than the read-path
+behavior described above: a stored row that later drifts still surfaces as
+`UnverifiedReason` on verification, but an incoming MCP write with a
+mismatched explicit hash never reaches storage at all.
+
+### Worktree citation warning
+
+`kb add` and the `kb_add` MCP tool print a warning for every `citation_path`
+beginning with `.state/worktrees/`:
+
+```
+warn: citation_path under .state/worktrees/ will go stale after the worktree is removed: <paths>
+```
+
+This is a non-blocking warning (`add_validation::warn_nested_worktree_citations`,
+called from both `src/commands/add.rs` and `src/commands/mcp.rs`): the write
+still succeeds. It exists because a citation rooted in a disposable worktree
+directory becomes unresolvable once that worktree is removed — such
+citations should be re-cited against the merged path once work lands.
 
 ## Verification Semantics
 
@@ -77,6 +129,7 @@ The `verify_evidence()` function **never returns an error**. All conditions that
 
 - Malformed citation path
 - File not found or not a regular file
+- Symbolic link in any citation path component
 - Byte range outside file bounds
 - I/O errors during hashing
 - Hash mismatch
@@ -95,6 +148,28 @@ When a whole-file citation's hash no longer matches at its original path, but th
 ```
 
 This is the natural generalization of range relocation: a whole-file citation at a new location becomes a bare whole-file citation at that location.
+
+### Relocation safety and scan bounds
+
+Relocation succeeds only for exactly one excerpt match. If a second match is
+found, `Verifier::search_for_excerpt` stops and reports `NonUnique`; it never
+picks one candidate. `multiple_candidates_report_multiplicity` and
+`prop_non_unique_is_never_relocated` pin this behavior.
+
+Repository-wide relocation does not descend into `.git`, `target`,
+`node_modules`, `.state`, or `agent-kb`, and `excluded_names` also adds plain
+non-glob names from the repository-root `.gitignore`. This prevents build
+outputs and the KB's own stored excerpts from becoming candidates; see
+`excluded_directories_are_not_searched`, `gitignored_directory_is_not_searched`,
+and `search_never_treats_the_kb_store_as_a_relocation_candidate`.
+
+The scan charges each candidate file's size against
+`MAX_RELOCATION_SCAN_BYTES`. If the next file exceeds the remaining budget,
+`Verifier::scan_file` returns `CapExceeded`, which becomes the user-visible
+unverified reason `scan_cap_exceeded` (`ScanCapExceeded`). This means the scan
+could not establish repository-wide uniqueness within its bounded work; it
+does not mean that no candidate exists, and a candidate found before exhaustion
+is not accepted as unique.
 
 ## The `kb cite` Tool
 
@@ -119,6 +194,12 @@ The tool outputs a JSON object:
   "file_size": 12345
 }
 ```
+
+`citation_sha` is the git HEAD commit SHA resolved at the cited file's own
+parent directory, not the process's current working directory
+(`compute_citation_fields` in `src/commands/cite.rs`). A file cited from
+inside a nested worktree therefore records that worktree's HEAD, which can
+differ from the outer repository's HEAD at the time of citation.
 
 ### MCP Usage
 

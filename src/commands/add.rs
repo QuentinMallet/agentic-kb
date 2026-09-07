@@ -9,7 +9,9 @@
 //! The `"session_id"` field is `$OMC_SESSION_ID` when set, else absent (NULL in DB).
 //! The `expire_reason` is `"replaced by --replace-path"`.
 
-use crate::commands::add_validation::{compute_evidence_status_write, validate_kb_add_inputs};
+use crate::commands::add_validation::{
+    compute_evidence_status_write, validate_kb_add_inputs, warn_nested_worktree_citations,
+};
 use crate::components::embedder;
 use crate::components::kb_core;
 use crate::config;
@@ -74,7 +76,7 @@ impl Add {
     pub fn execute(&self) -> anyhow::Result<()> {
         let paths = config::Paths::discover()?;
         let embedder = make_embedder(&paths);
-        crate::commands::rebuild::rebuild_if_schema_obsolete(&paths, embedder.as_ref())?;
+        crate::commands::rebuild::recover_if_needed(&paths, embedder.as_ref())?;
         self.execute_with(&paths, embedder.as_ref())
     }
 
@@ -113,6 +115,7 @@ impl Add {
 
         // Validate kind, tags, and evidence before acquiring the lock.
         validate_kb_add_inputs(&id, &self.kind, &tags_json, &evidence_rows)?;
+        warn_nested_worktree_citations(&evidence_rows);
 
         let evidence_status = compute_evidence_status_write(&self.kind, &evidence_rows);
         let version_ref = self.version_ref.clone().or_else(config::git_head_sha);
@@ -204,11 +207,56 @@ pub fn make_embedder_with_opts(
     }
 }
 
+/// Lock files each thread currently holds, keyed on `(ThreadId, CANONICAL path)`
+/// and valued by the source location that acquired the lock.
+///
+/// `fs2::lock_exclusive` is `flock(2)`, associated with the open file
+/// description: a thread that acquires a lock it already holds opens a second
+/// description and blocks on itself forever. The type system cannot see that —
+/// `&Lock` proves a live guard exists at a mutating open, not that the same
+/// call chain did not take the lock twice — so the registry converts that
+/// self-deadlock into an immediate error naming the first acquisition site.
+///
+/// **Scoped to the acquiring thread, not the process.** A *different* thread
+/// waiting on the same flock is ordinary mutual exclusion, not a deadlock, and
+/// the codebase depends on it: `rebuild`'s schema-upgrade single-flight and its
+/// Phase 2 concurrent-writer guarantee are both exercised by in-process threads
+/// that must serialize on the flock rather than fail. Every self-deadlock ADR-1
+/// names — `rebuild.rs`'s documented case, `handle_import` under `L2` — is one
+/// thread re-entering its own lock.
+///
+/// Keying on the canonical path is load-bearing: two spellings of one lock file
+/// (a relative path, a `..` component, a symlinked repo root) must collapse to
+/// one entry or a re-entrant acquire slips through under an alias and hangs.
+/// See `.state/agent-kb/tla/decisions/lock-contract-no-spec.md`, re-entrancy row.
+type LockRegistryKey = (std::thread::ThreadId, std::path::PathBuf);
+
+static HELD_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<LockRegistryKey, String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn held_locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<LockRegistryKey, String>>
+{
+    // A panic while the registry is held would otherwise poison every later
+    // acquire; the map itself is always left consistent, so recover in place.
+    HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Acquire the agentic lock.
+///
+/// Blocking and exclusive, released when the returned [`Lock`] is dropped.
+/// A second acquire of the same file *on the same thread* is rejected rather
+/// than deadlocked — callers that already hold the lock must pass the guard
+/// down (see [`crate::components::kb_core::add_locked`]). Other threads still
+/// block on the flock, which is real mutual exclusion.
+#[track_caller]
 pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
     use anyhow::Context;
     use fs2::FileExt;
     use std::fs::{self, OpenOptions};
+
+    let caller = std::panic::Location::caller();
+    let site = format!("{}:{}", caller.file(), caller.line());
 
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
@@ -219,20 +267,72 @@ pub fn acquire_lock(lock_path: &std::path::Path) -> anyhow::Result<Lock> {
         .truncate(false)
         .open(lock_path)
         .with_context(|| format!("open lock {}", lock_path.display()))?;
-    f.lock_exclusive()
-        .with_context(|| format!("acquire lock {}", lock_path.display()))?;
-    Ok(Lock(f))
+    // Canonicalize only after the file exists, so a first-ever acquire resolves.
+    let canonical = fs::canonicalize(lock_path)
+        .with_context(|| format!("canonicalize lock {}", lock_path.display()))?;
+
+    let owner = std::thread::current().id();
+    let key: LockRegistryKey = (owner, canonical.clone());
+    {
+        let mut held = held_locks();
+        if let Some(first) = held.get(&key) {
+            anyhow::bail!(
+                "re-entrant acquire of {}: this thread already holds it (acquired at {first}). \
+                 Pass the existing Lock down instead of re-acquiring — e.g. kb_core::add_locked \
+                 or db::open_rw(&paths, &lock).",
+                canonical.display()
+            );
+        }
+        held.insert(key.clone(), site);
+    }
+
+    if let Err(e) = f.lock_exclusive() {
+        held_locks().remove(&key);
+        return Err(anyhow::Error::new(e).context(format!("acquire lock {}", lock_path.display())));
+    }
+    crate::components::events::note_log_lock_acquired();
+    Ok(Lock {
+        file: f,
+        path: canonical,
+        owner,
+    })
 }
 
 /// RAII lock guard — holds the file lock until dropped.
-pub struct Lock(#[allow(dead_code)] std::fs::File);
+///
+/// Carries the canonicalized path of the file it locks so a mutating open can
+/// assert it was handed the *right* lock, not merely *a* lock (ADR-1).
+/// Construction and drop are the only places the event-log lock depth moves, so
+/// the append path's destructive span repair can assert the flock structurally
+/// instead of documenting it.
+pub struct Lock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    /// Thread that acquired it. Recorded so the registry entry is cleared
+    /// under its owner's key even when the guard is dropped on another thread.
+    owner: std::thread::ThreadId,
+}
+
+impl Lock {
+    /// Canonicalized path of the locked file.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        held_locks().remove(&(self.owner, self.path.clone()));
+        crate::components::events::note_log_lock_released();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::{db, embedder::NoopEmbedder, events};
     use crate::config::Paths;
-    use rusqlite::Connection;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command as Cmd;
@@ -321,7 +421,7 @@ mod tests {
         assert!(events_content.contains("test-id-1"));
 
         // Verify DB row
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let (path, summary): (String, String) = conn
             .query_row(
                 "SELECT path, summary FROM entries WHERE id='test-id-1'",
@@ -358,7 +458,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let permanent: i64 = conn
             .query_row(
                 "SELECT permanent FROM entries WHERE id='perm-test-1'",
@@ -422,7 +522,7 @@ mod tests {
         });
         events::append_event(&paths.events, &old_event).unwrap();
 
-        let conn = db::open_db(&paths.db).unwrap();
+        let (_paths, conn) = db::test_db(root);
         db::apply_event(&conn, &embedder, &old_event).unwrap();
 
         let permanent: i64 = conn
@@ -480,7 +580,7 @@ mod tests {
         };
         cmd2.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let old_stale: i64 = conn
             .query_row("SELECT is_stale FROM entries WHERE id='rp-old'", [], |r| {
                 r.get(0)
@@ -530,7 +630,7 @@ mod tests {
         };
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let version_ref: Option<String> = conn
             .query_row(
                 "SELECT version_ref FROM entries WHERE path = 'src/lib.rs'",
@@ -554,7 +654,7 @@ mod tests {
         let cmd = make_add("src/lib.rs", "kind-default-1");
         cmd.execute_with(&paths, &embedder).unwrap();
 
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let kind: String = conn
             .query_row(
                 "SELECT kind FROM entries WHERE id='kind-default-1'",
@@ -653,7 +753,7 @@ mod tests {
             };
             cmd.execute_with(&paths, &embedder).unwrap();
 
-            let conn = crate::components::db::open_db(&paths.db).unwrap();
+            let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
             let stored_status: String = conn
                 .query_row(
                     "SELECT evidence_status FROM entries WHERE id = ?1",
@@ -670,6 +770,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join(".state/agent-kb")).unwrap();
+        // add_locked resolves + re-verifies citation_path against a real repo
+        // file under the flock, so the cited files must actually exist.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/foo.rs"), b"fn foo() {}\nfn foo2() {}\n").unwrap();
+        fs::write(root.join("src/bar.rs"), b"fn bar() {}\nfn bar2() {}\n").unwrap();
         let paths = Paths::from_root(root);
         let embedder = NoopEmbedder;
 
@@ -684,8 +789,8 @@ mod tests {
             replace_path: false,
             kind: "observation".to_string(),
             evidence: vec![
-                r#"{"kind":"code","citation_path":"src/foo.rs:1-10","citation_sha":"abc","citation_hash":"sha256:aaa","citation_excerpt":"fn foo() {}"}"#.to_string(),
-                r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_sha":"abc","citation_hash":"sha256:bbb","citation_excerpt":"fn bar() {}"}"#.to_string(),
+                r#"{"kind":"code","citation_path":"src/foo.rs:1-10","citation_excerpt":"fn foo() {}"}"#.to_string(),
+                r#"{"kind":"code","citation_path":"src/bar.rs:5-15","citation_excerpt":"fn bar() {}"}"#.to_string(),
             ],
             evidence_file: None,
             cues: vec![],
@@ -693,32 +798,27 @@ mod tests {
         cmd.execute_with(&paths, &embedder).unwrap();
 
         // Verify events.jsonl has Add followed by 2 EvidenceAdd events
-        let events_content = fs::read_to_string(&paths.events).unwrap();
-        let lines: Vec<&str> = events_content.lines().collect();
-        // Should have 3 lines: 1 upsert + 2 evidence_add
-        assert_eq!(
-            lines.len(),
-            3,
-            "expected 3 event lines (1 add + 2 evidence_add)"
-        );
+        let lines = events::read_events(&paths.events).unwrap().events;
+        // Should have 3 events: 1 upsert + 2 evidence_add (markers are not events)
+        assert_eq!(lines.len(), 3, "expected 3 events (1 add + 2 evidence_add)");
 
-        let ev0: Value = serde_json::from_str(lines[0]).unwrap();
+        let ev0 = &lines[0];
         assert_eq!(ev0["action"], "upsert");
         assert_eq!(ev0["table"], "entries");
         assert_eq!(ev0["id"], "batch-ev-1");
         assert_eq!(ev0["kind"], "observation");
         assert_eq!(ev0["evidence_status"], "present");
 
-        let ev1: Value = serde_json::from_str(lines[1]).unwrap();
+        let ev1 = &lines[1];
         assert_eq!(ev1["action"], "evidence_add");
         assert_eq!(ev1["entry_id"], "batch-ev-1");
 
-        let ev2: Value = serde_json::from_str(lines[2]).unwrap();
+        let ev2 = &lines[2];
         assert_eq!(ev2["action"], "evidence_add");
         assert_eq!(ev2["entry_id"], "batch-ev-1");
 
         // Verify evidence rows in DB
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let ev_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evidence WHERE entry_id='batch-ev-1'",
@@ -779,7 +879,7 @@ mod tests {
         std::env::remove_var("OMC_SESSION_ID");
 
         // AC2: entries.session_id must be "test123" (NOT NULL).
-        let conn = Connection::open(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let session_id: Option<String> = conn
             .query_row(
                 "SELECT session_id FROM entries WHERE id='sess-prop-1'",
@@ -794,8 +894,8 @@ mod tests {
         );
 
         // AC1: the upsert event in the JSONL must also carry session_id.
-        let events_content = fs::read_to_string(&paths.events).unwrap();
-        let ev: Value = serde_json::from_str(events_content.lines().next().unwrap()).unwrap();
+        // Read through the span-aware reader: commit markers are not events.
+        let ev = events::read_events(&paths.events).unwrap().events.remove(0);
         assert_eq!(
             ev["session_id"],
             serde_json::json!("test123"),

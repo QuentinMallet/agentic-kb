@@ -1363,6 +1363,7 @@ dependencies = [
  "crossbeam-channel",
  "fs2",
  "half",
+ "kb",
  "libc",
  "num_cpus",
  "once_cell",

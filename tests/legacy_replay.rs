@@ -10,13 +10,15 @@
 //!      is for replay only, never for new writes.
 //!   5. Fresh DBs are stamped schema_version=current at creation.
 //!   6. A DB without the stamp (legacy schema) is detected obsolete;
-//!      rebuild_if_schema_obsolete rebuilds once, preserves entries, stamps.
-//!   7. On a current DB, rebuild_if_schema_obsolete is a no-op.
+//!      recover_if_needed rebuilds once, preserves entries, stamps.
+//!   7. On a current DB, recover_if_needed is a no-op.
 //!   8. End-to-end: kb rebuild over a log containing an oversized event
 //!      succeeds and stores the clamped entry.
 
-use kb::commands::rebuild::{rebuild_if_schema_obsolete, Rebuild};
-use kb::components::db::{apply_event, open_db, open_db_memory, schema_is_current};
+use kb::commands::rebuild::{recover_if_needed, Rebuild};
+use kb::components::db::{
+    apply_event, open_db_memory, open_unchecked_for_test, schema_is_current, SCHEMA_VERSION,
+};
 use kb::components::embedder::{Embedder, NoopEmbedder};
 use kb::components::events;
 use kb::components::kb_core::{add, AddArgs};
@@ -137,7 +139,7 @@ fn test_kb_core_add_rejects_oversized() {
 #[test]
 fn test_fresh_db_is_current() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = open_db(&dir.path().join("fresh.db")).unwrap();
+    let conn = kb::components::db::open_scratch(&dir.path().join("fresh.db")).unwrap();
     assert!(
         schema_is_current(&conn),
         "fresh DB must carry the current schema_version stamp"
@@ -157,7 +159,7 @@ fn test_obsolete_schema_forces_one_rebuild() {
 
     // Simulate a legacy DB: strip the stamp (pre-stamp binaries never wrote one).
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
         assert!(
@@ -168,18 +170,18 @@ fn test_obsolete_schema_forces_one_rebuild() {
 
     // A Noop embedder must DEFER (rebuilding would wipe entries_emb) and
     // must not stamp — the DB stays flagged for the next real interaction.
-    let deferred = rebuild_if_schema_obsolete(&paths, &NoopEmbedder).unwrap();
+    let deferred = recover_if_needed(&paths, &NoopEmbedder).unwrap();
     assert!(!deferred, "noop embedder must defer the upgrade");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(!schema_is_current(&conn), "deferral must not stamp");
     }
 
     // First real interaction: forces a rebuild, preserves entries, stamps.
-    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(rebuilt, "obsolete schema must trigger a rebuild");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(
             schema_is_current(&conn),
             "rebuilt DB must be stamped current"
@@ -197,7 +199,7 @@ fn test_obsolete_schema_forces_one_rebuild() {
     }
 
     // Second interaction: no-op.
-    let rebuilt_again = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    let rebuilt_again = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt_again, "current schema must not rebuild again");
 }
 
@@ -212,17 +214,17 @@ fn test_missing_log_does_not_disarm_upgrade() {
 
     add(&paths, &NoopEmbedder, base_args("orphaned")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
     // Simulate a layout mismatch: the log is unreachable at paths.events.
     fs::remove_file(&paths.events).unwrap();
 
-    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt, "no log -> no rebuild");
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         assert!(
             !schema_is_current(&conn),
             "populated DB without its log must NOT be stamped — the upgrade must retry"
@@ -233,14 +235,18 @@ fn test_missing_log_does_not_disarm_upgrade() {
     let dir2 = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir2.path().join(".state/agent-kb")).unwrap();
     let paths2 = Paths::from_root(dir2.path());
+    // paths2.db is the live path, so it must be schema-initialized through
+    // open_or_init (open_scratch refuses live db names) before the raw
+    // fixture connection below can touch kb_meta.
+    kb::components::db::open_or_init(&paths2).unwrap();
     {
-        let conn = open_db(&paths2.db).unwrap();
+        let conn = open_unchecked_for_test(&paths2.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
-    let rebuilt2 = rebuild_if_schema_obsolete(&paths2, &FixedEmbedder).unwrap();
+    let rebuilt2 = recover_if_needed(&paths2, &FixedEmbedder).unwrap();
     assert!(!rebuilt2);
-    let conn = open_db(&paths2.db).unwrap();
+    let conn = open_unchecked_for_test(&paths2.db).unwrap();
     assert!(
         schema_is_current(&conn),
         "empty DB with no log may stamp without rebuild"
@@ -260,19 +266,30 @@ fn test_partial_log_refuses_auto_rebuild() {
     add(&paths, &NoopEmbedder, base_args("legacy-a")).unwrap();
     add(&paths, &NoopEmbedder, base_args("legacy-b")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
-    // Simulate the partial-log hazard: the original log is gone; one later
-    // write created a fresh log containing only a NEW entry.
+    // Simulate the partial-log hazard: the original log is gone and a fresh one
+    // holds only a NEW entry. Staged by hand rather than through `add`, because
+    // C1/T4's write guard now refuses a write while the log is missing —
+    // resurrecting it is what orphans the entries this test is about.
     fs::remove_file(&paths.events).unwrap();
-    add(&paths, &NoopEmbedder, base_args("only-in-new-log")).unwrap();
+    let new_event = serde_json::json!({
+        "action": "upsert", "table": "entries", "id": "only-in-new-log",
+        "path": "src/only.rs", "summary": "s", "content": "c", "tags": [],
+        "kind": "belief", "evidence_status": "n/a", "ts": "2026-09-05T00:00:00Z",
+    });
+    events::append_event(&paths.events, &new_event).unwrap();
+    {
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
+        apply_event(&conn, &NoopEmbedder, &new_event).unwrap();
+    }
 
-    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(!rebuilt, "partial log must refuse auto-rebuild");
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "refusal must not stamp");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
@@ -294,7 +311,7 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
 
     add(&paths, &NoopEmbedder, base_args("rolled")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
             "UPDATE entries SET content='NEW db payload' WHERE id='rolled'",
             [],
@@ -304,14 +321,14 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
             .unwrap();
     }
     // Log covers the id but with the ORIGINAL payload (base_args content 'ok').
-    let rebuilt = rebuild_if_schema_obsolete(&paths, &FixedEmbedder).unwrap();
+    let rebuilt = recover_if_needed(&paths, &FixedEmbedder).unwrap();
     assert!(
         rebuilt,
         "covering log rebuilds — log is the source of truth"
     );
 
     // Live DB now reflects the log (rolled back to 'ok') and is stamped.
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let content: String = conn
         .query_row("SELECT content FROM entries WHERE id='rolled'", [], |r| {
@@ -321,7 +338,9 @@ fn test_upgrade_backs_up_pre_rebuild_db() {
     assert_eq!(content, "ok", "rebuild materializes the log");
 
     // The pre-upgrade DB (with 'NEW db payload') is preserved and recoverable.
-    let backup = paths.db.with_extension("db.pre-v2.bak");
+    let backup = paths
+        .db
+        .with_extension(format!("db.pre-v{SCHEMA_VERSION}.bak"));
     assert!(
         backup.exists(),
         "pre-upgrade backup must exist: {}",
@@ -354,21 +373,23 @@ fn test_upgrade_aborts_when_backup_fails() {
 
     add(&paths, &NoopEmbedder, base_args("keep")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
     // Make the backup target unwritable: pre-create it as a directory so
     // VACUUM INTO / remove_file cannot produce the snapshot file.
-    let backup = paths.db.with_extension("db.pre-v2.bak");
+    let backup = paths
+        .db
+        .with_extension(format!("db.pre-v{SCHEMA_VERSION}.bak"));
     fs::create_dir(&backup).unwrap();
     fs::create_dir(backup.join("blocker")).unwrap(); // non-empty → remove_file & rmdir fail
 
-    let res = rebuild_if_schema_obsolete(&paths, &FixedEmbedder);
+    let res = recover_if_needed(&paths, &FixedEmbedder);
     assert!(res.is_err(), "backup failure must abort the upgrade");
 
     // DB is untouched: obsolete, entry intact.
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(!schema_is_current(&conn), "aborted upgrade must not stamp");
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
@@ -389,7 +410,7 @@ fn test_concurrent_upgrade_single_flight() {
 
     add(&paths, &NoopEmbedder, base_args("cc-1")).unwrap();
     {
-        let conn = open_db(&paths.db).unwrap();
+        let conn = open_unchecked_for_test(&paths.db).unwrap();
         conn.execute("DELETE FROM kb_meta WHERE key='schema_version'", [])
             .unwrap();
     }
@@ -398,7 +419,7 @@ fn test_concurrent_upgrade_single_flight() {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let paths = &paths;
-                s.spawn(move || rebuild_if_schema_obsolete(paths, &FixedEmbedder).unwrap())
+                s.spawn(move || recover_if_needed(paths, &FixedEmbedder).unwrap())
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -410,7 +431,7 @@ fn test_concurrent_upgrade_single_flight() {
         "exactly one of the racers must rebuild, got {results:?}"
     );
 
-    let conn = open_db(&paths.db).unwrap();
+    let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert!(schema_is_current(&conn));
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM entries WHERE is_stale=0", [], |r| {
