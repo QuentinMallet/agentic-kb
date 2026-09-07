@@ -2346,24 +2346,29 @@ struct SearchRuntimeStats {
     cue_materialized_bytes: usize,
 }
 
+// Thread-local, not a process-global static: `record_search_runtime_stats` is
+// called synchronously on the thread that invokes `search_entries` (before any
+// verify-pool worker threads are spawned), and every caller of
+// `take_search_runtime_stats` runs on that same thread immediately after
+// `search_entries` returns. A process-global `Mutex<Option<..>>` let a
+// concurrently running test (under `cargo test --test-threads>1`, one
+// process) overwrite another thread's recorded stats between its record and
+// take, since both threads shared the same cell.
 #[cfg(test)]
-fn search_runtime_stats_cell() -> &'static std::sync::Mutex<Option<SearchRuntimeStats>> {
-    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<SearchRuntimeStats>>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Mutex::new(None))
+thread_local! {
+    static SEARCH_RUNTIME_STATS_CELL: std::cell::RefCell<Option<SearchRuntimeStats>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn record_search_runtime_stats(stats: SearchRuntimeStats) {
-    *search_runtime_stats_cell().lock().unwrap() = Some(stats);
+    SEARCH_RUNTIME_STATS_CELL.with(|cell| *cell.borrow_mut() = Some(stats));
 }
 
 #[cfg(test)]
 fn take_search_runtime_stats() -> SearchRuntimeStats {
-    search_runtime_stats_cell()
-        .lock()
-        .unwrap()
-        .take()
+    SEARCH_RUNTIME_STATS_CELL
+        .with(|cell| cell.borrow_mut().take())
         .expect("search runtime stats must be recorded")
 }
 
@@ -7420,6 +7425,63 @@ mod tests {
         assert_eq!(stats.effective_verify_pool_size, MAX_VERIFY_POOL_SIZE);
         assert_eq!(stats.spawned_verify_workers, MAX_VERIFY_POOL_SIZE);
         assert_eq!(stats.scheduled_verification_tasks, 1);
+    }
+
+    #[test]
+    fn test_search_runtime_stats_are_thread_local_under_concurrent_searches() {
+        // Regression test for bd-pc9q: `record_search_runtime_stats` /
+        // `take_search_runtime_stats` used to share a process-global
+        // `Mutex<Option<SearchRuntimeStats>>`. Two threads each running
+        // `search_entries` with a different `limit` could interleave their
+        // record/take pair, so one thread's `take_search_runtime_stats()`
+        // would observe the other thread's stats. With a thread-local sink,
+        // each thread must only ever see its own recorded `effective_limit`.
+        fn run_search_and_check_own_limit(limit: usize) {
+            let conn = open_db_memory().unwrap();
+            let embedder = NoopEmbedder;
+            let upsert = serde_json::json!({
+                "action": "upsert", "table": "entries",
+                "id": "tl-entry",
+                "path": "src/tl.rs",
+                "summary": "thread local stats needle",
+                "content": "thread local stats body",
+                "tags": ["tl"],
+                "kind": "observation",
+                "evidence_status": "present",
+                "ts": "2024-01-01T00:00:00Z"
+            });
+            apply_event(&conn, &embedder, &upsert).unwrap();
+
+            let opts = SearchOptions {
+                limit,
+                do_fts: true,
+                do_semantic: false,
+                path_prefix: None,
+                tag_filter: None,
+                inline_verify_k: limit,
+                repo_root: None,
+                verify_pool_size: Some(1),
+                recency_lambda: 0.0,
+                mmr_lambda: 0.0,
+            };
+            // Repeated iterations raise the odds of interleaving with the
+            // other thread's record/take pair, so a regression to a shared
+            // global cell fails reliably instead of only occasionally.
+            for _ in 0..200 {
+                search_entries(&conn, &embedder, "thread local stats needle", &opts).unwrap();
+                let stats = take_search_runtime_stats();
+                assert_eq!(
+                    stats.effective_limit, limit,
+                    "this thread's recorded stats must match its own search limit, \
+                     not a concurrently running thread's"
+                );
+            }
+        }
+
+        let t1 = std::thread::spawn(|| run_search_and_check_own_limit(3));
+        let t2 = std::thread::spawn(|| run_search_and_check_own_limit(7));
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     #[test]
