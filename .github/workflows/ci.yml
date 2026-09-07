@@ -22,7 +22,7 @@ jobs:
       - name: Test
         run: nix develop -c cargo test
       - name: Lint
-        run: nix develop -c cargo clippy -- -D warnings
+        run: nix develop -c cargo clippy --all-targets --all-features -- -D warnings
       - name: Format check
         run: nix develop -c cargo fmt --check
       - name: Elixir compile (mcp)
