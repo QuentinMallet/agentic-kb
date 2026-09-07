@@ -246,14 +246,14 @@ mod tests {
     struct CwdGuard(std::path::PathBuf);
     impl CwdGuard {
         fn set(dir: &Path) -> Self {
-            let orig = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
+            let orig = env::current_dir().unwrap();
+            env::set_current_dir(dir).unwrap();
             CwdGuard(orig)
         }
     }
     impl Drop for CwdGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
+            let _ = env::set_current_dir(&self.0);
         }
     }
 

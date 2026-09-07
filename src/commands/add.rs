@@ -753,7 +753,7 @@ mod tests {
             };
             cmd.execute_with(&paths, &embedder).unwrap();
 
-            let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
+            let conn = db::open_unchecked_for_test(&paths.db).unwrap();
             let stored_status: String = conn
                 .query_row(
                     "SELECT evidence_status FROM entries WHERE id = ?1",

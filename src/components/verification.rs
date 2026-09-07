@@ -2316,7 +2316,7 @@ mod tests {
     fn test_verify_evidence_rejects_parent_traversal() {
         let dir = tempfile::tempdir().unwrap();
         // Create a file outside the tempdir to make sure it can't be reached.
-        let outer = tempfile::NamedTempFile::new().unwrap();
+        let outer = NamedTempFile::new().unwrap();
         std::fs::write(outer.path(), b"secret").unwrap();
 
         let ev = make_evidence(
@@ -2536,7 +2536,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let repo = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside = NamedTempFile::new().unwrap();
         std::fs::write(outside.path(), b"outside secret needle").unwrap();
         let candidate = repo.path().join("candidate.txt");
         std::fs::write(&candidate, b"inside needle").unwrap();
@@ -2566,7 +2566,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let repo = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside = NamedTempFile::new().unwrap();
         std::fs::write(outside.path(), b"outside secret needle").unwrap();
         let candidate = repo.path().join("candidate.txt");
         std::fs::write(&candidate, b"inside only").unwrap();
@@ -2601,7 +2601,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let repo = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
+        let outside = NamedTempFile::new().unwrap();
         std::fs::write(outside.path(), b"outside secret needle").unwrap();
         let candidate = repo.path().join("candidate.txt");
 
@@ -2737,8 +2737,8 @@ mod tests {
         std::fs::write(&repo_file, b"inside").unwrap();
         std::fs::write(&sibling_file, b"outside").unwrap();
 
-        let inside = std::fs::File::open(&repo_file).unwrap();
-        let outside = std::fs::File::open(&sibling_file).unwrap();
+        let inside = File::open(&repo_file).unwrap();
+        let outside = File::open(&sibling_file).unwrap();
 
         assert!(opened_file_within_repo(&inside, &repo_file, &repo));
         assert!(!opened_file_within_repo(&outside, &sibling_file, &repo));

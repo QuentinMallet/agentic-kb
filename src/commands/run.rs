@@ -107,7 +107,7 @@ mod tests {
             "config": "{}", "ts": "2024-01-01T00:00:00Z"
         });
         {
-            let lock = crate::commands::add::acquire_lock(&paths.lock).unwrap();
+            let lock = acquire_lock(&paths.lock).unwrap();
             let conn = db::open_rw(&paths, &lock).unwrap();
             cursor::append_and_apply(&lock, &conn, &paths, &NoopEmbedder, &[test_case]).unwrap();
         }

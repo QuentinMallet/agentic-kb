@@ -1876,10 +1876,8 @@ mod tests {
             "verdict": verdict
         });
         let artifact_path = std::env::var_os("KB_REBUILD_BENCH_ARTIFACT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(".omc/benches/2026-08-15-rebuild-contention.json")
-            });
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".omc/benches/2026-08-15-rebuild-contention.json"));
         if let Some(parent) = artifact_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).unwrap();
         }

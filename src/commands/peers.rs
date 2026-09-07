@@ -1081,7 +1081,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let canonical_root = std::fs::canonicalize(root)
+        let canonical_root = fs::canonicalize(root)
             .unwrap()
             .to_string_lossy()
             .to_string();
@@ -1137,7 +1137,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let canonical_root = std::fs::canonicalize(root)
+        let canonical_root = fs::canonicalize(root)
             .unwrap()
             .to_string_lossy()
             .to_string();

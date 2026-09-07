@@ -483,7 +483,7 @@ mod tests {
             vec![
                 (
                     None,
-                    vec![crate::components::db::SearchEntry {
+                    vec![db::SearchEntry {
                         id: "low".into(),
                         path: "low".into(),
                         summary: String::new(),
@@ -501,7 +501,7 @@ mod tests {
                 ),
                 (
                     Some("peer".into()),
-                    vec![crate::components::db::SearchEntry {
+                    vec![db::SearchEntry {
                         id: "high".into(),
                         path: "high".into(),
                         summary: String::new(),
@@ -1092,7 +1092,7 @@ mod tests {
         add_cmd.execute_with(&paths, &embedder).unwrap();
 
         // Run search using db directly so we can inspect evidence field.
-        let opts = crate::components::db::SearchOptions {
+        let opts = db::SearchOptions {
             limit: 10,
             do_fts: true,
             do_semantic: false,
@@ -1104,16 +1104,14 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
 
         // repo_root is left None here (this test drives db::search_entries
         // directly rather than through Search::build_search_options), so
         // verification runs with no root to resolve citation paths against
         // and always reports Unverified. Just check the evidence array is
         // populated and verified is attempted (Some), not that it succeeded.
-        let results =
-            crate::components::db::search_entries(&conn, &embedder, "evidence test", &opts)
-                .unwrap();
+        let results = db::search_entries(&conn, &embedder, "evidence test", &opts).unwrap();
         assert!(!results.is_empty(), "search must return at least 1 result");
 
         let entry = results.iter().find(|r| r.id == "ev-search-test-1").unwrap();
@@ -1175,7 +1173,7 @@ mod tests {
         }
 
         // Search with inline_verify_k=1 → only first result gets verified=Some, rest get None.
-        let opts = crate::components::db::SearchOptions {
+        let opts = db::SearchOptions {
             limit: 10,
             do_fts: true,
             do_semantic: false,
@@ -1187,8 +1185,8 @@ mod tests {
             recency_lambda: 0.0,
             mmr_lambda: 0.0,
         };
-        let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
-        let results = crate::components::db::search_entries(
+        let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+        let results = db::search_entries(
             &conn,
             &embedder,
             "narrow k fallback entry authentication",
@@ -1242,19 +1240,19 @@ mod tests {
         // are treated as literals, not operators. Quote/backslash escaping
         // preserves valid FTS5 syntax.
         proptest! {
-            #![proptest_config(proptest::prelude::ProptestConfig {
+            #![proptest_config(ProptestConfig {
                 cases: proptest_cases(256),
-                .. proptest::prelude::ProptestConfig::default()
+                .. ProptestConfig::default()
             })]
             #[test]
             fn prop_fts_query_injection_no_panic(query in arb_adversarial_fts_query()) {
-                use crate::components::db::{open_db_memory, search_entries, SearchOptions};
+                use crate::components::db::search_entries;
                 use crate::components::embedder::NoopEmbedder;
                 use crate::commands::add::Add;
                 use crate::config::Paths;
-                use std::path::Path;
 
-                let dir = tempfile::tempdir().unwrap();
+
+                let dir = tempdir().unwrap();
                 let paths = Paths::from_root(dir.path());
                 fs::create_dir_all(dir.path().join(".state/agent-kb")).unwrap();
 
@@ -1278,8 +1276,8 @@ mod tests {
                 add_cmd.execute_with(&paths, &embedder).unwrap();
 
                 // Connect to DB and search with adversarial query
-                let conn = crate::components::db::open_unchecked_for_test(&paths.db).unwrap();
-                let opts = crate::components::db::SearchOptions {
+                let conn = db::open_unchecked_for_test(&paths.db).unwrap();
+                let opts = db::SearchOptions {
                     limit: 10,
                     do_fts: true,
                     do_semantic: false,
@@ -1342,7 +1340,7 @@ mod tests {
         let local_dir = tempdir().unwrap();
         let local_root = local_dir.path();
         fs::create_dir_all(local_root.join(".state/agent-kb")).unwrap();
-        let (_local_paths, local_conn) = crate::components::db::test_db(local_root);
+        let (_local_paths, local_conn) = db::test_db(local_root);
         let peer_root_str = peer_root.to_str().unwrap().to_string();
         local_conn
             .execute(
@@ -1358,7 +1356,7 @@ mod tests {
         ).unwrap();
 
         // FTS-only search with peers enabled
-        let opts = crate::components::db::SearchOptions {
+        let opts = db::SearchOptions {
             limit: 10,
             do_fts: true,
             do_semantic: false,
@@ -1371,13 +1369,13 @@ mod tests {
             mmr_lambda: 0.0,
         };
 
-        let peer_db = crate::config::Paths::from_root(std::path::Path::new(&peer_root_str)).db;
-        let peer_conn = crate::components::db::open_unchecked_for_test(&peer_db).unwrap();
-        let peer_opts = crate::components::db::SearchOptions {
+        let peer_db = Paths::from_root(std::path::Path::new(&peer_root_str)).db;
+        let peer_conn = db::open_unchecked_for_test(&peer_db).unwrap();
+        let peer_opts = db::SearchOptions {
             repo_root: Some(std::path::PathBuf::from(&peer_root_str)),
             ..opts.clone()
         };
-        let mut peer_results = crate::components::db::search_entries(
+        let mut peer_results = db::search_entries(
             &peer_conn,
             &embedder,
             "peer score_kind roundtrip",

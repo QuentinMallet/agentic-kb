@@ -626,6 +626,6 @@ mod tests {
         decode_f16_blob_into(&malformed, &mut scratch);
 
         assert!(scratch.is_empty());
-        assert!(corrupt_embedding_count() >= before + 1);
+        assert!(corrupt_embedding_count() > before);
     }
 }
