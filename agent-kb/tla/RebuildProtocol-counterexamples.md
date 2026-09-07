@@ -386,6 +386,14 @@ the byte-identical config with `BuggyAbort = FALSE` produces no error (58/50/13,
 matching `CE4_Fixed` exactly): the same `... -> CheckpointBusy` path is still
 reachable, but `wal_frames` is left alone, so `"W"` is still resolvable.
 
+### Analyst audit: PASS, one non-blocking note
+
+A second abort site, `verify_live_wal_drained`'s `ensure!` at
+`src/commands/rebuild.rs:623`, is unmodelled and unreachable in-model because
+`Checkpoint`'s success branch always empties `wal_frames`; that gate defends
+against a checkpoint that reports `(0,0,0)` without truncating, which the
+model cannot express.
+
 ## CE4 — unlink-before-rename loses the name's committed WAL state
 
 The initial live name maps to `old`; its main file is `{}`, while its committed
