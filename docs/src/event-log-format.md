@@ -70,7 +70,12 @@ durability, database apply, then cursor update. `append_events_batch_with_sync`,
 
 ## Measured cost
 
-TODO: fill from T2b on a quiet machine: **<T2b p50/p95, quiet machine>**.
+Like-for-like, interleaved on a quiet host (`load1` < 2, fixture with event
+log, 40 rounds): `kb add` p50 87.5 ms, p95 155 ms, a median +7.5 ms / mean
++10.5 ms overhead over the pre-D2 write path on the same fixture (ratio 1.10x
+p50 / 1.24x p95), attributable to the one added `fdatasync` call per add
+described above. Full provenance, absolute numbers, and the re-baselined
+acceptance gate: [Write-Path Baseline](../benchmarks/write-path-baseline.md#re-baseline-after-d2-fdatasync-ordering-fix-2026-09-07).
 
 ```sh
 BENCH_LANES=write bash scripts/bench-interactive.sh cold
