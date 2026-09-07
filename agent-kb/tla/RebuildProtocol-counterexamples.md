@@ -309,6 +309,83 @@ is present at the swap boundary, not only on paths where `BatchOpen` never
 fired — `CE4_Fixed` genuinely exercises the new actions, not just tolerates
 their absence.
 
+## bd-21ef.2.23 — busy-checkpoint abort (`CheckpointBusy`, `"aborted"`, `AbortLeavesLiveIntact`)
+
+`checkpoint_live_db` (`rebuild.rs` ~752-796) retries `wal_checkpoint(TRUNCATE)`
+five times at 50ms then `bail!`s when busy; nothing has been renamed or
+unlinked, the live DB is untouched, `TmpDbGuard` removes the tmp DB. `Checkpoint`
+was total (always drains); this adds its sibling:
+
+- `CheckpointBusy == Fixed /\ phase = "KP_PRE_CHECKPOINT" /\ ~killed /\ wal_frames # {} -> wal_frames' = IF BuggyAbort THEN {} ELSE wal_frames, phase' = "aborted"`.
+  Gated on `Fixed` (the busy-retry path only exists in the fixed design — today's
+  code never attempts a checkpoint before swap). Gated on `wal_frames # {}`
+  per the framing that a drain with nothing to do cannot be busy. `Checkpoint`
+  and `CheckpointBusy` are both enabled from the same state whenever
+  `wal_frames # {}` under `Fixed` — TLC explores both the successful-drain and
+  the busy-abort branch nondeterministically from there.
+- `"aborted"` is fully terminal (no action leaves it, added to `TypeOK`'s phase
+  set): this is not a crash (no `KillPoint`, `Kill` does not apply), it is
+  `checkpoint_live_db` returning an error from a still-running process. A
+  subsequent rebuild attempt is a fresh run of the whole state machine (a new
+  `Init`), not a restart of this one, so no `Reopen`-style recovery was added.
+- `tmp_db` is left `UNCHANGED`: the module has no existing "discard" action
+  for it, and `files["tmp"]` — what `TmpDbGuard` actually deletes on disk —
+  is still `{}` at `KP_PRE_CHECKPOINT` regardless, since `VerifyAndClose` (the
+  only writer of `files["tmp"]`) has not run yet on this path. Nothing to
+  discard in `files` either; only `wal_frames` carries the `BuggyAbort`
+  distinction.
+- `BuggyAbort` is a non-vacuity `CONSTANT` toggle mirroring `Fixed`/`RetainedConn`:
+  `FALSE` (shipped) leaves `wal_frames` alone on abort; `TRUE` (rejected
+  alternative) unlinks the sidecars too.
+- `AbortLeavesLiveIntact == phase = "aborted" => live_db.db = "old" /\ (Scenario = "CE4" => "W" \in NamedDbContents)`.
+  The first conjunct is structural (no action before `FirstNameOperation`
+  touches `live_db`, and `CheckpointBusy` only fires well before that phase);
+  the second is what `BuggyAbort` can actually falsify.
+
+`BuggyAbort = FALSE` bound in every pre-existing `.cfg`. New file
+`RebuildProtocol_NV_AbortUnlinks.cfg`: `Scenario = "CE4", Fixed = TRUE,
+BuggyAbort = TRUE, INVARIANT AbortLeavesLiveIntact`.
+
+### Run matrix
+
+| Config | Result | States (gen/distinct) | Depth | vs. bd-21ef.2.22 baseline |
+|---|---|---|---|---|
+| `CE4_Fixed` + `AbortLeavesLiveIntact` | No error | 58/50 | 13 | was 56/48/13 — grew by 2, non-vacuous |
+| `NV_AbortUnlinks` (new; CE4, Fixed=TRUE, BuggyAbort=TRUE) | `AbortLeavesLiveIntact` violated | 12/10 | 5 | new — witness below |
+| probe: identical config, `BuggyAbort = FALSE` | No error | 58/50 | 13 | matches `CE4_Fixed` exactly — confirms non-vacuity |
+| `CE4_Current` | `NameResolvesCommitted` violated (unchanged) | 24/21 | 8 | identical — `CheckpointBusy` inert under `Fixed = FALSE` |
+| `WAL_Fixed` | No error | 58/50 | 13 | was 56/48/13 — grew by 2, same reason as `CE4_Fixed` |
+| `CE6_Fixed` | No error | 165/134 | 15 | was 162/131/15 — grew by 3 |
+| `NV_TypeOK` | `TypeOK` violated at Init | 1 state | 0 | identical |
+| `NV_WAL_Current` | `SwappedInWalMode` violated | 23/20 | 8 | identical — `CheckpointBusy` inert under `Fixed = FALSE` |
+| `NV_RetainedConn` | `NoWriterConnAtSwap` violated | 14/12 | 5 | was 13/11/5 — grew by 1 (new sibling branch reachable), same invariant/violation |
+
+`CE6_Fixed`'s own invariants (`BatchAtomic`, `TypeOK`, `CursorMatchesAtDone`,
+`NoReplayOnMatchedCursor`, `AbortLeavesLiveIntact`) all still pass with no
+error at the larger count — `CheckpointBusy` is reachable there too (a batch
+write via `BatchOpen`/`BatchCommitAndClose` gives CE6 a non-empty `wal_frames`
+before `KP_PRE_CHECKPOINT`), coverage growth, not a regression.
+
+### `NV_AbortUnlinks` witness trace (`BuggyAbort = TRUE`)
+
+```text
+State 1  Init             phase=p1              wal_frames={"W"}
+State 2  Phase1Snapshot   phase=p2
+State 3  Phase2Replay     phase=p3
+State 4  Phase3CatchUp    phase=KP_PRE_CHECKPOINT
+State 5  CheckpointBusy   phase=aborted          wal_frames={}   <- violates AbortLeavesLiveIntact
+```
+
+No batch writer is needed: CE4's own `Init` already sets `wal_frames = {"W"}`,
+so this is the shortest possible witness. At state 5, `files["old"]` is still
+`{}` (only a successful `Checkpoint` ever writes it), so with `wal_frames`
+unlinked to `{}` by `BuggyAbort`, `NamedDbContents = {} \union {} = {}` and
+`"W" \notin NamedDbContents` — a reader opening the live name after the abort
+would see nothing, even though nothing was supposed to have changed. Re-running
+the byte-identical config with `BuggyAbort = FALSE` produces no error (58/50/13,
+matching `CE4_Fixed` exactly): the same `... -> CheckpointBusy` path is still
+reachable, but `wal_frames` is left alone, so `"W"` is still resolvable.
+
 ## CE4 — unlink-before-rename loses the name's committed WAL state
 
 The initial live name maps to `old`; its main file is `{}`, while its committed
