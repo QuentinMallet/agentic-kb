@@ -29,7 +29,7 @@ by adding `agentic_kb_mcp` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:agentic_kb_mcp, "~> 0.1.0"}
+    {:agentic_kb_mcp, "~> 0.2.0"}
   ]
 end
 ```

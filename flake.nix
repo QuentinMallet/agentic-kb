@@ -38,7 +38,7 @@
             # Elixir MCP server (escript — no external hex deps, uses OTP 27 :json)
             mcpPackage = pkgs.stdenv.mkDerivation {
               pname = "agentic-kb-mcp";
-              version = "0.1.0";
+              version = "0.2.0";
               src = ./mcp;
               nativeBuildInputs = [ pkgs.elixir_1_18 pkgs.makeWrapper ];
               MIX_ENV = "prod";
@@ -130,7 +130,7 @@
           // pkgs.lib.optionalAttrs hasCargoLock {
             default = platform.buildRustPackage {
               pname = "kb";
-              version = "0.1.0";
+              version = "0.2.0";
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
 
