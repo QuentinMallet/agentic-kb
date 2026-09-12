@@ -18,25 +18,25 @@ Git-permission validation. Structural and data-integrity validation remain requi
 | Work | Authoritative evidence |
 |---|---|
 | `bd-pia3.1` startup model | Closed. TLC covers 31 states and six scenarios; commits `77f451e` and `78c9cdb`. |
-| `bd-pia3` package startup | Closed. The original runtime closure fix is proven by its startup model and package smoke lane. The OPA integration now also has a later e848 package build; its strict `tools/list` JSON decoding remains an active integration blocker below. |
+| `bd-pia3` package startup | Closed. The original runtime closure fix is proven by its startup model and package smoke lane. |
 | `bd-bvy4.6` reliability specification | Closed. Shared specification is on `agentic` at `32cb…`; its TLA+ disposition covers the current reliability lanes. |
 | `bd-dhi0.1` Option B contract tests | Closed. The implementation lane began from `a150081`; focused Rust test was 3/0 RED before source changes. |
+| `bd-dhi0.2` OPA implementation | Closed at `0294f1e`. Active OPA/auth/caller/rate-limit code and package/dev wiring scans are clean; a clean-locale local escript JSON-decodes initialize and all 17 tools; retired caller and invalid-startup checks pass; Mix is 70/0. The final integrated Nix package/closure gate remains `bd-dhi0.4`. |
 
 ## Active implementation lanes
 
 | Lane / Beads | Head and current evidence | Required next result |
 |---|---|---|
-| OPA excision, `bd-dhi0.2` | Startup/CLI head is `e848bf4`. Nix package `/nix/store/gsqakdnj4k4dpkiy3wcpffphmz40pkx0-agentic-kb-mcp-0.2.0` builds; clean-PATH startup, retired caller flag, invalid `KB_BIN`, and OPA-closure checks pass. Rust functional suite is 876 passed, 0 failed, 4 ignored; Elixir is 70/0. | Fix the invalid Unicode wire encoding in the actual `tools/list` response and prove JSON decoding plus all 17 tools from the package. Then rebuild the final package and run `bd-dhi0.4`. |
-| JSON-RPC validation, frames, version: `bd-bvy4.2`, `.3`, `.4` | `bd-bvy4-protocol` committed HEAD remains `34e18e6` after `248b6dc`, `8308efd`, `9ce8e94`; it is not yet accepted. A separate uncommitted `-noinput` prototype is green for 10 MiB recovery. | Finish EOF/lifecycle behavior and review the prototype before accepting or committing it; then re-run the relevant suite and Nix check. |
+| JSON-RPC validation, frames, version: `bd-bvy4.2`, `.3`, `.4` | Protocol worktree now includes approved direct-port change `49b4994` atop `7310e35` and `34e18e6`. `McpServer` is the sole direct fd 0 owner; the six framing scenarios and their specification gates are unchanged. | Integrate with lifecycle only after the final EOF/lifecycle review, then re-run the relevant suite and Nix check. |
 | Production lifecycle, `bd-bvy4.1` | Lifecycle integration head is `ddb1728`; its 72-test Mix suite and process scripts pass. | Keep it isolated pending integration and review; run the default and isolated suites again after integration with protocol/OPA changes. |
 
 ## Open Beads snapshot
 
-Beads currently reports seven open items and five in progress.
+Beads currently reports seven open items and four in progress.
 
 | Status | IDs |
 |---|---|
-| In progress | `bd-dhi0.2`, `bd-bvy4.1`, `bd-bvy4.2`, `bd-bvy4.3`, `bd-bvy4.4` |
+| In progress | `bd-bvy4.1`, `bd-bvy4.2`, `bd-bvy4.3`, `bd-bvy4.4` |
 | Open implementation/refactor | `bd-bvy4.5` |
 | Open documentation | `bd-dhi0.3`, `bd-bvy4.7` |
 | Open post-implementation gates | `bd-dhi0.4`, `bd-bvy4.8` |
@@ -62,10 +62,10 @@ lane has a passing local suite.
 
 ## Current risks
 
-- The e848 package has a strict protocol blocker: `tools/list` contains a literal `\x{2014}` escape,
-  which is invalid JSON. Startup smoke's grep checks pass, but a JSON decoder correctly rejects it.
-- Protocol framing's `-noinput` prototype exercises 10 MiB recovery, but remains uncommitted pending
-  EOF/lifecycle semantics and review; committed `34e18e6` is not accepted.
+- The final Nix package/closure proof, including clean-PATH JSON decoding of `tools/list`, is deferred
+  to `bd-dhi0.4` after integration; it is not implied by the local OPA implementation proof.
+- The approved direct-port protocol implementation preserves the six framing scenarios; its remaining
+  integration risk is EOF/lifecycle behavior with the isolated lifecycle lane.
 - Lifecycle head `ddb1728` is locally green (72 Mix tests and process scripts) but remains isolated
   until review and integration evidence exists.
 - The Criterion benchmark started by `cargo test --all-targets --locked` was intentionally terminated
