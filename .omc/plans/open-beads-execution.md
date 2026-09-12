@@ -17,7 +17,7 @@ Git-permission validation. Structural and data-integrity validation remain requi
 
 | Work | Authoritative evidence |
 |---|---|
-| `bd-pia3.1` startup model | Closed. `McpPackageStartup` has an expected Buggy counterexample (missing eager prerequisite) and a Fixed pass (both eager prerequisites present); commits `77f451e` and `78c9cdb`. The 31-state, six-scenario TLC coverage belongs to `McpBoundary`, not this startup model. |
+| `bd-pia3.1` startup model | Closed. Fresh TLC runs: `McpPackageStartup_Buggy.cfg` has the expected `EventuallyReady` counterexample (`launching -> failed`; 3 generated / 2 distinct states, exit 13); `McpPackageStartup_Fixed.cfg` passes (`No error has been found`; 3 generated / 2 distinct states, depth 2, exit 0). Commits `77f451e` and `78c9cdb`. The 31-state, six-scenario TLC coverage belongs to `McpBoundary`, not this startup model. |
 | `bd-pia3` package startup | Closed. The original runtime closure fix is proven by its startup model and package smoke lane. |
 | `bd-bvy4.6` reliability specification | Closed. Shared specification is on `agentic` at `32cb…`; its TLA+ disposition covers the current reliability lanes. |
 | `bd-dhi0.1` Option B contract tests | Closed. The implementation lane began from `a150081`; focused Rust test was 3/0 RED before source changes. |
