@@ -27,7 +27,7 @@ Git-permission validation. Structural and data-integrity validation remain requi
 | Lane / Beads | Head and current evidence | Required next result |
 |---|---|---|
 | OPA excision, `bd-dhi0.2` | `bd-bvy4-lifecycle`, base `a150081`; OPA excision is implemented with uncommitted review fixes. Rust focused tests are 129/0; full Elixir suite 70/0. Latest Nix build is live and may predate the CLI review fix. | Commit review fixes; run the final package build/startup/closure check after the CLI fix; then run `bd-dhi0.4`. |
-| JSON-RPC validation, frames, version: `bd-bvy4.2`, `.3`, `.4` | `bd-bvy4-protocol` HEAD `34e18e6`, after `248b6dc`, `8308efd`, `9ce8e94`. Full suite is 101/0 and Nix build is valid. | Fix the Critical pipe-frame violation: `IO.binread/2` must not request a frame-size read that exceeds its allowed range (`124` bytes observed). Re-run the full suite and Nix check. |
+| JSON-RPC validation, frames, version: `bd-bvy4.2`, `.3`, `.4` | `bd-bvy4-protocol` HEAD `34e18e6`, after `248b6dc`, `8308efd`, `9ce8e94`. Full suite is 101/0 and Nix build is valid. | Fix the Critical oversized-frame performance defect: per-byte `IO.binread(:stdio, 1)` makes the 10 MiB pipe test time out with exit code 124. Re-run the full suite and Nix check. |
 | Production lifecycle, `bd-bvy4.1` | `bd-bvy4-lifecycle` HEAD `643ec83` atop `a150081`; 72/0 with `mix test --no-start`. | Fix the Critical default-runner failure: ordinary `mix test` must exit successfully at EOF and must not eagerly require default configuration. Re-run both default and isolated suites. |
 
 ## Open Beads snapshot
@@ -63,7 +63,7 @@ lane has a passing local suite.
 ## Current risks
 
 - The latest live Nix build may predate the OPA CLI review fix; a fresh final package check is required.
-- Protocol framing has a confirmed Critical over-read condition despite its current 101/0 suite.
+- Protocol framing has a confirmed Critical per-byte read performance defect: the 10 MiB pipe test times out with exit code 124 despite its current 101/0 suite.
 - Lifecycle tests pass only under `--no-start`; default application startup still needs the EOF and
   default-configuration correction.
 - Active OPA documentation and historical changelog content must be separated during `bd-dhi0.3` so
