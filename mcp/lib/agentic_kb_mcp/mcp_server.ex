@@ -1345,7 +1345,7 @@ defmodule AgenticKbMcp.McpServer do
   # ---------------------------------------------------------------------------
 
   defp write_response(response) do
-    IO.puts(json_encode!(response))
+    IO.binwrite(:stdio, [json_encode!(response), "\n"])
   end
 
   # A missing `arguments` key decodes to nil; an explicit JSON `null` decodes
