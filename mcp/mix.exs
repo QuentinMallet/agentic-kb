@@ -20,7 +20,7 @@ defmodule AgenticKbMcp.MixProject do
   end
 
   defp escript do
-    [main_module: AgenticKbMcp.CLI]
+    [main_module: AgenticKbMcp.CLI, emu_args: "-noinput"]
   end
 
   # Zero external deps — uses OTP 27 :json module
