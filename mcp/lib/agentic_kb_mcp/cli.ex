@@ -5,9 +5,14 @@ defmodule AgenticKbMcp.CLI do
 
   def main(args) do
     validate_args!(args)
-    Application.ensure_all_started(:agentic_kb_mcp)
-    # Block forever; McpServer calls System.halt(0) on stdin EOF.
-    receive do
+    case Application.ensure_all_started(:agentic_kb_mcp) do
+      {:ok, _} ->
+        receive do
+        end
+
+      {:error, reason} ->
+        IO.puts(:stderr, "agentic-kb-mcp failed to start: #{Exception.message(reason)}")
+        System.halt(1)
     end
   end
 

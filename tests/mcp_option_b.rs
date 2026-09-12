@@ -82,6 +82,7 @@ fn caller_id_is_rejected_on_the_rust_port_boundary() {
     std::fs::write(repo.path().join("fixture.txt"), "fixture\n").unwrap();
     let (paths, _initial_conn) = db::test_db(repo.path());
     let entry_id = add_auditable(&paths, "option-b/reject-client-identity");
+    let events_before = events::read_events(&paths.events).unwrap().events.len();
 
     for request in [
         json!({"id":"expire","method":"expire","entry_id":entry_id,"caller_id":"client"}),
@@ -93,6 +94,8 @@ fn caller_id_is_rejected_on_the_rust_port_boundary() {
         assert_eq!(response["code"], "parse_error");
         assert!(response["message"].as_str().unwrap_or_default().contains("caller_id"));
     }
+
+    assert_eq!(events::read_events(&paths.events).unwrap().events.len(), events_before);
 }
 
 #[test]

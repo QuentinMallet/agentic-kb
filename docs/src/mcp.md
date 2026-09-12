@@ -195,9 +195,7 @@ nix develop <worktree> -c mix test
 
 In `.github/workflows/ci.yml`, the `ci` job runs `Elixir compile (mcp)`,
 `Elixir test (mcp)`, and `Elixir format check (mcp)` through `nix develop`, in
-addition to the Rust checks. The dev shell also wraps the escript with
-`open-policy-agent` on `PATH` so OPA-backed authorization can be exercised
-locally; see [MCP Authorization](./security/mcp-authorization.md).
+addition to the Rust checks.
 
 `mcp/test/schema_contract.json` is a shared fixture cross-checked from both
 suites: the Rust `test_deployed_machines_conf_pin_fields_are_all_accepted`

@@ -176,7 +176,6 @@
               # a hard floor. Pin the versioned, OTP-scoped attribute (not bare
               # `elixir`, which tracks the default BEAM set and can drift under it).
               beam27Packages.elixir
-              open-policy-agent
 
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao

@@ -733,6 +733,28 @@ fn handle_request(
         };
     }
 
+    // Reject retired/private-port identity fields before recovery can take a
+    // write lock. These methods are mutating, so their closed request shapes
+    // must be established before the generic recovery guard below.
+    match method.as_str() {
+        "expire" => {
+            if let Err(error) = serde_json::from_value::<ExpireRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        "audit_run" => {
+            if let Err(error) = serde_json::from_value::<AuditRunRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        "audit_record" => {
+            if let Err(error) = serde_json::from_value::<AuditRecordRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        _ => {}
+    }
+
     // C1/D3: the server is long-lived, so recovering only at startup is not
     // enough — an external `kb compact` or another process's crash gap can open
     // at any point during a session. Every mutating method re-checks before it
