@@ -72,7 +72,7 @@
               installPhase = ''
                 install -Dm755 agentic_kb_mcp $out/bin/agentic-kb-mcp
                 wrapProgram $out/bin/agentic-kb-mcp \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ beam.erlang kbPackage ]}
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ beam.erlang kbPackage pkgs.coreutils ]}
               '';
             };
           in
