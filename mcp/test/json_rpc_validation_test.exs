@@ -63,6 +63,28 @@ defmodule AgenticKbMcp.JsonRpcTest do
     assert %{"id" => :null, "error" => %{"code" => -32600}} = response
   end
 
+  test "request boundary table returns exactly one protocol response" do
+    invalid_ids = ["true", "false", "1.5", "{}", "[]", "null"]
+
+    for id <- invalid_ids do
+      response = call_line(~s({"jsonrpc":"2.0","method":"initialize","id":#{id}}))
+      assert %{"id" => :null, "error" => %{"code" => -32600}} = response
+    end
+
+    for payload <- [
+          "null",
+          "[]",
+          "1",
+          ~s({"jsonrpc":"2.0","method":"initialize","params":null}),
+          ~s({"jsonrpc":"2.0","method":"initialize","id":1,"params":[]})
+        ] do
+      response = call_line(payload)
+      assert %{"id" => :null, "error" => %{"code" => -32600}} = response
+    end
+
+    assert %{"id" => :null, "error" => %{"code" => -32700}} = call_line("{")
+  end
+
   test "valid no-id tools/call is silent and does not dispatch" do
     assert nil ==
              call_line(
