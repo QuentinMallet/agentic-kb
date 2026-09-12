@@ -6,12 +6,12 @@ EXTENDS TLC
 (*                                                                            *)
 (* The packaged MCP launcher has two eager runtime prerequisites: the Erlang  *)
 (* `escript` interpreter that runs the generated escript, and the Rust `kb`   *)
-(* binary that backs a discovered database. OPA is request-lazy: it can deny  *)
-(* a later mutation, but it does not decide whether initialize/tools/list can *)
-(* start.                                                                     *)
+(* binary that backs a discovered database. OPA was historically request-lazy *)
+(* and did not decide whether initialize/tools/list could start. It is absent *)
+(* from the final Option B package and has no startup-model role.             *)
 (*                                                                            *)
-(* The broken wrapper exposes OPA only, so the escript cannot execute (and a *)
-(* missing `kb` fails the supervised startup). It terminates Failed; it does  *)
+(* The broken wrapper omitted the escript interpreter, so it cannot execute  *)
+(* (and a missing `kb` fails the supervised startup). It terminates Failed;  *)
 (* not falsely report Ready. The repaired closure reaches Ready precisely when *)
 (* both eager prerequisites are present, otherwise it terminates Failed.      *)
 (******************************************************************************)
@@ -49,9 +49,8 @@ TypeOK == phase \in {"launching", "ready", "failed"}
 critical_ReadyRequiresEagerRuntime ==
   phase = "ready" => EscriptInClosure /\ KbInClosure
 
-(* OPA is deliberately absent from Start's condition. A fixed launcher may
-   fail only for a missing eager prerequisite, never merely because OPA is
-   unavailable for a later mutation. *)
+(* OpaInClosure is retained only as historical model input. Start depends
+   exclusively on eager runtime prerequisites. *)
 critical_FailureRequiresMissingEagerRuntime ==
   phase = "failed" => ~EscriptInClosure \/ ~KbInClosure
 
