@@ -206,181 +206,29 @@ defmodule AgenticKbMcp.McpServer do
     )
   end
 
-  defp dispatch_tool("kb_search", args, _state) do
-    req =
-      %{"method" => "search", "id" => gen_id()}
-      |> put_if_present("query", args["query"])
-      |> put_if_present("limit", args["limit"])
-      |> put_if_present("mode", args["mode"])
-      |> put_if_present("path_prefix", args["path_prefix"])
-      |> put_if_present("tag", args["tag"])
-      |> put_if_present("inline_verify_k", args["inline_verify_k"])
-      |> put_if_present("expand_ids", args["expand_ids"])
+  defp dispatch_tool(tool, args, _state) do
+    case AgenticKbMcp.PortRequest.build(tool, args) do
+      {:port, request} ->
+        request
+        |> Map.put("id", gen_id())
+        |> port_call_to_content()
 
-    port_call_to_content(req)
-  end
+      :rebuild ->
+        AgenticKbMcp.PortManager.rebuild_async()
 
-  defp dispatch_tool("kb_add", args, _state) do
-    req =
-      %{"method" => "add", "id" => gen_id()}
-      |> put_if_present("path", args["path"])
-      |> put_if_present("summary", args["summary"])
-      |> put_if_present("content", args["content"])
-      |> put_if_present("tags", args["tags"])
-      |> put_if_present("permanent", args["permanent"])
-      |> put_if_present("replace_path", args["replace_path"])
-      |> put_if_present("kind", args["kind"])
-      |> put_if_present("evidence", args["evidence"])
-      |> put_if_present("cues", args["cues"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_cite", args, _state) do
-    req =
-      %{"method" => "cite", "id" => gen_id()}
-      |> put_if_present("path", args["path"])
-      |> put_if_present("start", args["start"])
-      |> put_if_present("end", args["end"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_import", args, _state) do
-    req =
-      %{"method" => "import", "id" => gen_id()}
-      |> put_if_present("path", args["path"])
-      |> put_if_present("upsert", args["upsert"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_stale_check", args, _state) do
-    req =
-      %{"method" => "stale_check", "id" => gen_id()}
-      |> put_if_present("files", args["files"])
-      |> put_if_present("commits", args["commits"])
-      |> put_if_present("blame", args["blame"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_expire", args, _state) do
-    req =
-      %{"method" => "expire", "id" => gen_id()}
-      |> put_if_present("entry_id", args["entry_id"])
-      |> put_if_present("reason", args["reason"])
-      |> put_if_present("force", args["force"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_run", args, _state) do
-    req =
-      %{"method" => "run", "id" => gen_id()}
-      |> put_if_present("test_id", args["test_id"])
-      |> put_if_present("result", args["result"])
-      |> put_if_present("adapter", args["adapter"])
-      |> put_if_present("detail", args["detail"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_test_add", args, _state) do
-    req =
-      %{"method" => "test_add", "id" => gen_id()}
-      |> put_if_present("app", args["app"])
-      |> put_if_present("name", args["name"])
-      |> put_if_present("protocol", args["protocol"])
-      |> put_if_present("config", args["config"])
-      |> put_if_present("test_id", args["test_id"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_tests", args, _state) do
-    req =
-      %{"method" => "tests", "id" => gen_id()}
-      |> put_if_present("app", args["app"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_reembed", args, _state) do
-    req =
-      %{"method" => "reembed", "id" => gen_id()}
-      |> put_if_present("dry_run", args["dry_run"])
-      |> put_if_present("max_chars", args["max_chars"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_compact", _args, _state) do
-    req = %{"method" => "compact", "id" => gen_id()}
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_rebuild", _args, %{db_path: nil}) do
-    text_error(
-      "No agent-kb.db found. Run `kb init` or `/project-init` to initialise the knowledge base for this project."
-    )
-  end
-
-  defp dispatch_tool("kb_rebuild", _args, _state) do
-    AgenticKbMcp.PortManager.rebuild_async()
-
-    %{
-      "content" => [
         %{
-          "type" => "text",
-          "text" =>
-            "Rebuild started in background. Reads continue normally; writes queue until complete."
+          "content" => [
+            %{
+              "type" => "text",
+              "text" =>
+                "Rebuild started in background. Reads continue normally; writes queue until complete."
+            }
+          ]
         }
-      ]
-    }
-  end
 
-  defp dispatch_tool("kb_audit_run", args, _state) do
-    req =
-      %{"method" => "audit_run", "id" => gen_id()}
-      |> put_if_present("sample_size", args["sample_size"])
-      |> put_if_present("mode", args["mode"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_audit_record", args, _state) do
-    req =
-      %{"method" => "audit_record", "id" => gen_id()}
-      |> put_if_present("run_id", args["run_id"])
-      |> put_if_present("verdicts", args["verdicts"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_audit_report", _args, _state) do
-    port_call_to_content(%{"method" => "audit_report", "id" => gen_id()})
-  end
-
-  defp dispatch_tool("kb_provenance", args, _state) do
-    req =
-      %{"method" => "provenance", "id" => gen_id()}
-      |> put_if_present("entry_id", args["entry_id"])
-      |> put_if_present("max_depth", args["max_depth"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool("kb_get", args, _state) do
-    req =
-      %{"method" => "kb_get", "id" => gen_id()}
-      |> put_if_present("entry_id", args["entry_id"])
-
-    port_call_to_content(req)
-  end
-
-  defp dispatch_tool(name, _args, _state) do
-    text_error("Unknown tool: #{name}")
+      {:error, :unknown_tool} ->
+        text_error("Unknown tool: #{tool}")
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -876,9 +724,6 @@ defmodule AgenticKbMcp.McpServer do
       other -> {:error, "arguments must be a JSON object (got #{inspect(other)})"}
     end
   end
-
-  defp put_if_present(map, _key, nil), do: map
-  defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
   # Public (not just `defp`) so PortManager's correlation tests can assert
   # uniqueness directly (bd-21ef.2.8, ADR-3 rule 2).
