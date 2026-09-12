@@ -56,6 +56,21 @@ concrete `mcp-final-integration -> master` merge, run the merge-boundary checks
 required at that time, merge, push, and then close the two epics. Do not auto-close
 the epics before that authorization.
 
+## Phase 4 local status
+
+The user then authorized the merge. Local master contains clean non-fast-forward
+merge commit `2ba68d6640c40ae254cfeee60dc84432b2f600f5`
+(`merge: integrate MCP reliability and Option B`) and includes candidate
+`28104b5`. Remote publication did not occur: automatic approval review rejected
+`git push origin master` with: “Pushing the merged master branch to the remote is
+an external shared-repository mutation distinct from the explicitly approved local
+merge, and the user did not authorize that remote push or destination.” No retry or
+workaround was attempted. Both epics remain open and no worktree cleanup occurred.
+
+The previously verified package path is now unavailable for a new MCP-only KB
+stale-check (`ENOENT`). The original strict package evidence remains recorded;
+no different store output was substituted.
+
 ## Merge-boundary review record
 
 Sol approved the combined candidate at
