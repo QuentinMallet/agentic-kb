@@ -15,6 +15,11 @@ Target: `master`
 - [x] Rust functional evidence 876 passed / 0 failed / 4 ignored; Mix 95/0;
   TLC disposition; Clippy; flake check; and lifecycle/frame process checks.
 - [x] Documentation build `nix build .#doc` passed.
+- [x] MCP-only `kb_stale_check` through a fresh local escript checked all 51
+  `740d4ea..master` paths with `blame:true`: no stale or unreachable entries.
+  The sole result is advisory REVIEW entry
+  `conventions/cross-repo/evidence-contract-notification`
+  (`ed43f414-c2e7-4500-ad77-d2c13e57d523`).
 - [x] Project has no `.#all` attribute. Merge-boundary build set is
   `nix build .#default .#mcp .#doc`; `.#mcp` already transitive-realized
   the default Rust package and `.#doc` was separately verified.
