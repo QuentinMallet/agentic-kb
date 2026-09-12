@@ -56,6 +56,8 @@ defmodule AgenticKbMcp.PortManager do
   use GenServer
   require Logger
 
+  alias AgenticKbMcp.Transport
+
   @handshake_timeout 5_000
   @call_timeout 30_000
 
@@ -67,6 +69,9 @@ defmodule AgenticKbMcp.PortManager do
     name = Keyword.get(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
+
+  @doc false
+  def line_limit, do: Transport.max_frame_bytes()
 
   @doc """
   Send a request map to the Rust port and wait for the response map.
@@ -126,7 +131,7 @@ defmodule AgenticKbMcp.PortManager do
         :binary,
         :use_stdio,
         :exit_status,
-        {:line, 10_485_760},
+        {:line, line_limit()},
         {:args, ["mcp", "--db", db_path]}
       ])
 

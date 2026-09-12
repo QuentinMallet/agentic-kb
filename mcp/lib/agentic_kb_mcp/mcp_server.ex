@@ -8,6 +8,7 @@ defmodule AgenticKbMcp.McpServer do
   require Logger
 
   alias AgenticKbMcp.JsonRpc
+  alias AgenticKbMcp.Transport
   alias AgenticKbMcp.Transport.Stdio
 
   @protocol_version "2024-11-05"
@@ -15,7 +16,6 @@ defmodule AgenticKbMcp.McpServer do
   @format_entries_max_bytes 32_000
   @evidence_preview_limit 3
   @derived_from_max_len 200
-  @max_stdio_frame_bytes 10 * 1024 * 1024
 
   @tools [
     %{
@@ -1415,7 +1415,7 @@ defmodule AgenticKbMcp.McpServer do
   # ---------------------------------------------------------------------------
 
   defp read_stdin(server) do
-    read_stdin(server, Stdio.new(@max_stdio_frame_bytes))
+    read_stdin(server, Stdio.new(Transport.max_frame_bytes()))
   end
 
   defp read_stdin(server, framer) do
