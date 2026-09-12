@@ -592,8 +592,9 @@ defmodule AgenticKbMcp.McpServer do
   def init(opts) do
     db_path = Keyword.get(opts, :db_path)
     parent = self()
-    Task.start_link(fn -> read_stdin(parent) end)
-    {:ok, %{db_path: db_path}}
+    reader = Keyword.get(opts, :reader, &read_stdin/1)
+    {:ok, reader_pid} = Task.start_link(fn -> reader.(parent) end)
+    {:ok, %{db_path: db_path, reader: reader_pid}}
   end
 
   @impl true
