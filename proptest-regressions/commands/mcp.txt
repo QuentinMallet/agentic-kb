@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 249d143c78a14cb8eb9a2340b13c77dae486e804fe6fd092f0563ff15293b49d # shrinks to n_replays = 2
+cc a7971130d349b5bd052c5ea2662cb6cf85959ea21ad5f96bbababd3ab1f1607e # shrinks to null_count = 1, named_count = 1, ki = 0, verdict_null = [false], verdict_named = [false]
+cc 0cbe14d7adccfb28ef2f09c8e0f4d41ec162cfe05739837a9242630ba8dbbd5b # shrinks to verdicts = [(0, 0, false)]
+cc 269ba0f0987b7c6297a4445164406645f25c34fb545e42a4df8fba2b26a40e70 # shrinks to verdicts = [(0, 0, false), (0, 0, false), (0, 0, false), (0, 0, false)]

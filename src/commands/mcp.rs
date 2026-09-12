@@ -5094,7 +5094,7 @@ mod tests {
             .query_row(
                 "SELECT
                     (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1)",
                 params![run_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -6067,7 +6067,7 @@ mod tests {
                     (SELECT is_stale FROM entries WHERE id=?1),
                     (SELECT COUNT(*) FROM audit_runs WHERE run_id=?2 AND entry_id=?1),
                     (SELECT COALESCE(SUM(failures),0) FROM source_weights WHERE kind='observation' AND session_id='compact-session'),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                 params![eid, run_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -6169,7 +6169,7 @@ mod tests {
             .query_row(
                 "SELECT
                     (SELECT is_stale FROM entries WHERE id=?1),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                 params![eid, run_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -6335,7 +6335,7 @@ mod tests {
                         (SELECT is_stale FROM entries WHERE id=?1),
                         (SELECT evidence_status FROM entries WHERE id=?1),
                         (SELECT COALESCE(group_concat(id, ','), '') FROM evidence WHERE entry_id=?1),
-                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                     params![eid, run_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -6456,7 +6456,7 @@ mod tests {
                         (SELECT updated_at FROM entries WHERE id=?1),
                         (SELECT evidence_status FROM entries WHERE id=?1),
                         (SELECT COUNT(*) FROM evidence WHERE entry_id=?1),
-                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                     params![eid, run_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -6599,12 +6599,12 @@ mod tests {
         let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'uniform','mcp-test')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
             [&uniform],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'traffic','mcp-test')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')",
             [&traffic],
         )
         .unwrap();
@@ -7564,9 +7564,7 @@ mod tests {
         let import = json!({"method":"import","id":"pin-import","path":"seeds.json","upsert":true});
         let stale = json!({"method":"stale_check","id":"pin-stale","files":["src/a.rs"],
                            "commits":["0000000000000000000000000000000000000000"],"blame":false});
-        // `caller_id` is deliberately absent: the deployed pin supplies only
-        // public MCP tool arguments. The Elixir host bridge injects identity
-        // into the private Rust port request after public validation.
+        // The deployed payload contains only declared request fields.
         let expire = json!({"method":"expire","id":"pin-expire","entry_id":"nope","reason":"r",
                             "force":true});
         let run = json!({"method":"run","id":"pin-run","test_id":"t1","result":"pass",
@@ -7641,18 +7639,7 @@ mod tests {
             &search, &add, &cite, &import, &stale, &expire, &run, &test_add, &tests, &reembed,
             &rebuild, &kb_get,
         ] {
-            // The public deployed-pin payload reaches Elixir first. Its host
-            // bridge, not an MCP client, adds caller identity to requests for
-            // private Rust handlers that require it.
-            let mut private_req = public_req.clone();
-            if private_req["method"] == "expire" {
-                private_req
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("caller_id".to_owned(), json!("mcp-test"));
-            }
-
-            let resp = dispatch(&paths, &emb, &private_req);
+            let resp = dispatch(&paths, &emb, public_req);
             let code = resp["code"].as_str().unwrap_or("");
             assert_ne!(
                 code, "parse_error",
