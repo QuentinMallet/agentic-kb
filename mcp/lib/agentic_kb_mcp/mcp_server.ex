@@ -11,7 +11,7 @@ defmodule AgenticKbMcp.McpServer do
   alias AgenticKbMcp.Transport.Stdio
 
   @protocol_version "2024-11-05"
-  @server_info %{"name" => "agentic-kb-mcp", "version" => "0.1.0"}
+  @server_name "agentic-kb-mcp"
   @format_entries_max_bytes 32_000
   @evidence_preview_limit 3
   @derived_from_max_len 200
@@ -676,7 +676,7 @@ defmodule AgenticKbMcp.McpServer do
       "id" => id,
       "result" => %{
         "protocolVersion" => @protocol_version,
-        "serverInfo" => @server_info,
+        "serverInfo" => %{"name" => @server_name, "version" => server_version()},
         "capabilities" => %{"tools" => %{}}
       }
     }
@@ -1431,5 +1431,11 @@ defmodule AgenticKbMcp.McpServer do
 
   defp json_encode!(term) do
     term |> :json.encode() |> IO.iodata_to_binary()
+  end
+
+  defp server_version do
+    :agentic_kb_mcp
+    |> Application.spec(:vsn)
+    |> to_string()
   end
 end
