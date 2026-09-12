@@ -13,9 +13,8 @@ or post-implementation Beads.
 The concrete merge candidate is branch `mcp-final-integration` at
 `28104b5fb33a2c3b82c60917282eb410ab7240a1`, based on master
 `740d4ea9c31697e80de27807fac5590dd9398be6`. It is a standalone program whose
-merge target is `master`. The local branch is ahead of `origin/mcp-final-integration`
-by the documentation commit; no fetch, push, rebase, merge, or release bump has
-been performed in this gate.
+merge target is `master`. The local branch tracks `origin/mcp-final-integration`;
+this audit performed no fetch, push, rebase, merge, or release bump.
 
 ## Closed scope
 
