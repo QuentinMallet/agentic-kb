@@ -597,8 +597,13 @@ defmodule AgenticKbMcp.McpServer do
     db_path = Keyword.get(opts, :db_path)
     authorization = Keyword.get(opts, :authorization)
     parent = self()
-    Task.start_link(fn -> read_stdin(parent) end)
-    {:ok, %{db_path: db_path, authorization: authorization}}
+    {:ok, reader} = Task.start_link(fn -> read_stdin(parent) end)
+    {:ok, %{db_path: db_path, authorization: authorization, reader: reader}}
+  end
+
+  @impl true
+  def terminate(_reason, %{reader: reader}) do
+    stop_reader(reader)
   end
 
   @impl true
@@ -1435,6 +1440,12 @@ defmodule AgenticKbMcp.McpServer do
       {^port, :eof} ->
         emit_frame_events(server, elem(Stdio.finish(framer), 2))
 
+      :stop ->
+        :ok
+
+      {:EXIT, ^server, _reason} ->
+        :ok
+
       {:EXIT, ^port, :normal} ->
         emit_frame_events(server, elem(Stdio.finish(framer), 2))
 
@@ -1447,6 +1458,25 @@ defmodule AgenticKbMcp.McpServer do
     {:ok, next_framer, events} = Stdio.feed(framer, bytes)
     emit_frame_events(server, events)
     read_stdin(server, port, next_framer)
+  end
+
+  defp stop_reader(reader) when is_pid(reader) do
+    if Process.alive?(reader) do
+      ref = Process.monitor(reader)
+      Process.unlink(reader)
+      send(reader, :stop)
+
+      receive do
+        {:DOWN, ^ref, :process, ^reader, _reason} -> :ok
+      after
+        1_000 ->
+          Process.exit(reader, :kill)
+
+          receive do
+            {:DOWN, ^ref, :process, ^reader, _reason} -> :ok
+          end
+      end
+    end
   end
 
   defp emit_frame_events(server, events) do
