@@ -27,7 +27,7 @@ MCP tool column also records which port methods are deliberately internal.
 | `add` | `kb_add` | `path: string`, `summary: string`, `content: string` | `tags: JSON`, `permanent: boolean`, `replace_path: boolean`, `kind: string`, `evidence: JSON[]`, `cues: string[]`, `session_id: string` |
 | `cite` | `kb_cite` | `path: string` | `start: integer`, `end: integer` |
 | `import` | `kb_import` | `path: string` | `upsert: boolean` |
-| `expire` | `kb_expire` | `entry_id: string`, `caller_id: string` | `reason: string`, `force: boolean` |
+| `expire` | `kb_expire` | `entry_id: string` | `reason: string`, `force: boolean` |
 | `stale_check` | `kb_stale_check` | — | `files: string[]`, `commits: string[]`, `blame: boolean` |
 | `compact` | `kb_compact` | — | — |
 | `rebuild` | `kb_rebuild` | — | — |
@@ -35,8 +35,8 @@ MCP tool column also records which port methods are deliberately internal.
 | `run` | `kb_run` | `test_id: string`, `result: string` | `adapter: string`, `detail: string` |
 | `test_add` | `kb_test_add` | `app: string`, `name: string`, `protocol: string`, `config: string` | `test_id: string` |
 | `tests` | `kb_tests` | — | `app: string` |
-| `audit_run` | `kb_audit_run` | `caller_id: string` | `sample_size: integer`, `mode: string` |
-| `audit_record` | `kb_audit_record` | `run_id: string`, `caller_id: string` | `verdicts: AuditVerdict[]` |
+| `audit_run` | `kb_audit_run` | — | `sample_size: integer`, `mode: string` |
+| `audit_record` | `kb_audit_record` | `run_id: string` | `verdicts: AuditVerdict[]` |
 | `audit_report` | `kb_audit_report` | — | — |
 | `provenance` | `kb_provenance` | `entry_id: string` | `max_depth: integer` |
 | `kb_get` | `kb_get` | `entry_id: string` | — |
@@ -50,14 +50,11 @@ For the exact field enumeration sent by the deployed fleet pin, including the
 accepted Rust-only superset, see `docs/decisions/b1-request-contract.md`; it
 is not duplicated here.
 
-`caller_id` on `expire`, `audit_run`, and `audit_record` is never a public
-MCP tool argument: the Elixir host bridge injects it from the launch-time
-`--caller-id` principal (`trusted_caller/1` in
-`mcp/lib/agentic_kb_mcp/mcp_server.ex`) before the port request is sent, and
-the Rust dispatcher rejects any of those three methods whose `caller_id` is
-absent or fails `1..=128` printable-char validation. See
-[MCP Authorization](./security/mcp-authorization.md) for the full boundary,
-including the OPA policy and rate limits enforced ahead of that check.
+The backing repository and JSONL filesystem permissions are the MCP trust
+boundary. The package has no caller authentication, per-tool authorization,
+OPA policy, or caller-keyed quota. `caller_id` is rejected as an unknown field
+on every current port request. Existing stores and historical JSONL may retain
+untrusted legacy attribution fields; they are ignored by live operations.
 
 `handle_search` rejects `limit` outside `1..=db::MAX_LIMIT` and
 `inline_verify_k` outside `0..=db::MAX_INLINE_VERIFY_K`; `NumField::bounded`
@@ -198,9 +195,7 @@ nix develop <worktree> -c mix test
 
 In `.github/workflows/ci.yml`, the `ci` job runs `Elixir compile (mcp)`,
 `Elixir test (mcp)`, and `Elixir format check (mcp)` through `nix develop`, in
-addition to the Rust checks. The dev shell also wraps the escript with
-`open-policy-agent` on `PATH` so OPA-backed authorization can be exercised
-locally; see [MCP Authorization](./security/mcp-authorization.md).
+addition to the Rust checks.
 
 `mcp/test/schema_contract.json` is a shared fixture cross-checked from both
 suites: the Rust `test_deployed_machines_conf_pin_fields_are_all_accepted`
@@ -208,3 +203,43 @@ suites: the Rust `test_deployed_machines_conf_pin_fields_are_all_accepted`
 machines_conf pin sends is accepted"` (`mcp/test/agentic_kb_mcp_test.exs`)
 both load it, so the two languages cannot silently diverge on accepted
 fields or numeric bounds like `kb_reembed.max_chars`.
+
+## 0.3.0 JSON-RPC, stdio, and lifecycle contract
+
+Effective in 0.3.0, the MCP surface has 17 advertised tools. The registry and
+closed input schemas have one source of truth in `AgenticKbMcp.ToolRegistry`;
+`McpServer.tools/0` exposes that registry and the Rust `kb mcp` process remains
+the one-line JSON port boundary. The package has no caller authorization layer:
+`caller_id` is an undeclared argument and is rejected, while the repository
+trust boundary is described in [MCP repository trust boundary](./security/mcp-authorization.md).
+
+The JSON-RPC layer classifies input before any port operation. Parse failures
+return `-32700`; malformed requests return `-32600`; invalid tool parameters
+return `-32602`; unknown methods return the JSON-RPC method-not-found error;
+and notifications are silent. Malformed input and notifications do not
+dispatch a Rust port operation.
+
+`AgenticKbMcp.Transport.max_frame_bytes/0` defines the shared 10 MiB input
+limit. `Transport.Stdio` accumulates newline-delimited frames, emits one
+deterministic frame-too-large error for an oversized frame, discards through
+its newline, and then resumes framing the following request. Empty lines are
+ignored. At EOF, an unterminated non-empty frame is dispatched once before the
+clean EOF event; an empty or discarded partial frame produces only EOF.
+
+The escript validates launch arguments before starting the OTP application,
+then starts the VM with `-noinput`. In production one supervisor tree starts
+one `PortManager` when a database is present and one `McpServer`. `McpServer`
+is the sole owner of its direct native fd 0 input port. EOF exits cleanly, and
+a child startup failure fails application startup. An abnormal stdin-port exit
+is handled by the one-for-one supervisor, which replaces the server and its
+input owner without duplicate responses. The package smoke test,
+`application_process_test.sh`, `stdio_pipe_test.sh`, and lifecycle tests cover
+those process-level outcomes.
+
+`serverInfo.version` derives from the Elixir application manifest; the
+JSON-RPC `protocolVersion` is independent. Module boundaries are `JsonRpc` for
+protocol classification, `ToolRegistry` for schemas and argument validation,
+`Transport.Stdio` for bounded framing, `PortRequest` for pure caller-free tool
+argument-to-Rust request mapping, `Renderer` for Rust result-to-MCP content
+rendering, `McpServer` for JSON-RPC/lifecycle orchestration and direct stdin
+ownership, and `PortManager` for the Rust child port and response correlation.

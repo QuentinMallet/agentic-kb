@@ -35,10 +35,6 @@ use crate::crash_sim::KillPoint;
 // Keep audit_record batches bounded to audit_run's maximum sample size.
 const MAX_AUDIT_VERDICTS: usize = 50;
 
-fn valid_caller_id(caller: &str) -> bool {
-    !caller.is_empty() && caller.len() <= 128 && !caller.bytes().any(|byte| byte < 0x20)
-}
-
 /// Run MCP port protocol server (line-delimited JSON over stdio)
 #[derive(Command, Debug, Parser)]
 pub struct Mcp {
@@ -341,7 +337,6 @@ request_struct!(
 request_struct!(
     /// `expire` — mark one entry stale.
     ExpireRequest {
-        caller_id: Option<String>,
         #[serde(deserialize_with = "de_entry_id")]
         entry_id: String,
         reason: Option<String>,
@@ -413,7 +408,6 @@ request_struct!(
 request_struct!(
     /// `audit_run` — draw an audit sample.
     AuditRunRequest {
-        caller_id: Option<String>,
         sample_size: Option<NumField>,
         mode: Option<String>,
     }
@@ -441,7 +435,6 @@ struct AuditVerdict {
 request_struct!(
     /// `audit_record` — record audit verdicts.
     AuditRecordRequest {
-        caller_id: Option<String>,
         #[serde(deserialize_with = "de_run_id")]
         run_id: String,
         verdicts: Option<Vec<AuditVerdict>>,
@@ -740,6 +733,28 @@ fn handle_request(
         };
     }
 
+    // Reject retired/private-port identity fields before recovery can take a
+    // write lock. These methods are mutating, so their closed request shapes
+    // must be established before the generic recovery guard below.
+    match method.as_str() {
+        "expire" => {
+            if let Err(error) = serde_json::from_value::<ExpireRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        "audit_run" => {
+            if let Err(error) = serde_json::from_value::<AuditRunRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        "audit_record" => {
+            if let Err(error) = serde_json::from_value::<AuditRecordRequest>(raw.clone()) {
+                return parse_error(&id, error);
+            }
+        }
+        _ => {}
+    }
+
     // C1/D3: the server is long-lived, so recovering only at startup is not
     // enough — an external `kb compact` or another process's crash gap can open
     // at any point during a session. Every mutating method re-checks before it
@@ -765,9 +780,6 @@ fn handle_request(
         "import" => handle_import(&typed!(ImportRequest), paths, emb),
         "expire" => {
             let req = typed!(ExpireRequest);
-            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
-                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
-            }
             handle_expire(&req, paths, emb)
         }
         "stale_check" => handle_stale_check(&typed!(StaleCheckRequest), paths),
@@ -787,16 +799,10 @@ fn handle_request(
         "rebuild" => handle_rebuild(&typed!(RebuildRequest), paths, emb),
         "audit_run" => {
             let req = typed!(AuditRunRequest);
-            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
-                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
-            }
             handle_audit_run(&req, paths)
         }
         "audit_record" => {
             let req = typed!(AuditRecordRequest);
-            if !req.caller_id.as_deref().is_some_and(valid_caller_id) {
-                return parse_error(&req.id, "caller_id must be 1..=128 printable chars");
-            }
             handle_audit_record(&req, paths, emb)
         }
         "audit_report" => handle_audit_report(&typed!(AuditReportRequest), paths),
@@ -1867,14 +1873,6 @@ fn handle_expire(
     let entry_id = req.entry_id.clone();
     let reason = req.reason.clone();
     let force = req.force.unwrap_or(false);
-    let Some(caller_id) = req
-        .caller_id
-        .as_deref()
-        .filter(|caller| valid_caller_id(caller))
-    else {
-        return parse_error(id, "caller_id must be 1..=128 printable chars");
-    };
-
     let lock = match acquire_lock(&paths.lock) {
         Ok(l) => l,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -1899,7 +1897,6 @@ fn handle_expire(
         "id": entry_id,
         "reason": reason,
         "ts": ts,
-        "session": caller_id,
     })) {
         Ok(event) => event,
         Err(e) => return json!({"id":id,"type":"error","code":"db_error","message":e.to_string()}),
@@ -2058,13 +2055,6 @@ fn handle_audit_run_with_rng(
     rng: &mut impl Rng,
 ) -> Value {
     let id = &req.id;
-    let Some(caller_id) = req
-        .caller_id
-        .as_deref()
-        .filter(|caller| valid_caller_id(caller))
-    else {
-        return parse_error(id, "caller_id must be 1..=128 printable chars");
-    };
     let sample_size = match NumField::non_negative(&req.sample_size, "sample_size") {
         Ok(v) => v.unwrap_or(5).clamp(1, MAX_AUDIT_VERDICTS as u64) as usize,
         Err(e) => return parse_error(id, e),
@@ -2164,7 +2154,6 @@ fn handle_audit_run_with_rng(
             "action": "audit_run_candidates_batch",
             "table": "audit_run_candidates",
             "run_id": run_id,
-            "caller_id": caller_id,
             "created_at": ts,
             "ts": ts,
             "candidates": candidates,
@@ -2195,13 +2184,6 @@ fn handle_audit_record(
     emb: &dyn embedder::Embedder,
 ) -> Value {
     let id = &req.id;
-    let Some(caller_id) = req
-        .caller_id
-        .as_deref()
-        .filter(|caller| valid_caller_id(caller))
-    else {
-        return parse_error(id, "caller_id must be 1..=128 printable chars");
-    };
     let run_id = req.run_id.clone();
     if run_id.is_empty() || run_id.len() > 128 || run_id.bytes().any(|b| b < 0x20) {
         return json!({"id":id,"type":"error","code":"parse_error","message":"run_id must be 1..=128 printable chars"});
@@ -2274,18 +2256,6 @@ fn handle_audit_record(
             return json!({"id":id,"type":"error","code":"unknown_run_candidates",
                 "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", v.entry_id, run_id)});
         }
-
-        let owner: String = conn
-            .query_row(
-                "SELECT caller_id FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
-                params![&run_id, &v.entry_id],
-                |r| r.get(0),
-            )
-            .unwrap_or_default();
-        if owner != caller_id {
-            return json!({"id":id,"type":"error","code":"run_owner_mismatch",
-                "message": format!("run_id '{}' belongs to a different caller", run_id)});
-        }
     }
 
     // Check every destructive verdict before appending any event or writing any row.
@@ -2300,20 +2270,19 @@ fn handle_audit_record(
 
     let mut pending_verdicts = Vec::new();
     for verdict_obj in &verdicts {
-        let existing: rusqlite::Result<Option<(String, Option<String>, String)>> = conn
+        let existing: rusqlite::Result<Option<(String, Option<String>)>> = conn
             .query_row(
-                "SELECT verdict, evidence_ref, caller_id FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                "SELECT verdict, evidence_ref FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
                 params![&run_id, &verdict_obj.entry_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional();
 
         match existing {
-            Ok(Some((existing_verdict, existing_note, existing_caller))) => {
+            Ok(Some((existing_verdict, existing_note))) => {
                 let expected_verdict = if verdict_obj.verdict { "true" } else { "false" };
                 if existing_verdict != expected_verdict
                     || existing_note.as_deref() != verdict_obj.note.as_deref()
-                    || existing_caller != caller_id
                 {
                     return json!({"id":id,"type":"error","code":"audit_record_conflict",
                         "message": format!("run_id '{}' already recorded a different verdict for entry '{}'", run_id, verdict_obj.entry_id)});
@@ -2344,15 +2313,14 @@ fn handle_audit_record(
     let preflight: rusqlite::Result<()> = (|| {
         for verdict_obj in &pending_verdicts {
             conn.execute(
-                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
+                 VALUES(?1,?2,?3,?4,?5)",
                 params![
                     &run_id,
                     &verdict_obj.entry_id,
                     if verdict_obj.verdict { "true" } else { "false" },
                     &verdict_obj.note,
                     &ts,
-                    caller_id,
                 ],
             )?;
 
@@ -2404,7 +2372,6 @@ fn handle_audit_record(
         "action": "audit_record_batch",
         "table": "audit_runs",
         "run_id": run_id,
-        "caller_id": caller_id,
         "audited_at": ts,
         "ts": ts,
         "verdicts": event_verdicts,
@@ -3312,7 +3279,7 @@ mod tests {
                 verdict_objs.push(verdict_json(&entry_id, *verdict));
             }
 
-            let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": verdict_objs});
+            let req = json!({"run_id": run_id, "verdicts": verdict_objs});
             let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok", "handle_audit_record must succeed");
 
@@ -3386,7 +3353,7 @@ mod tests {
             for (eid, v) in named_eids.iter().zip(verdict_named.iter().cycle()) {
                 verdict_objs.push(verdict_json(eid, *v));
             }
-            let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": verdict_objs})), &paths, &emb);
+            let resp = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": verdict_objs})), &paths, &emb);
             proptest::prop_assert_eq!(&resp["type"], "ok");
 
             let conn = db::open_unchecked_for_test(&paths.db).unwrap();
@@ -3489,14 +3456,14 @@ mod tests {
             let fwd_verdicts: Vec<Value> = items.iter().zip(&entry_ids_a).map(|((_, _, _, v), eid)| {
                 verdict_json(eid, *v)
             }).collect();
-            let resp_a = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": fwd_verdicts})), &paths_a, &emb_a);
+            let resp_a = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": fwd_verdicts})), &paths_a, &emb_a);
             proptest::prop_assert_eq!(&resp_a["type"], "ok", "forward apply must succeed");
 
             // DB-B: apply in reversed order.
             let rev_verdicts: Vec<Value> = items.iter().zip(&entry_ids_b).map(|((_, _, _, v), eid)| {
                 verdict_json(eid, *v)
             }).collect::<Vec<_>>().into_iter().rev().collect();
-            let resp_b = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": rev_verdicts})), &paths_b, &emb_b);
+            let resp_b = handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &json!({"run_id": run_id, "verdicts": rev_verdicts})), &paths_b, &emb_b);
             proptest::prop_assert_eq!(&resp_b["type"], "ok", "reversed apply must succeed");
 
             // Compare source_weights buckets across both DBs.
@@ -4332,7 +4299,7 @@ mod tests {
         let r = handle_add(&tr::<AddRequest>("add", &id, &req_add), &paths, &emb);
         let entry_id = r["entry_id"].as_str().unwrap();
 
-        let req = json!({"method":"expire","id":"e2","caller_id":"mcp-test","entry_id":entry_id});
+        let req = json!({"method":"expire","id":"e2","entry_id":entry_id});
         let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "ok");
         assert_eq!(resp["expired"].as_str().unwrap(), entry_id);
@@ -4348,13 +4315,13 @@ mod tests {
         let entry_id = r["entry_id"].as_str().unwrap();
 
         // Without force → error
-        let req = json!({"method":"expire","id":"pg2","caller_id":"mcp-test","entry_id":entry_id});
+        let req = json!({"method":"expire","id":"pg2","entry_id":entry_id});
         let resp = handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
         assert_eq!(resp["type"], "error");
         assert_eq!(resp["code"], "permanent_guard");
 
         // With force → ok
-        let req2 = json!({"method":"expire","id":"pg3","caller_id":"mcp-test","entry_id":entry_id,"force":true});
+        let req2 = json!({"method":"expire","id":"pg3","entry_id":entry_id,"force":true});
         let resp2 = handle_expire(&tr::<ExpireRequest>("expire", &id, &req2), &paths, &emb);
         assert_eq!(resp2["type"], "ok");
     }
@@ -4892,8 +4859,8 @@ mod tests {
     fn seed_audit_candidate(paths: &config::Paths, run_id: &str, entry_id: &str) {
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at,caller_id) VALUES(?1,?2,datetime('now'),?3)",
-            rusqlite::params![run_id, entry_id, "mcp-test"],
+            "INSERT OR IGNORE INTO audit_run_candidates(run_id,entry_id,created_at) VALUES(?1,?2,datetime('now'))",
+            rusqlite::params![run_id, entry_id],
         ).unwrap();
     }
 
@@ -5003,7 +4970,7 @@ mod tests {
         }
         let id = json!(null);
         // sample_size=100 should be clamped to 50 (max) but we only have 3 entries
-        let req = json!({"caller_id":"mcp-test","sample_size": 100});
+        let req = json!({"sample_size": 100});
         let resp = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req), &paths);
         assert_eq!(resp["type"], "ok");
         let samples = resp["samples"].as_array().unwrap();
@@ -5017,11 +4984,7 @@ mod tests {
         let _eid = add_live_entry(&paths, &emb, "p/kind-ev", None);
         let id = json!(null);
         let resp = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"caller_id":"mcp-test","sample_size": 10}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
             &paths,
         );
         assert_eq!(resp["type"], "ok");
@@ -5058,11 +5021,7 @@ mod tests {
         drop(conn);
 
         let response = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 2}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 2})),
             &paths,
         );
 
@@ -5084,7 +5043,7 @@ mod tests {
     fn run_audit_run_crash_child() {
         let root = env::var("KB_CRASH_TEST_ROOT").unwrap();
         let paths = config::Paths::from_root(Path::new(&root));
-        let req = json!({"caller_id":"mcp-test","sample_size": 2});
+        let req = json!({"sample_size": 2});
         handle_audit_run(
             &tr::<AuditRunRequest>("audit_run", &json!(null), &req),
             &paths,
@@ -5148,7 +5107,7 @@ mod tests {
             .query_row(
                 "SELECT
                     (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?1)",
                 params![run_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -5162,11 +5121,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
         let response = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(response["type"], "ok");
@@ -5208,7 +5163,7 @@ mod tests {
                 &tr::<AuditRunRequest>(
                     "audit_run",
                     &json!(null),
-                    &json!({"caller_id":"mcp-test","sample_size":2,"mode":"traffic"}),
+                    &json!({"sample_size":2,"mode":"traffic"}),
                 ),
                 &paths,
                 &mut rng,
@@ -5297,7 +5252,7 @@ mod tests {
             &tr::<AuditRunRequest>(
                 "audit_run",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size":1,"mode":"traffic"}),
+                &json!({"sample_size":1,"mode":"traffic"}),
             ),
             &paths,
         );
@@ -5335,7 +5290,7 @@ mod tests {
             &tr::<AuditRunRequest>(
                 "audit_run",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 3, "mode": "traffic"}),
+                &json!({"sample_size": 3, "mode": "traffic"}),
             ),
             &paths,
         );
@@ -5383,10 +5338,10 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/stale", None);
         // Expire it
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","entry_id": eid});
+        let req = json!({"entry_id": eid});
         handle_expire(&tr::<ExpireRequest>("expire", &id, &req), &paths, &emb);
 
-        let req2 = json!({"caller_id":"mcp-test","sample_size": 10});
+        let req2 = json!({"sample_size": 10});
         let resp = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req2), &paths);
         let samples = resp["samples"].as_array().unwrap();
         assert!(
@@ -5404,7 +5359,7 @@ mod tests {
         let resp = handle_add(&tr::<AddRequest>("add", &id, &req), &paths, &emb);
         let eid = resp["entry_id"].as_str().unwrap().to_string();
 
-        let req2 = json!({"caller_id":"mcp-test","sample_size": 10});
+        let req2 = json!({"sample_size": 10});
         let resp2 = handle_audit_run(&tr::<AuditRunRequest>("audit_run", &id, &req2), &paths);
         let samples = resp2["samples"].as_array().unwrap();
         assert!(
@@ -5420,7 +5375,7 @@ mod tests {
         let run_id = "run-001";
         seed_audit_candidate(&paths, run_id, &eid);
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5448,7 +5403,7 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/exp", None);
         seed_audit_candidate(&paths, "run-002", &eid);
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false, "note": "evidence is stale"}]});
+        let req = json!({"run_id": "run-002", "verdicts": [{"entry_id": eid, "verdict": false, "note": "evidence is stale"}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5480,7 +5435,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false}]}),
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false}]}),
             ),
             &paths,
             &emb,
@@ -5492,7 +5447,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"  \t"}]}),
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"  \t"}]}),
             ),
             &paths,
             &emb,
@@ -5503,7 +5458,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"unsupported evidence"}]}),
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":false_id,"verdict":false,"note":"unsupported evidence"}]}),
             ),
             &paths,
             &emb,
@@ -5514,7 +5469,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-note","verdicts":[{"entry_id":true_id,"verdict":true}]}),
+                &json!({"run_id":"run-note","verdicts":[{"entry_id":true_id,"verdict":true}]}),
             ),
             &paths,
             &emb,
@@ -5537,7 +5492,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-cap","verdicts":fifty}),
+                &json!({"run_id":"run-cap","verdicts":fifty}),
             ),
             &paths,
             &emb,
@@ -5555,7 +5510,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":"run-cap-too-many","verdicts":fifty_one}),
+                &json!({"run_id":"run-cap-too-many","verdicts":fifty_one}),
             ),
             &paths,
             &emb,
@@ -5585,11 +5540,7 @@ mod tests {
         let ordinary_id = add_live_entry(&paths, &emb, "p/ordinary-audit", None);
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"caller_id":"mcp-test","sample_size": 2}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 2})),
             &paths,
         );
         let run_id = run["run_id"].as_str().unwrap();
@@ -5603,7 +5554,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":run_id,"verdicts":[{"entry_id":permanent_id,"verdict":false,"note":"bad evidence"}]}),
+                &json!({"run_id":run_id,"verdicts":[{"entry_id":permanent_id,"verdict":false,"note":"bad evidence"}]}),
             ),
             &paths,
             &emb,
@@ -5616,7 +5567,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &id,
-                &json!({"caller_id":"mcp-test","run_id":run_id,"verdicts":[{"entry_id":ordinary_id,"verdict":false,"note":"bad evidence"}]}),
+                &json!({"run_id":run_id,"verdicts":[{"entry_id":ordinary_id,"verdict":false,"note":"bad evidence"}]}),
             ),
             &paths,
             &emb,
@@ -5655,7 +5606,7 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/sw", None);
         seed_audit_candidate(&paths, "run-003", &eid);
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-003", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": "run-003", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5679,7 +5630,7 @@ mod tests {
         let eid = add_live_entry(&paths, &emb, "p/idem", None);
         seed_audit_candidate(&paths, "run-idem", &eid);
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": "run-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5746,7 +5697,7 @@ mod tests {
         }
 
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-atomic-weight", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": "run-atomic-weight", "verdicts": [{"entry_id": eid, "verdict": true}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5796,7 +5747,7 @@ mod tests {
         }
 
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
+        let req = json!({"run_id": "run-atomic-expire", "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5843,7 +5794,7 @@ mod tests {
         } else {
             json!({"entry_id": entry_id, "verdict": true})
         };
-        let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [verdict_item]});
+        let req = json!({"run_id": run_id, "verdicts": [verdict_item]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -5917,7 +5868,7 @@ mod tests {
         // Retry: the already-recovered request is now an exact duplicate and
         // must not double-count either half of the pair.
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -6031,7 +5982,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &paths,
             &emb,
@@ -6051,11 +6002,7 @@ mod tests {
         );
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6066,7 +6013,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "unsupported"}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "unsupported"}]}),
             ),
             &paths,
             &emb,
@@ -6121,7 +6068,7 @@ mod tests {
                     (SELECT is_stale FROM entries WHERE id=?1),
                     (SELECT COUNT(*) FROM audit_runs WHERE run_id=?2 AND entry_id=?1),
                     (SELECT COALESCE(SUM(failures),0) FROM source_weights WHERE kind='observation' AND session_id='compact-session'),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                 params![eid, run_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -6147,7 +6094,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6168,11 +6115,7 @@ mod tests {
         );
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6180,11 +6123,7 @@ mod tests {
         assert_eq!(run["samples"][0]["id"], eid);
 
         let expired = handle_expire(
-            &tr::<ExpireRequest>(
-                "expire",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","entry_id": eid}),
-            ),
+            &tr::<ExpireRequest>("expire", &json!(null), &json!({"entry_id": eid})),
             &paths,
             &emb,
         );
@@ -6223,7 +6162,7 @@ mod tests {
             .query_row(
                 "SELECT
                     (SELECT is_stale FROM entries WHERE id=?1),
-                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                    (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                 params![eid, run_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -6241,7 +6180,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6254,7 +6193,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6266,7 +6205,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "changed"}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "changed"}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6299,11 +6238,7 @@ mod tests {
             .clone();
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6311,11 +6246,7 @@ mod tests {
         assert_eq!(run["samples"][0]["id"], eid);
 
         let expired = handle_expire(
-            &tr::<ExpireRequest>(
-                "expire",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","entry_id": eid}),
-            ),
+            &tr::<ExpireRequest>("expire", &json!(null), &json!({"entry_id": eid})),
             &paths,
             &emb,
         );
@@ -6389,7 +6320,7 @@ mod tests {
                         (SELECT is_stale FROM entries WHERE id=?1),
                         (SELECT evidence_status FROM entries WHERE id=?1),
                         (SELECT COALESCE(group_concat(id, ','), '') FROM evidence WHERE entry_id=?1),
-                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                     params![eid, run_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -6412,7 +6343,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6441,11 +6372,7 @@ mod tests {
             .clone();
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6510,7 +6437,7 @@ mod tests {
                         (SELECT updated_at FROM entries WHERE id=?1),
                         (SELECT evidence_status FROM entries WHERE id=?1),
                         (SELECT COUNT(*) FROM evidence WHERE entry_id=?1),
-                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1 AND caller_id='mcp-test')",
+                        (SELECT COUNT(*) FROM audit_run_candidates WHERE run_id=?2 AND entry_id=?1)",
                     params![eid, run_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -6527,7 +6454,7 @@ mod tests {
             &tr::<AuditRecordRequest>(
                 "audit_record",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
+                &json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": true}]}),
             ),
             &replay_paths,
             &replay_emb,
@@ -6542,7 +6469,8 @@ mod tests {
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"caller_id":"mcp-test","run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
+        let req =
+            json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -6621,7 +6549,7 @@ mod tests {
                 }
             })
             .collect();
-        let req = json!({"caller_id":"mcp-test","run_id": "run-report", "verdicts": verdicts});
+        let req = json!({"run_id": "run-report", "verdicts": verdicts});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -6653,17 +6581,17 @@ mod tests {
         let traffic = add_live_entry(&paths, &emb, "p/report-traffic", None);
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'uniform','mcp-test')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'uniform')",
             [&uniform],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO audit_run_candidates(run_id,entry_id,arm,caller_id) VALUES('arms',?1,'traffic','mcp-test')",
+            "INSERT INTO audit_run_candidates(run_id,entry_id,arm) VALUES('arms',?1,'traffic')",
             [&traffic],
         )
         .unwrap();
         drop(conn);
-        let req = json!({"caller_id":"mcp-test","run_id":"arms","verdicts":[
+        let req = json!({"run_id":"arms","verdicts":[
             {"entry_id":uniform,"verdict":true}, {"entry_id":traffic,"verdict":true}
         ]});
         assert_eq!(
@@ -6699,7 +6627,7 @@ mod tests {
             &tr::<AuditRunRequest>(
                 "audit_run",
                 &json!(null),
-                &json!({"caller_id":"mcp-test","sample_size": 2, "mode": "traffic"}),
+                &json!({"sample_size": 2, "mode": "traffic"}),
             ),
             &paths,
         );
@@ -6727,7 +6655,7 @@ mod tests {
             .iter()
             .map(|sample| json!({"entry_id": sample["id"].as_str().unwrap(), "verdict": true}))
             .collect();
-        let req = json!({"caller_id":"mcp-test","run_id": run["run_id"].as_str().unwrap(), "verdicts": verdicts});
+        let req = json!({"run_id": run["run_id"].as_str().unwrap(), "verdicts": verdicts});
         assert_eq!(
             handle_audit_record(
                 &tr::<AuditRecordRequest>("audit_record", &json!(null), &req),
@@ -7263,7 +7191,7 @@ mod tests {
         seed_audit_candidate(&paths, "run-conf1", &eid);
         let id = json!(null);
         // Record verdict=true
-        let req = json!({"caller_id":"mcp-test","run_id": "run-conf1", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req = json!({"run_id": "run-conf1", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -7299,7 +7227,8 @@ mod tests {
         seed_audit_candidate(&paths, "run-null-sid", &eid);
         let id = json!(null);
         // Record verdict for this entry (uses COALESCE → __GLOBAL__)
-        let req = json!({"caller_id":"mcp-test","run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req =
+            json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -7435,7 +7364,7 @@ mod tests {
             let eid = add_live_entry(&paths, &emb, "p/prop-idem", None);
             seed_audit_candidate(&paths, "run-prop-idem", &eid);
             let id = json!(null);
-            let req = json!({"caller_id":"mcp-test","run_id": "run-prop-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
+            let req = json!({"run_id": "run-prop-idem", "verdicts": [{"entry_id": eid, "verdict": true}]});
             // First call
             handle_audit_record(&tr::<AuditRecordRequest>("audit_record", &id, &req), &paths, &emb);
             // Replay n times
@@ -7464,11 +7393,7 @@ mod tests {
 
         // Step 2: kb_audit_run — sample live entries
         let run_resp = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"caller_id":"mcp-test","sample_size": 10}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
             &paths,
         );
         assert_eq!(run_resp["type"], "ok");
@@ -7477,7 +7402,7 @@ mod tests {
         assert!(samples.iter().any(|s| s["id"] == eid));
 
         // Step 3: kb_audit_record verdict=false → entry gone from kb_search
-        let rec_req = json!({"caller_id":"mcp-test","run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
+        let rec_req = json!({"run_id": run_id, "verdicts": [{"entry_id": eid, "verdict": false, "note": "invalid evidence"}]});
         let rec_resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &rec_req),
             &paths,
@@ -7552,7 +7477,8 @@ mod tests {
         // sess-1 already has failures=1 from Step 3 and would yield confidence=0.5.
         let e2 = add_live_entry(&paths, &emb, "e2e/conf", Some("sess-conf"));
         seed_audit_candidate(&paths, "run-conf-e2e", &e2);
-        let req_true = json!({"caller_id":"mcp-test","run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
+        let req_true =
+            json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req_true),
             &paths,
@@ -7618,9 +7544,7 @@ mod tests {
         let import = json!({"method":"import","id":"pin-import","path":"seeds.json","upsert":true});
         let stale = json!({"method":"stale_check","id":"pin-stale","files":["src/a.rs"],
                            "commits":["0000000000000000000000000000000000000000"],"blame":false});
-        // `caller_id` is deliberately absent: the deployed pin supplies only
-        // public MCP tool arguments. The Elixir host bridge injects identity
-        // into the private Rust port request after public validation.
+        // The deployed payload contains only declared request fields.
         let expire = json!({"method":"expire","id":"pin-expire","entry_id":"nope","reason":"r",
                             "force":true});
         let run = json!({"method":"run","id":"pin-run","test_id":"t1","result":"pass",
@@ -7695,18 +7619,7 @@ mod tests {
             &search, &add, &cite, &import, &stale, &expire, &run, &test_add, &tests, &reembed,
             &rebuild, &kb_get,
         ] {
-            // The public deployed-pin payload reaches Elixir first. Its host
-            // bridge, not an MCP client, adds caller identity to requests for
-            // private Rust handlers that require it.
-            let mut private_req = public_req.clone();
-            if private_req["method"] == "expire" {
-                private_req
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("caller_id".to_owned(), json!("mcp-test"));
-            }
-
-            let resp = dispatch(&paths, &emb, &private_req);
+            let resp = dispatch(&paths, &emb, public_req);
             let code = resp["code"].as_str().unwrap_or("");
             assert_ne!(
                 code, "parse_error",
@@ -7800,7 +7713,7 @@ mod tests {
         let missing_verdict = dispatch(
             &paths,
             &emb,
-            &json!({"method":"audit_record","id":"mv1","caller_id":"mcp-test","run_id":"run-x",
+            &json!({"method":"audit_record","id":"mv1","run_id":"run-x",
                     "verdicts":[{"entry_id":"whatever"}]}),
         );
         assert_eq!(
@@ -7811,7 +7724,7 @@ mod tests {
         let string_verdict = dispatch(
             &paths,
             &emb,
-            &json!({"method":"audit_record","id":"mv2","caller_id":"mcp-test","run_id":"run-x",
+            &json!({"method":"audit_record","id":"mv2","run_id":"run-x",
                     "verdicts":[{"entry_id":"whatever","verdict":"false"}]}),
         );
         assert_eq!(
@@ -7822,7 +7735,7 @@ mod tests {
         let missing_entry_id = dispatch(
             &paths,
             &emb,
-            &json!({"method":"audit_record","id":"mv3","caller_id":"mcp-test","run_id":"run-x",
+            &json!({"method":"audit_record","id":"mv3","run_id":"run-x",
                     "verdicts":[{"verdict":true}]}),
         );
         assert_eq!(
@@ -8337,7 +8250,6 @@ pub mod tests_api {
     pub struct AuditRunRequest {
         pub id: Value,
         method: &'static str,
-        pub caller_id: &'static str,
         pub sample_size: Option<u64>,
         pub mode: Option<String>,
     }
@@ -8347,7 +8259,6 @@ pub mod tests_api {
             Self {
                 id,
                 method: "audit_run",
-                caller_id: "mcp-test",
                 sample_size,
                 mode: mode.map(str::to_owned),
             }
@@ -8366,7 +8277,6 @@ pub mod tests_api {
     pub struct AuditRecordRequest {
         pub id: Value,
         method: &'static str,
-        pub caller_id: &'static str,
         pub run_id: String,
         pub verdicts: Vec<AuditVerdict>,
     }
@@ -8376,7 +8286,6 @@ pub mod tests_api {
             Self {
                 id,
                 method: "audit_record",
-                caller_id: "mcp-test",
                 run_id: run_id.into(),
                 verdicts,
             }

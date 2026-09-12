@@ -985,15 +985,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE audit_run_candidates ADD COLUMN arm TEXT NOT NULL DEFAULT 'uniform';",
     );
-    // MCP audit authorization (bd-1orr): every sampled run and recorded
-    // verdict carries the host-bound caller from the private port boundary.
-    // Existing rows are retained as legacy data but can never satisfy a new
-    // caller-owned record request.
-    let _ = conn
-        .execute_batch("ALTER TABLE audit_runs ADD COLUMN caller_id TEXT NOT NULL DEFAULT ''; ");
-    let _ = conn.execute_batch(
-        "ALTER TABLE audit_run_candidates ADD COLUMN caller_id TEXT NOT NULL DEFAULT '';",
-    );
     let _ = conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry ON audit_runs(run_id, entry_id);"
     );
@@ -1020,8 +1011,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id     TEXT NOT NULL,
             audited_at   TEXT DEFAULT (datetime('now')),
             verdict      TEXT NOT NULL CHECK(verdict IN ('true','false')),
-            evidence_ref TEXT,
-            caller_id    TEXT NOT NULL DEFAULT ''
+            evidence_ref TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_runs_run_entry
             ON audit_runs(run_id, entry_id);
@@ -1038,7 +1028,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             entry_id   TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             arm        TEXT NOT NULL DEFAULT 'uniform',
-            caller_id  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, entry_id)
         );
         "#,
@@ -1629,9 +1618,6 @@ fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Res
     let run_id = event["run_id"]
         .as_str()
         .context("audit_record_batch: missing run_id")?;
-    let caller_id = event["caller_id"]
-        .as_str()
-        .context("audit_record_batch: missing caller_id")?;
     let audited_at = event["audited_at"]
         .as_str()
         .or_else(|| event["ts"].as_str())
@@ -1652,19 +1638,17 @@ fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Res
             let note = verdict["note"].as_str();
             let verdict_text = if verdict_bool { "true" } else { "false" };
 
-            let existing: Option<(String, Option<String>, String)> = conn
+            let existing: Option<(String, Option<String>)> = conn
                 .query_row(
-                    "SELECT verdict, evidence_ref, caller_id FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
+                    "SELECT verdict, evidence_ref FROM audit_runs WHERE run_id=?1 AND entry_id=?2",
                     params![run_id, entry_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
 
             match existing {
-                Some((existing_verdict, existing_note, existing_caller))
-                    if existing_verdict == verdict_text
-                        && existing_note.as_deref() == note
-                        && existing_caller == caller_id =>
+                Some((existing_verdict, existing_note))
+                    if existing_verdict == verdict_text && existing_note.as_deref() == note =>
                 {
                     continue;
                 }
@@ -1677,9 +1661,9 @@ fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Res
             }
 
             conn.execute(
-                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at, caller_id)
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![run_id, entry_id, verdict_text, note, audited_at, caller_id],
+                "INSERT INTO audit_runs(run_id, entry_id, verdict, evidence_ref, audited_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![run_id, entry_id, verdict_text, note, audited_at],
             )?;
             crate::crash_sim::kill_point(crate::crash_sim::KillPoint::AuditAfterRunInsert);
 
@@ -1711,9 +1695,6 @@ fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value
     let run_id = event["run_id"]
         .as_str()
         .context("audit_run_candidates_batch: missing run_id")?;
-    let caller_id = event["caller_id"]
-        .as_str()
-        .context("audit_run_candidates_batch: missing caller_id")?;
     let created_at = event["created_at"]
         .as_str()
         .or_else(|| event["ts"].as_str())
@@ -1729,18 +1710,16 @@ fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value
                 .context("audit_run_candidates_batch: missing candidate entry_id")?;
             let arm = candidate["arm"].as_str().unwrap_or("uniform");
 
-            let existing: Option<(String, String)> = conn
+            let existing: Option<String> = conn
                 .query_row(
-                    "SELECT caller_id, arm FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
+                    "SELECT arm FROM audit_run_candidates WHERE run_id=?1 AND entry_id=?2",
                     params![run_id, entry_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
                 .optional()?;
 
             match existing {
-                Some((existing_caller, existing_arm))
-                    if existing_caller == caller_id && existing_arm == arm =>
-                {
+                Some(existing_arm) if existing_arm == arm => {
                     continue;
                 }
                 Some(_) => {
@@ -1752,9 +1731,9 @@ fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value
             }
 
             conn.execute(
-                "INSERT INTO audit_run_candidates(run_id,entry_id,created_at,arm,caller_id)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![run_id, entry_id, created_at, arm, caller_id],
+                "INSERT INTO audit_run_candidates(run_id,entry_id,created_at,arm)
+                 VALUES(?1,?2,?3,?4)",
+                params![run_id, entry_id, created_at, arm],
             )?;
         }
         Ok(())

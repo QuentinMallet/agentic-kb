@@ -358,8 +358,8 @@ pub fn writer_schema_samples() -> Vec<serde_json::Value> {
         serde_json::json!({"action":"evidence_expire","table":"evidence","entry_id":"schema-entry","evidence_id":"schema-evidence","reason":"sample","ts":"2024-01-01T00:00:04Z"}),
         serde_json::json!({"action":"upsert","table":"test_cases","id":"schema-test","app":"kb","name":"schema","protocol":"rust_tool","config":"{}","ts":"2024-01-01T00:00:05Z"}),
         serde_json::json!({"action":"insert","table":"run_history","test_id":"schema-test","run_id":"schema-run","result":"pass","detail":"sample","adapter":"rust_tool","ts":"2024-01-01T00:00:06Z"}),
-        serde_json::json!({"action":"audit_run_candidates_batch","table":"audit_run_candidates","run_id":"schema-audit","caller_id":"schema-caller","created_at":"2024-01-01T00:00:07Z","ts":"2024-01-01T00:00:07Z","candidates":[{"entry_id":"schema-entry","arm":"uniform"}]}),
-        serde_json::json!({"action":"audit_record_batch","table":"audit_runs","run_id":"schema-audit","caller_id":"schema-caller","audited_at":"2024-01-01T00:00:08Z","ts":"2024-01-01T00:00:08Z","verdicts":[{"entry_id":"schema-entry","verdict":true,"note":"sample"}]}),
+        serde_json::json!({"action":"audit_run_candidates_batch","table":"audit_run_candidates","run_id":"schema-audit","created_at":"2024-01-01T00:00:07Z","ts":"2024-01-01T00:00:07Z","candidates":[{"entry_id":"schema-entry","arm":"uniform"}]}),
+        serde_json::json!({"action":"audit_record_batch","table":"audit_runs","run_id":"schema-audit","audited_at":"2024-01-01T00:00:08Z","ts":"2024-01-01T00:00:08Z","verdicts":[{"entry_id":"schema-entry","verdict":true,"note":"sample"}]}),
         serde_json::json!({"action":"expire","table":"entries","id":"schema-entry","reason":"sample","ts":"2024-01-01T00:00:09Z"}),
     ]
 }

@@ -35,12 +35,32 @@
       {
         packages =
           let
+            beam = pkgs.beam27Packages;
+            kbPackage = platform.buildRustPackage {
+              pname = "kb";
+              version = "0.2.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+
+              nativeBuildInputs = with pkgs; [ pkg-config cmake ];
+              buildInputs = with pkgs; [ openssl ];
+
+              OPENSSL_NO_VENDOR = "1";
+              doCheck = false;
+
+              meta = with pkgs.lib; {
+                description = "Agent knowledge base CLI (SQLite + JSONL + semantic search)";
+                mainProgram = "kb";
+                platforms = platforms.unix;
+              };
+            };
+
             # Elixir MCP server (escript — no external hex deps, uses OTP 27 :json)
             mcpPackage = pkgs.stdenv.mkDerivation {
               pname = "agentic-kb-mcp";
               version = "0.2.0";
               src = ./mcp;
-              nativeBuildInputs = [ pkgs.elixir_1_18 pkgs.makeWrapper ];
+              nativeBuildInputs = [ beam.elixir pkgs.makeWrapper ];
               MIX_ENV = "prod";
               HEX_OFFLINE = "1";
               buildPhase = ''
@@ -52,7 +72,7 @@
               installPhase = ''
                 install -Dm755 agentic_kb_mcp $out/bin/agentic-kb-mcp
                 wrapProgram $out/bin/agentic-kb-mcp \
-                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.open-policy-agent ]}
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ beam.erlang kbPackage pkgs.coreutils ]}
               '';
             };
           in
@@ -128,24 +148,7 @@
             mcp = mcpPackage;
           }
           // pkgs.lib.optionalAttrs hasCargoLock {
-            default = platform.buildRustPackage {
-              pname = "kb";
-              version = "0.2.0";
-              src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
-
-              nativeBuildInputs = with pkgs; [ pkg-config cmake ];
-              buildInputs = with pkgs; [ openssl ];
-
-              OPENSSL_NO_VENDOR = "1";
-              doCheck = false;
-
-              meta = with pkgs.lib; {
-                description = "Agent knowledge base CLI (SQLite + JSONL + semantic search)";
-                mainProgram = "kb";
-                platforms = platforms.unix;
-              };
-            };
+            default = kbPackage;
           };
         devShells = {
           default = pkgs.mkShell {
@@ -173,7 +176,6 @@
               # a hard floor. Pin the versioned, OTP-scoped attribute (not bare
               # `elixir`, which tracks the default BEAM set and can drift under it).
               beam27Packages.elixir
-              open-policy-agent
 
               # Local dev: secrets vault (OpenBao) + OIDC provider (Dex)
               openbao

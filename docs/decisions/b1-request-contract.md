@@ -150,3 +150,26 @@ Per `conventions/cross-repo/evidence-contract-notification`, machines_conf is
 notified before this lands, because `kb-protocol.md` deploys fleet-wide and the
 tool descriptions it documents change. The notification is the caller's to send;
 this note is the payload.
+
+---
+
+## Amendment — 0.3.0 repository trust boundary
+
+**Effective:** 0.3.0. This amendment supersedes item 15 only. All other
+accepted B1 facts, including the deployed-pin snapshot and closed schema
+contract, remain the historical 0.2.0 record.
+
+The bridge no longer injects `caller_id` into `expire`, `audit_run`, or
+`audit_record`; those port requests are caller-free. The package no longer
+uses launch-time `--caller-id`, OPA/Rego evaluation, or caller-keyed rate
+limits. A connected MCP client invokes every advertised tool through the
+server process's OS credentials, within the filesystem/repository boundary
+chosen by the user launching that process. Package checks establish neither
+caller identity nor Git permissions.
+
+`caller_id` remains an undeclared MCP tool argument and is rejected by closed
+schemas. Existing SQLite and JSONL attribution fields are inert legacy data.
+A downgrade after new caller-free audit candidate/record batch events is not
+replay-safe on 0.2.0, whose Rust database handling requires `caller_id`; keep
+a pre-upgrade database plus JSONL snapshot, or use a compatible forward
+release. Upgrade performs no historical rewrite.
