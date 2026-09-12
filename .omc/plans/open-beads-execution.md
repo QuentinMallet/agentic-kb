@@ -55,3 +55,17 @@ Remaining operations are Phase 4 only: obtain explicit user authorization for th
 concrete `mcp-final-integration -> master` merge, run the merge-boundary checks
 required at that time, merge, push, and then close the two epics. Do not auto-close
 the epics before that authorization.
+
+## Merge-boundary review record
+
+Sol approved the combined candidate at
+`28104b5fb33a2c3b82c60917282eb410ab7240a1` against base
+`740d4ea9c31697e80de27807fac5590dd9398be6`: the worktree was clean and
+the review reported no concerns. The generic `nix build .#all` merge command
+does not apply because this flake exposes no `all` package. Its project-specific
+build surfaces are `.#default` (the Rust `kb` package), `.#mcp`, and
+`.#doc`; `.#mcp` transitively realized the default Rust package and docs were
+verified separately. The package proof at `1bcf948`, formatter-only
+`c1b90bb`, and documentation-only `28104b5` preserve the recorded
+provenance. Rust 876/0/4, Mix 95/0, TLC, Clippy, flake-check, and process evidence
+remain applicable. Explicit merge authorization is still pending.
