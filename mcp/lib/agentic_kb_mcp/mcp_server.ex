@@ -7,6 +7,8 @@ defmodule AgenticKbMcp.McpServer do
   use GenServer
   require Logger
 
+  alias AgenticKbMcp.JsonRpc
+
   @protocol_version "2024-11-05"
   @server_info %{"name" => "agentic-kb-mcp", "version" => "0.1.0"}
   @format_entries_max_bytes 32_000
@@ -612,15 +614,24 @@ defmodule AgenticKbMcp.McpServer do
   def handle_cast({:line, line}, state) do
     case json_decode(line) do
       {:ok, request} ->
-        case handle_request(request, state) do
-          nil -> :ok
-          response -> write_response(response)
+        case validated_request(request) do
+          nil ->
+            :ok
+
+          {:request, request} ->
+            case handle_request(request, state) do
+              nil -> :ok
+              response -> write_response(response)
+            end
+
+          response ->
+            write_response(response)
         end
 
       {:error, _} ->
         write_response(%{
           "jsonrpc" => "2.0",
-          "id" => nil,
+          "id" => :null,
           "error" => %{"code" => -32_700, "message" => "Parse error"}
         })
     end
@@ -631,6 +642,22 @@ defmodule AgenticKbMcp.McpServer do
   # ---------------------------------------------------------------------------
   # MCP method handlers
   # ---------------------------------------------------------------------------
+
+  defp validated_request(request) do
+    case JsonRpc.classify(request) do
+      {:notification, _method, _params} ->
+        nil
+
+      {:error, response} ->
+        response
+
+      {:request, _method, _id, _params} ->
+        case JsonRpc.validate_method(request) do
+          {:ok, _method, _id, _params} -> {:request, request}
+          {:error, response} -> response
+        end
+    end
+  end
 
   defp handle_request(%{"method" => "initialize", "id" => id}, _state) do
     %{
@@ -643,8 +670,6 @@ defmodule AgenticKbMcp.McpServer do
       }
     }
   end
-
-  defp handle_request(%{"method" => "initialized"}, _state), do: nil
 
   defp handle_request(%{"method" => "tools/list", "id" => id}, _state) do
     %{"jsonrpc" => "2.0", "id" => id, "result" => %{"tools" => @tools}}
@@ -674,9 +699,6 @@ defmodule AgenticKbMcp.McpServer do
 
     %{"jsonrpc" => "2.0", "id" => id, "result" => result}
   end
-
-  defp handle_request(%{"method" => "notifications/" <> _, "id" => _id}, _state), do: nil
-  defp handle_request(%{"method" => "notifications/" <> _}, _state), do: nil
 
   defp handle_request(%{"method" => method, "id" => id}, _state) do
     %{
