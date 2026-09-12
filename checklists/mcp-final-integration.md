@@ -18,6 +18,12 @@ Target: `master`
 - [x] Project has no `.#all` attribute. Merge-boundary build set is
   `nix build .#default .#mcp .#doc`; `.#mcp` already transitive-realized
   the default Rust package and `.#doc` was separately verified.
-- [ ] Explicit user authorization for `mcp-final-integration -> master`.
+- [x] User authorized and local merge completed as
+  `2ba68d6640c40ae254cfeee60dc84432b2f600f5`.
+- [ ] Push that merged master commit to `origin/master`. Automatic approval
+  review rejected the attempted normal push because it is an external
+  shared-repository mutation distinct from local merge approval.
+- [ ] Close the two epics and clean worktrees only after the remote push is
+  verified.
 
 Do not close the two parent epics, merge, push, or release before the final unchecked item.
