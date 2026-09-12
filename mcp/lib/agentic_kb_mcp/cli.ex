@@ -11,7 +11,7 @@ defmodule AgenticKbMcp.CLI do
         end
 
       {:error, reason} ->
-        IO.puts(:stderr, "agentic-kb-mcp failed to start: #{Exception.message(reason)}")
+        IO.puts(:stderr, "agentic-kb-mcp failed to start: #{inspect(reason)}")
         System.halt(1)
     end
   end
