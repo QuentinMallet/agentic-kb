@@ -5,6 +5,7 @@
 CLAUDE.md
 AGENTS.md
 /target
+/mcp/agentic_kb_mcp
 result
 result-*
 docs/book/

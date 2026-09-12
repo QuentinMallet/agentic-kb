@@ -27,7 +27,7 @@ MCP tool column also records which port methods are deliberately internal.
 | `add` | `kb_add` | `path: string`, `summary: string`, `content: string` | `tags: JSON`, `permanent: boolean`, `replace_path: boolean`, `kind: string`, `evidence: JSON[]`, `cues: string[]`, `session_id: string` |
 | `cite` | `kb_cite` | `path: string` | `start: integer`, `end: integer` |
 | `import` | `kb_import` | `path: string` | `upsert: boolean` |
-| `expire` | `kb_expire` | `entry_id: string`, `caller_id: string` | `reason: string`, `force: boolean` |
+| `expire` | `kb_expire` | `entry_id: string` | `reason: string`, `force: boolean` |
 | `stale_check` | `kb_stale_check` | — | `files: string[]`, `commits: string[]`, `blame: boolean` |
 | `compact` | `kb_compact` | — | — |
 | `rebuild` | `kb_rebuild` | — | — |
@@ -35,8 +35,8 @@ MCP tool column also records which port methods are deliberately internal.
 | `run` | `kb_run` | `test_id: string`, `result: string` | `adapter: string`, `detail: string` |
 | `test_add` | `kb_test_add` | `app: string`, `name: string`, `protocol: string`, `config: string` | `test_id: string` |
 | `tests` | `kb_tests` | — | `app: string` |
-| `audit_run` | `kb_audit_run` | `caller_id: string` | `sample_size: integer`, `mode: string` |
-| `audit_record` | `kb_audit_record` | `run_id: string`, `caller_id: string` | `verdicts: AuditVerdict[]` |
+| `audit_run` | `kb_audit_run` | — | `sample_size: integer`, `mode: string` |
+| `audit_record` | `kb_audit_record` | `run_id: string` | `verdicts: AuditVerdict[]` |
 | `audit_report` | `kb_audit_report` | — | — |
 | `provenance` | `kb_provenance` | `entry_id: string` | `max_depth: integer` |
 | `kb_get` | `kb_get` | `entry_id: string` | — |
@@ -50,14 +50,11 @@ For the exact field enumeration sent by the deployed fleet pin, including the
 accepted Rust-only superset, see `docs/decisions/b1-request-contract.md`; it
 is not duplicated here.
 
-`caller_id` on `expire`, `audit_run`, and `audit_record` is never a public
-MCP tool argument: the Elixir host bridge injects it from the launch-time
-`--caller-id` principal (`trusted_caller/1` in
-`mcp/lib/agentic_kb_mcp/mcp_server.ex`) before the port request is sent, and
-the Rust dispatcher rejects any of those three methods whose `caller_id` is
-absent or fails `1..=128` printable-char validation. See
-[MCP Authorization](./security/mcp-authorization.md) for the full boundary,
-including the OPA policy and rate limits enforced ahead of that check.
+The backing repository and JSONL filesystem permissions are the MCP trust
+boundary. The package has no caller authentication, per-tool authorization,
+OPA policy, or caller-keyed quota. `caller_id` is rejected as an unknown field
+on every current port request. Existing stores and historical JSONL may retain
+untrusted legacy attribution fields; they are ignored by live operations.
 
 `handle_search` rejects `limit` outside `1..=db::MAX_LIMIT` and
 `inline_verify_k` outside `0..=db::MAX_INLINE_VERIFY_K`; `NumField::bounded`

@@ -1044,130 +1044,38 @@ defmodule AgenticKbMcpTest do
       )
     end
 
-    defp start_allowing_authorizer do
-      name = :"mcp_authz_#{System.unique_integer([:positive, :monotonic])}"
+    test "kb_audit_run dispatches through the real tools/call and port paths without authorization" do
+      start_fake_port()
 
-      start_supervised!(
-        {AgenticKbMcp.Authorization,
-         name: name, caller_id: "host-agent-a", opa: fn _input, _opts -> {:ok, true} end},
-        id: name
-      )
+      response =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}),
+          @with_db
+        )
 
-      name
+      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
     end
 
-    defp start_authorizer(opa) do
-      name = :"mcp_authz_#{System.unique_integer([:positive, :monotonic])}"
+    test "traffic audit dispatches without package authorization" do
+      start_fake_port()
 
-      start_supervised!(
-        {AgenticKbMcp.Authorization, name: name, caller_id: "host-agent-a", opa: opa},
-        id: name
-      )
+      accepted =
+        call_line(
+          ~s({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"traffic"}}}),
+          @with_db
+        )
 
-      name
+      assert get_in(accepted, ["result", "content", Access.at(0), "text"]) =~
+               "Audit run audit-1"
     end
 
-    defp with_authorizer(state), do: Map.put(state, :authorization, start_allowing_authorizer())
-
-    test "mutating tools fail closed when authorization is missing" do
+    test "kb_audit_record dispatches through the real tools/call and port paths without authorization" do
       start_fake_port()
 
       response =
         call_line(
           ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}),
           @with_db
-        )
-
-      assert %{"result" => %{"isError" => true, "content" => [%{"text" => text}]}} = response
-      assert text =~ "authorization denied"
-      assert text =~ "missing_authorizer"
-    end
-
-    test "production module-atom authorizer is reachable from tools/call" do
-      start_fake_port()
-      test_pid = self()
-
-      start_supervised!(
-        {AgenticKbMcp.Authorization,
-         name: AgenticKbMcp.Authorization,
-         caller_id: "host-agent-a",
-         opa: fn input, _opts ->
-           send(test_pid, {:authz_input, input})
-           {:ok, true}
-         end},
-        id: :production_named_authorization
-      )
-
-      response =
-        call_line(
-          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}),
-          %{db_path: "/nonexistent/agent-kb.db", authorization: AgenticKbMcp.Authorization}
-        )
-
-      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
-      assert_receive {:authz_input, %{"action" => "kb.audit.run", "caller" => "host-agent-a"}}
-    end
-
-    test "kb_audit_run dispatches through the real tools/call and port paths" do
-      start_fake_port()
-
-      response =
-        call_line(
-          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":5,"mode":"uniform"}}}),
-          with_authorizer(@with_db)
-        )
-
-      assert get_in(response, ["result", "content", Access.at(0), "text"]) =~ "Audit run audit-1"
-    end
-
-    test "traffic audit requires both base audit and traffic authorization" do
-      start_fake_port()
-      test_pid = self()
-
-      traffic_only =
-        start_authorizer(fn input, _opts ->
-          send(test_pid, {:traffic_only_action, input["action"]})
-          {:ok, input["action"] == "kb.audit.traffic"}
-        end)
-
-      denied =
-        call_line(
-          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"traffic"}}}),
-          Map.put(@with_db, :authorization, traffic_only)
-        )
-
-      assert %{"result" => %{"isError" => true, "content" => [%{"text" => denied_text}]}} =
-               denied
-
-      assert denied_text =~ "authorization denied"
-      assert_receive {:traffic_only_action, "kb.audit.run"}
-
-      allowed =
-        start_authorizer(fn input, _opts ->
-          send(test_pid, {:dual_scope_action, input["action"]})
-          {:ok, input["action"] in ["kb.audit.run", "kb.audit.traffic"]}
-        end)
-
-      accepted =
-        call_line(
-          ~s({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kb_audit_run","arguments":{"sample_size":2,"mode":"traffic"}}}),
-          Map.put(@with_db, :authorization, allowed)
-        )
-
-      assert get_in(accepted, ["result", "content", Access.at(0), "text"]) =~
-               "Audit run audit-1"
-
-      assert_receive {:dual_scope_action, "kb.audit.run"}
-      assert_receive {:dual_scope_action, "kb.audit.traffic"}
-    end
-
-    test "kb_audit_record dispatches through the real tools/call and port paths" do
-      start_fake_port()
-
-      response =
-        call_line(
-          ~s({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"kb_audit_record","arguments":{"run_id":"audit-1","verdicts":[]}}}),
-          with_authorizer(@with_db)
         )
 
       assert get_in(response, ["result", "content", Access.at(0), "text"]) =~
@@ -1188,7 +1096,7 @@ defmodule AgenticKbMcpTest do
 
     test "audit run, verdict recording, and report compose through tools/call" do
       start_fake_port()
-      state = with_authorizer(@with_db)
+      state = @with_db
 
       run =
         call_line(

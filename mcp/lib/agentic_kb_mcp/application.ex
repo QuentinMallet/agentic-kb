@@ -43,26 +43,15 @@ defmodule AgenticKbMcp.Application do
           if File.exists?(path), do: path, else: nil
       end
 
-    caller_id = Application.get_env(:agentic_kb_mcp, :launch_caller_id)
-    policy_dir = Application.app_dir(:agentic_kb_mcp, "priv/policies")
-
     children =
       if db_path do
         [
           {AgenticKbMcp.PortManager, db_path: db_path, kb_bin: kb_bin},
-          {AgenticKbMcp.Authorization,
-           name: AgenticKbMcp.Authorization,
-           caller_id: caller_id,
-           opa_opts: [policy_dir: policy_dir]},
-          {AgenticKbMcp.McpServer, db_path: db_path, authorization: AgenticKbMcp.Authorization}
+          {AgenticKbMcp.McpServer, db_path: db_path}
         ]
       else
         [
-          {AgenticKbMcp.Authorization,
-           name: AgenticKbMcp.Authorization,
-           caller_id: caller_id,
-           opa_opts: [policy_dir: policy_dir]},
-          {AgenticKbMcp.McpServer, db_path: nil, authorization: AgenticKbMcp.Authorization}
+          {AgenticKbMcp.McpServer, db_path: nil}
         ]
       end
 

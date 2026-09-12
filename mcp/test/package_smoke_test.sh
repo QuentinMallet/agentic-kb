@@ -11,7 +11,7 @@ request_tools='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
 set +e
 output=$(env -i PATH=/usr/bin:/bin \
-  "$timeout_bin" 5s "$mcp_bin" --caller-id agentic-kb-host \
+  "$timeout_bin" 5s "$mcp_bin" \
   < <(printf '%s\n%s\n' "$request_initialize" "$request_tools"; sleep 1) 2>&1)
 status=$?
 set -e
@@ -26,3 +26,8 @@ fi
 # request.
 grep -E '^\{"id":1,"jsonrpc":"2\.0","result":.*"protocolVersion"' <<<"$output" >/dev/null
 grep -E '^\{"id":2,"jsonrpc":"2\.0","result":\{"tools":' <<<"$output" >/dev/null
+
+if grep -Eqi 'authorization denied|policy_unavailable|opa eval' <<<"$output"; then
+  printf 'MCP package emitted retired authorization runtime output:\n%s\n' "$output" >&2
+  exit 1
+fi

@@ -4,18 +4,18 @@ defmodule AgenticKbMcp.CLI do
   """
 
   def main(args) do
-    # This is process-launch metadata controlled by the host service/unit.
-    # It is read once before the OTP tree starts; MCP JSON-RPC metadata and
-    # tool arguments never participate in principal selection.
-    Application.put_env(:agentic_kb_mcp, :launch_caller_id, launch_caller(args))
+    validate_args!(args)
     Application.ensure_all_started(:agentic_kb_mcp)
     # Block forever; McpServer calls System.halt(0) on stdin EOF.
     receive do
     end
   end
 
-  defp launch_caller(["--caller-id", caller]) when is_binary(caller) and byte_size(caller) > 0,
-    do: caller
+  defp validate_args!([]), do: :ok
 
-  defp launch_caller(_), do: nil
+  defp validate_args!(["--caller-id" | _]) do
+    raise ArgumentError, "--caller-id is no longer supported"
+  end
+
+  defp validate_args!(_), do: raise(ArgumentError, "agentic-kb-mcp does not accept arguments")
 end

@@ -1,25 +1,17 @@
 # AgenticKbMcp
 
-## Authorization boundary
+## Trust boundary
 
-The stdio entry point accepts a single host-launch principal:
+The backing repository and JSONL filesystem permissions are the trust
+boundary. Anyone able to edit that data may invoke every MCP tool. The package
+does not authenticate callers, authorize individual tools, inspect Git
+permissions, use OPA, or apply caller-keyed quotas. `--caller-id` is retired
+and rejected before server startup.
 
-```text
-agentic-kb-mcp --caller-id <host-principal>
-```
-
-Mutating audit and expiry tools are denied unless this launch value is present,
-passes the bundled Rego policy, and stays within its per-caller
-action quota. The bundled policy is default-deny for any caller not listed in
-`trusted_callers`, but it ships with one principal already trusted:
-`agentic-kb-host`. Operators deploying under a different launch identity must
-replace `trusted_callers` in `priv/policies/agentic_kb.rego` with their own.
-MCP `initialize.clientInfo` and tool arguments are never used as
-identity. Runtime OPA evaluation uses a short-lived supervised port with both
-OPA and host deadlines; a missing binary, timeout, undefined decision, or
-evaluation error denies the request. See
-[MCP Authorization](../docs/src/security/mcp-authorization.md) for the full
-boundary, including rate limits and denial reasons.
+Tool schemas remain closed, and the Rust port continues to enforce structural
+validation, locking, bounded inputs, permanent-entry guards, and atomic audit
+updates. Historical `caller_id` data can remain in existing stores as inert
+legacy attribution; it has no effect on current requests.
 
 ## Installation
 
