@@ -595,9 +595,20 @@ defmodule AgenticKbMcp.McpServer do
   @impl true
   def init(opts) do
     db_path = Keyword.get(opts, :db_path)
-    parent = self()
-    Task.start_link(fn -> read_stdin(parent) end)
-    {:ok, %{db_path: db_path}}
+    port = Port.open({:fd, 0, 0}, [:binary, :eof, :in, {:line, Transport.max_frame_bytes()}])
+
+    {:ok,
+     %{
+       db_path: db_path,
+       port: port,
+       framer: Stdio.new(Transport.max_frame_bytes()),
+       stdin_eof: false
+     }}
+  end
+
+  @impl true
+  def terminate(_reason, %{port: port}) do
+    if Port.info(port), do: Port.close(port)
   end
 
   @impl true
@@ -648,6 +659,28 @@ defmodule AgenticKbMcp.McpServer do
     end
 
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({port, {:data, {:eol, bytes}}}, %{port: port} = state) do
+    feed_stdin(state, IO.iodata_to_binary([bytes, "\n"]))
+  end
+
+  def handle_info({port, {:data, {:noeol, bytes}}}, %{port: port} = state) do
+    feed_stdin(state, bytes)
+  end
+
+  def handle_info({port, :eof}, %{port: port} = state) do
+    emit_frame_events(self(), elem(Stdio.finish(state.framer), 2))
+    {:noreply, %{state | stdin_eof: true}}
+  end
+
+  def handle_info({:EXIT, port, :normal}, %{port: port, stdin_eof: true} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info({:EXIT, port, reason}, %{port: port} = state) do
+    {:stop, {:stdin_port, reason}, state}
   end
 
   # ---------------------------------------------------------------------------
@@ -1357,45 +1390,15 @@ defmodule AgenticKbMcp.McpServer do
   end
 
   # ---------------------------------------------------------------------------
-  # Stdin reader (runs in a Task). The escript starts the VM with `-noinput`,
-  # leaving this task as the sole owner of fd 0. The native line port supplies
-  # bounded physical chunks while Stdio retains the protocol framing contract.
+  # The escript starts the VM with `-noinput`, leaving this GenServer as the
+  # sole owner of fd 0. The native line port supplies bounded physical chunks
+  # while Stdio retains the protocol framing contract.
   # ---------------------------------------------------------------------------
 
-  defp read_stdin(server) do
-    Process.flag(:trap_exit, true)
-    port = Port.open({:fd, 0, 0}, [:binary, :eof, :in, {:line, Transport.max_frame_bytes()}])
-
-    try do
-      read_stdin(server, port, Stdio.new(Transport.max_frame_bytes()))
-    after
-      if Port.info(port), do: Port.close(port)
-    end
-  end
-
-  defp read_stdin(server, port, framer) do
-    receive do
-      {^port, {:data, {:eol, bytes}}} ->
-        feed_stdin(server, port, framer, IO.iodata_to_binary([bytes, "\n"]))
-
-      {^port, {:data, {:noeol, bytes}}} ->
-        feed_stdin(server, port, framer, bytes)
-
-      {^port, :eof} ->
-        emit_frame_events(server, elem(Stdio.finish(framer), 2))
-
-      {:EXIT, ^port, :normal} ->
-        emit_frame_events(server, elem(Stdio.finish(framer), 2))
-
-      {:EXIT, ^port, reason} ->
-        GenServer.cast(server, {:error, reason})
-    end
-  end
-
-  defp feed_stdin(server, port, framer, bytes) do
-    {:ok, next_framer, events} = Stdio.feed(framer, bytes)
-    emit_frame_events(server, events)
-    read_stdin(server, port, next_framer)
+  defp feed_stdin(state, bytes) do
+    {:ok, framer, events} = Stdio.feed(state.framer, bytes)
+    emit_frame_events(self(), events)
+    {:noreply, %{state | framer: framer}}
   end
 
   defp emit_frame_events(server, events) do
