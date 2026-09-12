@@ -108,12 +108,18 @@ defmodule AgenticKbMcp.ApplicationLifecycleTest do
 
     with port_manager when is_pid(port_manager) <- child_pid(children, PortManager),
          server when is_pid(server) <- child_pid(children, McpServer),
-         %{port: input_port} <- :sys.get_state(server),
+         {:ok, %{port: input_port}} <- server_state(server),
          true <- is_port(input_port) do
       %{port_manager: port_manager, server: server, input_port: input_port}
     else
       _ -> nil
     end
+  end
+
+  defp server_state(server) do
+    {:ok, :sys.get_state(server)}
+  catch
+    :exit, _reason -> :gone
   end
 
   defp child_pid(children, module) do

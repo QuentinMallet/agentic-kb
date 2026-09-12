@@ -14,11 +14,11 @@ defmodule AgenticKbMcp.Application do
   @doc false
   def child_specs(opts) do
     db_path = Keyword.fetch!(opts, :db_path)
-    reader = Keyword.get(opts, :reader)
+    input_port_factory = Keyword.get(opts, :input_port_factory)
 
     mcp_opts =
       [db_path: db_path]
-      |> maybe_put(:reader, reader)
+      |> maybe_put(:input_port_factory, input_port_factory)
 
     if db_path do
       kb_bin = Keyword.fetch!(opts, :kb_bin)
@@ -39,7 +39,7 @@ defmodule AgenticKbMcp.Application do
 
     opts =
       [db_path: db_path]
-      |> maybe_put(:reader, Keyword.get(overrides, :reader))
+      |> maybe_put(:input_port_factory, Keyword.get(overrides, :input_port_factory))
       |> maybe_put(:port_manager_name, Keyword.get(overrides, :port_manager_name))
 
     if db_path do

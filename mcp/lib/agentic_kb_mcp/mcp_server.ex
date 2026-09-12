@@ -595,7 +595,8 @@ defmodule AgenticKbMcp.McpServer do
   @impl true
   def init(opts) do
     db_path = Keyword.get(opts, :db_path)
-    port = Port.open({:fd, 0, 0}, [:binary, :eof, :in, {:line, Transport.max_frame_bytes()}])
+    input_port_factory = Keyword.get(opts, :input_port_factory, &open_stdin_port/0)
+    port = input_port_factory.()
 
     {:ok,
      %{
@@ -1394,6 +1395,10 @@ defmodule AgenticKbMcp.McpServer do
   # sole owner of fd 0. The native line port supplies bounded physical chunks
   # while Stdio retains the protocol framing contract.
   # ---------------------------------------------------------------------------
+
+  defp open_stdin_port do
+    Port.open({:fd, 0, 0}, [:binary, :eof, :in, {:line, Transport.max_frame_bytes()}])
+  end
 
   defp feed_stdin(state, bytes) do
     {:ok, framer, events} = Stdio.feed(state.framer, bytes)
