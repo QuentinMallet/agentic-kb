@@ -2256,7 +2256,6 @@ fn handle_audit_record(
             return json!({"id":id,"type":"error","code":"unknown_run_candidates",
                 "message": format!("entry '{}' was not sampled by audit_run for run_id '{}'", v.entry_id, run_id)});
         }
-
     }
 
     // Check every destructive verdict before appending any event or writing any row.
@@ -4985,11 +4984,7 @@ mod tests {
         let _eid = add_live_entry(&paths, &emb, "p/kind-ev", None);
         let id = json!(null);
         let resp = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"sample_size": 10}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
             &paths,
         );
         assert_eq!(resp["type"], "ok");
@@ -5026,11 +5021,7 @@ mod tests {
         drop(conn);
 
         let response = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 2}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 2})),
             &paths,
         );
 
@@ -5130,11 +5121,7 @@ mod tests {
         let (_dir, paths, emb) = setup();
         let entry_id = add_live_entry(&paths, &emb, "p/default-uniform", None);
         let response = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(response["type"], "ok");
@@ -5553,11 +5540,7 @@ mod tests {
         let ordinary_id = add_live_entry(&paths, &emb, "p/ordinary-audit", None);
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"sample_size": 2}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 2})),
             &paths,
         );
         let run_id = run["run_id"].as_str().unwrap();
@@ -6019,11 +6002,7 @@ mod tests {
         );
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6136,11 +6115,7 @@ mod tests {
         );
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6148,11 +6123,7 @@ mod tests {
         assert_eq!(run["samples"][0]["id"], eid);
 
         let expired = handle_expire(
-            &tr::<ExpireRequest>(
-                "expire",
-                &json!(null),
-                &json!({"entry_id": eid}),
-            ),
+            &tr::<ExpireRequest>("expire", &json!(null), &json!({"entry_id": eid})),
             &paths,
             &emb,
         );
@@ -6267,11 +6238,7 @@ mod tests {
             .clone();
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6279,11 +6246,7 @@ mod tests {
         assert_eq!(run["samples"][0]["id"], eid);
 
         let expired = handle_expire(
-            &tr::<ExpireRequest>(
-                "expire",
-                &json!(null),
-                &json!({"entry_id": eid}),
-            ),
+            &tr::<ExpireRequest>("expire", &json!(null), &json!({"entry_id": eid})),
             &paths,
             &emb,
         );
@@ -6409,11 +6372,7 @@ mod tests {
             .clone();
 
         let run = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &json!(null),
-                &json!({"sample_size": 1}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &json!(null), &json!({"sample_size": 1})),
             &paths,
         );
         assert_eq!(run["type"], "ok");
@@ -6510,7 +6469,8 @@ mod tests {
     fn test_handle_audit_record_invalid_entry_id() {
         let (_dir, paths, emb) = setup();
         let id = json!(null);
-        let req = json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
+        let req =
+            json!({"run_id": "run-bad", "verdicts": [{"entry_id": "no-such-id", "verdict": true}]});
         let resp = handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -7267,7 +7227,8 @@ mod tests {
         seed_audit_candidate(&paths, "run-null-sid", &eid);
         let id = json!(null);
         // Record verdict for this entry (uses COALESCE → __GLOBAL__)
-        let req = json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
+        let req =
+            json!({"run_id": "run-null-sid", "verdicts": [{"entry_id": eid, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req),
             &paths,
@@ -7432,11 +7393,7 @@ mod tests {
 
         // Step 2: kb_audit_run — sample live entries
         let run_resp = handle_audit_run(
-            &tr::<AuditRunRequest>(
-                "audit_run",
-                &id,
-                &json!({"sample_size": 10}),
-            ),
+            &tr::<AuditRunRequest>("audit_run", &id, &json!({"sample_size": 10})),
             &paths,
         );
         assert_eq!(run_resp["type"], "ok");
@@ -7520,7 +7477,8 @@ mod tests {
         // sess-1 already has failures=1 from Step 3 and would yield confidence=0.5.
         let e2 = add_live_entry(&paths, &emb, "e2e/conf", Some("sess-conf"));
         seed_audit_candidate(&paths, "run-conf-e2e", &e2);
-        let req_true = json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
+        let req_true =
+            json!({"run_id": "run-conf-e2e", "verdicts": [{"entry_id": e2, "verdict": true}]});
         handle_audit_record(
             &tr::<AuditRecordRequest>("audit_record", &id, &req_true),
             &paths,

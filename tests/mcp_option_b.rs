@@ -43,7 +43,10 @@ fn anonymous_expire_and_audit_operations_preserve_integrity_and_idempotency() {
         &paths,
         json!({"id":"expire","method":"expire","entry_id":direct_entry,"reason":"obsolete"}),
     );
-    assert_eq!(expired["type"], "ok", "anonymous expire must succeed: {expired}");
+    assert_eq!(
+        expired["type"], "ok",
+        "anonymous expire must succeed: {expired}"
+    );
 
     let audit_entry = add_auditable(&paths, "option-b/audit");
     let run = dispatch(
@@ -58,14 +61,20 @@ fn anonymous_expire_and_audit_operations_preserve_integrity_and_idempotency() {
         &paths,
         json!({"id":"record-1","method":"audit_record","run_id":run_id,"verdicts":[verdict]}),
     );
-    assert_eq!(first["type"], "ok", "anonymous audit record must succeed: {first}");
+    assert_eq!(
+        first["type"], "ok",
+        "anonymous audit record must succeed: {first}"
+    );
     assert_eq!(first["recorded"], 1);
 
     let replay = dispatch(
         &paths,
         json!({"id":"record-2","method":"audit_record","run_id":run_id,"verdicts":[{"entry_id":audit_entry,"verdict":true}]}),
     );
-    assert_eq!(replay["type"], "ok", "identical anonymous replay must succeed: {replay}");
+    assert_eq!(
+        replay["type"], "ok",
+        "identical anonymous replay must succeed: {replay}"
+    );
     assert_eq!(replay["recorded"], 0, "replay must not duplicate a verdict");
 
     let events = events::read_events(&paths.events).unwrap().events;
@@ -90,12 +99,21 @@ fn caller_id_is_rejected_on_the_rust_port_boundary() {
         json!({"id":"record","method":"audit_record","run_id":"run","verdicts":[],"caller_id":"client"}),
     ] {
         let response = dispatch(&paths, request);
-        assert_eq!(response["type"], "error", "caller_id must be an unknown request field: {response}");
+        assert_eq!(
+            response["type"], "error",
+            "caller_id must be an unknown request field: {response}"
+        );
         assert_eq!(response["code"], "parse_error");
-        assert!(response["message"].as_str().unwrap_or_default().contains("caller_id"));
+        assert!(response["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("caller_id"));
     }
 
-    assert_eq!(events::read_events(&paths.events).unwrap().events.len(), events_before);
+    assert_eq!(
+        events::read_events(&paths.events).unwrap().events.len(),
+        events_before
+    );
 }
 
 #[test]
@@ -126,6 +144,9 @@ fn historical_caller_attributed_candidate_replays_and_allows_anonymous_recording
             "verdicts":[{"entry_id":entry_id,"verdict":true}]
         }),
     );
-    assert_eq!(response["type"], "ok", "legacy caller data must not block anonymous use: {response}");
+    assert_eq!(
+        response["type"], "ok",
+        "legacy caller data must not block anonymous use: {response}"
+    );
     assert_eq!(response["recorded"], 1);
 }

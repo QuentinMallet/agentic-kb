@@ -1648,8 +1648,7 @@ fn apply_audit_record_batch(conn: &Connection, event: &serde_json::Value) -> Res
 
             match existing {
                 Some((existing_verdict, existing_note))
-                    if existing_verdict == verdict_text
-                        && existing_note.as_deref() == note =>
+                    if existing_verdict == verdict_text && existing_note.as_deref() == note =>
                 {
                     continue;
                 }
@@ -1720,8 +1719,7 @@ fn apply_audit_run_candidates_batch(conn: &Connection, event: &serde_json::Value
                 .optional()?;
 
             match existing {
-                Some(existing_arm) if existing_arm == arm =>
-                {
+                Some(existing_arm) if existing_arm == arm => {
                     continue;
                 }
                 Some(_) => {
