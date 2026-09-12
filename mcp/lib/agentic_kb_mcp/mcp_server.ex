@@ -8,12 +8,14 @@ defmodule AgenticKbMcp.McpServer do
   require Logger
 
   alias AgenticKbMcp.JsonRpc
+  alias AgenticKbMcp.Transport.Stdio
 
   @protocol_version "2024-11-05"
   @server_info %{"name" => "agentic-kb-mcp", "version" => "0.1.0"}
   @format_entries_max_bytes 32_000
   @evidence_preview_limit 3
   @derived_from_max_len 200
+  @max_stdio_frame_bytes 10 * 1024 * 1024
 
   @tools [
     %{
@@ -606,6 +608,16 @@ defmodule AgenticKbMcp.McpServer do
   def handle_cast({:error, reason}, _state) do
     Logger.error("stdin error: #{inspect(reason)}")
     System.halt(1)
+  end
+
+  def handle_cast(:frame_too_large, state) do
+    write_response(%{
+      "jsonrpc" => "2.0",
+      "id" => :null,
+      "error" => %{"code" => -32_700, "message" => "Frame exceeds 10 MiB limit"}
+    })
+
+    {:noreply, state}
   end
 
   def handle_cast({:line, ""}, state), do: {:noreply, state}
@@ -1345,21 +1357,37 @@ defmodule AgenticKbMcp.McpServer do
   end
 
   # ---------------------------------------------------------------------------
-  # Stdin reader (runs in a Task)
+  # Stdin reader (runs in a Task). Reading one byte at a time deliberately
+  # keeps a short, open-stdin request responsive: a fixed-size binary read can
+  # wait for its whole buffer before releasing a newline-terminated request.
+  # The framer is the sole 10 MiB frame accumulator.
   # ---------------------------------------------------------------------------
 
   defp read_stdin(server) do
-    case IO.read(:stdio, :line) do
+    read_stdin(server, Stdio.new(@max_stdio_frame_bytes))
+  end
+
+  defp read_stdin(server, framer) do
+    case IO.binread(:stdio, 1) do
       :eof ->
-        GenServer.cast(server, :eof)
+        emit_frame_events(server, elem(Stdio.finish(framer), 2))
 
       {:error, reason} ->
         GenServer.cast(server, {:error, reason})
 
-      line ->
-        GenServer.cast(server, {:line, String.trim(line)})
-        read_stdin(server)
+      bytes ->
+        {:ok, next_framer, events} = Stdio.feed(framer, bytes)
+        emit_frame_events(server, events)
+        read_stdin(server, next_framer)
     end
+  end
+
+  defp emit_frame_events(server, events) do
+    Enum.each(events, fn
+      {:line, line} -> GenServer.cast(server, {:line, line})
+      :frame_too_large -> GenServer.cast(server, :frame_too_large)
+      :eof -> GenServer.cast(server, :eof)
+    end)
   end
 
   # ---------------------------------------------------------------------------
