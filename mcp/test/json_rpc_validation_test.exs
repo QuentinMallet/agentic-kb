@@ -70,4 +70,9 @@ defmodule AgenticKbMcp.JsonRpcTest do
              )
   end
 
+  test "initialize advertises the application manifest version" do
+    response = call_line(~s({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}))
+    expected = Application.spec(:agentic_kb_mcp, :vsn) |> to_string()
+    assert get_in(response, ["result", "serverInfo", "version"]) == expected
+  end
 end
