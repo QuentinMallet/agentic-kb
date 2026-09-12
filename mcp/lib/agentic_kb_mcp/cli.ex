@@ -5,6 +5,7 @@ defmodule AgenticKbMcp.CLI do
 
   def main(args) do
     validate_args!(args)
+
     case Application.ensure_all_started(:agentic_kb_mcp) do
       {:ok, _} ->
         receive do

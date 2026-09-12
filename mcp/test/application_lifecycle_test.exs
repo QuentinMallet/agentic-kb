@@ -38,7 +38,9 @@ defmodule AgenticKbMcp.ApplicationLifecycleTest do
     supervisor = Process.whereis(AgenticKbMcp.Supervisor)
     assert is_pid(supervisor)
 
-    %{port_manager: port_manager, server: server, input_port: input_port} = lifecycle_pids(supervisor)
+    %{port_manager: port_manager, server: server, input_port: input_port} =
+      lifecycle_pids(supervisor)
+
     assert Process.alive?(port_manager)
     assert Process.alive?(server)
     assert is_port(input_port)
@@ -63,7 +65,8 @@ defmodule AgenticKbMcp.ApplicationLifecycleTest do
       assert_eventually_value(fn ->
         case lifecycle_pids(supervisor) do
           %{server: next_server, input_port: next_input_port} ->
-            if next_server != server and next_input_port != input_port and Port.info(next_input_port) do
+            if next_server != server and next_input_port != input_port and
+                 Port.info(next_input_port) do
               %{server: next_server, input_port: next_input_port}
             end
 
