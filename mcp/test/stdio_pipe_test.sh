@@ -12,7 +12,7 @@ trap 'rm -f "$output_file" "$partial_file" "$recovery_file"' EXIT
 request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
 run_held_open_server() {
-  timeout 30s elixir -pa _build/test/lib/agentic_kb_mcp/ebin -e '
+  timeout 30s elixir --erl "-noinput" -pa _build/test/lib/agentic_kb_mcp/ebin -e '
     Application.load(:agentic_kb_mcp)
     {:ok, _pid} = AgenticKbMcp.McpServer.start_link(db_path: nil)
     Process.sleep(500)
@@ -20,7 +20,7 @@ run_held_open_server() {
 }
 
 run_eof_server() {
-  timeout 30s elixir -pa _build/test/lib/agentic_kb_mcp/ebin -e '
+  timeout 30s elixir --erl "-noinput" -pa _build/test/lib/agentic_kb_mcp/ebin -e '
     Application.load(:agentic_kb_mcp)
     {:ok, _pid} = AgenticKbMcp.McpServer.start_link(db_path: nil)
     Process.sleep(:infinity)

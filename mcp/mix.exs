@@ -22,7 +22,7 @@ defmodule AgenticKbMcp.MixProject do
   defp escript do
     # CLI argument validation must run before the OTP application starts so a
     # retired launch flag cannot start a server as a side effect.
-    [main_module: AgenticKbMcp.CLI, app: nil]
+    [main_module: AgenticKbMcp.CLI, app: nil, emu_args: "-noinput"]
   end
 
   # Zero external deps — uses OTP 27 :json module

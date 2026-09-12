@@ -1357,29 +1357,45 @@ defmodule AgenticKbMcp.McpServer do
   end
 
   # ---------------------------------------------------------------------------
-  # Stdin reader (runs in a Task). Reading one byte at a time deliberately
-  # keeps a short, open-stdin request responsive: a fixed-size binary read can
-  # wait for its whole buffer before releasing a newline-terminated request.
-  # The framer is the sole 10 MiB frame accumulator.
+  # Stdin reader (runs in a Task). The escript starts the VM with `-noinput`,
+  # leaving this task as the sole owner of fd 0. The native line port supplies
+  # bounded physical chunks while Stdio retains the protocol framing contract.
   # ---------------------------------------------------------------------------
 
   defp read_stdin(server) do
-    read_stdin(server, Stdio.new(Transport.max_frame_bytes()))
+    Process.flag(:trap_exit, true)
+    port = Port.open({:fd, 0, 0}, [:binary, :eof, :in, {:line, Transport.max_frame_bytes()}])
+
+    try do
+      read_stdin(server, port, Stdio.new(Transport.max_frame_bytes()))
+    after
+      if Port.info(port), do: Port.close(port)
+    end
   end
 
-  defp read_stdin(server, framer) do
-    case IO.binread(:stdio, 1) do
-      :eof ->
+  defp read_stdin(server, port, framer) do
+    receive do
+      {^port, {:data, {:eol, bytes}}} ->
+        feed_stdin(server, port, framer, IO.iodata_to_binary([bytes, "\n"]))
+
+      {^port, {:data, {:noeol, bytes}}} ->
+        feed_stdin(server, port, framer, bytes)
+
+      {^port, :eof} ->
         emit_frame_events(server, elem(Stdio.finish(framer), 2))
 
-      {:error, reason} ->
-        GenServer.cast(server, {:error, reason})
+      {:EXIT, ^port, :normal} ->
+        emit_frame_events(server, elem(Stdio.finish(framer), 2))
 
-      bytes ->
-        {:ok, next_framer, events} = Stdio.feed(framer, bytes)
-        emit_frame_events(server, events)
-        read_stdin(server, next_framer)
+      {:EXIT, ^port, reason} ->
+        GenServer.cast(server, {:error, reason})
     end
+  end
+
+  defp feed_stdin(server, port, framer, bytes) do
+    {:ok, next_framer, events} = Stdio.feed(framer, bytes)
+    emit_frame_events(server, events)
+    read_stdin(server, port, next_framer)
   end
 
   defp emit_frame_events(server, events) do
