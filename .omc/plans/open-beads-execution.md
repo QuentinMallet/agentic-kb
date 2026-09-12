@@ -67,9 +67,13 @@ an external shared-repository mutation distinct from the explicitly approved loc
 merge, and the user did not authorize that remote push or destination.” No retry or
 workaround was attempted. Both epics remain open and no worktree cleanup occurred.
 
-The previously verified package path is now unavailable for a new MCP-only KB
-stale-check (`ENOENT`). The original strict package evidence remains recorded;
-no different store output was substituted.
+The original package path became unavailable (`ENOENT`) for a later stale-check,
+but that artifact gap is resolved: a fresh local final-integration escript with
+the current `target/debug/kb` invoked `kb_stale_check` over all 51 paths in
+`740d4ea..master`, including deleted paths, with `blame:true`. It reported no
+stale or unreachable entries. One advisory REVIEW entry remains:
+`conventions/cross-repo/evidence-contract-notification`
+(`ed43f414-c2e7-4500-ad77-d2c13e57d523`), matched by commit/blame.
 
 ## Merge-boundary review record
 
