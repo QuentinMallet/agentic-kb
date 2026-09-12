@@ -1,17 +1,20 @@
 # AgenticKbMcp
 
-## Trust boundary
+## Repository trust boundary
 
-The backing repository and JSONL filesystem permissions are the trust
-boundary. Anyone able to edit that data may invoke every MCP tool. The package
-does not authenticate callers, authorize individual tools, inspect Git
-permissions, use OPA, or apply caller-keyed quotas. `--caller-id` is retired
-and rejected before server startup.
+Effective in 0.3.0, a connected client invokes all 17 advertised MCP tools
+with the server process's OS credentials. The user launching the process
+chooses the repository and filesystem boundary. The package does not establish
+caller identity, inspect Git permissions, authorize individual tools, use OPA
+or Rego, or apply caller-keyed quotas. `--caller-id` is retired and rejected
+before server startup.
 
-Tool schemas remain closed, and the Rust port continues to enforce structural
-validation, locking, bounded inputs, permanent-entry guards, and atomic audit
-updates. Historical `caller_id` data can remain in existing stores as inert
-legacy attribution; it has no effect on current requests.
+Closed tool schemas, Rust structural validation, locking, bounded inputs,
+permanent-entry guards, and atomic audit updates remain in force. They protect
+request and data integrity; they are not caller authorization. Historical
+`caller_id` data remains inert legacy attribution. See the [MCP repository
+trust boundary](../docs/src/security/mcp-authorization.md) for migration and
+rollback guidance.
 
 ## Installation
 

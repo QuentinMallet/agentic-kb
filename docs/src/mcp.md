@@ -203,3 +203,43 @@ suites: the Rust `test_deployed_machines_conf_pin_fields_are_all_accepted`
 machines_conf pin sends is accepted"` (`mcp/test/agentic_kb_mcp_test.exs`)
 both load it, so the two languages cannot silently diverge on accepted
 fields or numeric bounds like `kb_reembed.max_chars`.
+
+## 0.3.0 JSON-RPC, stdio, and lifecycle contract
+
+Effective in 0.3.0, the MCP surface has 17 advertised tools. The registry and
+closed input schemas have one source of truth in `AgenticKbMcp.ToolRegistry`;
+`McpServer.tools/0` exposes that registry and the Rust `kb mcp` process remains
+the one-line JSON port boundary. The package has no caller authorization layer:
+`caller_id` is an undeclared argument and is rejected, while the repository
+trust boundary is described in [MCP repository trust boundary](./security/mcp-authorization.md).
+
+The JSON-RPC layer classifies input before any port operation. Parse failures
+return `-32700`; malformed requests return `-32600`; invalid tool parameters
+return `-32602`; unknown methods return the JSON-RPC method-not-found error;
+and notifications are silent. Malformed input and notifications do not
+dispatch a Rust port operation.
+
+`AgenticKbMcp.Transport.max_frame_bytes/0` defines the shared 10 MiB input
+limit. `Transport.Stdio` accumulates newline-delimited frames, emits one
+deterministic frame-too-large error for an oversized frame, discards through
+its newline, and then resumes framing the following request. Empty lines are
+ignored. At EOF, an unterminated non-empty frame is dispatched once before the
+clean EOF event; an empty or discarded partial frame produces only EOF.
+
+The escript validates launch arguments before starting the OTP application,
+then starts the VM with `-noinput`. In production one supervisor tree starts
+one `PortManager` when a database is present and one `McpServer`. `McpServer`
+is the sole owner of its direct native fd 0 input port. EOF exits cleanly, and
+a child startup failure fails application startup. An abnormal stdin-port exit
+is handled by the one-for-one supervisor, which replaces the server and its
+input owner without duplicate responses. The package smoke test,
+`application_process_test.sh`, `stdio_pipe_test.sh`, and lifecycle tests cover
+those process-level outcomes.
+
+`serverInfo.version` derives from the Elixir application manifest; the
+JSON-RPC `protocolVersion` is independent. Module boundaries are `JsonRpc` for
+protocol classification, `ToolRegistry` for schemas and argument validation,
+`Transport.Stdio` for bounded framing, `PortRequest` for pure caller-free tool
+argument-to-Rust request mapping, `Renderer` for Rust result-to-MCP content
+rendering, `McpServer` for JSON-RPC/lifecycle orchestration and direct stdin
+ownership, and `PortManager` for the Rust child port and response correlation.
