@@ -2,6 +2,7 @@
 
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -30,19 +31,22 @@ impl Drop for ChildGuard {
     }
 }
 
-fn wait_for_death(child: &mut ChildGuard) -> bool {
+fn wait_for_exit(child: &mut ChildGuard) -> Option<std::process::ExitStatus> {
     let pid = child.child.id();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         match child.child.try_wait() {
-            Ok(Some(_)) => {
-                return proc_start_time(pid).as_deref() != Some(child.start_time.as_str())
+            Ok(Some(status))
+                if proc_start_time(pid).as_deref() != Some(child.start_time.as_str()) =>
+            {
+                return Some(status)
             }
+            Ok(Some(_)) => return None,
             Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
-    false
+    None
 }
 
 fn start_supervised_rebuild(cwd: &Path, db: &Path) -> ChildGuard {
@@ -59,7 +63,12 @@ fn start_supervised_rebuild(cwd: &Path, db: &Path) -> ChildGuard {
     ChildGuard { child, start_time }
 }
 
-fn assert_uses_selected_lock_and_exits_on_eof(cwd: &Path, selected_db: &Path, _lock: &File) {
+fn assert_uses_selected_lock_and_exits_on_termination(
+    cwd: &Path,
+    selected_db: &Path,
+    _lock: &File,
+    cancel: bool,
+) {
     let mut child = start_supervised_rebuild(cwd, selected_db);
 
     thread::sleep(Duration::from_millis(300));
@@ -68,11 +77,18 @@ fn assert_uses_selected_lock_and_exits_on_eof(cwd: &Path, selected_db: &Path, _l
         "the selected store lock must keep the supervised child alive while stdin remains open"
     );
 
-    drop(child.child.stdin.take());
-    let exited = wait_for_death(&mut child);
+    if cancel {
+        let stdin = child.child.stdin.as_mut().unwrap();
+        stdin.write_all(&[0x03]).unwrap();
+        stdin.flush().unwrap();
+    } else {
+        drop(child.child.stdin.take());
+    }
+
+    let status = wait_for_exit(&mut child);
     assert!(
-        exited,
-        "closing the OTP-owned stdin pipe must end the supervised rebuild child"
+        status.is_some_and(|status| status.code() == Some(130)),
+        "EOF or the private cancellation byte must end the supervised rebuild child with 130"
     );
 }
 
@@ -89,9 +105,14 @@ fn supervised_rebuild_binds_the_explicit_canonical_store_and_exits_on_eof() {
     fs::create_dir_all(selected_lock.parent().unwrap()).unwrap();
     fs::create_dir_all(canonical_db(cwd.path()).parent().unwrap()).unwrap();
 
-    let lock = OpenOptions::new().create(true).read(true).write(true).open(selected_lock).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(selected_lock)
+        .unwrap();
     lock.lock_exclusive().unwrap();
-    assert_uses_selected_lock_and_exits_on_eof(cwd.path(), &selected_db, &lock);
+    assert_uses_selected_lock_and_exits_on_termination(cwd.path(), &selected_db, &lock, false);
 }
 
 #[test]
@@ -103,7 +124,12 @@ fn supervised_rebuild_binds_an_explicit_adjacent_legacy_store_and_exits_on_eof()
     fs::create_dir_all(selected_lock.parent().unwrap()).unwrap();
     fs::create_dir_all(canonical_db(cwd.path()).parent().unwrap()).unwrap();
 
-    let lock = OpenOptions::new().create(true).read(true).write(true).open(selected_lock).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(selected_lock)
+        .unwrap();
     lock.lock_exclusive().unwrap();
-    assert_uses_selected_lock_and_exits_on_eof(cwd.path(), &selected_db, &lock);
+    assert_uses_selected_lock_and_exits_on_termination(cwd.path(), &selected_db, &lock, true);
 }

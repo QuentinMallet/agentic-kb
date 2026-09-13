@@ -10,7 +10,10 @@ use anyhow::Context;
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 /// Test-only hook: when set, `execute_with` waits on this barrier at the
 /// START of Phase 2 (after Phase 1 releases the lock, before replay begins).
@@ -339,14 +342,31 @@ fn full_rebuild_for(
             })?;
     } // release the write flock — Rebuild re-acquires it per phase
     eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
-    (Rebuild).execute_with(paths, embedder)?;
+    Rebuild::default().execute_with(paths, embedder)?;
     eprintln!("kb: rebuild complete.");
     Ok(true)
 }
 
 /// Replay all events and rebuild agent-kb.db from scratch
 #[derive(Command, Debug, Parser)]
-pub struct Rebuild;
+pub struct Rebuild {
+    /// Rebuild the explicitly selected agent-kb database.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+
+    /// Bind this direct child to its supervising OTP port's stdin lifetime.
+    #[arg(long, hide = true)]
+    pub supervised: bool,
+}
+
+impl Default for Rebuild {
+    fn default() -> Self {
+        Self {
+            db: None,
+            supervised: false,
+        }
+    }
+}
 
 impl Runnable for Rebuild {
     fn run(&self) {
@@ -360,7 +380,14 @@ impl Runnable for Rebuild {
 impl Rebuild {
     /// Execute the rebuild command.
     pub fn execute(&self) -> anyhow::Result<()> {
-        let paths = config::Paths::discover()?;
+        if self.supervised {
+            arm_supervised_stdin_guard()?;
+        }
+
+        let paths = match &self.db {
+            Some(db) => config::Paths::from_mcp_db(db),
+            None => config::Paths::discover()?,
+        };
         let embedder = make_embedder(&paths);
         self.execute_with(&paths, embedder.as_ref())
     }
@@ -420,7 +447,7 @@ impl Rebuild {
                 }
                 let bytes = match fs::read(&paths.events) {
                     Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
                     Err(error) => return Err(error.into()),
                 };
                 // The snapshot boundary must be a committed_len value: no span
@@ -677,6 +704,42 @@ impl Rebuild {
     }
 }
 
+/// Keep a supervised rebuild leaf bound to the stdin pipe owned by its OTP
+/// port. This is deliberately unavailable to ordinary CLI invocations.
+fn arm_supervised_stdin_guard() -> anyhow::Result<()> {
+    let (armed_tx, armed_rx) = mpsc::sync_channel(0);
+
+    thread::Builder::new()
+        .name("kb-rebuild-stdin-guard".to_owned())
+        .spawn(move || {
+            // The parent waits until this thread owns stdin before any path
+            // discovery or replay work starts. The guard never writes stdout.
+            let mut stdin = io::stdin().lock();
+            let _ = armed_tx.send(());
+            let mut byte = [0_u8; 1];
+
+            let status = supervised_guard_exit_status(stdin.read(&mut byte), byte[0]);
+
+            std::process::exit(status);
+        })
+        .context("spawn supervised rebuild stdin guard")?;
+
+    armed_rx
+        .recv()
+        .context("arm supervised rebuild stdin guard")?;
+    Ok(())
+}
+
+fn supervised_guard_exit_status(read: io::Result<usize>, byte: u8) -> i32 {
+    match read {
+        Ok(0) => 130,
+        Ok(1) if byte == 0x03 => 130,
+        // A supervised child accepts no work on stdin. Any other byte is a
+        // protocol violation and must stop it before work.
+        Ok(_) | Err(_) => 129,
+    }
+}
+
 struct TmpDbGuard {
     path: PathBuf,
     armed: bool,
@@ -783,7 +846,7 @@ fn checkpoint_live_db(db_path: &Path) -> anyhow::Result<Option<rusqlite::Connect
         }
         last_busy = busy;
         if attempt < ATTEMPTS {
-            std::thread::sleep(RETRY_DELAY);
+            thread::sleep(RETRY_DELAY);
         }
     }
     anyhow::bail!(
@@ -814,7 +877,7 @@ fn verify_live_wal_drained(db_path: &Path) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("stat live WAL {}", wal.display())),
     }
 }
@@ -896,16 +959,23 @@ mod tests {
     }
 
     #[test]
+    fn supervised_guard_accepts_only_eof_or_the_reserved_cancel_byte() {
+        assert_eq!(supervised_guard_exit_status(Ok(0), 0), 130);
+        assert_eq!(supervised_guard_exit_status(Ok(1), 0x03), 130);
+        assert_eq!(supervised_guard_exit_status(Ok(1), b'\n'), 129);
+        assert_eq!(
+            supervised_guard_exit_status(Err(io::Error::other("read failed")), 0),
+            129
+        );
+    }
+
+    #[test]
     fn rebuild_cli_accepts_explicit_canonical_db_with_supervised_guard() {
         let dir = tempdir().unwrap();
         let db = dir.path().join(".state/agent-kb/agent-kb.db");
 
-        let parsed = Rebuild::try_parse_from([
-            "rebuild",
-            "--db",
-            db.to_str().unwrap(),
-            "--supervised",
-        ]);
+        let parsed =
+            Rebuild::try_parse_from(["rebuild", "--db", db.to_str().unwrap(), "--supervised"]);
 
         assert!(
             parsed.is_ok(),
@@ -918,12 +988,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = dir.path().join("legacy-store/agent-kb.db");
 
-        let parsed = Rebuild::try_parse_from([
-            "rebuild",
-            "--db",
-            db.to_str().unwrap(),
-            "--supervised",
-        ]);
+        let parsed =
+            Rebuild::try_parse_from(["rebuild", "--db", db.to_str().unwrap(), "--supervised"]);
 
         assert!(
             parsed.is_ok(),
@@ -1018,7 +1084,7 @@ mod tests {
                 std::process::exit(0);
             }
             "rebuild" => {
-                let result = Rebuild.execute_with(&paths, &NoopEmbedder);
+                let result = Rebuild::default().execute_with(&paths, &NoopEmbedder);
                 panic!("child rebuild returned {result:?} without hitting the kill point");
             }
             other => panic!("unknown swap crash role {other:?}"),
@@ -1170,7 +1236,9 @@ mod tests {
         for idx in 0..SWAP_SEEDED {
             events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
         }
-        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, &NoopEmbedder)
+            .unwrap();
 
         // Header bytes 18/19 are the write/read file format versions: 2 means
         // WAL. This is the regression test for the self-heal C2's open_ro
@@ -1220,7 +1288,7 @@ mod tests {
             .unwrap();
         assert_eq!(held, SWAP_SEEDED as i64);
 
-        let error = Rebuild
+        let error = Rebuild::default()
             .execute_with(&paths, &NoopEmbedder)
             .expect_err("a persistently busy checkpoint must abort the rebuild");
         let message = format!("{error:#}");
@@ -1254,7 +1322,7 @@ mod tests {
         let emb = NoopEmbedder;
         events::append_event(&paths.events, &upsert("rb1", 1)).unwrap();
         events::append_event(&paths.events, &upsert("rb2", 2)).unwrap();
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 2);
     }
 
@@ -1268,7 +1336,7 @@ mod tests {
             &["rb-hit".to_string()],
             "test",
         );
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 1);
         assert_eq!(
             crate::components::query_hits::counts(&paths.query_hits).unwrap(),
@@ -1284,7 +1352,7 @@ mod tests {
         fs::write(&paths.events, "").unwrap();
         insert_expired_peer(&paths);
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let peers: i64 = conn
@@ -1318,7 +1386,7 @@ mod tests {
             .unwrap();
         assert_eq!(count_entries(&paths), 0);
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 10, "rebuild must restore all events");
     }
 
@@ -1351,7 +1419,7 @@ mod tests {
             Arc::clone(&attempts),
         );
         thread::scope(|scope| {
-            let handle = scope.spawn(|| Rebuild.execute_with(paths, &NoopEmbedder));
+            let handle = scope.spawn(|| Rebuild::default().execute_with(paths, &NoopEmbedder));
             started.wait();
             mutation();
             done.wait();
@@ -1445,7 +1513,9 @@ mod tests {
         fs::write(&abandoned, b"abandoned").unwrap();
         fs::write(&journal, b"journal").unwrap();
 
-        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, &NoopEmbedder)
+            .unwrap();
 
         assert!(!abandoned.exists());
         assert!(!journal.exists());
@@ -1520,7 +1590,7 @@ mod tests {
         });
 
         // First rebuild runs concurrently with Worker A.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         worker_a.join().unwrap();
 
         // Worker B writes evidence_add events after Worker A finishes to avoid
@@ -1531,7 +1601,7 @@ mod tests {
         }
 
         // All events are now in the log.  A second rebuild guarantees convergence.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         // Verify DB == Materialize(all events in log).
         let all_events = events::read_events(&paths.events).unwrap();
@@ -1626,11 +1696,11 @@ mod tests {
             }
         });
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         writer.join().unwrap();
 
         // All 30 events are now in the log.  A second rebuild converges the DB.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         let log_len = events::read_events(&paths.events).unwrap().events.len() as i64;
         assert_eq!(log_len, 30);
@@ -1767,8 +1837,9 @@ mod tests {
 
         let paths_rebuild = clone_paths(&paths);
         let emb_rebuild = Arc::clone(&emb);
-        let rebuild_handle =
-            thread::spawn(move || Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref()));
+        let rebuild_handle = thread::spawn(move || {
+            Rebuild::default().execute_with(&paths_rebuild, emb_rebuild.as_ref())
+        });
         let writer_handles: Vec<_> = (0..WRITERS)
             .map(|w| {
                 spawn_writer(
@@ -1943,7 +2014,9 @@ mod tests {
         // regression. Keep failing only when the measurement itself is invalid.
 
         // Second rebuild: guarantees DB == Materialize(all events in log).
-        Rebuild.execute_with(&paths, emb.as_ref()).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, emb.as_ref())
+            .unwrap();
 
         // AC2: no malformed JSONL — every line parses as valid JSON.
         let log_content =

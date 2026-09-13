@@ -452,7 +452,9 @@ fn test_rebuild_survives_oversized_legacy_event() {
     // Inject a legacy oversized event straight into the log (predates caps).
     events::append_event(&paths.events, &oversized_event("legacy-big", 90_000, 300)).unwrap();
 
-    (Rebuild).execute_with(&paths, &NoopEmbedder).unwrap();
+    Rebuild::default()
+        .execute_with(&paths, &NoopEmbedder)
+        .unwrap();
 
     let conn = rusqlite::Connection::open(&paths.db).unwrap();
     let (s, c) = entry_lens(&conn, "legacy-big");
