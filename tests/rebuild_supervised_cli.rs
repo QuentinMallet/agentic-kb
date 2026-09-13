@@ -14,26 +14,39 @@ fn proc_start_time(pid: u32) -> Option<String> {
         .and_then(|stat| stat.split_whitespace().nth(21).map(str::to_owned))
 }
 
-fn wait_for_death(pid: u32, start_time: &str) -> bool {
+struct ChildGuard {
+    child: Child,
+    start_time: String,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none()
+            && proc_start_time(self.child.id()).as_deref() == Some(self.start_time.as_str())
+        {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn wait_for_death(child: &mut ChildGuard) -> bool {
+    let pid = child.child.id();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if proc_start_time(pid).as_deref() != Some(start_time) {
-            return true;
+        match child.child.try_wait() {
+            Ok(Some(_)) => {
+                return proc_start_time(pid).as_deref() != Some(child.start_time.as_str())
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => return false,
         }
-        thread::sleep(Duration::from_millis(20));
     }
     false
 }
 
-fn terminate_if_same_process(child: &mut Child, start_time: &str) {
-    if proc_start_time(child.id()).as_deref() == Some(start_time) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-fn start_supervised_rebuild(cwd: &Path, db: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_kb"))
+fn start_supervised_rebuild(cwd: &Path, db: &Path) -> ChildGuard {
+    let child = Command::new(env!("CARGO_BIN_EXE_kb"))
         .args(["rebuild", "--db", db.to_str().unwrap(), "--supervised"])
         .current_dir(cwd)
         .env("KB_NO_EMBED", "1")
@@ -41,24 +54,22 @@ fn start_supervised_rebuild(cwd: &Path, db: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap()
+        .unwrap();
+    let start_time = proc_start_time(child.id()).expect("child must expose a Linux start time");
+    ChildGuard { child, start_time }
 }
 
 fn assert_uses_selected_lock_and_exits_on_eof(cwd: &Path, selected_db: &Path, _lock: &File) {
     let mut child = start_supervised_rebuild(cwd, selected_db);
-    let start_time = proc_start_time(child.id()).expect("child must expose a Linux start time");
 
     thread::sleep(Duration::from_millis(300));
     assert!(
-        child.try_wait().unwrap().is_none(),
+        child.child.try_wait().unwrap().is_none(),
         "the selected store lock must keep the supervised child alive while stdin remains open"
     );
 
-    drop(child.stdin.take());
-    let exited = wait_for_death(child.id(), &start_time);
-    if !exited {
-        terminate_if_same_process(&mut child, &start_time);
-    }
+    drop(child.child.stdin.take());
+    let exited = wait_for_death(&mut child);
     assert!(
         exited,
         "closing the OTP-owned stdin pipe must end the supervised rebuild child"
@@ -74,7 +85,7 @@ fn supervised_rebuild_binds_the_explicit_canonical_store_and_exits_on_eof() {
     let cwd = tempdir().unwrap();
     let selected = tempdir().unwrap();
     let selected_db = canonical_db(selected.path());
-    let selected_lock = selected.path().join(".state/agent-kb/agent-kb.lock");
+    let selected_lock = selected.path().join(".state/.lock");
     fs::create_dir_all(selected_lock.parent().unwrap()).unwrap();
     fs::create_dir_all(canonical_db(cwd.path()).parent().unwrap()).unwrap();
 
