@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -18,7 +19,7 @@ fn proc_start_time(pid: u32) -> Option<String> {
 
 struct ChildGuard {
     child: Child,
-    stdout: BufReader<ChildStdout>,
+    stdout: Option<BufReader<ChildStdout>>,
     start_time: String,
 }
 
@@ -52,9 +53,36 @@ fn wait_for_exit(child: &mut ChildGuard) -> Option<std::process::ExitStatus> {
 }
 
 fn read_frame(child: &mut ChildGuard) -> Value {
-    let mut line = String::new();
-    child.stdout.read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    let stdout = child.stdout.take().expect("child stdout must be available");
+    let (tx, rx) = mpsc::sync_channel(1);
+
+    thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut line = String::new();
+        let result = stdout
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())
+            .and_then(|_| serde_json::from_str(&line).map_err(|error| error.to_string()));
+        let _ = tx.send((stdout, result));
+    });
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok((stdout, result)) => {
+            child.stdout = Some(stdout);
+            result.expect("supervised child must emit a JSON control frame")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.child.kill();
+            let (stdout, _) = rx
+                .recv()
+                .expect("killing a silent child must unblock its stdout reader");
+            child.stdout = Some(stdout);
+            panic!("timed out waiting for a supervised rebuild control frame");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("supervised rebuild stdout reader exited without a result");
+        }
+    }
 }
 
 fn assert_no_stderr(child: &mut ChildGuard) {
@@ -82,7 +110,7 @@ fn start_supervised_rebuild(cwd: &Path, db: &Path) -> ChildGuard {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let stdout = Some(BufReader::new(child.stdout.take().unwrap()));
     let start_time = proc_start_time(child.id()).expect("child must expose a Linux start time");
     ChildGuard {
         child,
