@@ -25,7 +25,8 @@ rotation implementation, or of Unix/BEAM parent-death behaviour.
 - Old-owner death enters an explicit `orphaned` state; the guard's fair exit
   releases the lock at OS child exit, then new-owner observation gates a fresh
   attempt. A cancellation timeout enters `unknown` and likewise retains the
-  slot until observed child exit.
+  slot until observed child exit. An explicit unknown-state recovery probe is
+  lock-fenced: a busy candidate errors/exits atomically and cannot acknowledge.
 - Retained control/status bytes are capped. This is an abstract retention
   property, not a proof of concrete file rotation.
 
@@ -40,16 +41,16 @@ original negative intent.
 
 Commands ran from `.state/agent-kb/tla` with TLC 2.19 and `-workers auto`
 (12 workers). Final logs are retained in
-`/tmp/mcp-rebuild-lock-v4-fixed.log` and
-`/tmp/mcp-rebuild-lock-v4-{Detached,WrongStore,FailedAck,UnboundedOutput}.log`.
+`/tmp/mcp-rebuild-lock-v5-fixed.log` and
+`/tmp/mcp-rebuild-lock-v5-{Detached,WrongStore,FailedAck,UnboundedOutput}.log`.
 
 | Configuration | Result | Evidence |
 | --- | --- | --- |
-| `McpRebuildLifecycle_Fixed.cfg` | pass | 219 generated, 134 distinct states, depth 13; all invariants, `EventuallyQuiescent`, and fair guard reaping hold. |
-| `McpRebuildLifecycle_Detached.cfg` | expected failure | TLC exit 13 after 61 generated / 36 distinct states; the detached configuration violates temporal `EventuallyGuardReapsOrphan`. |
+| `McpRebuildLifecycle_Fixed.cfg` | pass | 252 generated, 153 distinct states, depth 12; all invariants, `EventuallyQuiescent`, and fair guard reaping hold. |
+| `McpRebuildLifecycle_Detached.cfg` | expected failure | TLC exit 13 after 67 generated / 40 distinct states; the detached configuration violates temporal `EventuallyGuardReapsOrphan`. |
 | `McpRebuildLifecycle_WrongStore.cfg` | expected failure | TLC exit 12 after 3 generated / 3 distinct states; lock acquisition and READY use `other-store`, violating `critical_ExactStoreBinding`. |
 | `McpRebuildLifecycle_FailedAck.cfg` | expected failure | TLC exit 12 after 2 generated / 2 distinct states; a failed launch advances the acknowledgement, violating `critical_AcknowledgementOnlyAfterAcceptedLaunch`. |
-| `McpRebuildLifecycle_UnboundedOutput.cfg` | expected failure | TLC exit 12 after 57 generated / 49 distinct states; control-frame retention exceeds `MaxLogBytes`, violating `critical_BoundedLogState`. |
+| `McpRebuildLifecycle_UnboundedOutput.cfg` | expected failure | TLC exit 12 after 56 generated / 50 distinct states; control-frame retention exceeds `MaxLogBytes`, violating `critical_BoundedLogState`. |
 
 `OwnerDeathKillsChild` remains an explicit assumption about the inherited
 stdin EOF guard. Production verification must prove normal EOF, owner crash,
