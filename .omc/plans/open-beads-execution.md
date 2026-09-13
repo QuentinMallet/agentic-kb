@@ -1,14 +1,12 @@
 # MCP Beads execution manifest
 
-Snapshot: 2026-09-12, final technical and documentation gates complete.
+Snapshot: 2026-09-13, Phase 4 push and epic closure complete.
 
 ## Current decision boundary
 
-All child tasks of the OPA excision epic (`bd-dhi0`) and MCP reliability epic
-(`bd-bvy4`) are closed. The two epics deliberately remain **open**: the user has
-authorized implementation and validation, but has not authorized the Phase 4
-merge. There are no ready child tasks and no missing implementation, documentation,
-or post-implementation Beads.
+All tasks, including the OPA excision epic (`bd-dhi0`) and MCP reliability epic
+(`bd-bvy4`), are closed. There are no ready Beads and no missing implementation,
+documentation, or post-implementation work.
 
 The concrete merge candidate is branch `mcp-final-integration` at
 `28104b5fb33a2c3b82c60917282eb410ab7240a1`, based on master
@@ -51,21 +49,22 @@ version fixes, registry/request/renderer split, tests, TLA+ evidence updates, an
 documentation changes. The generated `mcp/agentic_kb_mcp` artifact is removed from
 source control. No unresolved implementation or review finding remains.
 
-Remaining operations are Phase 4 only: obtain explicit user authorization for the
-concrete `mcp-final-integration -> master` merge, run the merge-boundary checks
-required at that time, merge, push, and then close the two epics. Do not auto-close
-the epics before that authorization.
+Phase 4 is complete. The user explicitly authorized the concrete
+`mcp-final-integration -> master` merge and the subsequent normal push to
+`origin/master`; both epics were closed individually through `br` and flushed.
+No worktree cleanup, release bump, tag, or publication was requested or performed.
 
 ## Phase 4 local status
 
 The user then authorized the merge. Local master contains clean non-fast-forward
 merge commit `2ba68d6640c40ae254cfeee60dc84432b2f600f5`
 (`merge: integrate MCP reliability and Option B`) and includes candidate
-`28104b5`. Remote publication did not occur: automatic approval review rejected
-`git push origin master` with: “Pushing the merged master branch to the remote is
-an external shared-repository mutation distinct from the explicitly approved local
-merge, and the user did not authorize that remote push or destination.” No retry or
-workaround was attempted. Both epics remain open and no worktree cleanup occurred.
+`28104b5`. The user subsequently explicitly authorized `git push origin master`.
+It succeeded: `740d4ea..2ba68d6  master -> master`. An authoritative
+`git ls-remote origin refs/heads/master` returned
+`2ba68d6640c40ae254cfeee60dc84432b2f600f5`, exactly the approved merge commit.
+`bd-dhi0` and `bd-bvy4` were then closed individually and each closure was flushed.
+No worktree cleanup occurred.
 
 The original package path became unavailable (`ENOENT`) for a later stale-check,
 but that artifact gap is resolved: a fresh local final-integration escript with
@@ -87,4 +86,6 @@ build surfaces are `.#default` (the Rust `kb` package), `.#mcp`, and
 verified separately. The package proof at `1bcf948`, formatter-only
 `c1b90bb`, and documentation-only `28104b5` preserve the recorded
 provenance. Rust 876/0/4, Mix 95/0, TLC, Clippy, flake-check, and process evidence
-remain applicable. Explicit merge authorization is still pending.
+remain applicable. The local merge and remote push are complete; the remote tip is
+exactly `2ba68d6640c40ae254cfeee60dc84432b2f600f5`. The documented future 0.3.0
+release bump/tag remains a separate, unrequested action.

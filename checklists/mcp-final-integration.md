@@ -25,10 +25,13 @@ Target: `master`
   the default Rust package and `.#doc` was separately verified.
 - [x] User authorized and local merge completed as
   `2ba68d6640c40ae254cfeee60dc84432b2f600f5`.
-- [ ] Push that merged master commit to `origin/master`. Automatic approval
-  review rejected the attempted normal push because it is an external
-  shared-repository mutation distinct from local merge approval.
-- [ ] Close the two epics and clean worktrees only after the remote push is
-  verified.
+- [x] User explicitly authorized the normal push; `git push origin master`
+  advanced `origin/master` from `740d4ea` to
+  `2ba68d6640c40ae254cfeee60dc84432b2f600f5`. `git ls-remote origin
+  refs/heads/master` confirmed that exact remote tip.
+- [x] Closed `bd-dhi0` and `bd-bvy4` individually through `br` and flushed each
+  closure after remote verification. Worktree cleanup was outside the approved
+  push scope and was not performed.
 
-Do not close the two parent epics, merge, push, or release before the final unchecked item.
+Phase 4 merge and push are complete. The documented 0.3.0 version bump/tag remains
+a separate, unrequested release action.
