@@ -55,6 +55,8 @@ defmodule AgenticKbMcp.RebuildManager do
   @impl true
   def handle_call(:request_rebuild, from, %{phase: :unknown, port: port} = state) do
     safe_close(port)
+    cancel_timer(state.ready_timer)
+    reply_launch_waiter(state.launch_waiter, {:error, {:launch_failed, :rebuild_status_unknown}})
     reply_terminal_waiters(state.terminal_waiters, {:error, :rebuild_status_unknown})
     reply_unknown_cancel_waiter(state.cancel_waiter)
 
@@ -64,6 +66,8 @@ defmodule AgenticKbMcp.RebuildManager do
         terminal: nil,
         terminal_waiters: [],
         cancel_waiter: nil,
+        launch_waiter: nil,
+        ready_timer: nil,
         exit_status_grace_timer: nil
     })
   end

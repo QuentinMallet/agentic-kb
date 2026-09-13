@@ -139,9 +139,9 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     %{port: port} = :sys.get_state(manager)
     send(manager, {port, :closed})
 
-    assert {:error, {:launch_failed, :exit_status_missing}} = Task.await(launch, 2_000)
     System.put_env("REBUILD_FIXTURE_MODE", "hold")
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert {:error, {:launch_failed, :rebuild_status_unknown}} = Task.await(launch, 2_000)
     assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
