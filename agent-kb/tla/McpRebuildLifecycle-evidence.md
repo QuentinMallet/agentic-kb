@@ -20,7 +20,8 @@ rotation implementation, or of Unix/BEAM parent-death behaviour.
 - Two transient PIDs may overlap, but `active` counts lock-owning replay
   work and remains at most one per selected store.
 - A busy contender emits ERROR and exits before replay, READY, or successful
-  acknowledgement.
+  acknowledgement. Its nonblocking try-lock, ERROR, and exit are one atomic
+  model event; real PID overlap/timing is verified by production OS-PID tests.
 - Old-owner death enters an explicit `orphaned` state; the guard's fair exit
   releases the lock at OS child exit, then new-owner observation gates a fresh
   attempt. A cancellation timeout enters `unknown` and likewise retains the
@@ -29,7 +30,8 @@ rotation implementation, or of Unix/BEAM parent-death behaviour.
   property, not a proof of concrete file rotation.
 
 The fixed configuration covers accepted and failed launches, lock acquisition
-then READY, duplicate coalescing, a transient busy contender, completion,
+then READY, duplicate coalescing, an atomically rejected busy contender,
+completion,
 cancellation followed by observed exit, owner death, and fresh requests.
 `Detached`, `WrongStore`, `FailedAck`, and `UnboundedOutput` retain their
 original negative intent.
@@ -37,17 +39,17 @@ original negative intent.
 ## TLC runs
 
 Commands ran from `.state/agent-kb/tla` with TLC 2.19 and `-workers auto`
-(12 workers). Revision-two logs are retained in
-`/tmp/mcp-rebuild-lock-v2-fixed.log` and
-`/tmp/mcp-rebuild-lock-v2-{Detached,WrongStore,FailedAck,UnboundedOutput}.log`.
+(12 workers). Final logs are retained in
+`/tmp/mcp-rebuild-lock-v4-fixed.log` and
+`/tmp/mcp-rebuild-lock-v4-{Detached,WrongStore,FailedAck,UnboundedOutput}.log`.
 
 | Configuration | Result | Evidence |
 | --- | --- | --- |
-| `McpRebuildLifecycle_Fixed.cfg` | pass | 244 generated, 144 distinct states, depth 11; all invariants, `EventuallyQuiescent`, and fair guard reaping hold. |
-| `McpRebuildLifecycle_Detached.cfg` | expected failure | TLC exit 13 after 64 generated / 37 distinct states; the detached configuration violates temporal `EventuallyGuardReapsOrphan`. |
+| `McpRebuildLifecycle_Fixed.cfg` | pass | 219 generated, 134 distinct states, depth 13; all invariants, `EventuallyQuiescent`, and fair guard reaping hold. |
+| `McpRebuildLifecycle_Detached.cfg` | expected failure | TLC exit 13 after 61 generated / 36 distinct states; the detached configuration violates temporal `EventuallyGuardReapsOrphan`. |
 | `McpRebuildLifecycle_WrongStore.cfg` | expected failure | TLC exit 12 after 3 generated / 3 distinct states; lock acquisition and READY use `other-store`, violating `critical_ExactStoreBinding`. |
 | `McpRebuildLifecycle_FailedAck.cfg` | expected failure | TLC exit 12 after 2 generated / 2 distinct states; a failed launch advances the acknowledgement, violating `critical_AcknowledgementOnlyAfterAcceptedLaunch`. |
-| `McpRebuildLifecycle_UnboundedOutput.cfg` | expected failure | TLC exit 12 after 47 generated / 41 distinct states; control-frame retention exceeds `MaxLogBytes`, violating `critical_BoundedLogState`. |
+| `McpRebuildLifecycle_UnboundedOutput.cfg` | expected failure | TLC exit 12 after 57 generated / 49 distinct states; control-frame retention exceeds `MaxLogBytes`, violating `critical_BoundedLogState`. |
 
 `OwnerDeathKillsChild` remains an explicit assumption about the inherited
 stdin EOF guard. Production verification must prove normal EOF, owner crash,

@@ -101,11 +101,11 @@ AcquireLifetimeLockAndReady ==
                  requests, freshRequests, attempt, workerStore, report>>
 
 (******************************************************************************
-A replacement owner may open another Rust process while the incumbent still
-holds the kernel lock. The nonblocking lock attempt is abstracted as atomic:
-while this busy contender is live, it must emit ERROR and exit before the old
-guard may release the incumbent lock. Thus it cannot be silently discarded or
-turn into a later READY/replay attempt.
+A replacement owner may briefly overlap a Rust contender with the incumbent.
+The nonblocking try-lock plus busy ERROR/exit is one atomic abstract event:
+the model intentionally does not schedule contender setup against the old
+guard exit. This preserves the property that the busy contender cannot become
+a later READY/replay attempt; OS-PID timing remains a production-test concern.
 ******************************************************************************)
 ReplacementOwner ==
   /\ owner = "none" /\ phase = "orphaned"
@@ -118,18 +118,28 @@ ReplacementOwner ==
 SpawnBusyContender ==
   /\ owner = "new" /\ phase = "orphaned" /\ child = "live"
   /\ lockHolder = "incumbent" /\ contender = "none" /\ requests < MaxRequests
-  /\ contender' = "live" /\ requests' = requests + 1
+  /\ contender' = "exited" /\ lastFrame' = "error" /\ logBytes' = LogAdd(logBytes)
+  /\ requests' = requests + 1
   /\ freshRequests' = freshRequests + 1 /\ attempt' = attempt + 1
   /\ UNCHANGED <<phase, owner, child, lockHolder, active, observed, pending,
                  terminationRequested, acknowledgedAttempt, workerStore,
-                 acceptedAttempt, report, logBytes, lastFrame>>
+                 acceptedAttempt, report>>
 
-RejectBusyContender ==
-  /\ contender = "live" /\ lockHolder = "incumbent"
+(******************************************************************************
+An explicit recovery request in unknown state may close the stale Elixir port
+and try a lock-fenced candidate. While the old OS child owns the lock, the
+candidate is the same atomic busy ERROR/exit outcome: it cannot acknowledge or
+compute. Only observed old-child exit permits the later fresh launch.
+******************************************************************************)
+ProbeUnknownLock ==
+  /\ owner = "old" /\ phase = "unknown" /\ child = "live"
+  /\ lockHolder = "incumbent" /\ contender = "none" /\ requests < MaxRequests
   /\ contender' = "exited" /\ lastFrame' = "error" /\ logBytes' = LogAdd(logBytes)
+  /\ requests' = requests + 1 /\ freshRequests' = freshRequests + 1
+  /\ attempt' = attempt + 1
   /\ UNCHANGED <<phase, owner, child, lockHolder, active, observed, pending,
-                 terminationRequested, requests, freshRequests, attempt,
-                 acknowledgedAttempt, workerStore, acceptedAttempt, report>>
+                 terminationRequested, acknowledgedAttempt, workerStore,
+                 acceptedAttempt, report>>
 
 Finish ==
   /\ owner = "old" /\ phase = "running" /\ child = "live" /\ lockHolder = "incumbent"
@@ -170,7 +180,6 @@ OwnerDeath ==
 GuardEOFExit ==
   /\ OwnerDeathKillsChild /\ owner \in {"none", "new"}
   /\ phase = "orphaned" /\ child = "live" /\ lockHolder = "incumbent"
-  /\ contender # "live"
   /\ child' = "exited" /\ lockHolder' = "none" /\ active' = 0
   /\ observed' = FALSE /\ lastFrame' = "none" /\ logBytes' = LogAdd(logBytes)
   /\ UNCHANGED <<phase, owner, contender, pending, terminationRequested,
@@ -224,7 +233,7 @@ OutputControlFrame ==
                  acknowledgedAttempt, workerStore, acceptedAttempt, report, lastFrame>>
 
 Next == ClientRequest \/ CoalesceRequest \/ Launch \/ AcquireLifetimeLockAndReady \/
-        ReplacementOwner \/ SpawnBusyContender \/ RejectBusyContender \/
+        ReplacementOwner \/ SpawnBusyContender \/ ProbeUnknownLock \/
         Finish \/ Cancel \/ ObserveTermination \/ OwnerDeath \/ GuardEOFExit \/
         ObserveGuardExit \/ StopAfterGuardExit \/ CancellationTimesOut \/
         ObserveUnknownExit \/ OutputControlFrame
@@ -232,7 +241,7 @@ Next == ClientRequest \/ CoalesceRequest \/ Launch \/ AcquireLifetimeLockAndRead
 Spec == Init /\ [][Next]_vars /\ WF_vars(Launch) /\ WF_vars(AcquireLifetimeLockAndReady) /\
         WF_vars(Finish) /\ WF_vars(ObserveTermination) /\ WF_vars(GuardEOFExit) /\
         WF_vars(ObserveGuardExit) /\ WF_vars(ObserveUnknownExit) /\
-        WF_vars(StopAfterGuardExit) /\ WF_vars(RejectBusyContender)
+        WF_vars(StopAfterGuardExit)
 
 TypeOK ==
   /\ phase \in Phases /\ owner \in Owners /\ child \in Children /\ contender \in Children
