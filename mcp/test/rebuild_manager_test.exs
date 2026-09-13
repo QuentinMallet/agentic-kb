@@ -46,6 +46,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert {:ok, :already_running} = RebuildManager.request_rebuild(manager)
     assert launch_count(ctx.launch_file) == 1
     assert worker_alive?(first)
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
   test "private cancellation waits for observed OS exit before a retry can launch", ctx do
@@ -63,6 +64,32 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     second = await_live_identity(ctx.launch_file)
     assert second != first
     assert worker_alive?(second)
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
+  end
+
+  test "a cancellation timeout keeps the rebuild slot occupied with an explicit error", ctx do
+    {manager, _pid} = start_manager(ctx, :hold)
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert {:error, :timeout} = RebuildManager.cancel_and_await(manager, 1)
+    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+
+    assert {:ok, %{exit_status: 130}} = RebuildManager.await_terminal(manager, 2_000)
+  end
+
+  test "a closed port without exit status releases terminal waiters as an error but stays occupied",
+       ctx do
+    {manager, _pid} = start_manager(ctx, :hold)
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    %{port: port} = :sys.get_state(manager)
+
+    waiter = Task.async(fn -> RebuildManager.await_terminal(manager, 2_000) end)
+    send(manager, {port, :closed})
+
+    assert {:error, :exit_status_missing} = Task.await(waiter, 2_000)
+    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+
+    Port.close(port)
+    assert_eventually(fn -> File.exists?(ctx.completed_file) end)
   end
 
   test "an executable launch failure is returned rather than acknowledged as started", ctx do
@@ -71,6 +98,49 @@ defmodule AgenticKbMcp.RebuildManagerTest do
 
     assert {:error, {:launch_failed, _reason}} = RebuildManager.request_rebuild(manager)
     refute File.exists?(ctx.rebuild_log)
+  end
+
+  test "a pre-ready busy error is returned instead of a false started acknowledgment", ctx do
+    {manager, _pid} = start_manager(ctx, :pre_ready_error)
+
+    assert {:error, {:launch_failed, "busy"}} = RebuildManager.request_rebuild(manager)
+    assert {:ok, %{exit_status: 75}} = RebuildManager.await_terminal(manager, 2_000)
+  end
+
+  test "a child that never becomes ready returns a launch timeout and remains occupied", ctx do
+    {manager, _pid} = start_manager(ctx, :no_ready)
+
+    assert {:error, :ready_timeout} = RebuildManager.request_rebuild(manager)
+    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    %{port: port} = :sys.get_state(manager)
+    Port.close(port)
+    assert_eventually(fn -> File.exists?(ctx.completed_file) end)
+  end
+
+  test "a concurrent request cannot coalesce before READY", ctx do
+    {manager, _pid} = start_manager(ctx, :delayed_ready)
+    launch = Task.async(fn -> RebuildManager.request_rebuild(manager) end)
+
+    assert_eventually(fn -> :sys.get_state(manager).phase == :starting end)
+    assert {:error, :rebuild_starting} = RebuildManager.request_rebuild(manager)
+    assert {:error, :ready_timeout} = Task.await(launch, 2_000)
+    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    assert {:ok, %{exit_status: 130}} = RebuildManager.await_terminal(manager, 2_000)
+    assert File.read!(ctx.control_file) == "cancel-byte\n"
+  end
+
+  test "a pre-READY close resolves the blocked launch request", ctx do
+    {manager, _pid} = start_manager(ctx, :no_ready)
+    launch = Task.async(fn -> RebuildManager.request_rebuild(manager) end)
+
+    assert_eventually(fn -> :sys.get_state(manager).phase == :starting end)
+    %{port: port} = :sys.get_state(manager)
+    send(manager, {port, :closed})
+
+    assert {:error, {:launch_failed, :exit_status_missing}} = Task.await(launch, 2_000)
+    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    Port.close(port)
+    assert_eventually(fn -> File.exists?(ctx.completed_file) end)
   end
 
   test "a nonzero child exit is observed asynchronously and retained in the log", ctx do
@@ -109,6 +179,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
 
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
     assert_eventually(fn -> launch_count(ctx.launch_file) == 2 end)
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
   test "ordinary MCP-port requests remain responsive while rebuild holds its lock", ctx do

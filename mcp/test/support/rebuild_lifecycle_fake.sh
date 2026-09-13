@@ -18,6 +18,7 @@ printf '%s %s\n' "$$" "$start_time" >> "$REBUILD_LAUNCH_FILE"
 
 case "${REBUILD_FIXTURE_MODE:-hold}" in
   hold)
+    printf '{"rebuild":"ready"}\n'
     # A lifecycle manager must close stdin and wait for this child to exit;
     # ignoring TERM prevents a test from mistaking a signal send for observed
     # process termination. Production's Rust EOF guard exits promptly.
@@ -34,14 +35,36 @@ case "${REBUILD_FIXTURE_MODE:-hold}" in
     : > "$REBUILD_COMPLETED_FILE"
     ;;
   fail)
-    printf 'controlled rebuild failure\n' >&2
+    printf '{"rebuild":"ready"}\n'
+    printf '{"rebuild":"error","message":"controlled rebuild failure"}\n'
     : > "$REBUILD_COMPLETED_FILE"
     exit 42
     ;;
   flood)
+    printf '{"rebuild":"ready"}\n'
     printf 'flood-started\n'
     head -c 131072 /dev/zero | tr '\0' x
     printf '\nTAIL: flood-complete\n'
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  pre_ready_error)
+    printf '{"rebuild":"error","message":"busy"}\n'
+    : > "$REBUILD_COMPLETED_FILE"
+    exit 75
+    ;;
+  no_ready)
+    cat >/dev/null
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  delayed_ready)
+    sleep 0.7
+    printf '{"rebuild":"ready"}\n'
+    while IFS= read -r -n 1 byte; do
+      if [ "$byte" = $'\003' ]; then
+        printf 'cancel-byte\n' > "$REBUILD_CONTROL_FILE"
+        exit 130
+      fi
+    done
     : > "$REBUILD_COMPLETED_FILE"
     ;;
   *)
