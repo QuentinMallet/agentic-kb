@@ -102,8 +102,10 @@ AcquireLifetimeLockAndReady ==
 
 (******************************************************************************
 A replacement owner may open another Rust process while the incumbent still
-holds the kernel lock. It is a transient PID only: it emits ERROR and exits
-without replay, READY, or a successful acknowledgement.
+holds the kernel lock. The nonblocking lock attempt is abstracted as atomic:
+while this busy contender is live, it must emit ERROR and exit before the old
+guard may release the incumbent lock. Thus it cannot be silently discarded or
+turn into a later READY/replay attempt.
 ******************************************************************************)
 ReplacementOwner ==
   /\ owner = "none" /\ phase = "orphaned"
@@ -168,6 +170,7 @@ OwnerDeath ==
 GuardEOFExit ==
   /\ OwnerDeathKillsChild /\ owner \in {"none", "new"}
   /\ phase = "orphaned" /\ child = "live" /\ lockHolder = "incumbent"
+  /\ contender # "live"
   /\ child' = "exited" /\ lockHolder' = "none" /\ active' = 0
   /\ observed' = FALSE /\ lastFrame' = "none" /\ logBytes' = LogAdd(logBytes)
   /\ UNCHANGED <<phase, owner, contender, pending, terminationRequested,
@@ -227,7 +230,9 @@ Next == ClientRequest \/ CoalesceRequest \/ Launch \/ AcquireLifetimeLockAndRead
         ObserveUnknownExit \/ OutputControlFrame
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Launch) /\ WF_vars(AcquireLifetimeLockAndReady) /\
-        WF_vars(Finish) /\ WF_vars(ObserveTermination) /\ WF_vars(GuardEOFExit)
+        WF_vars(Finish) /\ WF_vars(ObserveTermination) /\ WF_vars(GuardEOFExit) /\
+        WF_vars(ObserveGuardExit) /\ WF_vars(ObserveUnknownExit) /\
+        WF_vars(StopAfterGuardExit) /\ WF_vars(RejectBusyContender)
 
 TypeOK ==
   /\ phase \in Phases /\ owner \in Owners /\ child \in Children /\ contender \in Children
@@ -250,6 +255,8 @@ critical_ReadyFrameRequiresLifetimeLock ==
 critical_CoalescedRequestDoesNotCreateLaunchTicket == attempt <= freshRequests
 critical_CancellationObservesExitBeforeFreshSlot ==
   phase = "idle" => /\ active = 0 /\ child # "live" /\ observed /\ ~terminationRequested
+critical_NoLiveContenderAtFreshSlot ==
+  phase = "idle" => contender # "live"
 critical_NoOrphanAfterOwnerDeath ==
   phase = "stopped" => /\ active = 0 /\ child # "live" /\ contender # "live" /\ observed
 critical_ExactStoreBinding == active > 0 => workerStore = McpStore
