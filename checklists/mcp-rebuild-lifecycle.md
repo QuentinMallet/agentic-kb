@@ -3,7 +3,8 @@
 Epic: `bd-mcp-rebuild-lifecycle-gbi9`; standalone cascade target: `master`.
 Base `2ba68d6640c40ae254cfeee60dc84432b2f600f5`; local `master`,
 `origin/master`, a fresh authenticated remote query, and the epic merge-base
-match it. User merge approval remains pending.
+matched it before merge. The user explicitly approved the Phase 4 merge and
+push.
 
 ## Entry gate
 
@@ -20,6 +21,12 @@ match it. User merge approval remains pending.
 - [x] CI-equivalent Rust suite: `2cd6135` changes CI to `cargo nextest run` and runs doctests separately. `PROPTEST_CASES=16` nextest passed 884/884; the documented serial fallback also passed. The three vacuum fixtures are slow because this proptest setting selects 12,000-event fixtures, not because of a deadlock.
 - [x] Block C: lifecycle docs and KB evidence are complete.
 - [x] Block D: final independent CISO review found no blocker; the old packaged binary fails the strict stdout canary and the new package passes it, proving the regression test discriminates.
-- [ ] Phase 4: explicit user approval is required before merge. No merge or remote push has been performed.
+- [x] Phase 4: explicit user approval was received. `master` was merged with
+  `--no-ff` as `e59d276f902e9a4bd82f527a8b1f64400f9945cc` (parents
+  `2ba68d6640c40ae254cfeee60dc84432b2f600f5` and
+  `b9b6a2c6f7de71c664cdd860e9ad8030ab2c61ba`), checked with `git diff
+  --check`, and pushed to `origin/master`. The epic was closed through `br`;
+  its six descendants are closed and `br sync --flush-only` had nothing to
+  export.
 
 Scope check: cumulative diff adds explicit public `kb rebuild --db` path binding and a hidden `--supervised` worker guard, a dedicated OTP manager, tests, docs, and no new MCP tool. The Rust rebuild algorithm remains the existing leaf computation.
