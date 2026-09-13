@@ -137,6 +137,38 @@ does not extend to `PortProtocol.tla` itself, and is invalidated by any peer
 read path added without the filter or any nested-acquire path outside the
 registry.
 
+## Supervised rebuild lifecycle
+
+`kb_rebuild` remains a no-argument MCP tool. Its immediate success response
+means that a rebuild is already running or that the new worker has acquired
+the selected store's lifetime lock and emitted READY. It does not mean that
+event replay completed. A launch failure, a worker error before READY, or a
+busy recovery candidate returns a tool error. When no database is selected,
+the existing initialization hint remains the response and no worker starts.
+
+The MCP application owns rebuild lifecycle through a dedicated OTP
+`RebuildManager`. It starts the Rust worker directly with the active
+database path and an internal supervised mode; that private mode is not a
+public CLI or MCP API. The worker arms its inherited-stdin EOF guard before
+READY/work, then takes the per-store lifetime lock. A transient contender may
+exist while an older worker still owns that lock, but it cannot replay data or
+emit READY; it reports bounded ERROR and exits.
+
+Concurrent tool calls coalesce only after READY. Private cancellation sends the
+reserved control byte through the still-open worker port and waits for its
+matching exit status before freeing the slot. EOF, owner death, and VM
+termination close the guard's input and cause the worker to stop. If the exit
+status is uncertain, the manager retains an unknown state; an explicit
+recovery probe is lock-fenced and returns busy/error while the old worker still
+holds the lock. Ordinary MCP reads continue through the separate `kb mcp`
+port during rebuild.
+
+Rebuild control output is limited to READY/ERROR frames. Free-form worker
+stderr is suppressed, and Elixir retains a capped diagnostic tail and log.
+The package and real-process tests verify OS-child exit and bounded output;
+the TLA+ lifecycle model records the abstract lock/READY contract on the
+agentic branch.
+
 ## Internal methods and audit controls
 
 Only `kb_peers_add`, `kb_peers_list`, and `kb_peers_remove` have no Elixir MCP
