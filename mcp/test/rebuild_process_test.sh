@@ -154,7 +154,10 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
 
         # A whole-VM kill must close the port stdin and reap the direct rebuild
         # child even while ordinary rebuild work is blocked on the writer lock.
-        kill_process_group(proc)
+        vm_executable = os.readlink(f"/proc/{proc.pid}/exe")
+        assert Path(vm_executable).name.startswith("beam"), vm_executable
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=TIMEOUT)
         wait_for(
             lambda: proc_start_time(child_pid) != child_start,
             "supervised rebuild child survived whole MCP VM termination",
