@@ -97,6 +97,7 @@ defmodule AgenticKbMcp.ApplicationLifecycleTest do
              {RebuildManager, rebuild_opts},
              {McpServer, _server_opts}
            ] = children
+
     assert port_opts[:db_path] == db_path
     assert rebuild_opts[:db_path] == db_path
     assert rebuild_opts[:kb_bin] == @fake_port

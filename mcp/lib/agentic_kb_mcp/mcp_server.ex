@@ -41,6 +41,8 @@ defmodule AgenticKbMcp.McpServer do
     {:ok,
      %{
        db_path: db_path,
+       rebuild_manager_name:
+         Keyword.get(opts, :rebuild_manager_name, AgenticKbMcp.RebuildManager),
        port: port,
        framer: Stdio.new(Transport.max_frame_bytes()),
        stdin_eof: false
@@ -204,7 +206,7 @@ defmodule AgenticKbMcp.McpServer do
     )
   end
 
-  defp dispatch_tool(tool, args, _state) do
+  defp dispatch_tool(tool, args, state) do
     case AgenticKbMcp.PortRequest.build(tool, args) do
       {:port, request} ->
         request
@@ -212,17 +214,21 @@ defmodule AgenticKbMcp.McpServer do
         |> port_call_to_content()
 
       :rebuild ->
-        AgenticKbMcp.PortManager.rebuild_async()
-
-        %{
-          "content" => [
+        case AgenticKbMcp.RebuildManager.request_rebuild(state.rebuild_manager_name) do
+          {:ok, _status} ->
             %{
-              "type" => "text",
-              "text" =>
-                "Rebuild started in background. Reads continue normally; writes queue until complete."
+              "content" => [
+                %{
+                  "type" => "text",
+                  "text" =>
+                    "Rebuild started in background. Reads continue normally; writes queue until complete."
+                }
+              ]
             }
-          ]
-        }
+
+          {:error, reason} ->
+            text_error("Rebuild failed to start: #{inspect(reason)}")
+        end
 
       {:error, :unknown_tool} ->
         text_error("Unknown tool: #{tool}")

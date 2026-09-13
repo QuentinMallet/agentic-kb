@@ -16,6 +16,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     args_file = Path.join(root, "rebuild.args")
     launch_file = Path.join(root, "rebuild.launches")
     completed_file = Path.join(root, "rebuild.completed")
+    control_file = Path.join(root, "rebuild.control")
     db_path = Path.join([root, ".state", "agent-kb", "agent-kb.db"])
     File.mkdir_p!(Path.dirname(db_path))
     File.write!(db_path, "")
@@ -28,6 +29,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
       args_file: args_file,
       launch_file: launch_file,
       completed_file: completed_file,
+      control_file: control_file,
       rebuild_log: Path.join(Path.dirname(db_path), "rebuild.log"),
       db_path: db_path
     }
@@ -53,6 +55,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert worker_alive?(first)
 
     assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
+    assert File.read!(ctx.control_file) == "cancel-byte\n"
     refute worker_alive?(first)
     assert launch_count(ctx.launch_file) == 1
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
@@ -99,6 +102,15 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert File.stat!(log).size <= @log_limit
   end
 
+  test "a fresh request starts only after natural completion has been observed", ctx do
+    {manager, _pid} = start_manager(ctx, :flood)
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert {:ok, %{exit_status: 0}} = RebuildManager.await_terminal(manager, 2_000)
+
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert_eventually(fn -> launch_count(ctx.launch_file) == 2 end)
+  end
+
   test "ordinary MCP-port requests remain responsive while rebuild holds its lock", ctx do
     {manager, _pid} = start_manager(ctx, :hold)
     port_name = :"rebuild_port_#{System.unique_integer([:positive, :monotonic])}"
@@ -109,7 +121,13 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
 
     assert %{"id" => "ordinary-read", "type" => "result"} =
-             PortManager.call_port(%{"id" => "ordinary-read", "method" => "echo"}, 1_000, port_name)
+             PortManager.call_port(
+               %{"id" => "ordinary-read", "method" => "echo"},
+               1_000,
+               port_name
+             )
+
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
   defp start_manager(ctx, mode, opts \\ []) do
@@ -123,6 +141,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     System.put_env("REBUILD_ARGS_FILE", ctx.args_file)
     System.put_env("REBUILD_LAUNCH_FILE", ctx.launch_file)
     System.put_env("REBUILD_COMPLETED_FILE", ctx.completed_file)
+    System.put_env("REBUILD_CONTROL_FILE", ctx.control_file)
 
     on_exit(fn ->
       restore_env("REBUILD_FIXTURE_MODE", previous)
@@ -131,6 +150,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
       System.delete_env("REBUILD_ARGS_FILE")
       System.delete_env("REBUILD_LAUNCH_FILE")
       System.delete_env("REBUILD_COMPLETED_FILE")
+      System.delete_env("REBUILD_CONTROL_FILE")
     end)
 
     kb_bin = Keyword.get(opts, :kb_bin, @fixture)
@@ -162,14 +182,15 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     case File.read("/proc/#{pid}/stat") do
       {:ok, stat} ->
         with [_comm, rest] <- String.split(stat, ")", parts: 2),
-             [state | fields] <- String.split(rest, trim: true),
+             [state | fields] <- String.split(rest, ~r/\s+/, trim: true),
              ^start_time <- Enum.at(fields, 18) do
           state != "Z"
         else
           _ -> false
         end
 
-      _ -> false
+      _ ->
+        false
     end
   end
 

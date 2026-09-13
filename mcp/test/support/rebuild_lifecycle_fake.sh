@@ -9,6 +9,7 @@ set -euo pipefail
 : "${REBUILD_ARGS_FILE:?REBUILD_ARGS_FILE must name the argv capture file}"
 : "${REBUILD_LAUNCH_FILE:?REBUILD_LAUNCH_FILE must name the launch capture file}"
 : "${REBUILD_COMPLETED_FILE:?REBUILD_COMPLETED_FILE must name the completion marker}"
+: "${REBUILD_CONTROL_FILE:?REBUILD_CONTROL_FILE must name the control capture file}"
 
 printf '%s\n' "$$" > "$REBUILD_PID_FILE"
 printf '%s\n' "$*" > "$REBUILD_ARGS_FILE"
@@ -21,7 +22,14 @@ case "${REBUILD_FIXTURE_MODE:-hold}" in
     # ignoring TERM prevents a test from mistaking a signal send for observed
     # process termination. Production's Rust EOF guard exits promptly.
     trap '' TERM
-    cat >/dev/null
+    while IFS= read -r -n 1 byte; do
+      if [ "$byte" = $'\003' ]; then
+        printf 'cancel-byte\n' > "$REBUILD_CONTROL_FILE"
+        sleep "${REBUILD_EOF_EXIT_DELAY:-0}"
+        : > "$REBUILD_COMPLETED_FILE"
+        exit 130
+      fi
+    done
     sleep "${REBUILD_EOF_EXIT_DELAY:-0}"
     : > "$REBUILD_COMPLETED_FILE"
     ;;
