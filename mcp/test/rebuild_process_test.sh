@@ -46,6 +46,9 @@ def request(proc, payload):
     proc.stdin.flush()
     return response(proc.stdout, payload["id"])
 
+def assert_success(response):
+    assert "result" in response and "error" not in response, response
+    assert response["result"].get("isError") is not True, response
 
 def proc_start_time(pid):
     try:
@@ -94,6 +97,14 @@ def wait_for(predicate, message):
         time.sleep(0.02)
     raise AssertionError(message)
 
+def lifetime_released(path):
+    with open(path, "a+b") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+    return True
+
 
 def kill_process_group(proc):
     if proc.poll() is None:
@@ -135,18 +146,18 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                        "clientInfo": {"name": "rebuild-process", "version": "1"}},
         })
-        assert "result" in initialized and "error" not in initialized, initialized
+        assert_success(initialized)
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         started = request(proc, {
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "kb_rebuild", "arguments": {}},
         })
-        assert "result" in started and "error" not in started, started
+        assert_success(started)
         readable = request(proc, {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "kb_search", "arguments": {"query": "before"}},
         })
-        assert "result" in readable and "error" not in readable, readable
+        assert_success(readable)
 
         child_pid = wait_for(
             lambda: next((pid for pid in descendants(proc.pid)
@@ -156,6 +167,36 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
         )
         child_start = proc_start_time(child_pid)
         assert child_start is not None
+
+        after = subprocess.Popen(
+            [KB_BIN, "add", "--path", "fixture/after", "--summary", "after",
+             "--content", "after", "--tags", "fixture"],
+            cwd=root, env=env, stdout=subprocess.DEVNULL,
+        )
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        after.wait(timeout=TIMEOUT)
+        fence = root / ".state" / ".rebuild-lifetime.lock"
+        wait_for(lambda: lifetime_released(fence), "managed rebuild did not complete")
+        visible = request(proc, {
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "kb_search", "arguments": {"query": "after"}},
+        })
+        assert_success(visible)
+        assert "fixture/after" in json.dumps(visible), visible
+
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        restarted = request(proc, {
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "kb_rebuild", "arguments": {}},
+        })
+        assert_success(restarted)
+        child_pid = wait_for(
+            lambda: next((pid for pid in descendants(proc.pid)
+                          if b"rebuild" in command_line(pid)
+                          and proc_start_time(pid) is not None), None),
+            "second supervised rebuild child did not start",
+        )
+        child_start = proc_start_time(child_pid)
 
         # A whole-VM kill must close the port stdin and reap the direct rebuild
         # child even while ordinary rebuild work is blocked on the writer lock.
