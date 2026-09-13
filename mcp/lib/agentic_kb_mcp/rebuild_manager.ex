@@ -53,8 +53,19 @@ defmodule AgenticKbMcp.RebuildManager do
   end
 
   @impl true
-  def handle_call(:request_rebuild, _from, %{phase: :unknown} = state) do
-    {:reply, {:error, :rebuild_status_unknown}, state}
+  def handle_call(:request_rebuild, from, %{phase: :unknown, port: port} = state) do
+    safe_close(port)
+    reply_terminal_waiters(state.terminal_waiters, {:error, :rebuild_status_unknown})
+    reply_unknown_cancel_waiter(state.cancel_waiter)
+
+    start_rebuild(from, %{
+      state
+      | port: nil,
+        terminal: nil,
+        terminal_waiters: [],
+        cancel_waiter: nil,
+        exit_status_grace_timer: nil
+    })
   end
 
   def handle_call(:request_rebuild, _from, %{phase: :starting} = state) do
@@ -67,23 +78,7 @@ defmodule AgenticKbMcp.RebuildManager do
   end
 
   def handle_call(:request_rebuild, from, state) do
-    case open_rebuild_port(state) do
-      {:ok, port, state} ->
-        ready_timer = Process.send_after(self(), {:ready_timeout, port}, @ready_timeout)
-
-        {:noreply,
-         %{
-           state
-           | port: port,
-             phase: :starting,
-             terminal: nil,
-             launch_waiter: from,
-             ready_timer: ready_timer
-         }}
-
-      {:error, reason} ->
-        {:reply, {:error, {:launch_failed, reason}}, state}
-    end
+    start_rebuild(from, state)
   end
 
   def handle_call({:cancel_and_await, _timeout}, _from, %{phase: :idle} = state) do
@@ -111,6 +106,26 @@ defmodule AgenticKbMcp.RebuildManager do
   def handle_call({:await_terminal, timeout}, from, state) do
     timer = Process.send_after(self(), {:terminal_timeout, from}, timeout)
     {:noreply, %{state | terminal_waiters: [{from, timer} | state.terminal_waiters]}}
+  end
+
+  defp start_rebuild(from, state) do
+    case open_rebuild_port(state) do
+      {:ok, port, state} ->
+        ready_timer = Process.send_after(self(), {:ready_timeout, port}, @ready_timeout)
+
+        {:noreply,
+         %{
+           state
+           | port: port,
+             phase: :starting,
+             terminal: nil,
+             launch_waiter: from,
+             ready_timer: ready_timer
+         }}
+
+      {:error, reason} ->
+        {:reply, {:error, {:launch_failed, reason}}, state}
+    end
   end
 
   @impl true
@@ -143,7 +158,7 @@ defmodule AgenticKbMcp.RebuildManager do
     cancel_timer(state.ready_timer)
     reply_launch_waiter(state.launch_waiter, {:error, {:launch_failed, {:exit_status, status}}})
     terminal = {:ok, %{exit_status: status, log_tail: state.log_tail}}
-    persist_log_tail(state.log, state.log_tail)
+    log_persist_error(state.log, state.log_tail)
     reply_terminal_waiters(state.terminal_waiters, terminal)
     reply_cancel_waiter(state.cancel_waiter, status)
 
@@ -293,6 +308,13 @@ defmodule AgenticKbMcp.RebuildManager do
     GenServer.reply(from, :ok)
   end
 
+  defp reply_unknown_cancel_waiter(nil), do: :ok
+
+  defp reply_unknown_cancel_waiter({from, timer}) do
+    Process.cancel_timer(timer)
+    GenServer.reply(from, {:error, :rebuild_status_unknown})
+  end
+
   defp await_exit_status(%{phase: :idle} = state), do: {:noreply, state}
 
   defp await_exit_status(%{exit_status_grace_timer: nil, port: port} = state) do
@@ -312,9 +334,18 @@ defmodule AgenticKbMcp.RebuildManager do
   defp reply_launch_waiter(nil, _reply), do: :ok
   defp reply_launch_waiter(from, reply), do: GenServer.reply(from, reply)
 
+  defp log_persist_error(log, tail) do
+    case persist_log_tail(log, tail) do
+      :ok -> :ok
+      {:error, reason} -> Logger.error("kb rebuild log persistence failed: #{inspect(reason)}")
+    end
+  end
+
   defp persist_log_tail(log, tail) do
-    File.mkdir_p!(Path.dirname(log))
-    File.write!(log, tail)
+    with :ok <- File.mkdir_p(Path.dirname(log)),
+         :ok <- File.write(log, tail) do
+      :ok
+    end
   end
 
   defp rebuild_signal(bytes) do

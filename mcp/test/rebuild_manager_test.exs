@@ -71,12 +71,12 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     {manager, _pid} = start_manager(ctx, :hold)
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
     assert {:error, :timeout} = RebuildManager.cancel_and_await(manager, 1)
-    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    assert %{phase: :unknown} = :sys.get_state(manager)
 
     assert {:ok, %{exit_status: 130}} = RebuildManager.await_terminal(manager, 2_000)
   end
 
-  test "a closed port without exit status releases terminal waiters as an error but stays occupied",
+  test "a closed port without exit status releases waiters and permits an explicit lock-gated retry",
        ctx do
     {manager, _pid} = start_manager(ctx, :hold)
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
@@ -86,10 +86,12 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     send(manager, {port, :closed})
 
     assert {:error, :exit_status_missing} = Task.await(waiter, 2_000)
-    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
-
-    Port.close(port)
-    assert_eventually(fn -> File.exists?(ctx.completed_file) end)
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert_eventually(fn -> launch_count(ctx.launch_file) == 2 end)
+    %{port: replacement} = :sys.get_state(manager)
+    send(manager, {port, {:exit_status, 99}})
+    assert %{port: ^replacement, phase: :running} = :sys.get_state(manager)
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
   test "an executable launch failure is returned rather than acknowledged as started", ctx do
@@ -111,7 +113,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     {manager, _pid} = start_manager(ctx, :no_ready)
 
     assert {:error, :ready_timeout} = RebuildManager.request_rebuild(manager)
-    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    assert %{phase: :unknown} = :sys.get_state(manager)
     %{port: port} = :sys.get_state(manager)
     Port.close(port)
     assert_eventually(fn -> File.exists?(ctx.completed_file) end)
@@ -124,7 +126,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert_eventually(fn -> :sys.get_state(manager).phase == :starting end)
     assert {:error, :rebuild_starting} = RebuildManager.request_rebuild(manager)
     assert {:error, :ready_timeout} = Task.await(launch, 2_000)
-    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
+    assert %{phase: :unknown} = :sys.get_state(manager)
     assert {:ok, %{exit_status: 130}} = RebuildManager.await_terminal(manager, 2_000)
     assert File.read!(ctx.control_file) == "cancel-byte\n"
   end
@@ -138,9 +140,9 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     send(manager, {port, :closed})
 
     assert {:error, {:launch_failed, :exit_status_missing}} = Task.await(launch, 2_000)
-    assert {:error, :rebuild_status_unknown} = RebuildManager.request_rebuild(manager)
-    Port.close(port)
-    assert_eventually(fn -> File.exists?(ctx.completed_file) end)
+    System.put_env("REBUILD_FIXTURE_MODE", "hold")
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+    assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
   end
 
   test "a nonzero child exit is observed asynchronously and retained in the log", ctx do
@@ -155,6 +157,17 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     refute worker_alive?(failed)
     assert tail =~ "controlled rebuild failure"
     assert File.read!(ctx.rebuild_log) =~ "controlled rebuild failure"
+  end
+
+  test "a log persistence error does not strand terminal waiters", ctx do
+    {manager, _pid} = start_manager(ctx, :fail, db_path: "/dev/null/agent-kb.db")
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager)
+
+    assert {:ok, %{exit_status: 42, log_tail: tail}} =
+             RebuildManager.await_terminal(manager, 2_000)
+
+    assert tail =~ "controlled rebuild failure"
+    assert %{phase: :idle} = :sys.get_state(manager)
   end
 
   test "captured rebuild output is bounded", ctx do
@@ -225,7 +238,8 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     end)
 
     kb_bin = Keyword.get(opts, :kb_bin, @fixture)
-    {name, start_supervised!({RebuildManager, db_path: ctx.db_path, kb_bin: kb_bin, name: name})}
+    db_path = Keyword.get(opts, :db_path, ctx.db_path)
+    {name, start_supervised!({RebuildManager, db_path: db_path, kb_bin: kb_bin, name: name})}
   end
 
   defp restore_env(key, nil), do: System.delete_env(key)
