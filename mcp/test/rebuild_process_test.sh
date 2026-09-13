@@ -77,7 +77,7 @@ def assert_no_unsolicited_stdout(proc):
 def proc_start_time(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().split()[21]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -90,7 +90,7 @@ def direct_children(parent):
             fields = (candidate / "stat").read_text().split()
             if int(fields[3]) == parent:
                 children.append(int(candidate.name))
-        except (FileNotFoundError, IndexError, ValueError):
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
             continue
     return children
 
@@ -108,7 +108,7 @@ def descendants(parent):
 def command_line(pid):
     try:
         return Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return []
 
 
@@ -117,7 +117,7 @@ def rebuild_child(parent, db):
     for pid in descendants(parent):
         try:
             executable = os.path.realpath(f"/proc/{pid}/exe")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         if executable == KB_BIN and command_line(pid) == expected and proc_start_time(pid):
             return pid
@@ -197,6 +197,9 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        # `select` must see all pending bytes; BufferedReader.readline can
+        # prefetch a later non-JSON line and hide it from the fd readiness check.
+        bufsize=0,
     )
     try:
         initialized = request(proc, {
