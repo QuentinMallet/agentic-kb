@@ -895,6 +895,52 @@ mod tests {
         (dir, paths)
     }
 
+    #[test]
+    fn rebuild_cli_accepts_explicit_canonical_db_with_supervised_guard() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join(".state/agent-kb/agent-kb.db");
+
+        let parsed = Rebuild::try_parse_from([
+            "rebuild",
+            "--db",
+            db.to_str().unwrap(),
+            "--supervised",
+        ]);
+
+        assert!(
+            parsed.is_ok(),
+            "OTP-owned rebuild must accept its explicit canonical database and private guard"
+        );
+    }
+
+    #[test]
+    fn rebuild_cli_accepts_adjacent_legacy_db_with_supervised_guard() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("legacy-store/agent-kb.db");
+
+        let parsed = Rebuild::try_parse_from([
+            "rebuild",
+            "--db",
+            db.to_str().unwrap(),
+            "--supervised",
+        ]);
+
+        assert!(
+            parsed.is_ok(),
+            "OTP-owned rebuild must accept an explicitly selected adjacent legacy store"
+        );
+    }
+
+    #[test]
+    fn supervised_rebuild_guard_is_an_internal_cli_switch() {
+        let parsed = Rebuild::try_parse_from(["rebuild", "--supervised"]);
+
+        assert!(
+            parsed.is_ok(),
+            "the EOF parent-lifetime guard must be selectable only by the OTP child argv"
+        );
+    }
+
     fn upsert(id: &str, idx: u32) -> serde_json::Value {
         serde_json::json!({
             "action": "upsert", "table": "entries",
