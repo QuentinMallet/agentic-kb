@@ -106,7 +106,9 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     name = :"rebuild_#{System.unique_integer([:positive, :monotonic])}"
 
     previous = System.get_env("REBUILD_FIXTURE_MODE")
+    previous_eof_delay = System.get_env("REBUILD_EOF_EXIT_DELAY")
     System.put_env("REBUILD_FIXTURE_MODE", Atom.to_string(mode))
+    System.put_env("REBUILD_EOF_EXIT_DELAY", "0.2")
     System.put_env("REBUILD_PID_FILE", ctx.pid_file)
     System.put_env("REBUILD_ARGS_FILE", ctx.args_file)
     System.put_env("REBUILD_LAUNCH_FILE", ctx.launch_file)
@@ -114,6 +116,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
 
     on_exit(fn ->
       restore_env("REBUILD_FIXTURE_MODE", previous)
+      restore_env("REBUILD_EOF_EXIT_DELAY", previous_eof_delay)
       System.delete_env("REBUILD_PID_FILE")
       System.delete_env("REBUILD_ARGS_FILE")
       System.delete_env("REBUILD_LAUNCH_FILE")
