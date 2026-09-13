@@ -44,13 +44,17 @@ defmodule AgenticKbMcp.RebuildOwnerRecoveryTest do
 
   test "owner death releases the real child before replacement rebuild", %{root: root, db: db} do
     supervisor = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    manager_name = :"rebuild_owner_recovery_#{System.unique_integer([:positive, :monotonic])}"
 
     assert {:ok, _} =
-             DynamicSupervisor.start_child(supervisor, {RebuildManager, db_path: db, kb_bin: @kb})
+             DynamicSupervisor.start_child(
+               supervisor,
+               {RebuildManager, db_path: db, kb_bin: @kb, name: manager_name}
+             )
 
     old_owner = child_pid(supervisor)
     compute = hold_lock(Path.join([root, ".state", ".lock"]))
-    assert {:ok, :started} = RebuildManager.request_rebuild()
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager_name)
     %{port: old_port} = :sys.get_state(old_owner)
     old_pid = Port.info(old_port)[:os_pid]
     old_start = proc_start_time(old_pid)
@@ -68,21 +72,21 @@ defmodule AgenticKbMcp.RebuildOwnerRecoveryTest do
     # Rust Path::with_extension on the dotfile `.lock` appends this suffix.
     lifetime = Path.join([root, ".state", ".lock.rebuild-lifetime.lock"])
     blocker = hold_lock(lifetime)
-    assert {:error, {:launch_failed, message}} = RebuildManager.request_rebuild()
+    assert {:error, {:launch_failed, message}} = RebuildManager.request_rebuild(manager_name)
     assert message =~ "acquire supervised rebuild lifetime lock"
-    assert {:ok, %{exit_status: _}} = RebuildManager.await_terminal()
+    assert {:ok, %{exit_status: _}} = RebuildManager.await_terminal(manager_name)
     blocker_pid = Port.info(blocker)[:os_pid]
     blocker_start = proc_start_time(blocker_pid)
     Port.close(blocker)
     eventually(fn -> proc_start_time(blocker_pid) != blocker_start end)
 
-    assert {:ok, :started} = RebuildManager.request_rebuild()
+    assert {:ok, :started} = RebuildManager.request_rebuild(manager_name)
     %{port: port} = :sys.get_state(owner)
     os_pid = Port.info(port)[:os_pid]
     assert is_integer(os_pid)
     assert proc_start_time(os_pid)
     Port.close(compute)
-    assert {:ok, %{exit_status: 0}} = RebuildManager.await_terminal()
+    assert {:ok, %{exit_status: 0}} = RebuildManager.await_terminal(manager_name)
   end
 
   defp hold_lock(path) do
