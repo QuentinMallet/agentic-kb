@@ -37,7 +37,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     {manager, _pid} = start_manager(ctx, :hold)
 
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
-    first = await_identity(ctx.launch_file)
+    first = await_live_identity(ctx.launch_file)
     assert worker_alive?(first)
     assert File.read!(ctx.args_file) =~ "rebuild --db #{ctx.db_path} --supervised"
 
@@ -49,7 +49,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
   test "private cancellation waits for observed OS exit before a retry can launch", ctx do
     {manager, _pid} = start_manager(ctx, :hold)
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
-    first = await_identity(ctx.launch_file)
+    first = await_live_identity(ctx.launch_file)
     assert worker_alive?(first)
 
     assert :ok = RebuildManager.cancel_and_await(manager, 2_000)
@@ -57,7 +57,7 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert launch_count(ctx.launch_file) == 1
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
     assert_eventually(fn -> launch_count(ctx.launch_file) == 2 end)
-    second = await_identity(ctx.launch_file)
+    second = await_live_identity(ctx.launch_file)
     assert second != first
     assert worker_alive?(second)
   end
@@ -74,8 +74,13 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     {manager, _pid} = start_manager(ctx, :fail)
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
 
-    failed = await_identity(ctx.launch_file)
-    assert_eventually(fn -> File.exists?(ctx.completed_file) and not worker_alive?(failed) end)
+    failed = await_captured_identity(ctx.launch_file)
+
+    assert {:ok, %{exit_status: 42, log_tail: tail}} =
+             RebuildManager.await_terminal(manager, 2_000)
+
+    refute worker_alive?(failed)
+    assert tail =~ "controlled rebuild failure"
     assert File.read!(ctx.rebuild_log) =~ "controlled rebuild failure"
   end
 
@@ -84,8 +89,13 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     assert {:ok, :started} = RebuildManager.request_rebuild(manager)
 
     log = ctx.rebuild_log
-    flooded = await_identity(ctx.launch_file)
-    assert_eventually(fn -> File.exists?(ctx.completed_file) and not worker_alive?(flooded) end)
+    flooded = await_captured_identity(ctx.launch_file)
+
+    assert {:ok, %{exit_status: 0, log_tail: tail}} =
+             RebuildManager.await_terminal(manager, 2_000)
+
+    refute worker_alive?(flooded)
+    assert tail =~ "TAIL: flood-complete"
     assert File.stat!(log).size <= @log_limit
   end
 
@@ -130,9 +140,21 @@ defmodule AgenticKbMcp.RebuildManagerTest do
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
 
-  defp await_identity(pid_file) do
-    assert_eventually(fn -> match?({:ok, _identity}, worker_identity(pid_file)) end)
-    {:ok, identity} = worker_identity(pid_file)
+  defp await_live_identity(launch_file) do
+    assert_eventually(fn ->
+      case captured_identity(launch_file) do
+        {:ok, identity} -> worker_alive?(identity)
+        _ -> false
+      end
+    end)
+
+    {:ok, identity} = captured_identity(launch_file)
+    identity
+  end
+
+  defp await_captured_identity(launch_file) do
+    assert_eventually(fn -> match?({:ok, _identity}, captured_identity(launch_file)) end)
+    {:ok, identity} = captured_identity(launch_file)
     identity
   end
 
@@ -151,16 +173,12 @@ defmodule AgenticKbMcp.RebuildManagerTest do
     end
   end
 
-  defp worker_identity(path) do
+  defp captured_identity(path) do
     with {:ok, contents} <- File.read(path),
          line when is_binary(line) <- contents |> String.split("\n", trim: true) |> List.last(),
          [pid, start_time] <- String.split(line, " ", trim: true),
-         {pid, ""} <- Integer.parse(pid),
-         {:ok, stat} <- File.read("/proc/#{pid}/stat"),
-         [_comm, rest] <- String.split(stat, ")", parts: 2),
-         [state | fields] <- String.split(rest, trim: true),
-         ^start_time <- Enum.at(fields, 18) do
-      {:ok, %{pid: pid, start_time: start_time, state: state}}
+         {pid, ""} <- Integer.parse(pid) do
+      {:ok, %{pid: pid, start_time: start_time}}
     else
       _ -> :gone
     end

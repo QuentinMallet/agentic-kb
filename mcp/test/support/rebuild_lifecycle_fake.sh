@@ -33,6 +33,7 @@ case "${REBUILD_FIXTURE_MODE:-hold}" in
   flood)
     printf 'flood-started\n'
     head -c 131072 /dev/zero | tr '\0' x
+    printf '\nTAIL: flood-complete\n'
     : > "$REBUILD_COMPLETED_FILE"
     ;;
   *)
