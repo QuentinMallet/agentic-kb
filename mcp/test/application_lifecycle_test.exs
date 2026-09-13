@@ -1,7 +1,7 @@
 defmodule AgenticKbMcp.ApplicationLifecycleTest do
   use ExUnit.Case, async: false
 
-  alias AgenticKbMcp.{McpServer, PortManager}
+  alias AgenticKbMcp.{McpServer, PortManager, RebuildManager}
 
   @fake_port Path.expand("support/fake_port.sh", __DIR__)
   @silent_crash Path.expand("support/fake_port_silent_crash.sh", __DIR__)
@@ -82,6 +82,32 @@ defmodule AgenticKbMcp.ApplicationLifecycleTest do
     assert :ok = Elixir.Application.stop(:agentic_kb_mcp)
     refute Process.alive?(restarted_server)
     refute Port.info(restarted_input_port)
+  end
+
+  test "production topology owns a rebuild manager beside the request port", %{db_path: db_path} do
+    children =
+      AgenticKbMcp.Application.child_specs(
+        db_path: db_path,
+        kb_bin: @fake_port,
+        input_port_factory: &AgenticKbMcp.TestSupport.HeldInput.open/0
+      )
+
+    assert [
+             {PortManager, port_opts},
+             {RebuildManager, rebuild_opts},
+             {McpServer, _server_opts}
+           ] = children
+    assert port_opts[:db_path] == db_path
+    assert rebuild_opts[:db_path] == db_path
+    assert rebuild_opts[:kb_bin] == @fake_port
+  end
+
+  test "no database starts only the stdio server, never a rebuild owner" do
+    assert [{McpServer, _server_opts}] =
+             AgenticKbMcp.Application.child_specs(
+               db_path: nil,
+               input_port_factory: &AgenticKbMcp.TestSupport.HeldInput.open/0
+             )
   end
 
   test "a PortManager child startup crash fails the application start without a live supervisor",
