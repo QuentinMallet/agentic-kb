@@ -1,10 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use fs2::FileExt;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use serde_json::Value;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -17,6 +18,7 @@ fn proc_start_time(pid: u32) -> Option<String> {
 
 struct ChildGuard {
     child: Child,
+    stdout: BufReader<ChildStdout>,
     start_time: String,
 }
 
@@ -49,47 +51,53 @@ fn wait_for_exit(child: &mut ChildGuard) -> Option<std::process::ExitStatus> {
     None
 }
 
+fn read_frame(child: &mut ChildGuard) -> Value {
+    let mut line = String::new();
+    child.stdout.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn assert_no_stderr(child: &mut ChildGuard) {
+    let mut stderr = String::new();
+    child
+        .child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.is_empty(),
+        "supervised child stderr must be suppressed: {stderr:?}"
+    );
+}
+
 fn start_supervised_rebuild(cwd: &Path, db: &Path) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_kb"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kb"))
         .args(["rebuild", "--db", db.to_str().unwrap(), "--supervised"])
         .current_dir(cwd)
         .env("KB_NO_EMBED", "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
     let start_time = proc_start_time(child.id()).expect("child must expose a Linux start time");
-    ChildGuard { child, start_time }
+    ChildGuard {
+        child,
+        stdout,
+        start_time,
+    }
 }
 
-fn assert_uses_selected_lock_and_exits_on_termination(
-    cwd: &Path,
-    selected_db: &Path,
-    _lock: &File,
-    cancel: bool,
-) {
-    let mut child = start_supervised_rebuild(cwd, selected_db);
-
-    thread::sleep(Duration::from_millis(300));
-    assert!(
-        child.child.try_wait().unwrap().is_none(),
-        "the selected store lock must keep the supervised child alive while stdin remains open"
-    );
-
-    if cancel {
-        let stdin = child.child.stdin.as_mut().unwrap();
-        stdin.write_all(&[0x03]).unwrap();
-        stdin.flush().unwrap();
-    } else {
-        drop(child.child.stdin.take());
-    }
-
-    let status = wait_for_exit(&mut child);
-    assert!(
-        status.is_some_and(|status| status.code() == Some(130)),
-        "EOF or the private cancellation byte must end the supervised rebuild child with 130"
-    );
+fn cancel_and_assert(child: &mut ChildGuard) {
+    let stdin = child.child.stdin.as_mut().unwrap();
+    stdin.write_all(&[0x03]).unwrap();
+    stdin.flush().unwrap();
+    let status = wait_for_exit(child);
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
+    assert_no_stderr(child);
 }
 
 fn canonical_db(root: &Path) -> PathBuf {
@@ -97,7 +105,7 @@ fn canonical_db(root: &Path) -> PathBuf {
 }
 
 #[test]
-fn supervised_rebuild_binds_the_explicit_canonical_store_and_exits_on_eof() {
+fn supervised_rebuild_serializes_restart_contenders_for_the_selected_canonical_store() {
     let cwd = tempdir().unwrap();
     let selected = tempdir().unwrap();
     let selected_db = canonical_db(selected.path());
@@ -105,6 +113,8 @@ fn supervised_rebuild_binds_the_explicit_canonical_store_and_exits_on_eof() {
     fs::create_dir_all(selected_lock.parent().unwrap()).unwrap();
     fs::create_dir_all(canonical_db(cwd.path()).parent().unwrap()).unwrap();
 
+    // Keep normal rebuild work blocked after READY so this test isolates the
+    // separate lifetime fence used across OTP owner restarts.
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -112,24 +122,65 @@ fn supervised_rebuild_binds_the_explicit_canonical_store_and_exits_on_eof() {
         .open(selected_lock)
         .unwrap();
     lock.lock_exclusive().unwrap();
-    assert_uses_selected_lock_and_exits_on_termination(cwd.path(), &selected_db, &lock, false);
+
+    let mut first = start_supervised_rebuild(cwd.path(), &selected_db);
+    assert_eq!(
+        read_frame(&mut first),
+        serde_json::json!({"rebuild": "ready"})
+    );
+
+    let mut contender = start_supervised_rebuild(cwd.path(), &selected_db);
+    let error = read_frame(&mut contender);
+    assert_eq!(error["rebuild"], "error");
+    assert!(error["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+    assert!(wait_for_exit(&mut contender).is_some());
+    assert_no_stderr(&mut contender);
+
+    cancel_and_assert(&mut first);
+
+    let mut replacement = start_supervised_rebuild(cwd.path(), &selected_db);
+    assert_eq!(
+        read_frame(&mut replacement),
+        serde_json::json!({"rebuild": "ready"})
+    );
+    cancel_and_assert(&mut replacement);
 }
 
 #[test]
-fn supervised_rebuild_binds_an_explicit_adjacent_legacy_store_and_exits_on_eof() {
+fn supervised_rebuild_binds_an_adjacent_legacy_store_and_accepts_eof() {
     let cwd = tempdir().unwrap();
     let selected = tempdir().unwrap();
     let selected_db = selected.path().join("agent-kb/agent-kb.db");
-    let selected_lock = selected.path().join("agent-kb/agent-kb.lock");
-    fs::create_dir_all(selected_lock.parent().unwrap()).unwrap();
+    let selected_events = selected.path().join("agent-kb/agent-kb-events.jsonl");
+    fs::create_dir_all(selected_events.parent().unwrap()).unwrap();
+    fs::write(selected_events, b"").unwrap();
     fs::create_dir_all(canonical_db(cwd.path()).parent().unwrap()).unwrap();
 
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(selected_lock)
-        .unwrap();
-    lock.lock_exclusive().unwrap();
-    assert_uses_selected_lock_and_exits_on_termination(cwd.path(), &selected_db, &lock, true);
+    let mut child = start_supervised_rebuild(cwd.path(), &selected_db);
+    assert_eq!(
+        read_frame(&mut child),
+        serde_json::json!({"rebuild": "ready"})
+    );
+    drop(child.child.stdin.take());
+    let status = wait_for_exit(&mut child);
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
+    assert_no_stderr(&mut child);
+}
+
+#[test]
+fn supervised_rebuild_reports_a_bounded_json_error_without_stderr() {
+    let cwd = tempdir().unwrap();
+    let impossible_component = "x".repeat(800);
+    let db = cwd.path().join(impossible_component).join("agent-kb.db");
+    let mut child = start_supervised_rebuild(cwd.path(), &db);
+    let error = read_frame(&mut child);
+
+    assert_eq!(error["rebuild"], "error");
+    assert!(error["message"]
+        .as_str()
+        .is_some_and(|message| message.len() <= 512));
+    assert!(wait_for_exit(&mut child).is_some());
+    assert_no_stderr(&mut child);
 }

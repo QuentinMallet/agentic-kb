@@ -8,9 +8,10 @@ use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
 use anyhow::Context;
 use clap::Parser;
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -381,15 +382,43 @@ impl Rebuild {
     /// Execute the rebuild command.
     pub fn execute(&self) -> anyhow::Result<()> {
         if self.supervised {
-            arm_supervised_stdin_guard()?;
+            return self.execute_supervised();
         }
 
-        let paths = match &self.db {
-            Some(db) => config::Paths::from_mcp_db(db),
-            None => config::Paths::discover()?,
-        };
+        let paths = self.resolve_paths()?;
         let embedder = make_embedder(&paths);
         self.execute_with(&paths, embedder.as_ref())
+    }
+
+    fn resolve_paths(&self) -> anyhow::Result<config::Paths> {
+        match &self.db {
+            Some(db) => Ok(config::Paths::from_mcp_db(db)),
+            None => config::Paths::discover(),
+        }
+    }
+
+    fn execute_supervised(&self) -> anyhow::Result<()> {
+        let output = SupervisedOutput::capture()?;
+
+        if let Err(error) = output.redirect_process_output() {
+            let _ = output.error(&format!("{error:#}"));
+            return Err(error);
+        }
+
+        let result = (|| {
+            arm_supervised_stdin_guard()?;
+            let paths = self.resolve_paths()?;
+            let _lifetime = acquire_supervised_lifetime_lock(&paths)?;
+            output.ready()?;
+            let embedder = make_embedder(&paths);
+            self.execute_with(&paths, embedder.as_ref())
+        })();
+
+        if let Err(error) = &result {
+            let _ = output.error(&format!("{error:#}"));
+        }
+
+        result
     }
 
     /// Execute with explicit paths and embedder (for testing).
@@ -740,6 +769,88 @@ fn supervised_guard_exit_status(read: io::Result<usize>, byte: u8) -> i32 {
     }
 }
 
+const SUPERVISED_DIAGNOSTIC_LIMIT: usize = 512;
+
+struct SupervisedOutput {
+    control: fs::File,
+}
+
+impl SupervisedOutput {
+    fn capture() -> anyhow::Result<Self> {
+        let control = rustix::io::dup(io::stdout())
+            .context("duplicate supervised rebuild stdout control descriptor")?;
+        Ok(Self {
+            control: control.into(),
+        })
+    }
+
+    fn redirect_process_output(&self) -> anyhow::Result<()> {
+        let null = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .context("open /dev/null for supervised rebuild output")?;
+        rustix::stdio::dup2_stdout(&null).context("suppress supervised rebuild stdout")?;
+        rustix::stdio::dup2_stderr(&null).context("suppress supervised rebuild stderr")?;
+        Ok(())
+    }
+
+    fn ready(&self) -> anyhow::Result<()> {
+        self.write_frame(serde_json::json!({"rebuild": "ready"}))
+    }
+
+    fn error(&self, diagnostic: &str) -> anyhow::Result<()> {
+        self.write_frame(serde_json::json!({
+            "rebuild": "error",
+            "message": bounded_supervised_diagnostic(diagnostic),
+        }))
+    }
+
+    fn write_frame(&self, frame: serde_json::Value) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(&frame).context("encode supervised rebuild frame")?;
+        let mut control = &self.control;
+        control
+            .write_all(&bytes)
+            .and_then(|()| control.write_all(b"\n"))
+            .context("write supervised rebuild frame")
+    }
+}
+
+fn bounded_supervised_diagnostic(diagnostic: &str) -> &str {
+    if diagnostic.len() <= SUPERVISED_DIAGNOSTIC_LIMIT {
+        return diagnostic;
+    }
+
+    let end = diagnostic
+        .char_indices()
+        .take_while(|(index, _)| *index <= SUPERVISED_DIAGNOSTIC_LIMIT)
+        .map(|(index, character)| index + character.len_utf8())
+        .take_while(|end| *end <= SUPERVISED_DIAGNOSTIC_LIMIT)
+        .last()
+        .unwrap_or_default();
+    &diagnostic[..end]
+}
+
+fn supervised_lifetime_lock_path(paths: &config::Paths) -> PathBuf {
+    paths.lock.with_extension("rebuild-lifetime.lock")
+}
+
+fn acquire_supervised_lifetime_lock(paths: &config::Paths) -> anyhow::Result<fs::File> {
+    let path = supervised_lifetime_lock_path(paths);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open supervised rebuild lifetime lock {}", path.display()))?;
+    lock.try_lock_exclusive().with_context(|| {
+        format!(
+            "acquire supervised rebuild lifetime lock {}",
+            path.display()
+        )
+    })?;
+    Ok(lock)
+}
+
 struct TmpDbGuard {
     path: PathBuf,
     armed: bool,
@@ -967,6 +1078,15 @@ mod tests {
             supervised_guard_exit_status(Err(io::Error::other("read failed")), 0),
             129
         );
+    }
+
+    #[test]
+    fn supervised_diagnostic_truncation_preserves_utf8_boundaries() {
+        let input = format!("{}é", "x".repeat(SUPERVISED_DIAGNOSTIC_LIMIT - 1));
+        let bounded = bounded_supervised_diagnostic(&input);
+        assert_eq!(bounded, "x".repeat(SUPERVISED_DIAGNOSTIC_LIMIT - 1));
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.len() <= SUPERVISED_DIAGNOSTIC_LIMIT);
     }
 
     #[test]
