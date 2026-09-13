@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 KB_BIN, MCP_BIN = sys.argv[1:]
@@ -23,7 +24,13 @@ TIMEOUT = 5
 
 
 def fail(message, proc=None):
-    raise AssertionError(message)
+    if proc is None:
+        raise AssertionError(message)
+    readable, _, _ = select.select([proc.stderr], [], [], 0)
+    stderr = os.read(proc.stderr.fileno(), 65_536) if readable else b""
+    raise AssertionError(
+        f"{message}; MCP exit={proc.poll()}; stderr={stderr.decode(errors='replace')!r}"
+    )
 
 
 def response(stream, expected_id):
@@ -35,9 +42,13 @@ def response(stream, expected_id):
         line = stream.readline()
         if not line:
             break
-        value = json.loads(line)
-        if value.get("id") == expected_id:
-            return value
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise AssertionError(f"non-JSON MCP stdout: {line!r}") from error
+        if value.get("id") != expected_id:
+            raise AssertionError(f"unexpected MCP response id: {value!r}")
+        return value
     raise AssertionError(f"timed out waiting for JSON-RPC response id={expected_id}")
 
 
@@ -49,6 +60,19 @@ def request(proc, payload):
 def assert_success(response):
     assert "result" in response and "error" not in response, response
     assert response["result"].get("isError") is not True, response
+
+
+def assert_tool_error(response):
+    assert "result" in response and "error" not in response, response
+    assert response["result"].get("isError") is True, response
+
+
+def assert_no_unsolicited_stdout(proc):
+    readable, _, _ = select.select([proc.stdout], [], [], 0.2)
+    if readable:
+        line = proc.stdout.readline()
+        if line:
+            raise AssertionError(f"unsolicited MCP stdout: {line!r}")
 
 def proc_start_time(pid):
     try:
@@ -83,9 +107,21 @@ def descendants(parent):
 
 def command_line(pid):
     try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        return Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
     except FileNotFoundError:
-        return b""
+        return []
+
+
+def rebuild_child(parent, db):
+    expected = [os.fsencode(KB_BIN), b"rebuild", b"--db", os.fsencode(db), b"--supervised"]
+    for pid in descendants(parent):
+        try:
+            executable = os.path.realpath(f"/proc/{pid}/exe")
+        except FileNotFoundError:
+            continue
+        if executable == KB_BIN and command_line(pid) == expected and proc_start_time(pid):
+            return pid
+    return None
 
 
 def wait_for(predicate, message):
@@ -107,9 +143,31 @@ def lifetime_released(path):
 
 
 def kill_process_group(proc):
-    if proc.poll() is None:
+    try:
         os.killpg(proc.pid, signal.SIGKILL)
-    proc.wait(timeout=TIMEOUT)
+    except ProcessLookupError:
+        pass
+    if proc.poll() is None:
+        proc.wait(timeout=TIMEOUT)
+
+
+def append_committed_event(events):
+    batch_id = str(uuid.uuid4())
+    event = {
+        "action": "upsert", "table": "entries", "id": f"managed-{batch_id}",
+        "path": "fixture/after", "summary": "after", "content": "after",
+        "tags": ["fixture"], "kind": "belief", "evidence_status": "n/a",
+        "ts": "2026-09-13T00:00:00Z",
+    }
+    lines = [
+        {"action": "batch_begin", "batch_id": batch_id, "n": 1},
+        event,
+        {"action": "batch_commit", "batch_id": batch_id, "n": 1},
+    ]
+    with events.open("ab") as handle:
+        handle.write(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
@@ -160,41 +218,68 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
         assert_success(readable)
 
         child_pid = wait_for(
-            lambda: next((pid for pid in descendants(proc.pid)
-                          if b"rebuild" in command_line(pid)
-                          and proc_start_time(pid) is not None), None),
-            "supervised rebuild child did not start",
+            lambda: rebuild_child(proc.pid, str(db)),
+            "supervised rebuild child did not start with the selected DB",
         )
         child_start = proc_start_time(child_pid)
         assert child_start is not None
 
-        after = subprocess.Popen(
-            [KB_BIN, "add", "--path", "fixture/after", "--summary", "after",
-             "--content", "after", "--tags", "fixture"],
-            cwd=root, env=env, stdout=subprocess.DEVNULL,
-        )
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
-        after.wait(timeout=TIMEOUT)
-        fence = root / ".state" / ".rebuild-lifetime.lock"
-        wait_for(lambda: lifetime_released(fence), "managed rebuild did not complete")
-        visible = request(proc, {
+        # Append one committed event while the writer lock is held. A second
+        # `kb add` would materialize it itself and make this test vacuous.
+        events = db.parent / "agent-kb-events.jsonl"
+        append_committed_event(events)
+        absent = request(proc, {
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "kb_search", "arguments": {"query": "after"}},
+        })
+        assert_success(absent)
+        assert "fixture/after" not in json.dumps(absent), absent
+
+        fence = root / ".state" / ".lock.rebuild-lifetime.lock"
+        assert not lifetime_released(fence), "managed rebuild lifetime fence was not held"
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        wait_for(lambda: lifetime_released(fence), "managed rebuild did not complete")
+        wait_for(lambda: proc_start_time(child_pid) != child_start,
+                 "managed rebuild child did not exit")
+        rebuild_log = db.parent / "rebuild.log"
+        wait_for(rebuild_log.exists, "managed rebuild completion was not observed")
+        visible = request(proc, {
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": {"name": "kb_search", "arguments": {"query": "after"}},
         })
         assert_success(visible)
         assert "fixture/after" in json.dumps(visible), visible
+        assert_no_unsolicited_stdout(proc)
+
+        # A busy lifetime fence is an MCP tool error, and its nonzero worker
+        # diagnostic must not leak through the JSON-RPC stdout stream.
+        with fence.open("a+b") as busy_lock:
+            fcntl.flock(busy_lock, fcntl.LOCK_EX)
+            failed = request(proc, {
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "kb_rebuild", "arguments": {}},
+            })
+            assert_tool_error(failed)
+            wait_for(lambda: "acquire supervised rebuild lifetime lock" in
+                     rebuild_log.read_text(), "busy rebuild did not report its error")
+            assert_no_unsolicited_stdout(proc)
+
+        still_visible = request(proc, {
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "kb_search", "arguments": {"query": "after"}},
+        })
+        assert_success(still_visible)
+        assert "fixture/after" in json.dumps(still_visible), still_visible
 
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         restarted = request(proc, {
-            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {"name": "kb_rebuild", "arguments": {}},
         })
         assert_success(restarted)
         child_pid = wait_for(
-            lambda: next((pid for pid in descendants(proc.pid)
-                          if b"rebuild" in command_line(pid)
-                          and proc_start_time(pid) is not None), None),
-            "second supervised rebuild child did not start",
+            lambda: rebuild_child(proc.pid, str(db)),
+            "second supervised rebuild child did not start with the selected DB",
         )
         child_start = proc_start_time(child_pid)
 
@@ -213,18 +298,4 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
         fail(str(error), proc)
     finally:
         lock_file.close()
-
-    subprocess.run(
-        [KB_BIN, "add", "--path", "fixture/after", "--summary", "after",
-         "--content", "after", "--tags", "fixture"],
-        cwd=root,
-        env=env,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
-    subprocess.run([KB_BIN, "rebuild", "--db", str(db)], cwd=root, env=env, check=True,
-                   stdout=subprocess.DEVNULL)
-    search = subprocess.run([KB_BIN, "search", "after"], cwd=root, env=env, check=True,
-                            stdout=subprocess.PIPE).stdout.decode()
-    assert "fixture/after" in search, search
 PY
