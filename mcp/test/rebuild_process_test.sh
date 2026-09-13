@@ -135,13 +135,18 @@ with tempfile.TemporaryDirectory(prefix="mcp-rebuild-process.") as raw_root:
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                        "clientInfo": {"name": "rebuild-process", "version": "1"}},
         })
-        assert "result" in initialized, initialized
+        assert "result" in initialized and "error" not in initialized, initialized
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         started = request(proc, {
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "kb_rebuild", "arguments": {}},
         })
-        assert "result" in started, started
+        assert "result" in started and "error" not in started, started
+        readable = request(proc, {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "kb_search", "arguments": {"query": "before"}},
+        })
+        assert "result" in readable and "error" not in readable, readable
 
         child_pid = wait_for(
             lambda: next((pid for pid in descendants(proc.pid)
