@@ -1,7 +1,7 @@
 defmodule AgenticKbMcp.McpCleanupContractTest do
   use ExUnit.Case, async: false
 
-  alias AgenticKbMcp.McpServer
+  alias AgenticKbMcp.{McpServer, RebuildManager}
 
   @no_db_text "No agent-kb.db found. Run `kb init` or `/project-init` to initialise the knowledge base for this project."
   @rebuild_text "Rebuild started in background. Reads continue normally; writes queue until complete."
@@ -95,8 +95,13 @@ defmodule AgenticKbMcp.McpCleanupContractTest do
 
     fake = Path.expand("support/capturing_fake_port.sh", __DIR__)
     start_supervised!({AgenticKbMcp.PortManager, db_path: db_path, kb_bin: fake})
+    rebuild_manager_name = :"cleanup_rebuild_#{System.unique_integer([:positive, :monotonic])}"
 
-    %{capture: capture, db_path: db_path}
+    start_supervised!(
+      {RebuildManager, db_path: db_path, kb_bin: fake, name: rebuild_manager_name}
+    )
+
+    %{capture: capture, db_path: db_path, rebuild_manager_name: rebuild_manager_name}
   end
 
   test "tools/list preserves the literal ordered public schema field contract" do
@@ -112,14 +117,19 @@ defmodule AgenticKbMcp.McpCleanupContractTest do
 
   test "public tools/call requests retain literal port maps and omit optional fields", %{
     capture: capture,
-    db_path: db_path
+    db_path: db_path,
+    rebuild_manager_name: rebuild_manager_name
   } do
     for {tool, arguments, _expected} <- @port_requests do
-      response = call_tool(tool, arguments, %{db_path: db_path})
+      response =
+        call_tool(tool, arguments, %{db_path: db_path, rebuild_manager_name: rebuild_manager_name})
+
       refute get_in(response, ["result", "isError"]), "#{tool}: #{inspect(response)}"
     end
 
-    rebuild = call_tool("kb_rebuild", %{}, %{db_path: db_path})
+    rebuild =
+      call_tool("kb_rebuild", %{}, %{db_path: db_path, rebuild_manager_name: rebuild_manager_name})
+
     assert get_in(rebuild, ["result", "content", Access.at(0), "text"]) == @rebuild_text
 
     captured =

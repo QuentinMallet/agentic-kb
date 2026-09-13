@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Controlled direct-child fixture for RebuildManager lifecycle tests. It records
+# the real OS pid and argv, then either waits for inherited stdin EOF, fails, or
+# emits more than the retained-log budget. It intentionally does not emulate
+# the long-lived MCP JSON protocol.
+set -euo pipefail
+
+: "${REBUILD_PID_FILE:?REBUILD_PID_FILE must name the PID capture file}"
+: "${REBUILD_ARGS_FILE:?REBUILD_ARGS_FILE must name the argv capture file}"
+: "${REBUILD_LAUNCH_FILE:?REBUILD_LAUNCH_FILE must name the launch capture file}"
+: "${REBUILD_COMPLETED_FILE:?REBUILD_COMPLETED_FILE must name the completion marker}"
+: "${REBUILD_CONTROL_FILE:?REBUILD_CONTROL_FILE must name the control capture file}"
+
+printf '%s\n' "$$" > "$REBUILD_PID_FILE"
+printf '%s\n' "$*" > "$REBUILD_ARGS_FILE"
+start_time=$(awk '{print $22}' "/proc/$$/stat")
+printf '%s %s\n' "$$" "$start_time" >> "$REBUILD_LAUNCH_FILE"
+
+case "${REBUILD_FIXTURE_MODE:-hold}" in
+  hold)
+    printf '{"rebuild":"ready"}\n'
+    # A lifecycle manager must close stdin and wait for this child to exit;
+    # ignoring TERM prevents a test from mistaking a signal send for observed
+    # process termination. Production's Rust EOF guard exits promptly.
+    trap '' TERM
+    while IFS= read -r -n 1 byte; do
+      if [ "$byte" = $'\003' ]; then
+        printf 'cancel-byte\n' > "$REBUILD_CONTROL_FILE"
+        sleep "${REBUILD_EOF_EXIT_DELAY:-0}"
+        : > "$REBUILD_COMPLETED_FILE"
+        exit 130
+      fi
+    done
+    sleep "${REBUILD_EOF_EXIT_DELAY:-0}"
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  fail)
+    printf '{"rebuild":"ready"}\n'
+    printf '{"rebuild":"error","message":"controlled rebuild failure"}\n'
+    : > "$REBUILD_COMPLETED_FILE"
+    exit 42
+    ;;
+  flood)
+    printf '{"rebuild":"ready"}\n'
+    printf 'flood-started\n'
+    head -c 131072 /dev/zero | tr '\0' x
+    printf '\nTAIL: flood-complete\n'
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  pre_ready_error)
+    printf '{"rebuild":"error","message":"busy"}\n'
+    : > "$REBUILD_COMPLETED_FILE"
+    exit 75
+    ;;
+  no_ready)
+    cat >/dev/null
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  delayed_ready)
+    sleep 0.7
+    printf '{"rebuild":"ready"}\n'
+    while IFS= read -r -n 1 byte; do
+      if [ "$byte" = $'\003' ]; then
+        printf 'cancel-byte\n' > "$REBUILD_CONTROL_FILE"
+        exit 130
+      fi
+    done
+    : > "$REBUILD_COMPLETED_FILE"
+    ;;
+  *)
+    printf 'unknown REBUILD_FIXTURE_MODE: %s\n' "$REBUILD_FIXTURE_MODE" >&2
+    exit 64
+    ;;
+esac

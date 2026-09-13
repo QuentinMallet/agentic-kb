@@ -61,17 +61,7 @@ impl Runnable for Mcp {
 
 impl Mcp {
     pub fn execute(&self) -> Result<()> {
-        let mut paths = config::Paths::from_db(&self.db);
-        // Compatibility fallback for stores whose event/lock files live next
-        // to the explicitly selected database.
-        if let Some(dir) = self.db.parent() {
-            if !paths.events.exists() && dir.join("agent-kb-events.jsonl").exists() {
-                paths.events = dir.join("agent-kb-events.jsonl");
-                paths.lock = dir.join("agent-kb.lock");
-            }
-            paths.query_hits = dir.join("query-hits.db");
-        }
-        let paths = paths;
+        let paths = config::Paths::from_mcp_db(&self.db);
 
         // br-3gp: read KbConfig::inline_verify_k once at startup so MCP search
         // requests without an explicit override fall back to the configured cap
@@ -1567,7 +1557,7 @@ fn handle_rebuild(
 ) -> Value {
     use crate::commands::rebuild::Rebuild;
     let id = &req.id;
-    match (Rebuild).execute_with(paths, emb) {
+    match Rebuild::default().execute_with(paths, emb) {
         Ok(()) => {
             let read = events::read_events(&paths.events).ok();
             let rebuilt = read.as_ref().map(|r| r.events.len()).unwrap_or(0);

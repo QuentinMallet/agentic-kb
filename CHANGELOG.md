@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- MCP rebuilds are supervised by the OTP application. A `kb_rebuild` success
+  now means an existing rebuild is READY or a new worker acquired the selected
+  store's lifetime lock; completion is reported separately through bounded
+  diagnostics. Busy and pre-READY failures are errors, cancellation waits for
+  terminal exit, and inherited-stdin EOF terminates the worker.
+
+### Added
+
+- `kb rebuild --db <path>` selects an explicit database for rebuild. The
+  internal supervised launch mode remains private to the MCP application.
+
 ### Breaking
 
 - Effective in 0.3.0, MCP package authorization is removed. A connected client invokes all 17 advertised tools with the MCP process's OS credentials inside the user-selected repository/filesystem boundary. `--caller-id`, OPA/Rego setup, `OPA_BIN`, and caller-keyed rate limits are retired; `caller_id` remains rejected as an undeclared tool argument. Existing attribution is inert legacy data. Upgrades do not rewrite history. Downgrade after new caller-free audit candidate/record batch events requires a pre-upgrade database plus JSONL snapshot, or a compatible forward release, because 0.2.0 cannot replay those events.

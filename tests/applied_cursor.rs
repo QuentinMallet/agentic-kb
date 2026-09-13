@@ -1356,7 +1356,9 @@ fn test_rebuild_over_an_empty_log_leaves_a_current_cursor() {
     let (_dir, paths) = repo();
     fs::write(&paths.events, b"").unwrap();
     db::open_or_init(&paths).unwrap();
-    (Rebuild).execute_with(&paths, &FixedEmbedder).unwrap();
+    Rebuild::default()
+        .execute_with(&paths, &FixedEmbedder)
+        .unwrap();
 
     let conn = open_unchecked_for_test(&paths.db).unwrap();
     assert_eq!(cursor::inspect(&conn, &paths), Decision::NoOp);
@@ -1425,7 +1427,9 @@ fn test_a_full_rebuild_skips_quarantined_records() {
 
     // A rebuild that re-applied the dead-lettered event would fail on exactly
     // the record recovery already gave up on.
-    (Rebuild).execute_with(&paths, &PoisonEmbedder).unwrap();
+    Rebuild::default()
+        .execute_with(&paths, &PoisonEmbedder)
+        .unwrap();
     assert_eq!(live_ids(&paths), vec!["good".to_string()]);
 }
 

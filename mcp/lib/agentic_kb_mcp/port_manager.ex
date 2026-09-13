@@ -100,16 +100,6 @@ defmodule AgenticKbMcp.PortManager do
       }
   end
 
-  @doc """
-  Spawn `kb rebuild` as a separate OS process and return immediately.
-  The subprocess acquires the file lock, so concurrent writes queue safely.
-  Reads through the normal port continue unblocked during the rebuild.
-  """
-  @spec rebuild_async() :: :ok
-  def rebuild_async do
-    GenServer.cast(__MODULE__, :rebuild_async)
-  end
-
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
@@ -142,32 +132,6 @@ defmodule AgenticKbMcp.PortManager do
       {:error, reason} ->
         {:stop, reason}
     end
-  end
-
-  @impl true
-  def handle_cast(:rebuild_async, %{kb_bin: kb_bin, db_path: db_path} = state) do
-    # Derive repo root: <root>/agent-kb/agent-kb.db → <root>
-    repo_root = db_path |> Path.dirname() |> Path.dirname()
-    log = Path.join(Path.dirname(db_path), "rebuild.log")
-    # Shell double-fork: sh (port child) exits immediately after backgrounding
-    # kb rebuild. The grandchild is adopted by init and survives BEAM shutdown,
-    # so the agent can quit as soon as this cast returns.
-    # KB_BIN and LOG are passed via env to avoid shell injection.
-    {_output, exit_code} =
-      System.cmd("sh", ["-c", ~s("$KB_BIN" rebuild >"$LOG" 2>&1 &)],
-        cd: repo_root,
-        env: [{"KB_BIN", kb_bin}, {"LOG", log}]
-      )
-
-    if exit_code == 0 do
-      Logger.info("kb rebuild started in background (log: #{log})")
-    else
-      Logger.error(
-        "kb rebuild: sh exited #{exit_code} — rebuild may not have started (log: #{log})"
-      )
-    end
-
-    {:noreply, state}
   end
 
   @impl true
@@ -218,16 +182,8 @@ defmodule AgenticKbMcp.PortManager do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
-  def terminate(_reason, _state) do
-    # ADR-3 consequences: trapping exits obliges stating what happens to the
-    # `handle_cast(:rebuild_async, ...)` System.cmd child on shutdown. That
-    # child is a double-forked `kb rebuild` background job — System.cmd/3
-    # returns as soon as the backgrounding shell itself exits, so by the
-    # time rebuild_async/0's cast returns, the actual rebuild process is
-    # already adopted by init(1) and detached from this BEAM entirely. It is
-    # unaffected by this manager terminating (crash or normal shutdown
-    # alike); no cleanup is needed or possible here.
-    :ok
+  def terminate(_reason, %{port: port}) do
+    if Port.info(port), do: Port.close(port)
   end
 
   # ---------------------------------------------------------------------------

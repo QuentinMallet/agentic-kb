@@ -8,9 +8,13 @@ use crate::crash_sim::{kill_point, KillPoint};
 use abscissa_core::{Command, Runnable};
 use anyhow::Context;
 use clap::Parser;
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 /// Test-only hook: when set, `execute_with` waits on this barrier at the
 /// START of Phase 2 (after Phase 1 releases the lock, before replay begins).
@@ -339,14 +343,22 @@ fn full_rebuild_for(
             })?;
     } // release the write flock — Rebuild re-acquires it per phase
     eprintln!("kb: pre-upgrade DB backed up to {}", backup.display());
-    (Rebuild).execute_with(paths, embedder)?;
+    Rebuild::default().execute_with(paths, embedder)?;
     eprintln!("kb: rebuild complete.");
     Ok(true)
 }
 
 /// Replay all events and rebuild agent-kb.db from scratch
-#[derive(Command, Debug, Parser)]
-pub struct Rebuild;
+#[derive(Command, Debug, Default, Parser)]
+pub struct Rebuild {
+    /// Rebuild the explicitly selected agent-kb database.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+
+    /// Bind this direct child to its supervising OTP port's stdin lifetime.
+    #[arg(long, hide = true)]
+    pub supervised: bool,
+}
 
 impl Runnable for Rebuild {
     fn run(&self) {
@@ -360,9 +372,44 @@ impl Runnable for Rebuild {
 impl Rebuild {
     /// Execute the rebuild command.
     pub fn execute(&self) -> anyhow::Result<()> {
-        let paths = config::Paths::discover()?;
+        if self.supervised {
+            return self.execute_supervised();
+        }
+
+        let paths = self.resolve_paths()?;
         let embedder = make_embedder(&paths);
         self.execute_with(&paths, embedder.as_ref())
+    }
+
+    fn resolve_paths(&self) -> anyhow::Result<config::Paths> {
+        match &self.db {
+            Some(db) => Ok(config::Paths::from_mcp_db(db)),
+            None => config::Paths::discover(),
+        }
+    }
+
+    fn execute_supervised(&self) -> anyhow::Result<()> {
+        let output = SupervisedOutput::capture()?;
+
+        if let Err(error) = output.redirect_process_output() {
+            let _ = output.error(&format!("{error:#}"));
+            return Err(error);
+        }
+
+        let result = (|| {
+            arm_supervised_stdin_guard()?;
+            let paths = self.resolve_paths()?;
+            let _lifetime = acquire_supervised_lifetime_lock(&paths)?;
+            output.ready()?;
+            let embedder = make_embedder(&paths);
+            self.execute_with(&paths, embedder.as_ref())
+        })();
+
+        if let Err(error) = &result {
+            let _ = output.error(&format!("{error:#}"));
+        }
+
+        result
     }
 
     /// Execute with explicit paths and embedder (for testing).
@@ -420,7 +467,7 @@ impl Rebuild {
                 }
                 let bytes = match fs::read(&paths.events) {
                     Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
                     Err(error) => return Err(error.into()),
                 };
                 // The snapshot boundary must be a committed_len value: no span
@@ -677,6 +724,125 @@ impl Rebuild {
     }
 }
 
+/// Keep a supervised rebuild leaf bound to the stdin pipe owned by its OTP
+/// port. This is deliberately unavailable to ordinary CLI invocations.
+fn arm_supervised_stdin_guard() -> anyhow::Result<()> {
+    let (armed_tx, armed_rx) = mpsc::sync_channel(0);
+
+    thread::Builder::new()
+        .name("kb-rebuild-stdin-guard".to_owned())
+        .spawn(move || {
+            // The parent waits until this thread owns stdin before any path
+            // discovery or replay work starts. The guard never writes stdout.
+            let mut stdin = io::stdin().lock();
+            let _ = armed_tx.send(());
+            let mut byte = [0_u8; 1];
+
+            let status = supervised_guard_exit_status(stdin.read(&mut byte), byte[0]);
+
+            std::process::exit(status);
+        })
+        .context("spawn supervised rebuild stdin guard")?;
+
+    armed_rx
+        .recv()
+        .context("arm supervised rebuild stdin guard")?;
+    Ok(())
+}
+
+fn supervised_guard_exit_status(read: io::Result<usize>, byte: u8) -> i32 {
+    match read {
+        Ok(0) => 130,
+        Ok(1) if byte == 0x03 => 130,
+        // A supervised child accepts no work on stdin. Any other byte is a
+        // protocol violation and must stop it before work.
+        Ok(_) | Err(_) => 129,
+    }
+}
+
+const SUPERVISED_DIAGNOSTIC_LIMIT: usize = 512;
+
+struct SupervisedOutput {
+    control: fs::File,
+}
+
+impl SupervisedOutput {
+    fn capture() -> anyhow::Result<Self> {
+        let control = rustix::io::dup(io::stdout())
+            .context("duplicate supervised rebuild stdout control descriptor")?;
+        Ok(Self {
+            control: control.into(),
+        })
+    }
+
+    fn redirect_process_output(&self) -> anyhow::Result<()> {
+        let null = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .context("open /dev/null for supervised rebuild output")?;
+        rustix::stdio::dup2_stdout(&null).context("suppress supervised rebuild stdout")?;
+        rustix::stdio::dup2_stderr(&null).context("suppress supervised rebuild stderr")?;
+        Ok(())
+    }
+
+    fn ready(&self) -> anyhow::Result<()> {
+        self.write_frame(serde_json::json!({"rebuild": "ready"}))
+    }
+
+    fn error(&self, diagnostic: &str) -> anyhow::Result<()> {
+        self.write_frame(serde_json::json!({
+            "rebuild": "error",
+            "message": bounded_supervised_diagnostic(diagnostic),
+        }))
+    }
+
+    fn write_frame(&self, frame: serde_json::Value) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(&frame).context("encode supervised rebuild frame")?;
+        let mut control = &self.control;
+        control
+            .write_all(&bytes)
+            .and_then(|()| control.write_all(b"\n"))
+            .context("write supervised rebuild frame")
+    }
+}
+
+fn bounded_supervised_diagnostic(diagnostic: &str) -> &str {
+    if diagnostic.len() <= SUPERVISED_DIAGNOSTIC_LIMIT {
+        return diagnostic;
+    }
+
+    let end = diagnostic
+        .char_indices()
+        .take_while(|(index, _)| *index <= SUPERVISED_DIAGNOSTIC_LIMIT)
+        .map(|(index, character)| index + character.len_utf8())
+        .take_while(|end| *end <= SUPERVISED_DIAGNOSTIC_LIMIT)
+        .last()
+        .unwrap_or_default();
+    &diagnostic[..end]
+}
+
+fn supervised_lifetime_lock_path(paths: &config::Paths) -> PathBuf {
+    paths.lock.with_extension("rebuild-lifetime.lock")
+}
+
+fn acquire_supervised_lifetime_lock(paths: &config::Paths) -> anyhow::Result<fs::File> {
+    let path = supervised_lifetime_lock_path(paths);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open supervised rebuild lifetime lock {}", path.display()))?;
+    lock.try_lock_exclusive().with_context(|| {
+        format!(
+            "acquire supervised rebuild lifetime lock {}",
+            path.display()
+        )
+    })?;
+    Ok(lock)
+}
+
 struct TmpDbGuard {
     path: PathBuf,
     armed: bool,
@@ -783,7 +949,7 @@ fn checkpoint_live_db(db_path: &Path) -> anyhow::Result<Option<rusqlite::Connect
         }
         last_busy = busy;
         if attempt < ATTEMPTS {
-            std::thread::sleep(RETRY_DELAY);
+            thread::sleep(RETRY_DELAY);
         }
     }
     anyhow::bail!(
@@ -814,7 +980,7 @@ fn verify_live_wal_drained(db_path: &Path) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("stat live WAL {}", wal.display())),
     }
 }
@@ -895,6 +1061,64 @@ mod tests {
         (dir, paths)
     }
 
+    #[test]
+    fn supervised_guard_accepts_only_eof_or_the_reserved_cancel_byte() {
+        assert_eq!(supervised_guard_exit_status(Ok(0), 0), 130);
+        assert_eq!(supervised_guard_exit_status(Ok(1), 0x03), 130);
+        assert_eq!(supervised_guard_exit_status(Ok(1), b'\n'), 129);
+        assert_eq!(
+            supervised_guard_exit_status(Err(io::Error::other("read failed")), 0),
+            129
+        );
+    }
+
+    #[test]
+    fn supervised_diagnostic_truncation_preserves_utf8_boundaries() {
+        let input = format!("{}é", "x".repeat(SUPERVISED_DIAGNOSTIC_LIMIT - 1));
+        let bounded = bounded_supervised_diagnostic(&input);
+        assert_eq!(bounded, "x".repeat(SUPERVISED_DIAGNOSTIC_LIMIT - 1));
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.len() <= SUPERVISED_DIAGNOSTIC_LIMIT);
+    }
+
+    #[test]
+    fn rebuild_cli_accepts_explicit_canonical_db_with_supervised_guard() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join(".state/agent-kb/agent-kb.db");
+
+        let parsed =
+            Rebuild::try_parse_from(["rebuild", "--db", db.to_str().unwrap(), "--supervised"]);
+
+        assert!(
+            parsed.is_ok(),
+            "OTP-owned rebuild must accept its explicit canonical database and private guard"
+        );
+    }
+
+    #[test]
+    fn rebuild_cli_accepts_adjacent_legacy_db_with_supervised_guard() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("legacy-store/agent-kb.db");
+
+        let parsed =
+            Rebuild::try_parse_from(["rebuild", "--db", db.to_str().unwrap(), "--supervised"]);
+
+        assert!(
+            parsed.is_ok(),
+            "OTP-owned rebuild must accept an explicitly selected adjacent legacy store"
+        );
+    }
+
+    #[test]
+    fn supervised_rebuild_guard_is_an_internal_cli_switch() {
+        let parsed = Rebuild::try_parse_from(["rebuild", "--supervised"]);
+
+        assert!(
+            parsed.is_ok(),
+            "the EOF parent-lifetime guard must be selectable only by the OTP child argv"
+        );
+    }
+
     fn upsert(id: &str, idx: u32) -> serde_json::Value {
         serde_json::json!({
             "action": "upsert", "table": "entries",
@@ -972,7 +1196,7 @@ mod tests {
                 std::process::exit(0);
             }
             "rebuild" => {
-                let result = Rebuild.execute_with(&paths, &NoopEmbedder);
+                let result = Rebuild::default().execute_with(&paths, &NoopEmbedder);
                 panic!("child rebuild returned {result:?} without hitting the kill point");
             }
             other => panic!("unknown swap crash role {other:?}"),
@@ -1124,7 +1348,9 @@ mod tests {
         for idx in 0..SWAP_SEEDED {
             events::append_event(&paths.events, &upsert(&format!("swap{idx}"), idx)).unwrap();
         }
-        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, &NoopEmbedder)
+            .unwrap();
 
         // Header bytes 18/19 are the write/read file format versions: 2 means
         // WAL. This is the regression test for the self-heal C2's open_ro
@@ -1174,7 +1400,7 @@ mod tests {
             .unwrap();
         assert_eq!(held, SWAP_SEEDED as i64);
 
-        let error = Rebuild
+        let error = Rebuild::default()
             .execute_with(&paths, &NoopEmbedder)
             .expect_err("a persistently busy checkpoint must abort the rebuild");
         let message = format!("{error:#}");
@@ -1208,7 +1434,7 @@ mod tests {
         let emb = NoopEmbedder;
         events::append_event(&paths.events, &upsert("rb1", 1)).unwrap();
         events::append_event(&paths.events, &upsert("rb2", 2)).unwrap();
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 2);
     }
 
@@ -1222,7 +1448,7 @@ mod tests {
             &["rb-hit".to_string()],
             "test",
         );
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 1);
         assert_eq!(
             crate::components::query_hits::counts(&paths.query_hits).unwrap(),
@@ -1238,7 +1464,7 @@ mod tests {
         fs::write(&paths.events, "").unwrap();
         insert_expired_peer(&paths);
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         let conn = db::open_unchecked_for_test(&paths.db).unwrap();
         let peers: i64 = conn
@@ -1272,7 +1498,7 @@ mod tests {
             .unwrap();
         assert_eq!(count_entries(&paths), 0);
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         assert_eq!(count_entries(&paths), 10, "rebuild must restore all events");
     }
 
@@ -1305,7 +1531,7 @@ mod tests {
             Arc::clone(&attempts),
         );
         thread::scope(|scope| {
-            let handle = scope.spawn(|| Rebuild.execute_with(paths, &NoopEmbedder));
+            let handle = scope.spawn(|| Rebuild::default().execute_with(paths, &NoopEmbedder));
             started.wait();
             mutation();
             done.wait();
@@ -1399,7 +1625,9 @@ mod tests {
         fs::write(&abandoned, b"abandoned").unwrap();
         fs::write(&journal, b"journal").unwrap();
 
-        Rebuild.execute_with(&paths, &NoopEmbedder).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, &NoopEmbedder)
+            .unwrap();
 
         assert!(!abandoned.exists());
         assert!(!journal.exists());
@@ -1474,7 +1702,7 @@ mod tests {
         });
 
         // First rebuild runs concurrently with Worker A.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         worker_a.join().unwrap();
 
         // Worker B writes evidence_add events after Worker A finishes to avoid
@@ -1485,7 +1713,7 @@ mod tests {
         }
 
         // All events are now in the log.  A second rebuild guarantees convergence.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         // Verify DB == Materialize(all events in log).
         let all_events = events::read_events(&paths.events).unwrap();
@@ -1580,11 +1808,11 @@ mod tests {
             }
         });
 
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
         writer.join().unwrap();
 
         // All 30 events are now in the log.  A second rebuild converges the DB.
-        Rebuild.execute_with(&paths, &emb).unwrap();
+        Rebuild::default().execute_with(&paths, &emb).unwrap();
 
         let log_len = events::read_events(&paths.events).unwrap().events.len() as i64;
         assert_eq!(log_len, 30);
@@ -1721,8 +1949,9 @@ mod tests {
 
         let paths_rebuild = clone_paths(&paths);
         let emb_rebuild = Arc::clone(&emb);
-        let rebuild_handle =
-            thread::spawn(move || Rebuild.execute_with(&paths_rebuild, emb_rebuild.as_ref()));
+        let rebuild_handle = thread::spawn(move || {
+            Rebuild::default().execute_with(&paths_rebuild, emb_rebuild.as_ref())
+        });
         let writer_handles: Vec<_> = (0..WRITERS)
             .map(|w| {
                 spawn_writer(
@@ -1897,7 +2126,9 @@ mod tests {
         // regression. Keep failing only when the measurement itself is invalid.
 
         // Second rebuild: guarantees DB == Materialize(all events in log).
-        Rebuild.execute_with(&paths, emb.as_ref()).unwrap();
+        Rebuild::default()
+            .execute_with(&paths, emb.as_ref())
+            .unwrap();
 
         // AC2: no malformed JSONL — every line parses as valid JSON.
         let log_content =

@@ -18,6 +18,12 @@ exec 2>/dev/null
 
 set -uo pipefail
 
+if [ "${1:-}" = "rebuild" ]; then
+  printf '{"rebuild":"ready"}\n'
+  while IFS= read -r _line; do :; done
+  exit 0
+fi
+
 audit_state=$(mktemp "${TMPDIR:-/tmp}/agentic-kb-audit.XXXXXX")
 trap 'rm -f "$audit_state"' EXIT
 

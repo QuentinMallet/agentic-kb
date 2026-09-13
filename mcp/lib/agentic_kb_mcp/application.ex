@@ -26,6 +26,7 @@ defmodule AgenticKbMcp.Application do
 
       [
         {AgenticKbMcp.PortManager, db_path: db_path, kb_bin: kb_bin, name: port_manager_name},
+        {AgenticKbMcp.RebuildManager, db_path: db_path, kb_bin: kb_bin},
         {AgenticKbMcp.McpServer, mcp_opts}
       ]
     else

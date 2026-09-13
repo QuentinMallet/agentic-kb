@@ -294,6 +294,26 @@ impl Paths {
         }
         paths
     }
+
+    /// Resolve an explicitly selected database exactly as the MCP port does.
+    ///
+    /// Canonical stores use the repository `.state/` layout. For a canonical
+    /// database whose event log and lock instead live beside that database,
+    /// retain the MCP compatibility fallback so direct rebuild workers operate
+    /// on the same store as the long-lived MCP port.
+    pub fn from_mcp_db(db: &Path) -> Self {
+        let mut paths = Self::from_db(db);
+
+        if let Some(dir) = db.parent() {
+            if !paths.events.exists() && dir.join("agent-kb-events.jsonl").exists() {
+                paths.events = dir.join("agent-kb-events.jsonl");
+                paths.lock = dir.join("agent-kb.lock");
+            }
+            paths.query_hits = dir.join("query-hits.db");
+        }
+
+        paths
+    }
 }
 
 /// Derive a repository root from a canonical or legacy database path.

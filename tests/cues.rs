@@ -264,7 +264,7 @@ fn test_rebuild_replays_cue_rows() {
     );
 
     // Rebuild from the event log into a fresh DB (spec Rebuild action).
-    (Rebuild).execute_with(&paths, &emb).unwrap();
+    Rebuild::default().execute_with(&paths, &emb).unwrap();
 
     let after = live_cues(&paths);
     assert_eq!(after, before, "rebuild must rematerialize cue rows exactly");

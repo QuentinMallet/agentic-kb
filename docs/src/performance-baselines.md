@@ -36,7 +36,7 @@ cargo nextest run
 `cargo test` remains supported; use the same fast tier explicitly if needed:
 
 ```bash
-PROPTEST_CASES=16 cargo test
+PROPTEST_CASES=16 cargo test -- --test-threads=1
 ```
 
 Run the pre-merge full tier like this:
@@ -48,8 +48,12 @@ PROPTEST_CASES=256 cargo nextest run -P full
 If `cargo-nextest` is unavailable, the equivalent full-tier fallback is:
 
 ```bash
-PROPTEST_CASES=256 cargo test
+PROPTEST_CASES=256 cargo test -- --test-threads=1
 ```
+
+The plain `cargo test` fallback is serial because a small set of legacy tests
+temporarily changes the process-global current working directory. `nextest`
+isolates each test process and is therefore the normal parallel runner.
 
 Expectations for this split:
 

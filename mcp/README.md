@@ -33,6 +33,16 @@ Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_do
 and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
 be found at <https://hexdocs.pm/agentic_kb_mcp>.
 
+## Supervised rebuilds
+
+`kb_rebuild` acknowledges an accepted or already-READY rebuild; it does not
+report replay completion. The OTP application owns the direct Rust worker,
+which acquires the selected store's lifetime lock before READY. Busy recovery
+candidates return an error, cancellation waits for terminal exit, and
+inherited-stdin EOF stops the worker. The internal supervised launch mode is
+not a public MCP or CLI API. See [the MCP lifecycle
+contract](../docs/src/mcp.md#supervised-rebuild-lifecycle).
+
 ## Internal peer-graph port methods
 
 The Rust line-JSON port implements `kb_peers_add`, `kb_peers_list`, and
