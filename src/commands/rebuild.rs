@@ -349,7 +349,7 @@ fn full_rebuild_for(
 }
 
 /// Replay all events and rebuild agent-kb.db from scratch
-#[derive(Command, Debug, Parser)]
+#[derive(Command, Debug, Default, Parser)]
 pub struct Rebuild {
     /// Rebuild the explicitly selected agent-kb database.
     #[arg(long)]
@@ -358,15 +358,6 @@ pub struct Rebuild {
     /// Bind this direct child to its supervising OTP port's stdin lifetime.
     #[arg(long, hide = true)]
     pub supervised: bool,
-}
-
-impl Default for Rebuild {
-    fn default() -> Self {
-        Self {
-            db: None,
-            supervised: false,
-        }
-    }
 }
 
 impl Runnable for Rebuild {
@@ -840,6 +831,7 @@ fn acquire_supervised_lifetime_lock(paths: &config::Paths) -> anyhow::Result<fs:
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&path)
         .with_context(|| format!("open supervised rebuild lifetime lock {}", path.display()))?;
     lock.try_lock_exclusive().with_context(|| {

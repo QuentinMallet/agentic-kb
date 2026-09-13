@@ -147,6 +147,7 @@ fn supervised_rebuild_serializes_restart_contenders_for_the_selected_canonical_s
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(selected_lock)
         .unwrap();
     lock.lock_exclusive().unwrap();
