@@ -31,3 +31,23 @@
 .claude/backups/
 # br doctor per-run artifacts
 .doctor/
+
+# TLC model-checker output. This is the branch that accumulated 4013 blobs /
+# 2.4 GB of these; removing them needed a filter-repo rewrite and a force-push
+# (2026-09-23). The working tree was already clean at the time -- the files had
+# been deleted, only history held them -- so nothing but this rule stops a
+# repeat. TLC states are regenerable output and never belong in git.
+agent-kb/tla/states/
+
+# Crash artifacts. A core dump is process memory; never commit one.
+core.*
+*.log
+
+# SQLite side-files and migration backups of the tracked KB. agent-kb.db and
+# agent-kb-events.jsonl ARE tracked here deliberately -- do NOT add a blanket
+# agent-kb/ rule, it would stop new KB files being committed.
+agent-kb/*.db.tmp*
+agent-kb/*.db-shm
+agent-kb/*.db-wal
+agent-kb/*.db.pre-v*.bak
+agent-kb/*.stamp
