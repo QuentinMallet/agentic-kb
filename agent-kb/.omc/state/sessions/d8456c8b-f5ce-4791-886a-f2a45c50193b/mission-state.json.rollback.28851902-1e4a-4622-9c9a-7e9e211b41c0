@@ -1,0 +1,61 @@
+{
+  "updatedAt": "2026-09-05T17:12:37.987Z",
+  "missions": [
+    {
+      "id": "session:d8456c8b-f5ce-4791-886a-f2a45c50193b:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-09-05T17:07:21.881Z",
+      "updatedAt": "2026-09-05T17:12:37.987Z",
+      "status": "done",
+      "workerCount": 1,
+      "taskCounts": {
+        "total": 1,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 0,
+        "completed": 1,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "impl-t2a-fixture:aimpl-t",
+          "role": "impl-t2a-fixture",
+          "ownership": "aimpl-t2a-fixture-723e4c8ef9095d23",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-09-05T17:12:37.987Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-start:aimpl-t2a-fixture-723e4c8ef9095d23:2026-09-05T17:07:21.881Z",
+          "at": "2026-09-05T17:07:21.881Z",
+          "kind": "update",
+          "agent": "impl-t2a-fixture:aimpl-t",
+          "detail": "started impl-t2a-fixture:aimpl-t",
+          "sourceKey": "session-start:aimpl-t2a-fixture-723e4c8ef9095d23"
+        },
+        {
+          "id": "session-stop:averify-agg-c1-5bebe172fa3eaeb4:2026-09-05T17:09:04.998Z",
+          "at": "2026-09-05T17:09:04.998Z",
+          "kind": "completion",
+          "agent": "impl-t2a-fixture:aimpl-t",
+          "detail": "completed",
+          "sourceKey": "session-stop:averify-agg-c1-5bebe172fa3eaeb4"
+        },
+        {
+          "id": "session-stop:aimpl-v4b-ecc6d421a8bcccf3:2026-09-05T17:12:37.987Z",
+          "at": "2026-09-05T17:12:37.987Z",
+          "kind": "completion",
+          "agent": "impl-t2a-fixture:aimpl-t",
+          "detail": "completed",
+          "sourceKey": "session-stop:aimpl-v4b-ecc6d421a8bcccf3"
+        }
+      ]
+    }
+  ]
+}

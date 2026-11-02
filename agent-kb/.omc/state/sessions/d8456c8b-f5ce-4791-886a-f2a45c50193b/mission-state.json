@@ -1,0 +1,99 @@
+{
+  "updatedAt": "2026-09-05T17:45:21.542Z",
+  "missions": [
+    {
+      "id": "session:d8456c8b-f5ce-4791-886a-f2a45c50193b:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-09-05T17:07:21.881Z",
+      "updatedAt": "2026-09-05T17:45:21.542Z",
+      "status": "running",
+      "workerCount": 4,
+      "taskCounts": {
+        "total": 4,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 2,
+        "completed": 2,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "impl-t2a-fixture:aimpl-t",
+          "role": "impl-t2a-fixture",
+          "ownership": "aimpl-t2a-fixture-723e4c8ef9095d23",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-09-05T17:37:44.492Z"
+        },
+        {
+          "name": "impl-v4b:aimpl-v",
+          "role": "impl-v4b",
+          "ownership": "aimpl-v4b-ecc6d421a8bcccf3",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-05T17:37:29.137Z"
+        },
+        {
+          "name": "rev-rebase-c3:arev-re",
+          "role": "rev-rebase-c3",
+          "ownership": "arev-rebase-c3-8c3160fda8b5f70d",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-05T17:40:00.976Z"
+        },
+        {
+          "name": "rev-t2a-fixture:arev-t2",
+          "role": "rev-t2a-fixture",
+          "ownership": "arev-t2a-fixture-c1e4cdea9ca11214",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-09-05T17:45:21.542Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-stop:arebase-c3-agg-8fac66cfda49da9b:2026-09-05T17:37:44.492Z",
+          "at": "2026-09-05T17:37:44.492Z",
+          "kind": "completion",
+          "agent": "impl-t2a-fixture:aimpl-t",
+          "detail": "completed",
+          "sourceKey": "session-stop:arebase-c3-agg-8fac66cfda49da9b"
+        },
+        {
+          "id": "session-start:arev-rebase-c3-8c3160fda8b5f70d:2026-09-05T17:40:00.976Z",
+          "at": "2026-09-05T17:40:00.976Z",
+          "kind": "update",
+          "agent": "rev-rebase-c3:arev-re",
+          "detail": "started rev-rebase-c3:arev-re",
+          "sourceKey": "session-start:arev-rebase-c3-8c3160fda8b5f70d"
+        },
+        {
+          "id": "session-start:arev-t2a-fixture-c1e4cdea9ca11214:2026-09-05T17:40:12.976Z",
+          "at": "2026-09-05T17:40:12.976Z",
+          "kind": "update",
+          "agent": "rev-t2a-fixture:arev-t2",
+          "detail": "started rev-t2a-fixture:arev-t2",
+          "sourceKey": "session-start:arev-t2a-fixture-c1e4cdea9ca11214"
+        },
+        {
+          "id": "session-stop:arev-t2a-fixture-c1e4cdea9ca11214:2026-09-05T17:45:21.542Z",
+          "at": "2026-09-05T17:45:21.542Z",
+          "kind": "completion",
+          "agent": "rev-t2a-fixture:arev-t2",
+          "detail": "completed",
+          "sourceKey": "session-stop:arev-t2a-fixture-c1e4cdea9ca11214"
+        }
+      ]
+    }
+  ]
+}

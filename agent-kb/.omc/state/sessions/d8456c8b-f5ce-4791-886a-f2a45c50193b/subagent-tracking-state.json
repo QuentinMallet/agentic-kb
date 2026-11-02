@@ -1,0 +1,88 @@
+{
+  "agents": [
+    {
+      "agent_id": "aimpl-t2a-fixture-723e4c8ef9095d23",
+      "agent_type": "impl-t2a-fixture",
+      "started_at": "2026-09-05T17:07:21.881Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:36:01.436Z",
+      "duration_ms": 1719555,
+      "output_summary": "Marked as stale during unmatched stop reconciliation - exceeded timeout"
+    },
+    {
+      "agent_id": "averify-agg-c1-5bebe172fa3eaeb4",
+      "agent_type": "verify-agg-c1",
+      "started_at": "2026-09-05T17:09:04.998Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:09:04.998Z",
+      "synthetic": true,
+      "telemetry_status": "unmatched_stop",
+      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
+    },
+    {
+      "agent_id": "aimpl-v4b-ecc6d421a8bcccf3",
+      "agent_type": "impl-v4b",
+      "started_at": "2026-09-05T17:37:29.137Z",
+      "parent_mode": "none",
+      "status": "running",
+      "synthetic": true,
+      "telemetry_status": "unmatched_stop",
+      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
+    },
+    {
+      "agent_id": "asec-v4b-84d29a18a95515c6",
+      "agent_type": "sec-v4b",
+      "started_at": "2026-09-05T17:30:26.664Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:30:26.664Z",
+      "synthetic": true,
+      "telemetry_status": "unmatched_stop",
+      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
+    },
+    {
+      "agent_id": "arev-v4b-571c9349590a0599",
+      "agent_type": "rev-v4b",
+      "started_at": "2026-09-05T17:32:52.452Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:32:52.452Z",
+      "synthetic": true,
+      "telemetry_status": "unmatched_stop",
+      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
+    },
+    {
+      "agent_id": "arebase-c3-agg-8fac66cfda49da9b",
+      "agent_type": "rebase-c3-agg",
+      "started_at": "2026-09-05T17:37:44.492Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:37:44.492Z",
+      "synthetic": true,
+      "telemetry_status": "unmatched_stop",
+      "telemetry_note": "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."
+    },
+    {
+      "agent_id": "arev-rebase-c3-8c3160fda8b5f70d",
+      "agent_type": "rev-rebase-c3",
+      "started_at": "2026-09-05T17:40:00.976Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "arev-t2a-fixture-c1e4cdea9ca11214",
+      "agent_type": "rev-t2a-fixture",
+      "started_at": "2026-09-05T17:40:12.976Z",
+      "parent_mode": "none",
+      "status": "completed",
+      "completed_at": "2026-09-05T17:45:21.542Z",
+      "duration_ms": 308566
+    }
+  ],
+  "total_spawned": 4,
+  "total_completed": 7,
+  "total_failed": 1,
+  "last_updated": "2026-09-05T17:45:21.560Z"
+}

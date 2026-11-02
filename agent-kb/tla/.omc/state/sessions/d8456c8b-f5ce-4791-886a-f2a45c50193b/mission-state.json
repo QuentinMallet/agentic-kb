@@ -1,0 +1,101 @@
+{
+  "updatedAt": "2026-09-04T12:46:18.321Z",
+  "missions": [
+    {
+      "id": "session:d8456c8b-f5ce-4791-886a-f2a45c50193b:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-09-04T12:13:11.204Z",
+      "updatedAt": "2026-09-04T12:46:18.321Z",
+      "status": "running",
+      "workerCount": 5,
+      "taskCounts": {
+        "total": 5,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 5,
+        "completed": 0,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "review-c1-t0ab-specs:areview",
+          "role": "review-c1-t0ab-specs",
+          "ownership": "areview-c1-t0ab-specs-70a2b64ff27f5e54",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-04T12:13:11.204Z"
+        },
+        {
+          "name": "audit-c1-t0ab-specs:aaudit-",
+          "role": "audit-c1-t0ab-specs",
+          "ownership": "aaudit-c1-t0ab-specs-8289fe5b4db8843e",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-04T12:13:27.468Z"
+        },
+        {
+          "name": "rework-t0a-durablebatch:arework",
+          "role": "rework-t0a-durablebatch",
+          "ownership": "arework-t0a-durablebatch-509feff4b721ee07",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-04T12:45:41.477Z"
+        },
+        {
+          "name": "fixup-t0b-rebuild:afixup-",
+          "role": "fixup-t0b-rebuild",
+          "ownership": "afixup-t0b-rebuild-8fe754e190ba960c",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-04T12:45:58.058Z"
+        },
+        {
+          "name": "fixup-c2-t1-port:afixup-",
+          "role": "fixup-c2-t1-port",
+          "ownership": "afixup-c2-t1-port-6a790a95f46c7fa2",
+          "status": "running",
+          "currentStep": null,
+          "latestUpdate": null,
+          "completedSummary": null,
+          "updatedAt": "2026-09-04T12:46:18.321Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-start:arework-t0a-durablebatch-509feff4b721ee07:2026-09-04T12:45:41.477Z",
+          "at": "2026-09-04T12:45:41.477Z",
+          "kind": "update",
+          "agent": "rework-t0a-durablebatch:arework",
+          "detail": "started rework-t0a-durablebatch:arework",
+          "sourceKey": "session-start:arework-t0a-durablebatch-509feff4b721ee07"
+        },
+        {
+          "id": "session-start:afixup-t0b-rebuild-8fe754e190ba960c:2026-09-04T12:45:58.058Z",
+          "at": "2026-09-04T12:45:58.058Z",
+          "kind": "update",
+          "agent": "fixup-t0b-rebuild:afixup-",
+          "detail": "started fixup-t0b-rebuild:afixup-",
+          "sourceKey": "session-start:afixup-t0b-rebuild-8fe754e190ba960c"
+        },
+        {
+          "id": "session-start:afixup-c2-t1-port-6a790a95f46c7fa2:2026-09-04T12:46:18.321Z",
+          "at": "2026-09-04T12:46:18.321Z",
+          "kind": "update",
+          "agent": "fixup-c2-t1-port:afixup-",
+          "detail": "started fixup-c2-t1-port:afixup-",
+          "sourceKey": "session-start:afixup-c2-t1-port-6a790a95f46c7fa2"
+        }
+      ]
+    }
+  ]
+}

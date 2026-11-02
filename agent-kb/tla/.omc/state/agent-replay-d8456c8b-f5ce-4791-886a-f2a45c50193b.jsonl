@@ -1,0 +1,5 @@
+{"t":0,"agent":"areview","agent_type":"review-c1-t0ab-specs","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"aaudit-","agent_type":"audit-c1-t0ab-specs","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"arework","agent_type":"rework-t0a-durablebatch","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"afixup-","agent_type":"fixup-t0b-rebuild","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"afixup-","agent_type":"fixup-c2-t1-port","event":"agent_start","parent_mode":"none"}

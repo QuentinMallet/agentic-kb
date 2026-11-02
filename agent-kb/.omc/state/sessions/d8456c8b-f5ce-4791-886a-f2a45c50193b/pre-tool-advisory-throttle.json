@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "entries": {
+    "445ed27a3872b681d98190bae61ccb84954e1bc4e140df5370be958dee776b3a": {
+      "last_emitted_at_ms": 1788630307767,
+      "message": "Verify changes work after editing. Test functionality before marking complete."
+    },
+    "466399dafa2d20f60587180bad0a07358eb7f2bce724df0ff682f038ad33f5ad": {
+      "last_emitted_at_ms": 1788630305961,
+      "message": "Read multiple files in parallel when possible for faster analysis."
+    },
+    "79a93d4a2f8f50b95f852280616242fee1855dc99a3c75211917f55e72e95fae": {
+      "last_emitted_at_ms": 1788630207562,
+      "message": "Use parallel execution for independent tasks. Use run_in_background for long operations (npm install, builds, tests)."
+    },
+    "fb50a74b206ca9b2bb19f919bcf623b015abe7af044ecaad4ac0e98571d37af1": {
+      "last_emitted_at_ms": 1788630010299,
+      "message": "Spawning agent: code-reviewer (sonnet) | Task: Review vendored corpus fixture commit | Active agents: 2"
+    },
+    "d633e7025c2171354eaa5dd980de039f3c0906b680d574c10aa62defbe9d594d": {
+      "last_emitted_at_ms": 1788628486622,
+      "message": "Spawning agent: security-reviewer (opus) | Task: Security review of V4b containment change"
+    },
+    "604d959953cfe78ccec87a45143979b2db21c0cd8bde1582373f501e241b0cd1": {
+      "last_emitted_at_ms": 1788628469942,
+      "message": "[SLOP WARNING] Detected fallback/workaround language in this tool input. Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. For architecture concerns, consult the architect for a concrete design first. If this seems environment-specific, ask the user to confirm constraints before proceeding.\n\nSpawning agent: code-reviewer (opus) | Task: Review V4b symlink parity"
+    },
+    "3a542848f94db22619cca9db7fe3d0186d65f83d138fcd89626e8750de6ee28b": {
+      "last_emitted_at_ms": 1788628039462,
+      "message": "Spawning agent: executor (sonnet) | Task: Build, test, commit vendored corpus fixture"
+    }
+  },
+  "updated_at": "2026-09-05T17:45:07.767Z"
+}

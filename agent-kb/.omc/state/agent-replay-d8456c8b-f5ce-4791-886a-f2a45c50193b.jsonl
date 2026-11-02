@@ -1,0 +1,12 @@
+{"t":0,"agent":"aimpl-t","agent_type":"impl-t2a-fixture","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"averify","agent_type":"verify-agg-c1","event":"agent_stop","success":true,"synthetic":true,"telemetry_status":"unmatched_stop","reason":"SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."}
+{"t":0,"agent":"aimpl-v","agent_type":"impl-v4b","event":"agent_stop","success":true,"synthetic":true,"telemetry_status":"unmatched_stop","reason":"SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."}
+{"t":0,"agent":"arev-v4","agent_type":"rev-v4b","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"asec-v4","agent_type":"sec-v4b","event":"agent_stop","success":true,"synthetic":true,"telemetry_status":"unmatched_stop","reason":"SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."}
+{"t":0,"agent":"arev-v4","agent_type":"rev-v4b","event":"agent_stop","success":true,"synthetic":true,"telemetry_status":"unmatched_stop","reason":"SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."}
+{"t":0,"agent":"aimpl-t","agent_type":"impl-t2a-fixture","event":"agent_stop","success":true,"duration_ms":1719555}
+{"t":0,"agent":"aimpl-v","agent_type":"impl-v4b","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"arebase","agent_type":"rebase-c3-agg","event":"agent_stop","success":true,"synthetic":true,"telemetry_status":"unmatched_stop","reason":"SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed."}
+{"t":0,"agent":"arev-re","agent_type":"rev-rebase-c3","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"arev-t2","agent_type":"rev-t2a-fixture","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"arev-t2","agent_type":"rev-t2a-fixture","event":"agent_stop","success":true,"duration_ms":308566}

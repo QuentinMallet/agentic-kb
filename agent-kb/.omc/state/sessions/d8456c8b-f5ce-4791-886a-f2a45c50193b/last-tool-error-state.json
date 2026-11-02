@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"until [ \\\"$(cut -d. -f1 /proc/loadavg)\\\" -lt 8 ] && ! pgrep -f 'cargo|rustc|nextest|beam.smp' >/dev/null; do sleep 30; done; echo \\\"QUIET at $(date -Iseconds), load=$(cat /proc/loadavg)\\\"\"...",
+  "error": "Exit code 143\nCommand timed out after 10m 0s",
+  "timestamp": "2026-09-05T17:40:26.584Z",
+  "retry_count": 1
+}

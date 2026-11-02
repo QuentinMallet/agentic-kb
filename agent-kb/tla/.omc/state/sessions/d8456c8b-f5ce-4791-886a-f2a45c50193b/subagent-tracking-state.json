@@ -1,0 +1,43 @@
+{
+  "agents": [
+    {
+      "agent_id": "areview-c1-t0ab-specs-70a2b64ff27f5e54",
+      "agent_type": "review-c1-t0ab-specs",
+      "started_at": "2026-09-04T12:13:11.204Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "aaudit-c1-t0ab-specs-8289fe5b4db8843e",
+      "agent_type": "audit-c1-t0ab-specs",
+      "started_at": "2026-09-04T12:13:27.468Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "arework-t0a-durablebatch-509feff4b721ee07",
+      "agent_type": "rework-t0a-durablebatch",
+      "started_at": "2026-09-04T12:45:41.477Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "afixup-t0b-rebuild-8fe754e190ba960c",
+      "agent_type": "fixup-t0b-rebuild",
+      "started_at": "2026-09-04T12:45:58.058Z",
+      "parent_mode": "none",
+      "status": "running"
+    },
+    {
+      "agent_id": "afixup-c2-t1-port-6a790a95f46c7fa2",
+      "agent_type": "fixup-c2-t1-port",
+      "started_at": "2026-09-04T12:46:18.321Z",
+      "parent_mode": "none",
+      "status": "running"
+    }
+  ],
+  "total_spawned": 5,
+  "total_completed": 0,
+  "total_failed": 0,
+  "last_updated": "2026-09-04T12:46:18.493Z"
+}
