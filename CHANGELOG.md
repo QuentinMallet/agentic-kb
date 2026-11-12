@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Per-request project root on the MCP port (ADR-6,
+  `docs/decisions/adr-6-per-request-project-root.md`). Every port request and
+  every MCP tool except `kb_rebuild` accepts an optional `repo_root` naming
+  the checkout the call is about; the server selects that project's
+  `.state/agent-kb` store and resolves `citation_path`s against that root. The
+  directory must lie under one of the operator's project roots — repeatable
+  `kb mcp --project-root <dir>`, merged with colon-separated
+  `KB_PROJECT_ROOTS`; the `--db` root is always allowed — after
+  canonicalization, or the request is refused with `project_root_rejected`
+  before any lock or file open. The `ready` envelope lists the effective
+  `project_roots`. Fixes `kb_add` returning `citation path escapes repository
+  root` for every project other than the one the long-lived server was
+  started in. An entry's `version_ref` is now the HEAD of the project it is
+  written to.
 - `kb rebuild --db <path>` selects an explicit database for rebuild. The
   internal supervised launch mode remains private to the MCP application.
 
