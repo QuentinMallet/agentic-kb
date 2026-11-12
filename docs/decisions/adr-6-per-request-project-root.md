@@ -78,10 +78,15 @@ filesystem the operator selected" (`docs/src/security/mcp-authorization.md`).
      a descendant of one (component-wise `Path::starts_with`);
    - the store's physical paths (database and SQLite sidecars, lock, event
      log, compact state, query-hit log) are walked component by component
-     with `lstat` semantics from the selected root. A symlink is accepted
-     only if it canonicalizes inside the selected root; a link leaving the
-     root, a dangling link, or an uninspectable component is refused
-     (`StoreEscapes`). Absent components are not created by this check;
+     with `lstat` semantics from the selected root, and **every existing
+     entry of each store directory** is `lstat`ed, so sidecars the store code
+     creates today or later (`.tmp`, `.generation`, `.deadletter`, rebuild
+     locks, `.bak`) are covered without a list of names. A symlink is
+     accepted only if it canonicalizes inside the selected root; a link
+     leaving the root, a dangling link, or an uninspectable component is
+     refused (`StoreEscapes`). Absent components are not created by this
+     check. Temp files are created `O_EXCL`, after unlinking a stale one, so
+     a link planted after the check fails instead of being followed;
    - otherwise the request is refused with `code: "project_root_rejected"`
      before any handler runs, any lock is taken, or any file is opened.
    A request without `repo_root` behaves exactly as before.
@@ -145,9 +150,15 @@ fd-pinned one. Stated plainly:
   processes. Two `kb` processes (CLI plus port) use the existing per-store
   lock; a store reached through two different in-root aliases would take two
   different lock files. This was not stress-tested.
-- **Existing-file stat/lstat.** Discovery and the check issue `stat`/`lstat`
-  inside the allowlisted root before authorization of the *store* finishes;
-  this is within the allowlist and opens no file contents.
+- **Discovery reads at most seven bytes, never through a link.** Discovery
+  and the check issue `stat`/`lstat` and list the store directories inside the
+  allowlisted root before authorization of the *store* finishes. The only file
+  whose content is read is a managed-worktree `.state/.git`, opened
+  `O_NOFOLLOW` after an `lstat` regular-file check; a symlinked `.git` is
+  treated as "not a gitlink" and its target is never opened.
+- **Not covered by the entry rule.** Entries created in a store directory
+  after the check (TOCTOU, above), and hard links (not distinguishable from
+  files by `lstat`). SQLite opens its own files `O_NOFOLLOW`.
 
 No TLA+ module models root selection (`McpBoundary.tla` covers framing,
 `CitationRelocation.tla` relocation within one root), and the change does not
