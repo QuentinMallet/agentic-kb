@@ -205,10 +205,29 @@ impl Paths {
     /// on the warning without mutating the process-wide cwd or capturing
     /// stderr.
     pub(crate) fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
+        Self::discover_bounded(start, None)
+    }
+
+    /// [`Self::discover_from`] confined to `floor` and its descendants: no
+    /// directory outside `floor` is inspected (no `stat`, no `read`), and the
+    /// walk stops at the boundary instead of climbing past it. `start` must
+    /// already be inside `floor`. The MCP port passes the allowlisted root
+    /// here so that authorization precedes every filesystem access (ADR-6).
+    pub(crate) fn discover_bounded(
+        start: &Path,
+        floor: Option<&Path>,
+    ) -> Result<(Self, Option<String>)> {
         let mut dir: &Path = start;
         let mut warned_about_inner_state = false;
         loop {
-            let inside_managed = is_inside_managed_state_worktree(dir);
+            if floor.is_some_and(|f| !dir.starts_with(f)) {
+                bail!(
+                    "Could not find repo root (no KB database or .state/ directory in {} up to the allowed boundary {})",
+                    start.display(),
+                    floor.map(|f| f.display().to_string()).unwrap_or_default()
+                );
+            }
+            let inside_managed = is_inside_managed_state_worktree(dir, floor);
             if inside_managed {
                 if dir.join(".state").is_dir() && !warned_about_inner_state {
                     eprintln!(
@@ -345,6 +364,9 @@ pub enum ProjectRootError {
     /// No `.state/` marker or database between the directory and its
     /// allowlisted ancestor: there is no project store to select.
     NoStore(PathBuf, String),
+    /// A store component (`.state`, `agent-kb`, db, lock, event log, …)
+    /// resolves outside the selected project root.
+    StoreEscapes { root: PathBuf, component: PathBuf },
 }
 
 impl std::fmt::Display for ProjectRootError {
@@ -359,6 +381,12 @@ impl std::fmt::Display for ProjectRootError {
                 p.display()
             ),
             Self::NoStore(p, e) => write!(f, "repo_root {} selects no KB store: {e}", p.display()),
+            Self::StoreEscapes { root, component } => write!(
+                f,
+                "store path {} resolves outside the selected project root {}",
+                component.display(),
+                root.display()
+            ),
         }
     }
 }
@@ -455,7 +483,15 @@ impl ProjectRoots {
         if !self.contains(&canonical) {
             return Err(ProjectRootError::NotAllowlisted(canonical));
         }
-        let (paths, warning) = Paths::discover_from(&canonical)
+        // Walk only inside the widest allowlisted root that contains the
+        // request: ancestors beyond it are never touched (ADR-6 decision 2).
+        let floor = self
+            .allowed
+            .iter()
+            .filter(|root| canonical.starts_with(root))
+            .min_by_key(|root| root.components().count())
+            .cloned();
+        let (paths, warning) = Paths::discover_bounded(&canonical, floor.as_deref())
             .map_err(|e| ProjectRootError::NoStore(canonical.clone(), e.to_string()))?;
         if let Some(warning) = warning {
             eprintln!("{warning}");
@@ -464,8 +500,69 @@ impl ProjectRoots {
         if !self.contains(&root) {
             return Err(ProjectRootError::NotAllowlisted(root));
         }
+        verify_store_containment(&root, &paths)?;
         Ok(SelectedProject { root, paths })
     }
+}
+
+/// Refuse a store whose physical location leaves the selected project root.
+///
+/// Every file the server may create or open for a request (database and its
+/// SQLite sidecars, lock, event log, compact state, query-hit log) is walked
+/// component by component from the canonical root with `lstat` semantics. A
+/// symlink is tolerated only if it canonicalizes inside the root; a dangling
+/// link, a link leaving the root, or any component that cannot be inspected
+/// is a refusal. Nothing is created or opened here, so a refusal happens
+/// before recovery and before the lock is taken.
+///
+/// This is a check-then-use pathname policy, not an fd-pinned one: a
+/// concurrent writer that swaps a component after this returns can defeat it
+/// (ADR-6, "Limits").
+fn verify_store_containment(
+    root: &Path,
+    paths: &Paths,
+) -> std::result::Result<(), ProjectRootError> {
+    let escapes = |component: &Path| ProjectRootError::StoreEscapes {
+        root: root.to_path_buf(),
+        component: component.to_path_buf(),
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for base in [&paths.db, &paths.query_hits] {
+        candidates.push(base.clone());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = base.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            candidates.push(PathBuf::from(sidecar));
+        }
+    }
+    candidates.extend([
+        paths.lock.clone(),
+        paths.events.clone(),
+        paths.compact_state.clone(),
+    ]);
+    for candidate in &candidates {
+        let relative = candidate
+            .strip_prefix(root)
+            .map_err(|_| escapes(candidate))?;
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let target = std::fs::canonicalize(&current).map_err(|_| escapes(&current))?;
+                    if !target.starts_with(root) {
+                        return Err(escapes(&current));
+                    }
+                }
+                Ok(_) => {}
+                // Absent: so is everything below it; it will be created
+                // under the components verified above.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return Err(escapes(&current)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Derive a repository root from a canonical or legacy database path.
@@ -498,8 +595,12 @@ fn is_canonical_db(db: &Path) -> bool {
             .is_some_and(|name| name == ".state")
 }
 
-fn is_inside_managed_state_worktree(candidate: &Path) -> bool {
+fn is_inside_managed_state_worktree(candidate: &Path, floor: Option<&Path>) -> bool {
     candidate.ancestors().any(|ancestor| {
+        // Never inspect an ancestor above the authorization boundary.
+        if floor.is_some_and(|f| !ancestor.starts_with(f)) {
+            return false;
+        }
         let state_dir = ancestor.join(".state");
         if !candidate.starts_with(&state_dir) {
             return false;

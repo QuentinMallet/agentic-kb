@@ -305,3 +305,309 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 2 — store containment (P1) and pre-authorization discovery (P2)
+// ---------------------------------------------------------------------------
+
+/// Every path under `dir` with its kind, length, mtime and link target, so a
+/// test can assert that the directory is byte-for-byte untouched.
+fn snapshot(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let md = fs::symlink_metadata(&p).unwrap();
+            let mtime = md.modified().unwrap();
+            out.push(format!(
+                "{} dir={} len={} mtime={:?} link={:?}",
+                p.display(),
+                md.is_dir(),
+                md.len(),
+                mtime,
+                fs::read_link(&p).ok()
+            ));
+            if md.is_dir() {
+                walk(&p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StoreSlot {
+    StateDir,
+    AgentKbDir,
+    Db,
+    Lock,
+    Events,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LinkTarget {
+    Dir,
+    ExistingFile,
+    Dangling,
+}
+
+/// Builds `<tmp>/allowed` (a real checkout) and `<tmp>/outside`, replaces
+/// `slot` inside `allowed` with a symlink into `outside`, and returns both.
+fn symlinked_store(tmp: &Path, slot: StoreSlot, target: LinkTarget) -> (PathBuf, PathBuf) {
+    let allowed = tmp.join("allowed");
+    let outside = tmp.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let is_dir_slot = matches!(slot, StoreSlot::StateDir | StoreSlot::AgentKbDir);
+    let link_to = match (is_dir_slot, target) {
+        (true, _) => {
+            fs::create_dir_all(outside.join("victim")).unwrap();
+            outside.join("victim")
+        }
+        (false, LinkTarget::ExistingFile) => {
+            fs::write(outside.join("victim"), b"").unwrap();
+            outside.join("victim")
+        }
+        (false, _) => outside.join("victim-not-yet"),
+    };
+    match slot {
+        StoreSlot::StateDir => {
+            fs::create_dir_all(&allowed).unwrap();
+            std::os::unix::fs::symlink(&link_to, allowed.join(".state")).unwrap();
+        }
+        StoreSlot::AgentKbDir => {
+            fs::create_dir_all(allowed.join(".state")).unwrap();
+            std::os::unix::fs::symlink(&link_to, allowed.join(".state/agent-kb")).unwrap();
+        }
+        StoreSlot::Db | StoreSlot::Events | StoreSlot::Lock => {
+            fs::create_dir_all(allowed.join(".state/agent-kb")).unwrap();
+            let name = match slot {
+                StoreSlot::Db => ".state/agent-kb/agent-kb.db",
+                StoreSlot::Events => ".state/agent-kb/agent-kb-events.jsonl",
+                _ => ".state/.lock",
+            };
+            std::os::unix::fs::symlink(&link_to, allowed.join(name)).unwrap();
+        }
+    }
+    (allowed, outside)
+}
+
+fn assert_store_symlink_rejected(slot: StoreSlot, target: LinkTarget) {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let (server, _conn) = db::test_db(&server_root);
+    let (allowed, outside) = symlinked_store(tmp.path(), slot, target);
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+    let before = snapshot(&outside);
+
+    // Direct resolution refuses.
+    let direct = roots.resolve(allowed.to_str().unwrap());
+    assert!(
+        matches!(direct, Err(ProjectRootError::StoreEscapes { .. })),
+        "{slot:?}/{target:?}: expected StoreEscapes, got {direct:?}"
+    );
+    // A write through the port refuses too, and nothing is created outside.
+    for method in ["add", "cite"] {
+        let req = match method {
+            "add" => json!({"id":"p1","method":"add","repo_root":allowed.to_string_lossy(),
+                "path":"p/q","summary":"s","content":"c","kind":"observation"}),
+            _ => json!({"id":"p1","method":"cite","repo_root":allowed.to_string_lossy(),
+                "path":"src/lib.rs"}),
+        };
+        let resp = dispatch(&server, &roots, req);
+        assert_eq!(
+            resp["type"], "error",
+            "{slot:?}/{target:?}/{method}: {resp}"
+        );
+        assert_eq!(resp["code"], "project_root_rejected", "{resp}");
+    }
+    assert_eq!(
+        before,
+        snapshot(&outside),
+        "{slot:?}/{target:?}: outside dir changed"
+    );
+}
+
+#[test]
+fn a_store_component_symlinked_outside_the_allowlist_is_rejected_and_nothing_is_created_there() {
+    for slot in [
+        StoreSlot::StateDir,
+        StoreSlot::AgentKbDir,
+        StoreSlot::Db,
+        StoreSlot::Lock,
+        StoreSlot::Events,
+    ] {
+        for target in [
+            LinkTarget::Dir,
+            LinkTarget::ExistingFile,
+            LinkTarget::Dangling,
+        ] {
+            let is_dir_slot = matches!(slot, StoreSlot::StateDir | StoreSlot::AgentKbDir);
+            if is_dir_slot && target != LinkTarget::Dir {
+                continue;
+            }
+            assert_store_symlink_rejected(slot, target);
+        }
+    }
+}
+
+#[test]
+fn a_store_symlink_that_stays_inside_the_selected_root_is_still_accepted() {
+    // Legacy checkouts alias `agent-kb` to `.state/agent-kb`; containment, not
+    // a blanket symlink ban, is the rule.
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let proj = checkout(tmp.path(), "proj");
+    fs::create_dir_all(proj.join("real-store")).unwrap();
+    fs::remove_dir_all(proj.join(".state/agent-kb")).unwrap();
+    std::os::unix::fs::symlink(proj.join("real-store"), proj.join(".state/agent-kb")).unwrap();
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&proj));
+    assert!(roots.resolve(proj.to_str().unwrap()).is_ok());
+}
+
+/// Minimal inotify watcher: reports opens/reads of the watched files.
+struct OpenWatch {
+    fd: i32,
+}
+
+impl OpenWatch {
+    fn new(files: &[&Path]) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1 failed");
+        for f in files {
+            let c = std::ffi::CString::new(f.as_os_str().as_bytes()).unwrap();
+            let wd =
+                unsafe { libc::inotify_add_watch(fd, c.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS) };
+            assert!(wd >= 0, "inotify_add_watch {} failed", f.display());
+        }
+        Self { fd }
+    }
+
+    /// Number of open/access events observed since the last call.
+    fn events(&self) -> usize {
+        let mut buf = [0u8; 4096];
+        let mut seen = 0usize;
+        loop {
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off < n as usize {
+                let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
+                seen += 1;
+                off += 16 + len;
+            }
+        }
+        seen
+    }
+}
+
+impl Drop for OpenWatch {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// `<tmp>/discovery/.state/{.git,.lock,agent-kb/agent-kb.db}` are sentinels
+/// *outside* the allowlist; the allowlisted directory is `.state/allowed`.
+fn discovery_fixture(tmp: &Path) -> (PathBuf, Vec<PathBuf>) {
+    let outer = tmp.join("discovery");
+    let state = outer.join(".state");
+    let allowed = state.join("allowed");
+    fs::create_dir_all(allowed.join("src")).unwrap();
+    fs::create_dir_all(state.join("agent-kb")).unwrap();
+    let sentinels = vec![
+        state.join(".git"),
+        state.join(".lock"),
+        state.join("agent-kb/agent-kb.db"),
+    ];
+    fs::write(&sentinels[0], b"gitdir: nonexistent\n").unwrap();
+    fs::write(&sentinels[1], b"").unwrap();
+    fs::write(&sentinels[2], b"not a database").unwrap();
+    (allowed, sentinels)
+}
+
+#[test]
+fn discovery_never_opens_files_in_ancestors_outside_the_allowlist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let (allowed, sentinels) = discovery_fixture(tmp.path());
+    let paths: Vec<&Path> = sentinels.iter().map(|p| p.as_path()).collect();
+    let watch = OpenWatch::new(&paths);
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+
+    // Sanity: the watcher does see a read (guards against a deaf test).
+    let _ = fs::read(&sentinels[0]).unwrap();
+    assert!(watch.events() > 0, "inotify watcher is not observing reads");
+
+    let result = roots.resolve(allowed.to_str().unwrap());
+    assert!(result.is_err(), "no store inside the allowlist: {result:?}");
+    assert_eq!(watch.events(), 0, "an outside ancestor file was opened");
+    let sub = roots.resolve(allowed.join("src").to_str().unwrap());
+    assert!(sub.is_err());
+    assert_eq!(watch.events(), 0, "an outside ancestor file was opened");
+}
+
+#[test]
+fn a_managed_state_worktree_selects_its_project_without_leaving_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let proj = checkout(tmp.path(), "proj");
+    fs::write(
+        proj.join(".state/.git"),
+        b"gitdir: ../.git/worktrees/state\n",
+    )
+    .unwrap();
+    let wt = proj.join(".state/worktrees/wt");
+    fs::create_dir_all(wt.join(".state/agent-kb")).unwrap();
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&proj));
+    let sel = roots.resolve(wt.to_str().unwrap()).unwrap();
+    assert_eq!(sel.root, fs::canonicalize(&proj).unwrap());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Wherever under the allowlisted directory the request points, discovery
+    /// never opens a sentinel in an outside ancestor.
+    #[test]
+    fn discovery_from_any_subdirectory_never_touches_outside_ancestors(
+        components in proptest::collection::vec(
+            prop_oneof![Just("..".to_string()), Just(".".to_string()), Just("src".to_string()), "[a-z]{1,3}"],
+            0..6,
+        )
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let server_root = checkout(tmp.path(), "server");
+        let (allowed, sentinels) = discovery_fixture(tmp.path());
+        let paths: Vec<&Path> = sentinels.iter().map(|p| p.as_path()).collect();
+        let watch = OpenWatch::new(&paths);
+        let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+        let mut candidate = allowed.clone();
+        for c in &components {
+            candidate.push(c);
+        }
+        let _ = roots.resolve(candidate.to_str().unwrap());
+        prop_assert_eq!(watch.events(), 0);
+    }
+
+    /// Any single symlinked store component pointing outside is refused and
+    /// leaves the outside directory untouched.
+    #[test]
+    fn any_symlinked_store_component_is_refused(
+        slot in prop_oneof![
+            Just(StoreSlot::StateDir), Just(StoreSlot::AgentKbDir), Just(StoreSlot::Db),
+            Just(StoreSlot::Lock), Just(StoreSlot::Events)],
+        target in prop_oneof![
+            Just(LinkTarget::Dir), Just(LinkTarget::ExistingFile),
+            Just(LinkTarget::Dangling)],
+    ) {
+        let is_dir_slot = matches!(slot, StoreSlot::StateDir | StoreSlot::AgentKbDir);
+        prop_assume!(!is_dir_slot || target == LinkTarget::Dir);
+        assert_store_symlink_rejected(slot, target);
+    }
+}
