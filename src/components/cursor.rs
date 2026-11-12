@@ -398,6 +398,24 @@ pub fn seed_fresh(conn: &Connection) -> Result<()> {
 // The log generation sidecar
 // ---------------------------------------------------------------------------
 
+/// Create a temp file that cannot be a pre-planted link.
+///
+/// A stale temp (left by a crash) is unlinked first — `remove_file` removes a
+/// symlink itself, never its target — then the file is created with
+/// `O_CREAT|O_EXCL`, which fails on any existing entry, symlinks included,
+/// instead of following it (ADR-6, "Limits").
+pub fn create_tmp_exclusive(path: &Path) -> std::io::Result<fs::File> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 fn sidecar(events_path: &Path, suffix: &str) -> PathBuf {
     let name = events_path
         .file_name()
@@ -432,7 +450,7 @@ pub fn bump_generation(events_path: &Path) -> Result<u64> {
     }
     let tmp = sidecar(events_path, "generation.tmp");
     {
-        let mut f = fs::File::create(&tmp)
+        let mut f = create_tmp_exclusive(&tmp)
             .with_context(|| format!("create generation sidecar {}", tmp.display()))?;
         use std::io::Write;
         writeln!(f, "{next}")?;
@@ -542,7 +560,7 @@ impl DeadLetter {
         let path = dead_letter_path(events_path);
         let tmp = sidecar(events_path, "deadletter.tmp");
         {
-            let mut file = fs::File::create(&tmp)
+            let mut file = create_tmp_exclusive(&tmp)
                 .with_context(|| format!("create dead-letter sidecar {}", tmp.display()))?;
             use std::io::Write;
             file.write_all(&serde_json::to_vec_pretty(self)?)

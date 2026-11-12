@@ -507,13 +507,25 @@ impl ProjectRoots {
 
 /// Refuse a store whose physical location leaves the selected project root.
 ///
-/// Every file the server may create or open for a request (database and its
-/// SQLite sidecars, lock, event log, compact state, query-hit log) is walked
-/// component by component from the canonical root with `lstat` semantics. A
-/// symlink is tolerated only if it canonicalizes inside the root; a dangling
-/// link, a link leaving the root, or any component that cannot be inspected
-/// is a refusal. Nothing is created or opened here, so a refusal happens
-/// before recovery and before the lock is taken.
+/// Two directory-level rules, so no list of file names has to track the
+/// sidecars the store code creates (`.tmp`, `.generation`, `.deadletter`,
+/// rebuild locks, `.bak`, ...):
+///
+/// 1. each known store path (database, query-hit log, lock, event log,
+///    compact state and the SQLite sidecars of the first two) is walked
+///    component by component from the canonical root with `lstat` semantics,
+///    so every directory on the way is a real directory or an in-root link;
+/// 2. every existing entry of each store directory (the parents of those
+///    paths) is `lstat`ed, and a symlink entry is refused unless it
+///    canonicalizes inside the root. A dangling link, a link leaving the
+///    root, or an uninspectable entry is a refusal.
+///
+/// Symlinks that stay inside the root are tolerated (legacy checkouts alias
+/// `agent-kb`). Nothing is created or opened here (directories are listed),
+/// so a refusal happens before recovery and before the lock is taken. Temp
+/// files are additionally created `O_EXCL` by the writers
+/// (`cursor::create_tmp_exclusive`), so a link planted after this check fails
+/// instead of being followed.
 ///
 /// This is a check-then-use pathname policy, not an fd-pinned one: a
 /// concurrent writer that swaps a component after this returns can defeat it
@@ -525,6 +537,15 @@ fn verify_store_containment(
     let escapes = |component: &Path| ProjectRootError::StoreEscapes {
         root: root.to_path_buf(),
         component: component.to_path_buf(),
+    };
+    // Rule for one path that is itself a symlink.
+    let check_link = |link: &Path| -> std::result::Result<(), ProjectRootError> {
+        let target = std::fs::canonicalize(link).map_err(|_| escapes(link))?;
+        if target.starts_with(root) {
+            Ok(())
+        } else {
+            Err(escapes(link))
+        }
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
     for base in [&paths.db, &paths.query_hits] {
@@ -540,6 +561,7 @@ fn verify_store_containment(
         paths.events.clone(),
         paths.compact_state.clone(),
     ]);
+    let mut store_dirs: Vec<PathBuf> = Vec::new();
     for candidate in &candidates {
         let relative = candidate
             .strip_prefix(root)
@@ -548,17 +570,34 @@ fn verify_store_containment(
         for component in relative.components() {
             current.push(component);
             match std::fs::symlink_metadata(&current) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    let target = std::fs::canonicalize(&current).map_err(|_| escapes(&current))?;
-                    if !target.starts_with(root) {
-                        return Err(escapes(&current));
-                    }
-                }
+                Ok(meta) if meta.file_type().is_symlink() => check_link(&current)?,
                 Ok(_) => {}
                 // Absent: so is everything below it; it will be created
                 // under the components verified above.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
                 Err(_) => return Err(escapes(&current)),
+            }
+        }
+        if let Some(dir) = candidate.parent() {
+            if !store_dirs.iter().any(|d| d == dir) {
+                store_dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    for dir in &store_dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // Absent store directory: nothing planted in it yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(escapes(dir)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| escapes(dir))?;
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => check_link(&path)?,
+                Ok(_) => {}
+                Err(_) => return Err(escapes(&path)),
             }
         }
     }
@@ -606,14 +645,28 @@ fn is_inside_managed_state_worktree(candidate: &Path, floor: Option<&Path>) -> b
             return false;
         }
 
+        // `lstat` + `O_NOFOLLOW`: a symlinked `.git` is never a gitlink and
+        // its target is never opened, whatever it points at.
         let gitlink = state_dir.join(".git");
-        std::fs::metadata(&gitlink)
+        std::fs::symlink_metadata(&gitlink)
             .map(|metadata| metadata.is_file())
             .unwrap_or(false)
-            && std::fs::read(&gitlink)
-                .map(|contents| contents.starts_with(b"gitdir:"))
-                .unwrap_or(false)
+            && read_gitlink_prefix_nofollow(&gitlink)
     })
+}
+
+fn read_gitlink_prefix_nofollow(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut head = [0u8; 7];
+    file.take(7).read_exact(&mut head).is_ok() && &head == b"gitdir:"
 }
 
 /// Report stores at known non-canonical sibling paths without selecting or modifying them.

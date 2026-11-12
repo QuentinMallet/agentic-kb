@@ -611,3 +611,159 @@ proptest! {
         assert_store_symlink_rejected(slot, target);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 3 — directory-level store containment and no-follow `.state/.git`
+// ---------------------------------------------------------------------------
+
+/// Sidecar names the store code really writes, plus one nobody has invented
+/// yet: the rule is per directory entry, not per known name.
+const SIDECAR_NAMES: &[&str] = &[
+    "agent-kb-events.jsonl.tmp",
+    "agent-kb-events.jsonl.generation",
+    "agent-kb-events.jsonl.generation.tmp",
+    "agent-kb-events.jsonl.deadletter",
+    "agent-kb-events.jsonl.deadletter.tmp",
+    "schema-upgrade.lock",
+    "rebuild-lifetime.lock",
+    "agent-kb.db.tmp.4242",
+    "agent-kb.db.pre-v7.bak",
+    "a-sidecar-name-from-the-future.tmp",
+];
+
+#[test]
+fn any_store_directory_entry_symlinked_outside_is_refused_and_the_target_untouched() {
+    for name in SIDECAR_NAMES {
+        for method in ["add", "compact"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let server_root = checkout(tmp.path(), "server");
+            let (server, _conn) = db::test_db(&server_root);
+            let allowed = checkout(tmp.path(), "allowed");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            let victim = outside.join("victim");
+            fs::write(&victim, b"precious\n").unwrap();
+            let link = allowed.join(".state/agent-kb").join(name);
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+
+            let req = match method {
+                "add" => add_request("r3", Some(&allowed), "src/lib.rs"),
+                _ => json!({"id":"r3","method":"compact","repo_root":allowed.to_string_lossy()}),
+            };
+            let resp = dispatch(&server, &roots, req);
+            assert_eq!(resp["type"], "error", "{name}/{method}: {resp}");
+            assert_eq!(
+                resp["code"], "project_root_rejected",
+                "{name}/{method}: {resp}"
+            );
+            assert_eq!(fs::read(&victim).unwrap(), b"precious\n", "{name}/{method}");
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}/{method}: planted link was replaced"
+            );
+            assert!(
+                !allowed
+                    .join(".state/agent-kb/agent-kb-events.jsonl")
+                    .exists(),
+                "{name}/{method}: event log created despite refusal"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_dangling_store_directory_entry_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let allowed = checkout(tmp.path(), "allowed");
+    std::os::unix::fs::symlink(
+        tmp.path().join("nowhere"),
+        allowed.join(".state/agent-kb/agent-kb-events.jsonl.tmp"),
+    )
+    .unwrap();
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+    let r = roots.resolve(allowed.to_str().unwrap());
+    assert!(
+        matches!(r, Err(ProjectRootError::StoreEscapes { .. })),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn an_in_root_store_directory_entry_symlink_is_still_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let allowed = checkout(tmp.path(), "allowed");
+    std::os::unix::fs::symlink(
+        allowed.join("src/lib.rs"),
+        allowed.join(".state/agent-kb/an-alias"),
+    )
+    .unwrap();
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+    assert!(roots.resolve(allowed.to_str().unwrap()).is_ok());
+}
+
+#[test]
+fn compact_never_follows_a_stale_in_root_tmp_link() {
+    // Defense in depth for the check-then-use window: even when a link
+    // survives the directory scan (it points inside the root), creating the
+    // tmp file replaces the link instead of writing through it.
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let (server, _conn) = db::test_db(&server_root);
+    let allowed = checkout(tmp.path(), "allowed");
+    let target = allowed.join("src/lib.rs");
+    let before = fs::read(&target).unwrap();
+    std::os::unix::fs::symlink(
+        &target,
+        allowed.join(".state/agent-kb/agent-kb-events.jsonl.tmp"),
+    )
+    .unwrap();
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+    let add = dispatch(
+        &server,
+        &roots,
+        add_request("r3a", Some(&allowed), "src/lib.rs"),
+    );
+    assert_eq!(add["type"], "ok", "{add}");
+    // `mcp` compact needs the abscissa app cell; drive the command directly.
+    let selected = roots.resolve(allowed.to_str().unwrap()).unwrap();
+    kb::commands::compact::Compact
+        .execute_with_paths(&selected.paths)
+        .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), before, "tmp link was followed");
+    let events = allowed.join(".state/agent-kb/agent-kb-events.jsonl");
+    assert!(
+        !fs::symlink_metadata(&events)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "event log became a symlink"
+    );
+}
+
+#[test]
+fn a_symlinked_state_git_is_not_opened_during_discovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server_root = checkout(tmp.path(), "server");
+    let allowed = checkout(tmp.path(), "allowed");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let gitlink = outside.join("gitlink");
+    fs::write(&gitlink, b"gitdir: nonexistent\n").unwrap();
+    std::os::unix::fs::symlink(&gitlink, allowed.join(".state/.git")).unwrap();
+    let wt = allowed.join(".state/worktrees/wt");
+    fs::create_dir_all(&wt).unwrap();
+    let watch = OpenWatch::new(&[gitlink.as_path()]);
+    let _ = fs::read(&gitlink).unwrap();
+    assert!(watch.events() > 0, "inotify watcher is not observing reads");
+
+    let roots = ProjectRoots::new(&server_root, std::slice::from_ref(&allowed));
+    let _ = roots.resolve(wt.to_str().unwrap());
+    let _ = roots.resolve(allowed.to_str().unwrap());
+    assert_eq!(watch.events(), 0, "outside gitlink target was opened");
+}

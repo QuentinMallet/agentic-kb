@@ -6,7 +6,7 @@ use crate::config::{self, VacuumConfig};
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 
 /// Persistent state for the compact command (JSON-serialized alongside the event log).
@@ -404,7 +404,7 @@ impl Compact {
 
         let tmp = paths.events.with_extension("jsonl.tmp");
         {
-            let mut f = File::create(&tmp)?;
+            let mut f = crate::components::cursor::create_tmp_exclusive(&tmp)?;
             for ev in &compacted {
                 writeln!(f, "{}", serde_json::to_string(ev)?)?;
             }
