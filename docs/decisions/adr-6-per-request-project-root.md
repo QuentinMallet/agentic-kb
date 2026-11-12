@@ -65,12 +65,23 @@ filesystem the operator selected" (`docs/src/security/mcp-authorization.md`).
    - must be an absolute path that exists and canonicalizes
      (`fs::canonicalize`: symlinks and `..` are resolved, so neither can name
      a directory outside the allowlist);
-   - the same discovery walk as the CLI (`Paths::discover_from`) runs from the
-     canonical directory, so a worktree under `<repo>/.state/worktrees/` or a
-     subdirectory selects the enclosing repository's store, with the same
-     canonical-over-legacy layout precedence (B3);
+   - the same discovery walk as the CLI runs from the canonical directory
+     (`Paths::discover_bounded`), so a worktree under
+     `<repo>/.state/worktrees/` or a subdirectory selects the enclosing
+     repository's store, with the same canonical-over-legacy layout precedence
+     (B3). The walk is *bounded*: it never inspects a directory outside the
+     widest allowlisted root containing the request — each candidate and each
+     ancestor consulted by the managed-worktree check is tested for
+     containment before any `stat`/`read` of it, and the walk stops at the
+     boundary;
    - the discovered root, canonicalized, must equal an allowlisted root or be
      a descendant of one (component-wise `Path::starts_with`);
+   - the store's physical paths (database and SQLite sidecars, lock, event
+     log, compact state, query-hit log) are walked component by component
+     with `lstat` semantics from the selected root. A symlink is accepted
+     only if it canonicalizes inside the selected root; a link leaving the
+     root, a dangling link, or an uninspectable component is refused
+     (`StoreEscapes`). Absent components are not created by this check;
    - otherwise the request is refused with `code: "project_root_rejected"`
      before any handler runs, any lock is taken, or any file is opened.
    A request without `repo_root` behaves exactly as before.
@@ -99,7 +110,44 @@ could already make inside the single root. Nothing is read before the
 allowlist check passes; the check compares canonical paths, so `..`,
 absolute paths and symlinks pointing elsewhere cannot widen it. These
 properties are pinned by `tests/mcp_project_root.rs`, including a proptest
-over arbitrary relative component sequences.
+over arbitrary relative component sequences, a table/proptest of symlinked
+store components (`.state`, `.state/agent-kb`, db, lock, event log; to an
+outside directory, existing file, or dangling target) asserting refusal with
+the outside directory unchanged, and an inotify-observed test asserting that
+discovery never opens sentinel files in ancestors outside the allowlist.
+
+## Limits (what this does not protect against)
+
+The containment check is a pathname policy evaluated before use, not an
+fd-pinned one. Stated plainly:
+
+- **TOCTOU.** Between the check and the later open of the lock, database or
+  event log, a concurrent writer with filesystem access to an allowlisted
+  project can replace a verified directory or file with a symlink (or rename
+  directories) and redirect the open. No directory file descriptor pins the
+  verified directory and the store is opened by pathname (SQLite and the
+  existing lock/event-log code take paths), so `O_NOFOLLOW`/`openat` hardening
+  is not applied. Anyone who can write inside an allowlisted project can
+  already write that project's store; the residual risk is a *less trusted
+  local process* redirecting the server to a store outside the allowlist.
+  Mitigation is operational: allowlist only directories writable solely by
+  the operator, or run mutually untrusted callers in separate processes.
+- **Bind mounts and other mount tricks.** Containment is a path-namespace
+  property. A bind mount (or another mount) inside an allowlisted project
+  that exposes an outside directory is indistinguishable from a real
+  subdirectory and is not detected. Case-insensitive filesystems are not
+  specially handled.
+- **Symlinks inside the root are allowed.** A store component that is a
+  symlink resolving inside the selected root is accepted (legacy checkouts
+  alias `agent-kb`); it may alias another in-root location, and the store
+  and the repository identity can then differ within that root.
+- **Concurrent writers.** The check does not coordinate with other
+  processes. Two `kb` processes (CLI plus port) use the existing per-store
+  lock; a store reached through two different in-root aliases would take two
+  different lock files. This was not stress-tested.
+- **Existing-file stat/lstat.** Discovery and the check issue `stat`/`lstat`
+  inside the allowlisted root before authorization of the *store* finishes;
+  this is within the allowlist and opens no file contents.
 
 No TLA+ module models root selection (`McpBoundary.tla` covers framing,
 `CitationRelocation.tla` relocation within one root), and the change does not
