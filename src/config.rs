@@ -204,7 +204,7 @@ impl Paths {
     /// (if any) instead of printing it directly. Split out so tests can assert
     /// on the warning without mutating the process-wide cwd or capturing
     /// stderr.
-    fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
+    pub(crate) fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
         let mut dir: &Path = start;
         let mut warned_about_inner_state = false;
         loop {
@@ -313,6 +313,158 @@ impl Paths {
         }
 
         paths
+    }
+}
+
+/// Operator allowlist of directories a long-lived MCP port may serve
+/// (ADR-6, `docs/decisions/adr-6-per-request-project-root.md`).
+///
+/// The port is launched for one store, but it serves sessions working in
+/// other checkouts. A request may name its project with `repo_root`; this type
+/// decides whether that directory is one the operator agreed to expose and,
+/// if so, which store it maps to. Every member is canonical, so membership is
+/// a component-wise prefix test on paths that no longer contain `..` or
+/// symlinks.
+#[derive(Debug, Clone)]
+pub struct ProjectRoots {
+    allowed: Vec<PathBuf>,
+}
+
+/// Why a requested `repo_root` was refused. Refusals happen before any file
+/// under the requested directory is opened and before any lock is taken.
+#[derive(Debug)]
+pub enum ProjectRootError {
+    /// Relative paths would be resolved against the server's cwd, which the
+    /// caller does not control; only absolute paths are accepted.
+    NotAbsolute(String),
+    /// The directory does not exist or cannot be canonicalized.
+    NotFound(String, std::io::Error),
+    /// The canonical directory, or the repository root discovered from it, is
+    /// outside every allowlisted root.
+    NotAllowlisted(PathBuf),
+    /// No `.state/` marker or database between the directory and its
+    /// allowlisted ancestor: there is no project store to select.
+    NoStore(PathBuf, String),
+}
+
+impl std::fmt::Display for ProjectRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAbsolute(p) => write!(f, "repo_root must be an absolute path: {p:?}"),
+            Self::NotFound(p, e) => write!(f, "repo_root {p:?} cannot be resolved: {e}"),
+            Self::NotAllowlisted(p) => write!(
+                f,
+                "repo_root {} is outside the project roots this server was started with \
+                 (kb mcp --project-root / KB_PROJECT_ROOTS)",
+                p.display()
+            ),
+            Self::NoStore(p, e) => write!(f, "repo_root {} selects no KB store: {e}", p.display()),
+        }
+    }
+}
+
+impl std::error::Error for ProjectRootError {}
+
+/// A project a request selected: its canonical root and the store under it.
+#[derive(Debug, Clone)]
+pub struct SelectedProject {
+    pub root: PathBuf,
+    pub paths: Paths,
+}
+
+/// Environment variable merged into the allowlist: colon-separated directories.
+pub const PROJECT_ROOTS_ENV: &str = "KB_PROJECT_ROOTS";
+
+impl ProjectRoots {
+    /// Build the allowlist. The server's own root is always a member; every
+    /// `extra` entry is canonicalized and entries that do not exist are
+    /// dropped with a warning (fail closed: fewer roots, never more).
+    pub fn new(server_root: &Path, extra: &[PathBuf]) -> Self {
+        let mut allowed = Vec::with_capacity(extra.len() + 1);
+        match std::fs::canonicalize(server_root) {
+            Ok(root) => allowed.push(root),
+            Err(error) => {
+                eprintln!(
+                    "warn: server root {} cannot be canonicalized ({error}); using it as given",
+                    server_root.display()
+                );
+                allowed.push(server_root.to_path_buf());
+            }
+        }
+        for entry in extra {
+            match std::fs::canonicalize(entry) {
+                Ok(root) if root.is_dir() => {
+                    if !allowed.contains(&root) {
+                        allowed.push(root);
+                    }
+                }
+                Ok(_) => eprintln!(
+                    "warn: ignoring project root {} (not a directory)",
+                    entry.display()
+                ),
+                Err(error) => {
+                    eprintln!("warn: ignoring project root {} ({error})", entry.display())
+                }
+            }
+        }
+        Self { allowed }
+    }
+
+    /// `new`, plus the directories named by [`PROJECT_ROOTS_ENV`].
+    pub fn from_env_and_args(server_root: &Path, args: &[PathBuf]) -> Self {
+        let mut extra: Vec<PathBuf> = args.to_vec();
+        if let Some(env) = std::env::var_os(PROJECT_ROOTS_ENV) {
+            extra.extend(std::env::split_paths(&env).filter(|p| !p.as_os_str().is_empty()));
+        }
+        Self::new(server_root, &extra)
+    }
+
+    /// Canonical allowlisted roots, server root first.
+    pub fn allowed(&self) -> &[PathBuf] {
+        &self.allowed
+    }
+
+    fn contains(&self, canonical: &Path) -> bool {
+        self.allowed.iter().any(|root| canonical.starts_with(root))
+    }
+
+    /// Map a requested directory to the project store it selects.
+    ///
+    /// The directory must be absolute, exist, and canonicalize to a path
+    /// inside the allowlist; the same discovery walk the CLI uses then finds
+    /// the enclosing repository (a subdirectory or a `.state/worktrees/`
+    /// checkout selects the enclosing project), and that root must itself be
+    /// inside the allowlist. Nothing under the directory is opened until both
+    /// checks pass.
+    pub fn resolve(
+        &self,
+        requested: &str,
+    ) -> std::result::Result<SelectedProject, ProjectRootError> {
+        let requested_path = Path::new(requested);
+        if requested.is_empty() || !requested_path.is_absolute() {
+            return Err(ProjectRootError::NotAbsolute(requested.to_string()));
+        }
+        let canonical = std::fs::canonicalize(requested_path)
+            .map_err(|e| ProjectRootError::NotFound(requested.to_string(), e))?;
+        if !canonical.is_dir() {
+            return Err(ProjectRootError::NotFound(
+                requested.to_string(),
+                std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
+            ));
+        }
+        if !self.contains(&canonical) {
+            return Err(ProjectRootError::NotAllowlisted(canonical));
+        }
+        let (paths, warning) = Paths::discover_from(&canonical)
+            .map_err(|e| ProjectRootError::NoStore(canonical.clone(), e.to_string()))?;
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        let root = std::fs::canonicalize(&paths.root).unwrap_or_else(|_| paths.root.clone());
+        if !self.contains(&root) {
+            return Err(ProjectRootError::NotAllowlisted(root));
+        }
+        Ok(SelectedProject { root, paths })
     }
 }
 
