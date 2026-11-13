@@ -10,9 +10,19 @@ defmodule AgenticKbMcp.McpCleanupContractTest do
 
   # Literal public schema field sets and tool order. Do not generate this from
   # McpServer: it is the characterization fixture for the later registry move.
+  # `repo_root` is the ADR-6 project selector; only `kb_rebuild` omits it.
   @schema_fields [
     {"kb_search",
-     ["expand_ids", "inline_verify_k", "limit", "mode", "path_prefix", "query", "tag"]},
+     [
+       "expand_ids",
+       "inline_verify_k",
+       "limit",
+       "mode",
+       "path_prefix",
+       "query",
+       "repo_root",
+       "tag"
+     ]},
     {"kb_add",
      [
        "content",
@@ -22,24 +32,25 @@ defmodule AgenticKbMcp.McpCleanupContractTest do
        "path",
        "permanent",
        "replace_path",
+       "repo_root",
        "summary",
        "tags"
      ]},
-    {"kb_cite", ["end", "path", "start"]},
-    {"kb_import", ["path", "upsert"]},
-    {"kb_stale_check", ["blame", "commits", "files"]},
-    {"kb_expire", ["entry_id", "force", "reason"]},
-    {"kb_run", ["adapter", "detail", "result", "test_id"]},
-    {"kb_test_add", ["app", "config", "name", "protocol", "test_id"]},
-    {"kb_tests", ["app"]},
-    {"kb_reembed", ["dry_run", "max_chars"]},
-    {"kb_compact", []},
+    {"kb_cite", ["end", "path", "repo_root", "start"]},
+    {"kb_import", ["path", "repo_root", "upsert"]},
+    {"kb_stale_check", ["blame", "commits", "files", "repo_root"]},
+    {"kb_expire", ["entry_id", "force", "reason", "repo_root"]},
+    {"kb_run", ["adapter", "detail", "repo_root", "result", "test_id"]},
+    {"kb_test_add", ["app", "config", "name", "protocol", "repo_root", "test_id"]},
+    {"kb_tests", ["app", "repo_root"]},
+    {"kb_reembed", ["dry_run", "max_chars", "repo_root"]},
+    {"kb_compact", ["repo_root"]},
     {"kb_rebuild", []},
-    {"kb_audit_run", ["mode", "sample_size"]},
-    {"kb_audit_record", ["run_id", "verdicts"]},
-    {"kb_audit_report", []},
-    {"kb_provenance", ["entry_id", "max_depth"]},
-    {"kb_get", ["entry_id"]}
+    {"kb_audit_run", ["mode", "repo_root", "sample_size"]},
+    {"kb_audit_record", ["repo_root", "run_id", "verdicts"]},
+    {"kb_audit_report", ["repo_root"]},
+    {"kb_provenance", ["entry_id", "max_depth", "repo_root"]},
+    {"kb_get", ["entry_id", "repo_root"]}
   ]
 
   # Each expected port map is literal, including intended omission of optional

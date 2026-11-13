@@ -41,6 +41,12 @@ pub struct Mcp {
     /// Path to agent-kb.db
     #[arg(long)]
     pub db: PathBuf,
+    /// Additional directory a request may select with `repo_root` (ADR-6).
+    /// Repeatable; merged with the colon-separated `KB_PROJECT_ROOTS`
+    /// environment variable. Any checkout under a listed directory is
+    /// servable; the root derived from `--db` is always allowed.
+    #[arg(long = "project-root", value_name = "DIR")]
+    pub project_root: Vec<PathBuf>,
 }
 
 impl Runnable for Mcp {
@@ -62,6 +68,10 @@ impl Runnable for Mcp {
 impl Mcp {
     pub fn execute(&self) -> Result<()> {
         let paths = config::Paths::from_mcp_db(&self.db);
+        // ADR-6: the set of directories a request's `repo_root` may select.
+        // Canonicalized once here; every request is checked against it before
+        // any handler, lock, or file open.
+        let roots = config::ProjectRoots::from_env_and_args(&paths.root, &self.project_root);
 
         // br-3gp: read KbConfig::inline_verify_k once at startup so MCP search
         // requests without an explicit override fall back to the configured cap
@@ -91,7 +101,12 @@ impl Mcp {
         let ready = json!({
             "type": "ready",
             "version": "1.0",
-            "db": self.db.to_string_lossy()
+            "db": self.db.to_string_lossy(),
+            "project_roots": roots
+                .allowed()
+                .iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
         });
         println!("{ready}");
         io::stdout().flush()?;
@@ -107,9 +122,10 @@ impl Mcp {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    handle_request(
+                    handle_request_with_roots(
                         &line,
                         &paths,
+                        &roots,
                         emb.as_ref(),
                         inline_verify_k_default,
                         verify_pool_size_default,
@@ -266,6 +282,12 @@ macro_rules! request_struct {
             /// `deny_unknown_fields`; dispatch has already matched on it.
             #[allow(dead_code)]
             method: String,
+            /// ADR-6 project selector. Dispatch has already resolved it (or
+            /// refused the request) before this struct is built, so handlers
+            /// only ever see the selected `Paths`.
+            #[allow(dead_code)]
+            #[serde(default)]
+            repo_root: Option<String>,
             $( $(#[$inner])* $field: $ty, )*
         }
     };
@@ -676,9 +698,35 @@ const MUTATING_METHODS: &[&str] = &[
     "kb_peers_remove",
 ];
 
+/// Dispatch against the server's own store only: a `repo_root` naming that
+/// store is accepted, any other is refused. Production goes through
+/// [`handle_request_with_roots`] with the operator allowlist.
 fn handle_request(
     line: &str,
     paths: &config::Paths,
+    emb: &dyn embedder::Embedder,
+    inline_verify_k_default: usize,
+    verify_pool_size_default: Option<usize>,
+    recency_lambda_default: f32,
+    mmr_lambda_default: f32,
+) -> Value {
+    handle_request_with_roots(
+        line,
+        paths,
+        &config::ProjectRoots::new(&paths.root, &[]),
+        emb,
+        inline_verify_k_default,
+        verify_pool_size_default,
+        recency_lambda_default,
+        mmr_lambda_default,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_request_with_roots(
+    line: &str,
+    server_paths: &config::Paths,
+    roots: &config::ProjectRoots,
     emb: &dyn embedder::Embedder,
     inline_verify_k_default: usize,
     verify_pool_size_default: Option<usize>,
@@ -710,6 +758,29 @@ fn handle_request(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // ADR-6: select the project store before anything else. A refused
+    // `repo_root` never reaches recovery, a lock, or a handler, so no file
+    // under a non-allowlisted directory is ever opened on its behalf.
+    let selected;
+    let paths = match raw.get("repo_root") {
+        None | Some(Value::Null) => server_paths,
+        Some(Value::String(requested)) => match roots.resolve(requested) {
+            Ok(project) => {
+                selected = project;
+                &selected.paths
+            }
+            Err(e) => {
+                return json!({
+                    "id": id,
+                    "type": "error",
+                    "code": "project_root_rejected",
+                    "message": e.to_string()
+                })
+            }
+        },
+        Some(_) => return parse_error(&id, "repo_root must be a string"),
+    };
 
     // Deserialize the flat request object into this method's typed struct,
     // turning every unknown key, missing required field and wrong-typed field
@@ -1322,7 +1393,10 @@ fn handle_add(req: &AddRequest, paths: &config::Paths, emb: &dyn embedder::Embed
 
     let evidence_status = compute_evidence_status_write(&kind, &evidence_rows);
     let ts = Utc::now().to_rfc3339();
-    let version_ref = config::git_head_sha();
+    // The entry's version_ref is the HEAD of the project it is written to
+    // (ADR-6: that may not be the server's cwd), falling back to cwd for a
+    // non-git root as before.
+    let version_ref = config::git_head_sha_at(&paths.root).or_else(config::git_head_sha);
 
     // Delegate all event-writing and DB-apply work to kb_core::add (AC2, AC3).
     match kb_core::add(
@@ -8166,6 +8240,7 @@ mod tests {
             &ReembedRequest {
                 method: "reembed".to_string(),
                 id: json!("parity"),
+                repo_root: None,
                 dry_run: Some(false),
                 max_chars: None,
             },
@@ -8206,6 +8281,7 @@ mod tests {
             &ReembedRequest {
                 method: "reembed".to_string(),
                 id: json!("noop-check"),
+                repo_root: None,
                 dry_run: Some(false),
                 max_chars: None,
             },
@@ -8312,6 +8388,25 @@ pub mod tests_api {
         request: &Value,
     ) -> Value {
         super::handle_request(&request.to_string(), paths, emb, 10, None, 0.0, 0.0)
+    }
+
+    /// Dispatch with an explicit ADR-6 project allowlist, as production does.
+    pub fn dispatch_value_for_test_with_roots(
+        paths: &config::Paths,
+        roots: &config::ProjectRoots,
+        emb: &dyn embedder::Embedder,
+        request: &Value,
+    ) -> Value {
+        super::handle_request_with_roots(
+            &request.to_string(),
+            paths,
+            roots,
+            emb,
+            10,
+            None,
+            0.0,
+            0.0,
+        )
     }
 
     // `tr` is `#[cfg(test)]`-only (a unit-test fixture helper), so this

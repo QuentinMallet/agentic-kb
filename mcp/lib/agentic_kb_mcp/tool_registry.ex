@@ -1,7 +1,19 @@
 defmodule AgenticKbMcp.ToolRegistry do
   @derived_from_max_len 200
 
-  @tools [
+  # ADR-6 (docs/decisions/adr-6-per-request-project-root.md): every tool whose
+  # request reaches the Rust port may name the project it operates on. The
+  # Rust side resolves it against the operator allowlist before any handler
+  # runs. `kb_rebuild` is excluded: the supervised rebuild worker is bound to
+  # the store the server was started for.
+  @repo_root_property %{
+    "type" => "string",
+    "description" =>
+      "Absolute path of the project checkout this call is about (default: the server's own repository). The server selects that project's `.state/agent-kb` store and resolves `citation_path`s against that checkout. Must lie under one of the project roots the server was started with (`kb mcp --project-root` / `KB_PROJECT_ROOTS`); anything else is refused before any file is read."
+  }
+  @tools_without_repo_root ~w(kb_rebuild)
+
+  @tools_base [
     %{
       "name" => "kb_search",
       "description" =>
@@ -171,7 +183,8 @@ defmodule AgenticKbMcp.ToolRegistry do
         "properties" => %{
           "path" => %{
             "type" => "string",
-            "description" => "Repo-relative file path"
+            "description" =>
+              "File path relative to the selected repository root (`repo_root`, or the server's own repository)"
           },
           "start" => %{
             "type" => "integer",
@@ -468,8 +481,23 @@ defmodule AgenticKbMcp.ToolRegistry do
     }
   ]
 
+  @tools Enum.map(@tools_base, fn tool ->
+           if tool["name"] in @tools_without_repo_root do
+             tool
+           else
+             update_in(
+               tool,
+               ["inputSchema", "properties"],
+               &Map.put(&1, "repo_root", @repo_root_property)
+             )
+           end
+         end)
+
   @doc "Exposes the tool schema list for testing (tools/list mirrors this)."
   def tools, do: @tools
+
+  @doc "Tools whose schema deliberately omits the ADR-6 `repo_root` selector."
+  def tools_without_repo_root, do: @tools_without_repo_root
 
   # B1 / ADR-4: the argument allow-list is derived from the very schemas served
   # by tools/list, so a schema property and an accepted argument can never

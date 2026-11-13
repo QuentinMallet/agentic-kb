@@ -204,11 +204,30 @@ impl Paths {
     /// (if any) instead of printing it directly. Split out so tests can assert
     /// on the warning without mutating the process-wide cwd or capturing
     /// stderr.
-    fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
+    pub(crate) fn discover_from(start: &Path) -> Result<(Self, Option<String>)> {
+        Self::discover_bounded(start, None)
+    }
+
+    /// [`Self::discover_from`] confined to `floor` and its descendants: no
+    /// directory outside `floor` is inspected (no `stat`, no `read`), and the
+    /// walk stops at the boundary instead of climbing past it. `start` must
+    /// already be inside `floor`. The MCP port passes the allowlisted root
+    /// here so that authorization precedes every filesystem access (ADR-6).
+    pub(crate) fn discover_bounded(
+        start: &Path,
+        floor: Option<&Path>,
+    ) -> Result<(Self, Option<String>)> {
         let mut dir: &Path = start;
         let mut warned_about_inner_state = false;
         loop {
-            let inside_managed = is_inside_managed_state_worktree(dir);
+            if floor.is_some_and(|f| !dir.starts_with(f)) {
+                bail!(
+                    "Could not find repo root (no KB database or .state/ directory in {} up to the allowed boundary {})",
+                    start.display(),
+                    floor.map(|f| f.display().to_string()).unwrap_or_default()
+                );
+            }
+            let inside_managed = is_inside_managed_state_worktree(dir, floor);
             if inside_managed {
                 if dir.join(".state").is_dir() && !warned_about_inner_state {
                     eprintln!(
@@ -316,6 +335,275 @@ impl Paths {
     }
 }
 
+/// Operator allowlist of directories a long-lived MCP port may serve
+/// (ADR-6, `docs/decisions/adr-6-per-request-project-root.md`).
+///
+/// The port is launched for one store, but it serves sessions working in
+/// other checkouts. A request may name its project with `repo_root`; this type
+/// decides whether that directory is one the operator agreed to expose and,
+/// if so, which store it maps to. Every member is canonical, so membership is
+/// a component-wise prefix test on paths that no longer contain `..` or
+/// symlinks.
+#[derive(Debug, Clone)]
+pub struct ProjectRoots {
+    allowed: Vec<PathBuf>,
+}
+
+/// Why a requested `repo_root` was refused. Refusals happen before any file
+/// under the requested directory is opened and before any lock is taken.
+#[derive(Debug)]
+pub enum ProjectRootError {
+    /// Relative paths would be resolved against the server's cwd, which the
+    /// caller does not control; only absolute paths are accepted.
+    NotAbsolute(String),
+    /// The directory does not exist or cannot be canonicalized.
+    NotFound(String, std::io::Error),
+    /// The canonical directory, or the repository root discovered from it, is
+    /// outside every allowlisted root.
+    NotAllowlisted(PathBuf),
+    /// No `.state/` marker or database between the directory and its
+    /// allowlisted ancestor: there is no project store to select.
+    NoStore(PathBuf, String),
+    /// A store component (`.state`, `agent-kb`, db, lock, event log, …)
+    /// resolves outside the selected project root.
+    StoreEscapes { root: PathBuf, component: PathBuf },
+}
+
+impl std::fmt::Display for ProjectRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAbsolute(p) => write!(f, "repo_root must be an absolute path: {p:?}"),
+            Self::NotFound(p, e) => write!(f, "repo_root {p:?} cannot be resolved: {e}"),
+            Self::NotAllowlisted(p) => write!(
+                f,
+                "repo_root {} is outside the project roots this server was started with \
+                 (kb mcp --project-root / KB_PROJECT_ROOTS)",
+                p.display()
+            ),
+            Self::NoStore(p, e) => write!(f, "repo_root {} selects no KB store: {e}", p.display()),
+            Self::StoreEscapes { root, component } => write!(
+                f,
+                "store path {} resolves outside the selected project root {}",
+                component.display(),
+                root.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectRootError {}
+
+/// A project a request selected: its canonical root and the store under it.
+#[derive(Debug, Clone)]
+pub struct SelectedProject {
+    pub root: PathBuf,
+    pub paths: Paths,
+}
+
+/// Environment variable merged into the allowlist: colon-separated directories.
+pub const PROJECT_ROOTS_ENV: &str = "KB_PROJECT_ROOTS";
+
+impl ProjectRoots {
+    /// Build the allowlist. The server's own root is always a member; every
+    /// `extra` entry is canonicalized and entries that do not exist are
+    /// dropped with a warning (fail closed: fewer roots, never more).
+    pub fn new(server_root: &Path, extra: &[PathBuf]) -> Self {
+        let mut allowed = Vec::with_capacity(extra.len() + 1);
+        match std::fs::canonicalize(server_root) {
+            Ok(root) => allowed.push(root),
+            Err(error) => {
+                eprintln!(
+                    "warn: server root {} cannot be canonicalized ({error}); using it as given",
+                    server_root.display()
+                );
+                allowed.push(server_root.to_path_buf());
+            }
+        }
+        for entry in extra {
+            match std::fs::canonicalize(entry) {
+                Ok(root) if root.is_dir() => {
+                    if !allowed.contains(&root) {
+                        allowed.push(root);
+                    }
+                }
+                Ok(_) => eprintln!(
+                    "warn: ignoring project root {} (not a directory)",
+                    entry.display()
+                ),
+                Err(error) => {
+                    eprintln!("warn: ignoring project root {} ({error})", entry.display())
+                }
+            }
+        }
+        Self { allowed }
+    }
+
+    /// `new`, plus the directories named by [`PROJECT_ROOTS_ENV`].
+    pub fn from_env_and_args(server_root: &Path, args: &[PathBuf]) -> Self {
+        let mut extra: Vec<PathBuf> = args.to_vec();
+        if let Some(env) = std::env::var_os(PROJECT_ROOTS_ENV) {
+            extra.extend(std::env::split_paths(&env).filter(|p| !p.as_os_str().is_empty()));
+        }
+        Self::new(server_root, &extra)
+    }
+
+    /// Canonical allowlisted roots, server root first.
+    pub fn allowed(&self) -> &[PathBuf] {
+        &self.allowed
+    }
+
+    fn contains(&self, canonical: &Path) -> bool {
+        self.allowed.iter().any(|root| canonical.starts_with(root))
+    }
+
+    /// Map a requested directory to the project store it selects.
+    ///
+    /// The directory must be absolute, exist, and canonicalize to a path
+    /// inside the allowlist; the same discovery walk the CLI uses then finds
+    /// the enclosing repository (a subdirectory or a `.state/worktrees/`
+    /// checkout selects the enclosing project), and that root must itself be
+    /// inside the allowlist. Nothing under the directory is opened until both
+    /// checks pass.
+    pub fn resolve(
+        &self,
+        requested: &str,
+    ) -> std::result::Result<SelectedProject, ProjectRootError> {
+        let requested_path = Path::new(requested);
+        if requested.is_empty() || !requested_path.is_absolute() {
+            return Err(ProjectRootError::NotAbsolute(requested.to_string()));
+        }
+        let canonical = std::fs::canonicalize(requested_path)
+            .map_err(|e| ProjectRootError::NotFound(requested.to_string(), e))?;
+        if !canonical.is_dir() {
+            return Err(ProjectRootError::NotFound(
+                requested.to_string(),
+                std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
+            ));
+        }
+        if !self.contains(&canonical) {
+            return Err(ProjectRootError::NotAllowlisted(canonical));
+        }
+        // Walk only inside the widest allowlisted root that contains the
+        // request: ancestors beyond it are never touched (ADR-6 decision 2).
+        let floor = self
+            .allowed
+            .iter()
+            .filter(|root| canonical.starts_with(root))
+            .min_by_key(|root| root.components().count())
+            .cloned();
+        let (paths, warning) = Paths::discover_bounded(&canonical, floor.as_deref())
+            .map_err(|e| ProjectRootError::NoStore(canonical.clone(), e.to_string()))?;
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        let root = std::fs::canonicalize(&paths.root).unwrap_or_else(|_| paths.root.clone());
+        if !self.contains(&root) {
+            return Err(ProjectRootError::NotAllowlisted(root));
+        }
+        verify_store_containment(&root, &paths)?;
+        Ok(SelectedProject { root, paths })
+    }
+}
+
+/// Refuse a store whose physical location leaves the selected project root.
+///
+/// Two directory-level rules, so no list of file names has to track the
+/// sidecars the store code creates (`.tmp`, `.generation`, `.deadletter`,
+/// rebuild locks, `.bak`, ...):
+///
+/// 1. each known store path (database, query-hit log, lock, event log,
+///    compact state and the SQLite sidecars of the first two) is walked
+///    component by component from the canonical root with `lstat` semantics,
+///    so every directory on the way is a real directory or an in-root link;
+/// 2. every existing entry of each store directory (the parents of those
+///    paths) is `lstat`ed, and a symlink entry is refused unless it
+///    canonicalizes inside the root. A dangling link, a link leaving the
+///    root, or an uninspectable entry is a refusal.
+///
+/// Symlinks that stay inside the root are tolerated (legacy checkouts alias
+/// `agent-kb`). Nothing is created or opened here (directories are listed),
+/// so a refusal happens before recovery and before the lock is taken. Temp
+/// files are additionally created `O_EXCL` by the writers
+/// (`cursor::create_tmp_exclusive`), so a link planted after this check fails
+/// instead of being followed.
+///
+/// This is a check-then-use pathname policy, not an fd-pinned one: a
+/// concurrent writer that swaps a component after this returns can defeat it
+/// (ADR-6, "Limits").
+fn verify_store_containment(
+    root: &Path,
+    paths: &Paths,
+) -> std::result::Result<(), ProjectRootError> {
+    let escapes = |component: &Path| ProjectRootError::StoreEscapes {
+        root: root.to_path_buf(),
+        component: component.to_path_buf(),
+    };
+    // Rule for one path that is itself a symlink.
+    let check_link = |link: &Path| -> std::result::Result<(), ProjectRootError> {
+        let target = std::fs::canonicalize(link).map_err(|_| escapes(link))?;
+        if target.starts_with(root) {
+            Ok(())
+        } else {
+            Err(escapes(link))
+        }
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for base in [&paths.db, &paths.query_hits] {
+        candidates.push(base.clone());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = base.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            candidates.push(PathBuf::from(sidecar));
+        }
+    }
+    candidates.extend([
+        paths.lock.clone(),
+        paths.events.clone(),
+        paths.compact_state.clone(),
+    ]);
+    let mut store_dirs: Vec<PathBuf> = Vec::new();
+    for candidate in &candidates {
+        let relative = candidate
+            .strip_prefix(root)
+            .map_err(|_| escapes(candidate))?;
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => check_link(&current)?,
+                Ok(_) => {}
+                // Absent: so is everything below it; it will be created
+                // under the components verified above.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return Err(escapes(&current)),
+            }
+        }
+        if let Some(dir) = candidate.parent() {
+            if !store_dirs.iter().any(|d| d == dir) {
+                store_dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    for dir in &store_dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // Absent store directory: nothing planted in it yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(escapes(dir)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| escapes(dir))?;
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => check_link(&path)?,
+                Ok(_) => {}
+                Err(_) => return Err(escapes(&path)),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Derive a repository root from a canonical or legacy database path.
 pub fn root_from_db(db: &Path) -> PathBuf {
     let Some(db_dir) = db.parent() else {
@@ -346,21 +634,39 @@ fn is_canonical_db(db: &Path) -> bool {
             .is_some_and(|name| name == ".state")
 }
 
-fn is_inside_managed_state_worktree(candidate: &Path) -> bool {
+fn is_inside_managed_state_worktree(candidate: &Path, floor: Option<&Path>) -> bool {
     candidate.ancestors().any(|ancestor| {
+        // Never inspect an ancestor above the authorization boundary.
+        if floor.is_some_and(|f| !ancestor.starts_with(f)) {
+            return false;
+        }
         let state_dir = ancestor.join(".state");
         if !candidate.starts_with(&state_dir) {
             return false;
         }
 
+        // `lstat` + `O_NOFOLLOW`: a symlinked `.git` is never a gitlink and
+        // its target is never opened, whatever it points at.
         let gitlink = state_dir.join(".git");
-        std::fs::metadata(&gitlink)
+        std::fs::symlink_metadata(&gitlink)
             .map(|metadata| metadata.is_file())
             .unwrap_or(false)
-            && std::fs::read(&gitlink)
-                .map(|contents| contents.starts_with(b"gitdir:"))
-                .unwrap_or(false)
+            && read_gitlink_prefix_nofollow(&gitlink)
     })
+}
+
+fn read_gitlink_prefix_nofollow(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut head = [0u8; 7];
+    file.take(7).read_exact(&mut head).is_ok() && &head == b"gitdir:"
 }
 
 /// Report stores at known non-canonical sibling paths without selecting or modifying them.

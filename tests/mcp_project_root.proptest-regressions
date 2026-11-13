@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7cc0cc522a39f27c95a1b431a1fd0e9a8cb3258a0632f0e3cf7e5d616fe3bd4d # shrinks to components = []
+cc f3c0001102e8e83fd0c9b1bee1383b50b5a4d10726c4fd5407cbee3c7f287de6 # shrinks to slot = Db, target = OutsideDir

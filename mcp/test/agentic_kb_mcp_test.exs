@@ -811,13 +811,66 @@ defmodule AgenticKbMcpTest do
       assert registered == Enum.sort(expected)
     end
 
+    # The deployed pin predates ADR-6, so `repo_root` is an envelope field on
+    # top of the pin table, not a drift from it.
+    @envelope_fields ["repo_root"]
+
     test "deployed-pin field table exactly matches each Elixir tool schema" do
       for {tool_name, expected_fields} <- @deployed_pin_args do
         tool = Enum.find(McpServer.tools(), &(&1["name"] == tool_name))
         actual_fields = tool["inputSchema"]["properties"] |> Map.keys()
 
-        assert MapSet.new(actual_fields) == MapSet.new(expected_fields),
+        assert MapSet.new(actual_fields -- @envelope_fields) == MapSet.new(expected_fields),
                "#{tool_name} schema fields drifted from the shared deployed-pin table"
+      end
+    end
+  end
+
+  describe "per-request project root (ADR-6)" do
+    alias AgenticKbMcp.PortRequest
+    alias AgenticKbMcp.ToolRegistry
+
+    test "every tool except kb_rebuild declares repo_root as a string" do
+      for tool <- McpServer.tools() do
+        property = tool["inputSchema"]["properties"]["repo_root"]
+
+        if tool["name"] in ToolRegistry.tools_without_repo_root() do
+          assert property == nil, "#{tool["name"]} must not accept repo_root"
+        else
+          assert property["type"] == "string", "#{tool["name"]} must declare repo_root"
+          assert property["description"] =~ "KB_PROJECT_ROOTS"
+        end
+      end
+
+      assert ToolRegistry.tools_without_repo_root() == ["kb_rebuild"]
+    end
+
+    test "repo_root is forwarded on the port envelope for every port-backed tool" do
+      for tool <- McpServer.tools(), tool["name"] not in ToolRegistry.tools_without_repo_root() do
+        assert {:port, request} = PortRequest.build(tool["name"], %{"repo_root" => "/srv/proj"})
+        assert request["repo_root"] == "/srv/proj", "#{tool["name"]} dropped repo_root"
+      end
+    end
+
+    test "an absent or null repo_root is omitted so the Rust default applies" do
+      assert {:port, request} = PortRequest.build("kb_add", %{"path" => "a/b"})
+      refute Map.has_key?(request, "repo_root")
+
+      assert {:port, request} = PortRequest.build("kb_cite", %{"path" => "x", "repo_root" => nil})
+      refute Map.has_key?(request, "repo_root")
+    end
+
+    test "kb_rebuild rejects repo_root as an undeclared argument" do
+      assert {:error, message} =
+               McpServer.validate_tool_args("kb_rebuild", %{"repo_root" => "/x"})
+
+      assert message =~ "repo_root"
+    end
+
+    test "repo_root passes argument validation on every other tool" do
+      for tool <- McpServer.tools(), tool["name"] not in ToolRegistry.tools_without_repo_root() do
+        assert :ok == McpServer.validate_tool_args(tool["name"], %{"repo_root" => "/x"}),
+               "#{tool["name"]} must accept repo_root"
       end
     end
   end

@@ -1,6 +1,11 @@
 defmodule AgenticKbMcp.PortRequest do
   @moduledoc false
 
+  # ADR-6: the project selector travels on every port request's envelope,
+  # next to `method` and `id`, so the Rust side can resolve it before any
+  # method-specific field is read. `kb_rebuild` never builds a port request.
+  @envelope_fields ~w(repo_root)
+
   def build("kb_search", args),
     do: port("search", args, ~w(query limit mode path_prefix tag inline_verify_k expand_ids))
 
@@ -15,18 +20,18 @@ defmodule AgenticKbMcp.PortRequest do
   def build("kb_test_add", args), do: port("test_add", args, ~w(app name protocol config test_id))
   def build("kb_tests", args), do: port("tests", args, ~w(app))
   def build("kb_reembed", args), do: port("reembed", args, ~w(dry_run max_chars))
-  def build("kb_compact", _args), do: {:port, %{"method" => "compact"}}
+  def build("kb_compact", args), do: port("compact", args, [])
   def build("kb_rebuild", _args), do: :rebuild
   def build("kb_audit_run", args), do: port("audit_run", args, ~w(sample_size mode))
   def build("kb_audit_record", args), do: port("audit_record", args, ~w(run_id verdicts))
-  def build("kb_audit_report", _args), do: {:port, %{"method" => "audit_report"}}
+  def build("kb_audit_report", args), do: port("audit_report", args, [])
   def build("kb_provenance", args), do: port("provenance", args, ~w(entry_id max_depth))
   def build("kb_get", args), do: port("kb_get", args, ~w(entry_id))
   def build(_tool, _args), do: {:error, :unknown_tool}
 
   defp port(method, args, fields) do
     request =
-      Enum.reduce(fields, %{"method" => method}, fn field, request ->
+      Enum.reduce(@envelope_fields ++ fields, %{"method" => method}, fn field, request ->
         case Map.fetch(args, field) do
           {:ok, nil} -> request
           {:ok, value} -> Map.put(request, field, value)

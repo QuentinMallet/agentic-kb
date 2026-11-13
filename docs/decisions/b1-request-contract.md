@@ -74,6 +74,12 @@ also takes `session_id`. S1 now exposes `audit_run`, `audit_record`,
 `kb_audit_record`, `kb_audit_report`, and `kb_provenance`. The `kb_peers_*`
 methods remain port-only and have no Elixir tool.
 
+ADR-6 (`adr-6-per-request-project-root.md`) adds one envelope field beyond the
+pin: every port request, and every Elixir tool except `kb_rebuild`, accepts an
+optional `repo_root: string` next to `id` and `method`. The pin never sends it,
+so its absence keeps the pre-ADR-6 behaviour; `"deployed-pin field table
+exactly matches each Elixir tool schema"` subtracts it before comparing.
+
 ## Behaviour changes the fleet will see
 
 1. **An undeclared tool argument is now an error.** It was previously dropped in

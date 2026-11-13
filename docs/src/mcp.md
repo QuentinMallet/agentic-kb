@@ -7,9 +7,19 @@ in [First-run Behavior](./first-run.md).
 
 ## Request fields
 
-Every port object includes `id: any JSON value` and `method: string`.
-`request_struct!` applies `#[serde(deny_unknown_fields)]` to every typed Rust
-request in `src/commands/mcp.rs`. On the outer boundary, every schema returned
+Every port object includes `id: any JSON value` and `method: string`, and may
+include `repo_root: string` — the ADR-6 project selector
+(`docs/decisions/adr-6-per-request-project-root.md`). When present, the
+server maps that absolute directory to the enclosing project's
+`.state/agent-kb` store with the CLI's discovery walk and serves the request
+against it; the directory must canonicalize to a path under one of the roots
+given by `kb mcp --project-root <dir>` / `KB_PROJECT_ROOTS` (the `--db` root
+is always allowed), or the request is refused with `project_root_rejected`
+before any lock is taken or file opened. Without `repo_root` the server's own
+store is used. Every MCP tool except `kb_rebuild` declares `repo_root` and
+forwards it unchanged; the supervised rebuild stays bound to the startup
+store. `request_struct!` applies `#[serde(deny_unknown_fields)]` to every
+typed Rust request in `src/commands/mcp.rs`. On the outer boundary, every schema returned
 by `McpServer.tools/0` sets `additionalProperties: false`, and
 `validate_tool_args/2` reports undeclared arguments by name instead of
 dismissing them. The tests `every tool schema sets additionalProperties:
